@@ -57,6 +57,52 @@ class CameraViewerConfig:
     """Max width per camera tile in the display window."""
 
 
+def _is_displayable_image(value) -> bool:
+    return isinstance(value, np.ndarray) and value.ndim in (2, 3)
+
+
+def _prepare_display_tiles(
+    images: dict,
+    camera_names: list[str],
+    max_display_width: int,
+    is_recording: bool,
+) -> list[np.ndarray]:
+    tiles = []
+    for name in camera_names:
+        img = images.get(name)
+        if not _is_displayable_image(img):
+            continue
+
+        if img.ndim == 2:
+            img_bgr = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+            img_bgr = img_bgr.astype(np.uint8)
+            img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2BGR)
+        elif img.shape[2] == 3:
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        else:
+            img_bgr = img.copy()
+
+        h, w = img_bgr.shape[:2]
+        if w > max_display_width:
+            scale = max_display_width / w
+            img_bgr = cv2.resize(img_bgr, (max_display_width, int(h * scale)))
+
+        label = f"{name}"
+        if is_recording:
+            label = f"[REC] {name}"
+        cv2.putText(
+            img_bgr,
+            label,
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+        tiles.append(img_bgr)
+    return tiles
+
+
 def main(config: CameraViewerConfig):
     client = ComposedCameraClientSensor(server_ip=config.camera_host, port=config.camera_port)
 
@@ -72,8 +118,14 @@ def main(config: CameraViewerConfig):
         print("ERROR: No camera frames received after 10s. Check the camera server.")
         return
 
-    camera_names = sorted(sample["images"].keys())
+    camera_names = [
+        name for name in sorted(sample["images"].keys())
+        if _is_displayable_image(sample["images"][name])
+    ]
+    skipped_names = sorted(set(sample["images"].keys()) - set(camera_names))
     print(f"Detected {len(camera_names)} camera stream(s): {camera_names}")
+    if skipped_names:
+        print(f"Skipping non-display payload(s): {skipped_names}")
 
     output_dir = Path(config.output_path) if config.output_path else Path("camera_recordings")
 
@@ -102,35 +154,27 @@ def main(config: CameraViewerConfig):
                     time.sleep(remaining)
                 continue
 
-            tiles = []
-            for name in camera_names:
-                img = image_data["images"].get(name)
-                if img is None:
-                    continue
+            tiles = _prepare_display_tiles(
+                image_data["images"],
+                camera_names,
+                config.max_display_width,
+                is_recording,
+            )
 
-                if img.shape[2] == 3:
-                    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                else:
-                    img_bgr = img
-
-                if is_recording and name in video_writers:
-                    video_writers[name].write(img_bgr)
-
-                h, w = img_bgr.shape[:2]
-                if w > config.max_display_width:
-                    scale = config.max_display_width / w
-                    img_bgr = cv2.resize(
-                        img_bgr, (config.max_display_width, int(h * scale))
-                    )
-
-                label = f"{name}"
-                if is_recording:
-                    label = f"[REC] {name}"
-                cv2.putText(
-                    img_bgr, label, (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
-                )
-                tiles.append(img_bgr)
+            if is_recording:
+                for name in camera_names:
+                    img = image_data["images"].get(name)
+                    if not _is_displayable_image(img) or name not in video_writers:
+                        continue
+                    if img.ndim == 2:
+                        frame = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+                        frame = frame.astype(np.uint8)
+                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    elif img.shape[2] == 3:
+                        frame = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    else:
+                        frame = img.copy()
+                    video_writers[name].write(frame)
 
             if tiles:
                 max_h = max(t.shape[0] for t in tiles)
@@ -169,7 +213,7 @@ def main(config: CameraViewerConfig):
                     video_writers = {}
                     for name in camera_names:
                         img = image_data["images"].get(name)
-                        if img is not None:
+                        if _is_displayable_image(img):
                             h, w = img.shape[:2]
                             path = recording_dir / f"{name}.mp4"
                             video_writers[name] = cv2.VideoWriter(
