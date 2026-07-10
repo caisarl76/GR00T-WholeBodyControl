@@ -807,11 +807,41 @@ class YawAccumulator:
         Returns:
             Facing direction as [x, y, 0.0]
         """
-        self.dyaw = self.yaw_gain * (-rx) * dt
+        self.dyaw = self.yaw_gain * rx * dt
         if abs(rx) >= self.deadzone:
             self.yaw_angle_rad += self.dyaw
             self.heading = [np.cos(self.yaw_angle_rad), np.sin(self.yaw_angle_rad), 0.0]
         return self.heading
+
+
+def compute_planner_movement_from_left_stick(
+    lx: float,
+    ly: float,
+    mag: float,
+    facing: list[float] | np.ndarray,
+) -> list[float]:
+    """Convert PICO left-stick axes into a planner movement vector.
+
+    XRoboToolkit/PICO reports stick-right as negative X and stick-forward as
+    positive Y. The planner expects a world-frame movement vector, so rotate the
+    stick-local command by the current commanded facing direction.
+    """
+    denom = float(np.hypot(lx, ly))
+    if mag <= 0.0 or denom <= 0.0:
+        return [0.0, 0.0, 0.0]
+
+    scale = mag / denom
+    movement_local = np.array([-lx, ly], dtype=np.float64) * scale
+    facing_xy = np.asarray(facing[:2], dtype=np.float64)
+    facing_norm = float(np.linalg.norm(facing_xy))
+    if facing_norm <= 1e-9:
+        facing_xy = np.array([1.0, 0.0], dtype=np.float64)
+    else:
+        facing_xy = facing_xy / facing_norm
+
+    right_xy = np.array([facing_xy[1], -facing_xy[0]], dtype=np.float64)
+    movement_global = right_xy * movement_local[0] + facing_xy * movement_local[1]
+    return [float(movement_global[0]), float(movement_global[1]), 0.0]
 
 
 def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndarray):
@@ -2674,14 +2704,7 @@ class PlannerStreamer:
                 else:
                     speed = mag  # default 0 .. 1.0
 
-            denom = raw_mag if raw_mag > 0.0 else 1.0
-            scale = mag / denom
-            movement_local = np.array([-lx, ly]) * scale
-            perp_x, perp_y = -facing[1], facing[0]
-            rotation_facing = np.array([[perp_x, perp_y], [facing[0], facing[1]]])
-            movement_global = rotation_facing @ movement_local
-
-            movement = [movement_global[0], movement_global[1], 0.0]
+            movement = compute_planner_movement_from_left_stick(lx, ly, mag, facing)
 
             upper_body_position = None
             left_hand_position = None
