@@ -161,7 +161,9 @@ Run them, together with the existing controller regression test, using:
 
 ```bash
 cd /home/jihun/work/unitree_official/xr_teleoperate
-PYTHONPATH=teleop/televuer/src:. pytest -q \
+PYTHONPATH=teleop/televuer/src:. \
+  /home/jihun/work/GR00T-WholeBodyControl/.venv_teleop/bin/python \
+  -m pytest -q -p no:cacheprovider \
   tests/test_dex3_controller_pinch.py \
   tests/test_televuer_controller_payload.py \
   tests/test_teleop_keyboard_controls.py
@@ -210,12 +212,20 @@ schedule `alpha = numpy.linspace(0, 1, 11)`. It requires all pre-final
 distances to be positive, the sampled distances to be non-increasing within
 `1e-6 m`, and the absolute final distance to be at most `1e-6 m`.
 
-It separately starts at the open pose and repeatedly applies the deploy
-driver's per-joint update
-`q_next = q + clip(q_target - q, -0.25, 0.25)`. Both hands must reach the exact
-target in six ticks; the first five signed distances must be positive and
-non-increasing, and the final absolute signed distance must be at most
-`1e-6 m`. The verifier does not use `MjData.ncon` as a pass criterion.
+It separately checks an idealized command-space slew trajectory assuming
+perfect one-write tracking. Starting at the open pose, it repeatedly applies
+the recurrence `q_next = q + clip(q_target - q, -0.25, 0.25)`. Both hands must
+reach the exact target in six recurrence steps; the first five signed
+distances must be positive and non-increasing, and the final absolute signed
+distance must be at most `1e-6 m`.
+
+Those six recurrence steps are not a production-driver tick guarantee. On
+each write, the driver recalculates its delta from fresh measured DDS state;
+feedback lag may require more writes. If valid seven-motor state feedback is
+absent, the driver bypasses the per-tick slew clamp and publishes the
+max-close-limited target directly. The verifier documents the geometry of the
+idealized clamp recurrence; it does not model feedback latency and does not
+use `MjData.ncon` as a pass criterion.
 
 After these checks pass, real-robot acceptance remains a guarded hardware
 check: start open, pull one trigger slowly, confirm the middle finger stays
