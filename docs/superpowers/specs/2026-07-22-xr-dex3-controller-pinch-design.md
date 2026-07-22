@@ -1,6 +1,6 @@
 # XR Dex3 Controller Pinch Design
 
-Status: Revised after user review on 2026-07-22; pending re-approval.
+Status: Approved after two review rounds on 2026-07-22.
 
 ## Problem
 
