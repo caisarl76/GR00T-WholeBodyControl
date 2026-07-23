@@ -73,8 +73,10 @@ The user's unrelated untracked
   one publisher instance.
 - Modify `gear_sonic/tests/test_xr_upperbody_bridge.py`: corrected JSON order,
   route integration, pause, invalid-frame, stop, and manager-send behavior.
+- Create `gear_sonic/tests/test_xr_upperbody_bridge_routes.py`: production-loop
+  routing, stop-branch, invalid-frame, encoding, and transport-failure tests.
 - Modify `gear_sonic/scripts/verify_xr_dex3_controller_pinch.py`: symmetric
-  named-joint order for both hands.
+  named-joint order, middle-slot invariant, and deploy-limit validation.
 - Add the existing untracked
   `gear_sonic/tests/test_verify_xr_dex3_controller_pinch.py`: independent
   verifier-order regression.
@@ -103,17 +105,22 @@ HandCommandLimiter.preview(
     pause: bool = False,
 ) -> HandCommandPreview
 
-BridgePlannerPublisher.publish(
+BridgePlannerPublisher.prepare(
     command: PlannerCommand,
     *,
     ramp_phase: str,
+) -> PreparedPlannerPublication
+
+BridgePlannerPublisher.send(
+    prepared: PreparedPlannerPublication,
 ) -> bytes
 ```
 
 `PlannerCommand` is the only planner representation accepted by the production
 publisher. Compatibility helpers may still return encoded bytes for existing
-inspection tests, but production replay/live/stop code must build a command
-and call `BridgePlannerPublisher.publish()`.
+inspection tests, but production replay/live/stop code must build a command,
+catch only `PlannerPreparationError` around `prepare()`, and call `send()`
+outside that catch so transport failures propagate.
 
 ## Task 1: Pure Dual-Primitive XR Contract
 
@@ -176,6 +183,35 @@ def test_full_squeeze_selects_calibrated_pinch() -> None:
         right_squeeze_value=1.0,
     )
     assert_targets_close(actual, DEX3_LEFT_PINCH + DEX3_RIGHT_PINCH)
+
+
+def test_half_depth_squeeze_returns_half_calibrated_pinch() -> None:
+    actual = controller_gripper_targets(
+        left_trigger=False,
+        left_trigger_value=10.0,
+        left_squeeze=True,
+        left_squeeze_value=0.5,
+        right_trigger=False,
+        right_trigger_value=10.0,
+        right_squeeze=True,
+        right_squeeze_value=0.5,
+    )
+    expected = [0.5 * value for value in DEX3_LEFT_PINCH + DEX3_RIGHT_PINCH]
+    assert_targets_close(actual, expected)
+
+
+def test_active_squeeze_with_missing_analog_is_safe_open() -> None:
+    actual = controller_gripper_targets(
+        left_trigger=False,
+        left_trigger_value=10.0,
+        left_squeeze=True,
+        left_squeeze_value=None,
+        right_trigger=False,
+        right_trigger_value=10.0,
+        right_squeeze=True,
+        right_squeeze_value=None,
+    )
+    assert_targets_close(actual, DEX3_DUAL_OPEN)
 
 
 @pytest.mark.parametrize("trigger_depth", [0.0, 0.1, 0.5, 1.0])
@@ -644,7 +680,12 @@ Change the three pre-existing raw-trigger output oracles from pinch to legacy
 close:
 
 ```python
-from teleop.utils.dex3_controller_pinch import DEX3_LEFT_LEGACY_CLOSE
+from teleop.utils.dex3_controller_pinch import (
+    DEX3_DUAL_OPEN,
+    DEX3_LEFT_LEGACY_CLOSE,
+    DEX3_LEFT_PINCH,
+    DEX3_OPEN,
+)
 
 
 def test_raw_analog_trigger_value_scales_left_dex3_legacy_close() -> None:
@@ -663,11 +704,26 @@ def test_raw_nan_trigger_value_uses_pressed_boolean_fallback() -> None:
         rtol=0,
         atol=1e-6,
     )
+
+
+def test_raw_half_depth_squeeze_scales_calibrated_pinch() -> None:
+    targets = controller_targets_from_raw(
+        {"squeeze": True, "squeezeValue": 0.5}
+    )
+    expected = [0.5 * value for value in DEX3_LEFT_PINCH] + list(DEX3_OPEN)
+    np.testing.assert_allclose(targets, expected, rtol=0, atol=1e-6)
+
+
+def test_raw_active_squeeze_with_missing_analog_is_safe_open() -> None:
+    targets = controller_targets_from_raw({"squeeze": True})
+    np.testing.assert_allclose(targets, DEX3_DUAL_OPEN, rtol=0, atol=1e-6)
 ```
 
-In `test_extreme_finite_raw_trigger_values_clamp_without_wrapper_overflow`, use
-`DEX3_LEFT_LEGACY_CLOSE + DEX3_OPEN` for the raw `1e308` full-pull expected
-value; keep the raw `-1e308` expected value as `DEX3_DUAL_OPEN`.
+In `test_extreme_finite_raw_trigger_values_clamp_without_wrapper_overflow`,
+keep `trigger=False` and expect `DEX3_DUAL_OPEN` for both raw `1e308` and raw
+`-1e308`. The finite amplitude is clamped, but an inactive Boolean never
+selects the legacy-close branch. The separate active-trigger tests cover the
+full-close amplitude.
 
 - [ ] **Step 2: Run the payload tests and verify the red state**
 
@@ -1008,7 +1064,7 @@ Expected: no whitespace errors. Do not stage or commit the dirty XR checkout.
 - Modify: `gear_sonic/scripts/verify_xr_dex3_controller_pinch.py`
 - Add: `gear_sonic/tests/test_verify_xr_dex3_controller_pinch.py`
 
-- [ ] **Step 1: Make both repository oracles assert symmetric middle-first order**
+- [ ] **Step 1: Make repository oracles assert order, middle slots, and hard bounds**
 
 In `test_calibrated_controller_pinch_json_splits_exact_dex3_sides()`, set:
 
@@ -1016,10 +1072,31 @@ In `test_calibrated_controller_pinch_json_splits_exact_dex3_sides()`, set:
 right = [-0.379617, -0.516714, -0.121407, 0.0, 0.0, 1.273907, 0.419395]
 ```
 
-Keep the existing untracked verifier test exactly as the independent contract:
+Expand the existing untracked verifier test into this independent contract.
+The Python hard-limit arrays are deliberately pinned independently to
+`gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/dex3_hands.hpp`; do not
+import them from the XR helper:
 
 ```python
-from gear_sonic.scripts.verify_xr_dex3_controller_pinch import SIDE_ORDER
+import numpy as np
+import pytest
+
+from gear_sonic.scripts.verify_xr_dex3_controller_pinch import (
+    DEPLOY_HAND_HARD_MAX,
+    DEPLOY_HAND_HARD_MIN,
+    SIDE_ORDER,
+    validate_pinch_targets,
+)
+
+
+CALIBRATED = {
+    "left": np.array(
+        [-0.379616, 0.516712, 0.121406, 0.0, 0.0, -1.273903, -0.419393]
+    ),
+    "right": np.array(
+        [-0.379617, -0.516714, -0.121407, 0.0, 0.0, 1.273907, 0.419395]
+    ),
+}
 
 
 def test_verifier_uses_symmetric_physical_dex3_dds_order() -> None:
@@ -1034,6 +1111,51 @@ def test_verifier_uses_symmetric_physical_dex3_dds_order() -> None:
     )
     assert SIDE_ORDER["left"] == expected
     assert SIDE_ORDER["right"] == expected
+
+
+def test_verifier_pins_current_deploy_hard_limits() -> None:
+    np.testing.assert_allclose(
+        DEPLOY_HAND_HARD_MIN["left"],
+        [-1.05, -0.724, 0.0, -1.57, -1.75, -1.57, -1.75],
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        DEPLOY_HAND_HARD_MAX["left"],
+        [1.05, 1.05, 1.75, 0.0, 0.0, 0.0, 0.0],
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        DEPLOY_HAND_HARD_MIN["right"],
+        [-1.05, -1.05, -1.75, 0.0, 0.0, 0.0, 0.0],
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        DEPLOY_HAND_HARD_MAX["right"],
+        [1.05, 0.742, 0.0, 1.57, 1.75, 1.57, 1.75],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_calibrated_targets_pass_middle_and_deploy_limit_contract() -> None:
+    validate_pinch_targets(CALIBRATED)
+
+
+def test_verifier_rejects_nonzero_middle_slot() -> None:
+    bad = {side: values.copy() for side, values in CALIBRATED.items()}
+    bad["right"][3] = 0.01
+    with pytest.raises(ValueError, match="middle"):
+        validate_pinch_targets(bad)
+
+
+def test_verifier_rejects_target_outside_deploy_hard_limits() -> None:
+    bad = {side: values.copy() for side, values in CALIBRATED.items()}
+    bad["left"][0] = -1.051
+    with pytest.raises(ValueError, match="hard limits"):
+        validate_pinch_targets(bad)
 ```
 
 - [ ] **Step 2: Run both focused tests and verify red**
@@ -1046,8 +1168,9 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   gear_sonic/tests/test_verify_xr_dex3_controller_pinch.py
 ```
 
-Expected: the JSON split test exposes the old right expected vector or the
-verifier test fails because `SIDE_ORDER["right"]` is still index-first.
+Expected: the JSON split or order test exposes the old right mapping, while
+the invariant tests fail because the verifier has no hard-limit constants or
+target-validation function.
 
 - [ ] **Step 3: Correct the named-joint verifier order**
 
@@ -1066,8 +1189,35 @@ DEX3_API_ORDER = (
 SIDE_ORDER = {"left": DEX3_API_ORDER, "right": DEX3_API_ORDER}
 ```
 
-Do not derive this tuple from the XR helper; the verifier's named-joint mapping
-must remain an independent oracle.
+Add independent deploy limits and the validation function next to the order:
+
+```python
+DEPLOY_HAND_HARD_MIN = {
+    "left": np.array([-1.05, -0.724, 0.0, -1.57, -1.75, -1.57, -1.75]),
+    "right": np.array([-1.05, -1.05, -1.75, 0.0, 0.0, 0.0, 0.0]),
+}
+DEPLOY_HAND_HARD_MAX = {
+    "left": np.array([1.05, 1.05, 1.75, 0.0, 0.0, 0.0, 0.0]),
+    "right": np.array([1.05, 0.742, 0.0, 1.57, 1.75, 1.57, 1.75]),
+}
+
+
+def validate_pinch_targets(targets: dict[str, np.ndarray]) -> None:
+    for side in ("left", "right"):
+        target = np.asarray(targets[side], dtype=np.float64)
+        if target.shape != (7,) or not np.all(np.isfinite(target)):
+            raise ValueError(f"invalid {side} pinch target")
+        if not np.allclose(target[3:5], 0.0, rtol=0, atol=1e-12):
+            raise ValueError(f"{side} middle joints must remain zero")
+        if np.any(target < DEPLOY_HAND_HARD_MIN[side] - 1e-12) or np.any(
+            target > DEPLOY_HAND_HARD_MAX[side] + 1e-12
+        ):
+            raise ValueError(f"{side} target exceeds deploy hard limits")
+```
+
+Call `validate_pinch_targets(targets)` at the start of `verify_pinch()`, before
+loading the model or running the six-step recurrence. Do not derive order or
+limits from the XR helper; the verifier remains an independent oracle.
 
 - [ ] **Step 4: Run the focused tests and MuJoCo verifier**
 
@@ -1109,14 +1259,19 @@ Expected: one commit containing only the JSON/geometry order correction.
 Create the test file with these fixtures and cases:
 
 ```python
+import struct
+
 import numpy as np
 import pytest
+
+import gear_sonic.utils.teleop.bridge_planner_publisher as publisher_module
 
 from gear_sonic.utils.teleop.bridge_planner_publisher import (
     BridgePlannerPublisher,
     HandCommandLimiter,
     MAX_HAND_JOINT_STEP_RAD,
     PlannerCommand,
+    PlannerPreparationError,
 )
 
 
@@ -1204,6 +1359,32 @@ def test_failed_planner_send_commits_neither_hand() -> None:
         publisher.publish(command([1.0] * 7, [-1.0] * 7), ramp_phase="track")
     np.testing.assert_allclose(publisher.last_emitted("left"), [0.0] * 7)
     np.testing.assert_allclose(publisher.last_emitted("right"), [0.0] * 7)
+
+
+def test_encoding_failure_is_preparation_error_without_commit(monkeypatch) -> None:
+    def fail_encode(*args, **kwargs):
+        raise struct.error("float out of range")
+
+    monkeypatch.setattr(publisher_module, "build_planner_message", fail_encode)
+    socket = RecordingSocket()
+    publisher = BridgePlannerPublisher(socket)
+    with pytest.raises(PlannerPreparationError, match="invalid planner command"):
+        publisher.prepare(command([1.0] * 7, [-1.0] * 7), ramp_phase="track")
+    assert socket.sent == []
+    np.testing.assert_allclose(publisher.last_emitted("left"), [0.0] * 7)
+    np.testing.assert_allclose(publisher.last_emitted("right"), [0.0] * 7)
+
+
+def test_send_transport_failure_propagates_without_commit() -> None:
+    publisher = BridgePlannerPublisher(RecordingSocket(fail=True))
+    prepared = publisher.prepare(
+        command([1.0] * 7, [-1.0] * 7),
+        ramp_phase="track",
+    )
+    with pytest.raises(RuntimeError, match="send failed"):
+        publisher.send(prepared)
+    np.testing.assert_allclose(publisher.last_emitted("left"), [0.0] * 7)
+    np.testing.assert_allclose(publisher.last_emitted("right"), [0.0] * 7)
 ```
 
 - [ ] **Step 2: Run the new tests and verify import failure**
@@ -1225,6 +1406,7 @@ Create `bridge_planner_publisher.py` with these definitions:
 ```python
 from __future__ import annotations
 
+import struct
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
@@ -1235,6 +1417,10 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
 
 HAND_DOF = 7
 MAX_HAND_JOINT_STEP_RAD = 0.25
+
+
+class PlannerPreparationError(ValueError):
+    """The planner command could not be validated or encoded."""
 
 
 @dataclass(frozen=True)
@@ -1250,17 +1436,22 @@ class PlannerCommand:
     right_hand_position: Sequence[float] | None = None
 
     def encode(self) -> bytes:
-        return build_planner_message(
-            self.mode,
-            self.movement,
-            self.facing,
-            speed=self.speed,
-            height=self.height,
-            upper_body_position=self.upper_body_position,
-            upper_body_velocity=self.upper_body_velocity,
-            left_hand_position=self.left_hand_position,
-            right_hand_position=self.right_hand_position,
-        )
+        try:
+            return build_planner_message(
+                self.mode,
+                self.movement,
+                self.facing,
+                speed=self.speed,
+                height=self.height,
+                upper_body_position=self.upper_body_position,
+                upper_body_velocity=self.upper_body_velocity,
+                left_hand_position=self.left_hand_position,
+                right_hand_position=self.right_hand_position,
+            )
+        except (TypeError, ValueError, OverflowError, struct.error) as exc:
+            raise PlannerPreparationError(
+                f"invalid planner command: {exc}"
+            ) from exc
 
 
 @dataclass(frozen=True)
@@ -1292,9 +1483,9 @@ class HandCommandLimiter:
         try:
             array = np.asarray(value, dtype=np.float64)
         except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"invalid {side} hand command") from exc
+            raise PlannerPreparationError(f"invalid {side} hand command") from exc
         if array.shape != (HAND_DOF,) or not np.all(np.isfinite(array)):
-            raise ValueError(f"invalid {side} hand command")
+            raise PlannerPreparationError(f"invalid {side} hand command")
         return array
 
     def preview(self, left, right, *, pause: bool = False) -> HandCommandPreview:
@@ -1378,7 +1569,11 @@ class BridgePlannerPublisher:
 
 The class performs no DDS work, uses command-space zero only as its initial
 reference, and commits both included hands only after the planner socket send
-returns successfully.
+returns successfully. `prepare()` owns all hand validation and binary
+encoding, normalizes those failures to `PlannerPreparationError`, and performs
+no send or commit. `send()` performs transport and commit only; it never
+swallows transport exceptions. `publish()` remains a convenience wrapper for
+isolated tests, but production loops use the explicit prepare/send boundary.
 
 - [ ] **Step 4: Run the publisher tests and verify green**
 
@@ -1400,8 +1595,9 @@ git commit -m "feat(teleop): add shared hand-limited planner publisher"
 **Files:**
 - Modify: `gear_sonic/utils/teleop/xr_upperbody_bridge.py`
 - Modify: `gear_sonic/tests/test_xr_upperbody_bridge.py`
+- Create: `gear_sonic/tests/test_xr_upperbody_bridge_routes.py`
 
-- [ ] **Step 1: Add failing builder and route integration tests**
+- [ ] **Step 1: Add failing builder tests and production-loop route tests**
 
 Import `BridgePlannerPublisher`, `PlannerCommand`, and the new command builders
 in the bridge test. Add these focused contracts:
@@ -1512,9 +1708,106 @@ def test_replay_sequence_uses_one_limiter_state() -> None:
     np.testing.assert_allclose(second["left_hand_position"], [0.0] * 7)
 ```
 
-The production-route assertion is completed in Step 4 by replacing all four
-identified hand-bearing send sites. These tests exercise commands produced for
-replay, live, stop-release, and final hold.
+These builder-level tests stay as fast behavioral checks, but they do not count
+as proof of production routing.
+
+Create `test_xr_upperbody_bridge_routes.py` with a reusable `ScriptedZmq`
+fixture that installs a fake `zmq` module in `sys.modules`. Its context returns
+one scripted SUB socket and one recording PUB socket, its `recv()` script can
+yield bytes or raise `FakeAgain`, and every `send()` records both the message
+and the current receive-step number. Provide:
+
+```python
+class FakeAgain(Exception):
+    pass
+
+
+class FakeTransportError(RuntimeError):
+    pass
+
+
+class EndOfScript(RuntimeError):
+    pass
+
+
+def bridge_args(**overrides) -> argparse.Namespace:
+    values = dict(
+        bind_host="127.0.0.1",
+        port=5556,
+        source_host="127.0.0.1",
+        source_port=5560,
+        source_topic="xr_teleop",
+        source_timeout_s=0.001,
+        feedback_host="127.0.0.1",
+        feedback_port=5557,
+        feedback_topic="g1_debug",
+        feedback_prime_timeout_s=0.001,
+        no_feedback_prime=True,
+        allow_unseeded_start_control=True,
+        start_control=False,
+        start_command_repeat_s=0.0,
+        start_command_interval_s=0.2,
+        pub_warmup_s=0.0,
+        hz=50.0,
+        max_abs_joint=3.14,
+        max_joint_step=0.03,
+        stream_mode=5,
+        stop_release_s=1.0,
+        stop_final_hold_s=1.0,
+        stop_hand_preset="tucked-thumb",
+        stop_upper_body_preset="straight",
+        send_stop_on_exit=False,
+        anchor_planner_heading=False,
+        once=True,
+        debug_live=False,
+        debug_interval=0.5,
+        dry_run=False,
+        loop=False,
+    )
+    values.update(overrides)
+    return argparse.Namespace(**values)
+```
+
+Use `unpack_bridge_message(..., topic="planner")` for all numerical
+assertions. Add these exact production-boundary tests:
+
+1. `test_send_loop_replay_routes_consecutive_frames_through_one_publisher`:
+   call `_send_loop()` with two loaded frames whose hand targets are `+1` then
+   `-1` and `bridge_args(once=False, loop=False)`; assert the actual PUB
+   planner messages contain `+0.25` then `0.0`.
+2. `test_zmq_live_loop_routes_valid_frame_through_publisher`: feed one valid
+   topic-prefixed object payload to `_send_zmq_json_loop()` with `once=True`;
+   assert the actual planner hand fields are limited to `0.25`.
+3. `test_zmq_stop_release_routes_immediate_timeout_and_final_hold_branches`:
+   feed a tracking frame, then an `out` frame, then scripted `FakeAgain`
+   timeouts while a deterministic monotonic clock advances through release and
+   hold. Spy on `BridgePlannerPublisher.prepare()` to record `ramp_phase` and
+   record receive-step numbers in the PUB. Assert at least one stop planner send
+   occurs on the immediate-source step, another occurs after a timeout step,
+   both `stop-release` and `final-hold` phases occur, and every adjacent actual
+   hand command differs by at most `0.25 + 1e-7`. Run with `once=False`; end
+   the receive script with `EndOfScript`, catch that sentinel, and then inspect
+   the recorded production sends.
+4. `test_zmq_invalid_frames_continue_and_warning_is_rate_limited`: feed two
+   invalid frames less than one fake second apart—first valid JSON `[]`, then a
+   mapping with an invalid hand shape—followed by a valid frame. Assert exactly
+   one invalid-frame warning, one planner send, and a zero return code.
+5. `test_zmq_encoding_failure_does_not_commit_before_next_valid_frame`: feed a
+   valid object whose planner float is `1e308` so preparation raises the
+   dedicated encoding exception, then a normal frame with hand targets `+1`.
+   Assert the loop continues, only one planner message is sent, and its hand
+   fields are `0.25` from command-space zero rather than `0.5`.
+6. `test_zmq_transport_failure_propagates_and_does_not_commit`: configure the
+   recording PUB to raise `FakeTransportError` on its first planner send; assert
+   `_send_zmq_json_loop()` raises that exact error. Spy on the constructed
+   publisher and assert both `last_emitted()` vectors remain zero.
+
+For test 3, make `build_due_stop_release_commands()` return a phase string as
+described in Step 3. For tests 4 and 5, set `once=True`; invalid frames do not
+count as the one successful publication. The fake sockets implement all no-op
+`bind`, `connect`, `setsockopt`, `setsockopt_string`, and `close` methods used
+by the production functions so the test calls the real loops rather than a
+copied loop body.
 
 - [ ] **Step 2: Run focused bridge tests and verify red**
 
@@ -1522,13 +1815,15 @@ replay, live, stop-release, and final hold.
 cd /home/jihun/work/GR00T-WholeBodyControl/worktrees/xr-dex3-controller-pinch
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   /home/jihun/work/GR00T-WholeBodyControl/.venv_teleop/bin/python -m pytest -q -p no:cacheprovider \
-  gear_sonic/tests/test_xr_upperbody_bridge.py -k \
-  "planner_command or replay_sequence or pause_freezes or manager_failure or stop_release_and_final_hold"
+  gear_sonic/tests/test_xr_upperbody_bridge.py \
+  gear_sonic/tests/test_xr_upperbody_bridge_routes.py -k \
+  "planner_command or replay_sequence or pause_freezes or manager_failure or stop_release_and_final_hold or send_loop or zmq"
 ```
 
 Expected: collection fails because the command builders do not exist or tests
-show that builders still return bytes and production paths call `pub.send()`
-directly.
+show that production replay, live, immediate stop, timeout stop, and final hold
+still call `pub.send()` directly. Non-object JSON and encoding overflow also
+escape the current loop.
 
 - [ ] **Step 3: Introduce command builders while retaining byte wrappers**
 
@@ -1633,10 +1928,11 @@ def build_due_stop_release_commands(
     stream_mode: int,
     hand_preset: str,
     upper_body_preset: str,
-) -> tuple[PlannerCommand, bytes] | None:
+) -> tuple[PlannerCommand, bytes, str] | None:
     alpha = schedule.next_alpha(now=now, hz=hz)
     if alpha is None:
         return None
+    phase = "final-hold" if schedule.final_frame_sent else "stop-release"
     return (
         build_stop_standing_command(
             schedule.frame,
@@ -1645,6 +1941,7 @@ def build_due_stop_release_commands(
             upper_body_preset=upper_body_preset,
         ),
         build_manager_state_message(stream_mode=stream_mode),
+        phase,
     )
 
 
@@ -1652,14 +1949,16 @@ def build_due_stop_release_messages(*args, **kwargs) -> tuple[bytes, bytes] | No
     commands = build_due_stop_release_commands(*args, **kwargs)
     if commands is None:
         return None
-    planner_command, manager_message = commands
+    planner_command, manager_message, _phase = commands
     return planner_command.encode(), manager_message
 ```
 
 Production loops call `build_due_stop_release_commands()`; only compatibility
-tests call the byte-returning wrapper.
+tests call the byte-returning wrapper. `final_frame_sent` becomes true on the
+first exact-alpha-one publication, so the phase identifies the final-hold path
+without changing the existing schedule timing.
 
-- [ ] **Step 4: Route replay and all live stop branches through shared publish**
+- [ ] **Step 4: Route replay and all live stop branches through shared prepare/send**
 
 In `_send_loop()`, create exactly one publisher after the replay socket is
 created:
@@ -1673,7 +1972,8 @@ For every replay frame:
 ```python
 command = build_frame_planner_command(frame, config, filt)
 if planner_publisher is not None:
-    planner_publisher.publish(command, ramp_phase=frame.ramp_phase)
+    prepared = planner_publisher.prepare(command, ramp_phase=frame.ramp_phase)
+    planner_publisher.send(prepared)
     socket.send(build_manager_state_message(stream_mode=args.stream_mode))
 else:
     command.encode()
@@ -1684,45 +1984,51 @@ locally enqueued.
 
 In `_send_zmq_json_loop()`, create one
 `planner_publisher = BridgePlannerPublisher(pub)` before entering the loop.
-Replace the normal live send with:
-
-```python
-command = build_frame_planner_command(
-    frame,
-    config,
-    filt,
-    stop_hand_preset=args.stop_hand_preset,
-)
-planner_publisher.publish(command, ramp_phase=frame.ramp_phase)
-pub.send(
-    build_manager_state_message(
-        stream_mode=args.stream_mode,
-        toggle_data_collection=frame.toggle_data_collection,
-        toggle_data_abort=frame.toggle_data_abort,
-    )
-)
-```
+Replace the normal live send using the validation boundary in Step 5.
 
 In both stop-release branches—timeout polling and immediate source-frame
 handling—call `build_due_stop_release_commands()`, then:
 
 ```python
-planner_command, manager_state_message = commands
-planner_publisher.publish(planner_command, ramp_phase="stop")
+planner_command, manager_state_message, stop_phase = commands
+try:
+    prepared = planner_publisher.prepare(
+        planner_command,
+        ramp_phase=stop_phase,
+    )
+except PlannerPreparationError as exc:
+    warn_invalid_frame("invalid stop planner command", exc)
+    continue
+planner_publisher.send(prepared)
 pub.send(manager_state_message)
 ```
 
-Because the schedule emits repeated alpha-one commands during final hold, the
-same publisher continues slewing toward tucked-thumb without extending the
-existing hold timer. `"stop"` is intentionally used for both release and hold
-because only the exact `"pause"` phase freezes the limiter. No direct
-hand-bearing planner byte may bypass this
-publisher in replay, live, either stop-release branch, or final hold.
+`prepare()` is inside the dedicated preparation-error catch; `send()` and the
+manager transport are outside it. Because the schedule emits repeated
+alpha-one commands during final hold, the same publisher continues slewing
+toward tucked-thumb without extending the existing hold timer. No direct
+hand-bearing planner byte may bypass this publisher in replay, live, either
+stop-release branch, or final hold.
 
-- [ ] **Step 5: Catch invalid input frames without mutating limiter state**
+- [ ] **Step 5: Separate input validation, preparation, and transport**
 
-Wrap JSON decode, `normalize_live_source_payload()`, command building, and
-publisher preparation in a `try` that catches only input/encoding exceptions:
+Import `Mapping` and `PlannerPreparationError`. Initialize a dedicated warning
+clock and one local rate-limited reporter before the loop:
+
+```python
+last_invalid_frame_warn_time = -math.inf
+
+
+def warn_invalid_frame(context: str, exc: Exception) -> None:
+    nonlocal last_invalid_frame_warn_time
+    now = time.monotonic()
+    if now - last_invalid_frame_warn_time >= 1.0:
+        print(f"[xr_upperbody_bridge] {context} skipped: {exc}", flush=True)
+        last_invalid_frame_warn_time = now
+```
+
+Decode and validate the JSON object explicitly. This turns valid JSON such as
+`[]` into a handled invalid frame instead of an `AttributeError`:
 
 ```python
 try:
@@ -1732,47 +2038,35 @@ try:
         else raw
     )
     payload = json.loads(payload_bytes.decode("utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("live payload must be a JSON object")
     frame = normalize_live_source_payload(payload)
 except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
-    now = time.monotonic()
-    if now - last_invalid_frame_warn_time >= 1.0:
-        print(
-            f"[xr_upperbody_bridge] invalid live frame skipped: {exc}",
-            flush=True,
-        )
-        last_invalid_frame_warn_time = now
+    warn_invalid_frame("invalid live frame", exc)
     continue
 ```
 
-Initialize the separate warning clock before the loop:
+Build the normal live command, then catch only the dedicated validation and
+encoding error around `prepare()`. Keep `send()` and the manager send outside
+the catch:
 
 ```python
-last_invalid_frame_warn_time = 0.0
-```
-
-Around normal-live command creation/publishing, use this exact structure so a
-validation or encoding error skips the complete frame without committing
-either hand:
-
-```python
+command = build_frame_planner_command(
+    frame,
+    config,
+    filt,
+    stop_hand_preset=args.stop_hand_preset,
+)
 try:
-    command = build_frame_planner_command(
-        frame,
-        config,
-        filt,
-        stop_hand_preset=args.stop_hand_preset,
+    prepared = planner_publisher.prepare(
+        command,
+        ramp_phase=frame.ramp_phase,
     )
-    planner_publisher.publish(command, ramp_phase=frame.ramp_phase)
-except ValueError as exc:
-    now = time.monotonic()
-    if now - last_invalid_frame_warn_time >= 1.0:
-        print(
-            f"[xr_upperbody_bridge] invalid planner frame skipped: {exc}",
-            flush=True,
-        )
-        last_invalid_frame_warn_time = now
+except PlannerPreparationError as exc:
+    warn_invalid_frame("invalid planner frame", exc)
     continue
 
+planner_publisher.send(prepared)
 pub.send(
     build_manager_state_message(
         stream_mode=args.stream_mode,
@@ -1782,8 +2076,11 @@ pub.send(
 )
 ```
 
-Do not catch ZMQ send exceptions: a transport failure must leave limiter state
-uncommitted and exit through the existing cleanup.
+Use the same `prepare()` catch and outside-catch `send()` ordering in both stop
+branches from Step 4. `PlannerCommand.encode()` normalizes `struct.error`,
+`OverflowError`, `TypeError`, and `ValueError` to
+`PlannerPreparationError`. Do not catch ZMQ send exceptions: a transport
+failure must leave limiter state uncommitted and propagate through cleanup.
 
 - [ ] **Step 6: Run bridge unit and integration tests**
 
@@ -1791,19 +2088,22 @@ uncommitted and exit through the existing cleanup.
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   /home/jihun/work/GR00T-WholeBodyControl/.venv_teleop/bin/python -m pytest -q -p no:cacheprovider \
   gear_sonic/tests/test_bridge_planner_publisher.py \
-  gear_sonic/tests/test_xr_upperbody_bridge.py
+  gear_sonic/tests/test_xr_upperbody_bridge.py \
+  gear_sonic/tests/test_xr_upperbody_bridge_routes.py
 ```
 
-Expected: all tests pass, including replay/live routing, pause freeze,
-stop-release/final-hold limiting, invalid-frame continuation, atomic hand
-commit, and manager-send non-rollback.
+Expected: all tests pass, including calls to the real replay/live loops, both
+production stop branches, final hold, rate-limited invalid-frame continuation,
+encoding failure without commit, transport-failure propagation, pause freeze,
+atomic hand commit, and manager-send non-rollback.
 
 - [ ] **Step 7: Commit the bridge integration**
 
 ```bash
 git add \
   gear_sonic/utils/teleop/xr_upperbody_bridge.py \
-  gear_sonic/tests/test_xr_upperbody_bridge.py
+  gear_sonic/tests/test_xr_upperbody_bridge.py \
+  gear_sonic/tests/test_xr_upperbody_bridge_routes.py
 git commit -m "feat(teleop): limit all bridge hand publications"
 ```
 
@@ -1835,6 +2135,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   /home/jihun/work/GR00T-WholeBodyControl/.venv_teleop/bin/python -m pytest -q -p no:cacheprovider \
   gear_sonic/tests/test_bridge_planner_publisher.py \
   gear_sonic/tests/test_xr_upperbody_bridge.py \
+  gear_sonic/tests/test_xr_upperbody_bridge_routes.py \
   gear_sonic/tests/test_verify_xr_dex3_controller_pinch.py
 ```
 
@@ -1862,6 +2163,7 @@ ruff check --no-cache \
   gear_sonic/scripts/verify_xr_dex3_controller_pinch.py \
   gear_sonic/tests/test_bridge_planner_publisher.py \
   gear_sonic/tests/test_xr_upperbody_bridge.py \
+  gear_sonic/tests/test_xr_upperbody_bridge_routes.py \
   gear_sonic/tests/test_verify_xr_dex3_controller_pinch.py
 
 ruff format --check --no-cache \
@@ -1870,6 +2172,7 @@ ruff format --check --no-cache \
   gear_sonic/scripts/verify_xr_dex3_controller_pinch.py \
   gear_sonic/tests/test_bridge_planner_publisher.py \
   gear_sonic/tests/test_xr_upperbody_bridge.py \
+  gear_sonic/tests/test_xr_upperbody_bridge_routes.py \
   gear_sonic/tests/test_verify_xr_dex3_controller_pinch.py
 
 git diff --check
@@ -1927,8 +2230,8 @@ Expected: both lanes return APPROVE/CLEAR before hardware testing.
 - [ ] **Step 1: Start the bridge with tucked-thumb stop behavior**
 
 ```bash
-cd /home/jihun/work/GR00T-WholeBodyControl
-source .venv_teleop/bin/activate
+cd /home/jihun/work/GR00T-WholeBodyControl/worktrees/xr-dex3-controller-pinch
+source /home/jihun/work/GR00T-WholeBodyControl/.venv_teleop/bin/activate
 
 PYTHONPATH=. python gear_sonic/scripts/xr_upperbody_bridge.py \
   --source zmq-json \
@@ -1954,8 +2257,10 @@ PYTHONPATH=. python gear_sonic/scripts/xr_upperbody_bridge.py \
   --debug-live
 ```
 
-The bridge uses `.venv_teleop`; `--max-joint-step 0.03` remains the upper-body
-limit and is independent of the fixed `0.25 rad` hand limiter.
+This pre-integration hardware acceptance intentionally launches the reviewed
+feature-worktree implementation, not the main checkout. The bridge uses the
+main repository's `.venv_teleop`; `--max-joint-step 0.03` remains the
+upper-body limit and is independent of the fixed `0.25 rad` hand limiter.
 
 - [ ] **Step 2: Start XR export without bridge-only or simulation flags**
 
