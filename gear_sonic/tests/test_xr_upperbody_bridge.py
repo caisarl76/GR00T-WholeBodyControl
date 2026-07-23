@@ -8,26 +8,32 @@ import time
 import numpy as np
 import pytest
 
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import HEADER_SIZE
+from gear_sonic.utils.teleop.bridge_planner_publisher import (
+    BridgePlannerPublisher,
+    PlannerCommand,
+)
 from gear_sonic.utils.teleop.xr_upperbody_bridge import (
-    BridgeConfig,
     DEX3_LEFT_STOP_HAND_TUCKED,
     DEX3_RIGHT_STOP_HAND_TUCKED,
     G1_CALIB_FULL_UPPER_BODY,
     G1_STANDING_UPPER_BODY,
     G1_UPPER_BODY_JOINT_INDICES,
+    BridgeConfig,
     StopReleaseSchedule,
     UpperBodyFilter,
+    _send_zmq_json_loop,
     anchor_frame_planner_heading,
-    build_heading_hold_planner_message,
     build_due_stop_release_messages,
-    build_manager_state_message,
+    build_frame_planner_command,
     build_frame_planner_message,
+    build_heading_hold_planner_message,
     build_inspection_report,
+    build_manager_state_message,
     build_start_control_messages,
+    build_stop_standing_command,
     build_stop_standing_message,
-    feedback_payload_heading_yaw,
     collect_range_warnings,
+    feedback_payload_heading_yaw,
     frame_with_current_upper_body_position,
     load_frames,
     normalize_live_source_payload,
@@ -37,8 +43,19 @@ from gear_sonic.utils.teleop.xr_upperbody_bridge import (
     synthesize_missing_velocities,
     unpack_bridge_message,
     xr_g1_29_arm_to_sonic_upper_body,
-    _send_zmq_json_loop,
 )
+from gear_sonic.utils.teleop.zmq.zmq_planner_sender import HEADER_SIZE
+
+
+class _RecordingSocket:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.fail_manager = False
+
+    def send(self, message: bytes) -> None:
+        if self.fail_manager and message.startswith(b"manager_state"):
+            raise RuntimeError("manager send failed")
+        self.sent.append(message)
 
 
 def _valid_position(offset: float = 0.0) -> list[float]:
@@ -49,6 +66,87 @@ def _decode_header(message: bytes, topic: str = "planner") -> dict:
     start = len(topic)
     raw = message[start : start + HEADER_SIZE].rstrip(b"\x00")
     return json.loads(raw.decode("utf-8"))
+
+
+def test_frame_and_stop_builders_return_planner_commands() -> None:
+    frame = normalize_live_source_payload({"dual_arm_position": [0.0] * 14, "dual_hand_joints": [1.0] * 14})
+
+    live = build_frame_planner_command(frame, BridgeConfig())
+    stop = build_stop_standing_command(frame, alpha=1.0)
+
+    assert isinstance(live, PlannerCommand)
+    assert isinstance(stop, PlannerCommand)
+
+
+def test_live_pause_freezes_before_target_convergence_then_resume_slews() -> None:
+    socket = _RecordingSocket()
+    publisher = BridgePlannerPublisher(socket)
+    frame = normalize_live_source_payload({"dual_arm_position": [0.0] * 14, "dual_hand_joints": [1.0] * 14})
+    command = build_frame_planner_command(frame, BridgeConfig())
+
+    publisher.publish(command, ramp_phase="track")
+    publisher.publish(command, ramp_phase="pause")
+    publisher.publish(command, ramp_phase="resume")
+
+    first, paused, resumed = [unpack_bridge_message(raw, topic="planner") for raw in socket.sent]
+    np.testing.assert_allclose(first["left_hand_joints"], [0.25] * 7)
+    np.testing.assert_allclose(paused["left_hand_joints"], [0.25] * 7)
+    np.testing.assert_allclose(resumed["left_hand_joints"], [0.5] * 7)
+
+
+def test_manager_failure_cannot_roll_back_successful_planner_commit() -> None:
+    socket = _RecordingSocket()
+    publisher = BridgePlannerPublisher(socket)
+    frame = normalize_live_source_payload({"dual_arm_position": [0.0] * 14, "dual_hand_joints": [1.0] * 14})
+    command = build_frame_planner_command(frame, BridgeConfig())
+    publisher.publish(command, ramp_phase="track")
+
+    socket.fail_manager = True
+    with pytest.raises(RuntimeError, match="manager send failed"):
+        socket.send(build_manager_state_message())
+
+    np.testing.assert_allclose(publisher.last_emitted("left"), [0.25] * 7)
+
+
+def test_stop_release_and_final_hold_continue_from_live_limiter_state() -> None:
+    socket = _RecordingSocket()
+    publisher = BridgePlannerPublisher(socket)
+    frame = normalize_live_source_payload({"dual_arm_position": [0.0] * 14, "dual_hand_joints": [1.0] * 14})
+    publisher.publish(build_frame_planner_command(frame, BridgeConfig()), ramp_phase="track")
+    publisher.publish(
+        build_stop_standing_command(frame, alpha=0.5, hand_preset="tucked-thumb"),
+        ramp_phase="stop-release",
+    )
+    publisher.publish(
+        build_stop_standing_command(frame, alpha=1.0, hand_preset="tucked-thumb"),
+        ramp_phase="final-hold",
+    )
+
+    decoded = [unpack_bridge_message(raw, topic="planner") for raw in socket.sent]
+    for previous, current in zip(decoded, decoded[1:]):
+        for side in ("left_hand_joints", "right_hand_joints"):
+            assert np.max(np.abs(current[side] - previous[side])) <= 0.25 + 1e-7
+
+
+def test_replay_sequence_uses_one_limiter_state() -> None:
+    socket = _RecordingSocket()
+    publisher = BridgePlannerPublisher(socket)
+    frames = load_frames(
+        [
+            {"dual_arm_position": [0.0] * 14, "dual_hand_joints": [1.0] * 14},
+            {"dual_arm_position": [0.0] * 14, "dual_hand_joints": [-1.0] * 14},
+        ]
+    )
+
+    for frame in frames:
+        publisher.publish(
+            build_frame_planner_command(frame, BridgeConfig()),
+            ramp_phase=frame.ramp_phase,
+        )
+
+    first, second = [unpack_bridge_message(raw, topic="planner") for raw in socket.sent]
+    np.testing.assert_allclose(first["left_hand_joints"], [0.25] * 7)
+    np.testing.assert_allclose(second["left_hand_joints"], [0.0] * 7)
 
 
 def test_calib_full_upper_body_matches_teleop_all_zero_reference() -> None:
@@ -545,8 +643,7 @@ def test_start_control_defers_live_upper_body_until_late_feedback_seed(
         fake_context.source_messages.put(b"xr_teleop" + source_payload)
         time.sleep(0.2)
         assert not any(
-            message.startswith(b"planner")
-            for message in fake_context.sent_since(count_before_unseeded_source)
+            message.startswith(b"planner") for message in fake_context.sent_since(count_before_unseeded_source)
         )
 
         fake_context.feedback_messages.put(
@@ -644,16 +741,11 @@ def test_start_ramp_uses_fixed_origin_and_hard_step_limit() -> None:
     for frame_index in range(51):
         raw_alpha = frame_index / 50.0
         alpha = raw_alpha * raw_alpha * (3.0 - 2.0 * raw_alpha)
-        outputs.append(
-            filt.apply_ramped(target, ramp_phase="in", ramp_alpha=alpha)
-        )
+        outputs.append(filt.apply_ramped(target, ramp_phase="in", ramp_alpha=alpha))
 
     output_array = np.stack(outputs)
     assert np.allclose(output_array[0], seed)
-    assert (
-        np.max(np.abs(np.diff(output_array, axis=0)))
-        <= config.max_joint_step + 1e-6
-    )
+    assert np.max(np.abs(np.diff(output_array, axis=0))) <= config.max_joint_step + 1e-6
     assert np.allclose(
         output_array[25],
         np.full(17, 0.5, dtype=np.float32),
