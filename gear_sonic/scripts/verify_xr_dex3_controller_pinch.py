@@ -11,28 +11,39 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-SIDE_ORDER = {
-    "left": (
-        "thumb_0",
-        "thumb_1",
-        "thumb_2",
-        "middle_0",
-        "middle_1",
-        "index_0",
-        "index_1",
-    ),
-    "right": (
-        "thumb_0",
-        "thumb_1",
-        "thumb_2",
-        "index_0",
-        "index_1",
-        "middle_0",
-        "middle_1",
-    ),
+DEX3_API_ORDER = (
+    "thumb_0",
+    "thumb_1",
+    "thumb_2",
+    "middle_0",
+    "middle_1",
+    "index_0",
+    "index_1",
+)
+SIDE_ORDER = {"left": DEX3_API_ORDER, "right": DEX3_API_ORDER}
+DEPLOY_HAND_HARD_MIN = {
+    "left": np.array([-1.05, -0.724, 0.0, -1.57, -1.75, -1.57, -1.75]),
+    "right": np.array([-1.05, -1.05, -1.75, 0.0, 0.0, 0.0, 0.0]),
+}
+DEPLOY_HAND_HARD_MAX = {
+    "left": np.array([1.05, 1.05, 1.75, 0.0, 0.0, 0.0, 0.0]),
+    "right": np.array([1.05, 0.742, 0.0, 1.57, 1.75, 1.57, 1.75]),
 }
 DISTANCE_TOLERANCE_M = 1e-6
 MAX_COMMAND_STEP_RAD = 0.25
+
+
+def validate_pinch_targets(targets: dict[str, np.ndarray]) -> None:
+    for side in ("left", "right"):
+        target = np.asarray(targets[side], dtype=np.float64)
+        if target.shape != (7,) or not np.all(np.isfinite(target)):
+            raise ValueError(f"invalid {side} pinch target")
+        if not np.allclose(target[3:5], 0.0, rtol=0, atol=1e-12):
+            raise ValueError(f"{side} middle joints must remain zero")
+        if np.any(target < DEPLOY_HAND_HARD_MIN[side] - 1e-12) or np.any(
+            target > DEPLOY_HAND_HARD_MAX[side] + 1e-12
+        ):
+            raise ValueError(f"{side} target exceeds deploy hard limits")
 
 
 def load_xr_targets(xr_root: Path) -> dict[str, np.ndarray]:
@@ -127,6 +138,7 @@ def _assert_trace(
 
 
 def verify_pinch(model_path: Path, targets: dict[str, np.ndarray]) -> dict:
+    validate_pinch_targets(targets)
     model = mujoco.MjModel.from_xml_path(str(model_path))
     report = {"mujoco_version": mujoco.__version__, "sides": {}}
     alphas = np.linspace(0.0, 1.0, 11)

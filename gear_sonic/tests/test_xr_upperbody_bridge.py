@@ -296,7 +296,7 @@ def test_split_xr_dex3_dual_hand_joints() -> None:
 
 def test_calibrated_controller_pinch_json_splits_exact_dex3_sides() -> None:
     left = [-0.379616, 0.516712, 0.121406, 0.0, 0.0, -1.273903, -0.419393]
-    right = [-0.379617, -0.516714, -0.121407, 1.273907, 0.419395, 0.0, 0.0]
+    right = [-0.379617, -0.516714, -0.121407, 0.0, 0.0, 1.273907, 0.419395]
     payload = json.loads(
         json.dumps(
             {
