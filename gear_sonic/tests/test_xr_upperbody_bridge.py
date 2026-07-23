@@ -294,6 +294,24 @@ def test_split_xr_dex3_dual_hand_joints() -> None:
     assert np.allclose(right, [7, 8, 9, 10, 11, 12, 13])
 
 
+def test_calibrated_controller_pinch_json_splits_exact_dex3_sides() -> None:
+    left = [-0.379616, 0.516712, 0.121406, 0.0, 0.0, -1.273903, -0.419393]
+    right = [-0.379617, -0.516714, -0.121407, 1.273907, 0.419395, 0.0, 0.0]
+    payload = json.loads(
+        json.dumps(
+            {
+                "dual_arm_position": [0.0] * 14,
+                "dual_hand_joints": left + right,
+            }
+        )
+    )
+
+    frame = normalize_live_source_payload(payload)
+
+    np.testing.assert_allclose(frame.left_hand_joints, left, rtol=0, atol=1e-6)
+    np.testing.assert_allclose(frame.right_hand_joints, right, rtol=0, atol=1e-6)
+
+
 def test_tucked_stop_hand_preset_uses_thumb_opposition_joint() -> None:
     assert DEX3_LEFT_STOP_HAND_TUCKED[1] > 0.0
     assert DEX3_RIGHT_STOP_HAND_TUCKED[1] < 0.0
