@@ -1,5 +1,11 @@
 # XR Dex3 Controller Pinch Implementation Plan
 
+> **Status: SUPERSEDED on 2026-07-23. Do not execute this plan.** It describes
+> the obsolete trigger-only, asymmetric-order implementation. The current
+> reduced-scope design is
+> `docs/superpowers/specs/2026-07-22-xr-dex3-controller-pinch-design.md`; a new
+> implementation plan will replace this file after that design is approved.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the binary, crossing Dex3 controller close primitive with an analog thumb-index pinch whose calibrated pads reach tangency at full trigger pull.
