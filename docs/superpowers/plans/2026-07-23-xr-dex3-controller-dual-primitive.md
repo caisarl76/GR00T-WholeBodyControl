@@ -1788,10 +1788,12 @@ assertions. Add these exact production-boundary tests:
    hand command differs by at most `0.25 + 1e-7`. Run with `once=False`; end
    the receive script with `EndOfScript`, catch that sentinel, and then inspect
    the recorded production sends.
-4. `test_zmq_invalid_frames_continue_and_warning_is_rate_limited`: feed two
-   invalid frames less than one fake second apart—first valid JSON `[]`, then a
-   mapping with an invalid hand shape—followed by a valid frame. Assert exactly
-   one invalid-frame warning, one planner send, and a zero return code.
+4. `test_zmq_invalid_frames_continue_and_warning_is_rate_limited`: feed three
+   invalid frames less than one fake second apart—valid JSON `[]`, a mapping
+   with an invalid hand shape, and `{"mode": 1e309}` whose parsed `inf` raises
+   `OverflowError` during `int()` normalization—followed by a valid frame.
+   Assert exactly one invalid-frame warning, one planner send, and a zero
+   return code.
 5. `test_zmq_encoding_failure_does_not_commit_before_next_valid_frame`: feed a
    valid object whose planner float is `1e308` so preparation raises the
    dedicated encoding exception, then a normal frame with hand targets `+1`.
@@ -2041,7 +2043,13 @@ try:
     if not isinstance(payload, Mapping):
         raise ValueError("live payload must be a JSON object")
     frame = normalize_live_source_payload(payload)
-except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+except (
+    UnicodeDecodeError,
+    json.JSONDecodeError,
+    TypeError,
+    ValueError,
+    OverflowError,
+) as exc:
     warn_invalid_frame("invalid live frame", exc)
     continue
 ```
