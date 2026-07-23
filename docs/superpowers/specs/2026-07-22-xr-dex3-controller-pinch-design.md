@@ -1,7 +1,6 @@
 # XR Dex3 Controller Dual-Primitive Design
 
-Status: Reduced feature scope approved in conversation on 2026-07-23; pending
-written-spec review before implementation.
+Status: Approved for implementation on 2026-07-23.
 
 ## Problem
 
@@ -51,8 +50,8 @@ is outside this task.
 
 The earlier trigger-only implementation plan at
 `docs/superpowers/plans/2026-07-22-xr-dex3-controller-pinch.md` is superseded
-and must not be executed. A replacement test-driven plan will be written only
-after this revised design is approved.
+and must not be executed. The approved replacement is
+`docs/superpowers/plans/2026-07-23-xr-dex3-controller-dual-primitive.md`.
 
 ## Explicitly Deferred DDS-Hardening Task
 
