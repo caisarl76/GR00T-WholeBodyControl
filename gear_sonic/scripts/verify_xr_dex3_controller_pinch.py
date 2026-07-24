@@ -30,6 +30,8 @@ DEPLOY_HAND_HARD_MAX = {
     "right": np.array([1.05, 0.742, 0.0, 1.57, 1.75, 1.57, 1.75]),
 }
 DISTANCE_TOLERANCE_M = 1e-6
+CONTACT_DISTANCE_MIN_M = -0.00075
+CONTACT_DISTANCE_MAX_M = -0.00025
 MAX_COMMAND_STEP_RAD = 0.25
 
 
@@ -83,14 +85,15 @@ def _hand_ids(model: mujoco.MjModel, side: str) -> tuple[np.ndarray, int, int]:
     return np.asarray(qpos_addresses, dtype=int), geom_ids[0], geom_ids[1]
 
 
-def _signed_distance_trace(
+def _geometry_trace(
     model: mujoco.MjModel,
     side: str,
     states: list[np.ndarray],
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     data = mujoco.MjData(model)
     qpos_addresses, thumb_geom, index_geom = _hand_ids(model, side)
     distances = []
+    contact_counts = []
     for state in states:
         data.qpos[:] = model.qpos0
         data.qpos[qpos_addresses] = state
@@ -104,7 +107,14 @@ def _signed_distance_trace(
             np.zeros(6, dtype=float),
         )
         distances.append(float(distance))
-    return np.asarray(distances, dtype=float)
+        contact_counts.append(
+            sum(
+                1
+                for contact in data.contact
+                if {int(contact.geom1), int(contact.geom2)} == {thumb_geom, index_geom}
+            )
+        )
+    return np.asarray(distances, dtype=float), np.asarray(contact_counts, dtype=int)
 
 
 def idealized_slew_states(target: np.ndarray, max_step: float = MAX_COMMAND_STEP_RAD) -> list[np.ndarray]:
@@ -122,19 +132,29 @@ def _assert_trace(
     side: str,
     name: str,
     distances: np.ndarray,
+    contact_counts: np.ndarray,
     *,
     expected_steps: int,
 ) -> None:
     if distances.shape != (expected_steps,):
         raise AssertionError(f"{side} {name}: expected {expected_steps} samples, got {distances.size}")
+    if contact_counts.shape != (expected_steps,):
+        raise AssertionError(
+            f"{side} {name}: expected {expected_steps} contact samples, got {contact_counts.size}"
+        )
     if not np.all(np.isfinite(distances)):
         raise AssertionError(f"{side} {name}: non-finite trace {distances.tolist()}")
     if not np.all(distances[:-1] > 0.0):
         raise AssertionError(f"{side} {name}: pre-final contact {distances.tolist()}")
     if np.any(np.diff(distances) > DISTANCE_TOLERANCE_M):
         raise AssertionError(f"{side} {name}: non-monotonic {distances.tolist()}")
-    if abs(distances[-1]) > DISTANCE_TOLERANCE_M:
-        raise AssertionError(f"{side} {name}: final distance {distances[-1]} exceeds tolerance")
+    if not CONTACT_DISTANCE_MIN_M <= distances[-1] <= CONTACT_DISTANCE_MAX_M:
+        raise AssertionError(
+            f"{side} {name}: final distance {distances[-1]} is outside "
+            f"[{CONTACT_DISTANCE_MIN_M}, {CONTACT_DISTANCE_MAX_M}]"
+        )
+    if contact_counts[-1] < 1:
+        raise AssertionError(f"{side} {name}: no final distal thumb-index contact")
 
 
 def verify_pinch(model_path: Path, targets: dict[str, np.ndarray]) -> dict:
@@ -144,28 +164,32 @@ def verify_pinch(model_path: Path, targets: dict[str, np.ndarray]) -> dict:
     alphas = np.linspace(0.0, 1.0, 11)
     for side, target in targets.items():
         scalar_states = [alpha * target for alpha in alphas]
-        scalar_distances = _signed_distance_trace(model, side, scalar_states)
+        scalar_distances, scalar_contacts = _geometry_trace(model, side, scalar_states)
         _assert_trace(
             side,
             "scalar",
             scalar_distances,
+            scalar_contacts,
             expected_steps=len(scalar_states),
         )
 
         slew_states = idealized_slew_states(target)
         if len(slew_states) != 6:
             raise AssertionError(f"{side} idealized slew: expected 6 recurrence steps, got {len(slew_states)}")
-        slew_distances = _signed_distance_trace(model, side, slew_states)
+        slew_distances, slew_contacts = _geometry_trace(model, side, slew_states)
         _assert_trace(
             side,
             "idealized_slew",
             slew_distances,
+            slew_contacts,
             expected_steps=6,
         )
         report["sides"][side] = {
             "scalar_distances_m": scalar_distances.tolist(),
+            "scalar_final_contact_count": int(scalar_contacts[-1]),
             "idealized_slew_steps": len(slew_states),
             "idealized_slew_distances_m": slew_distances.tolist(),
+            "idealized_slew_final_contact_count": int(slew_contacts[-1]),
         }
     return report
 

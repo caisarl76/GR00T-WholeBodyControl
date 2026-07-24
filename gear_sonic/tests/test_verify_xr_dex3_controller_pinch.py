@@ -1,17 +1,23 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 from gear_sonic.scripts.verify_xr_dex3_controller_pinch import (
+    CONTACT_DISTANCE_MAX_M,
+    CONTACT_DISTANCE_MIN_M,
     DEPLOY_HAND_HARD_MAX,
     DEPLOY_HAND_HARD_MIN,
     SIDE_ORDER,
     validate_pinch_targets,
+    verify_pinch,
 )
 
 CALIBRATED = {
-    "left": np.array([-0.379616, 0.516712, 0.121406, 0.0, 0.0, -1.273903, -0.419393]),
-    "right": np.array([-0.379617, -0.516714, -0.121407, 0.0, 0.0, 1.273907, 0.419395]),
+    "left": np.array([-0.379616, 0.516712, 0.121406, 0.0, 0.0, -1.278903, -0.419393]),
+    "right": np.array([-0.379617, -0.516714, -0.121407, 0.0, 0.0, 1.278907, 0.419395]),
 }
+MODEL_PATH = Path(__file__).resolve().parents[2] / "gear_sonic_deploy" / "g1" / "g1_29dof_with_hand.xml"
 
 
 def test_verifier_uses_symmetric_physical_dex3_dds_order() -> None:
@@ -58,6 +64,19 @@ def test_verifier_pins_current_deploy_hard_limits() -> None:
 
 def test_calibrated_targets_pass_middle_and_deploy_limit_contract() -> None:
     validate_pinch_targets(CALIBRATED)
+
+
+def test_calibrated_targets_create_bounded_mujoco_contact() -> None:
+    report = verify_pinch(MODEL_PATH, CALIBRATED)
+
+    for side in ("left", "right"):
+        side_report = report["sides"][side]
+        scalar_distance = side_report["scalar_distances_m"][-1]
+        slew_distance = side_report["idealized_slew_distances_m"][-1]
+        assert CONTACT_DISTANCE_MIN_M <= scalar_distance <= CONTACT_DISTANCE_MAX_M
+        assert CONTACT_DISTANCE_MIN_M <= slew_distance <= CONTACT_DISTANCE_MAX_M
+        assert side_report["scalar_final_contact_count"] >= 1
+        assert side_report["idealized_slew_final_contact_count"] >= 1
 
 
 def test_verifier_rejects_nonzero_middle_slot() -> None:
