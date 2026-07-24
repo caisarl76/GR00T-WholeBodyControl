@@ -14,8 +14,8 @@ from gear_sonic.scripts.verify_xr_dex3_controller_pinch import (
 )
 
 CALIBRATED = {
-    "left": np.array([-0.379616, 0.516712, 0.121406, 0.0, 0.0, -1.328903, -0.419393]),
-    "right": np.array([-0.379617, -0.516714, -0.121407, 0.0, 0.0, 1.328907, 0.419395]),
+    "left": np.array([-0.379616, 0.516712, 0.121406, 0.0, 0.0, -1.378903, -0.419393]),
+    "right": np.array([-0.379617, -0.516714, -0.121407, 0.0, 0.0, 1.378907, 0.419395]),
 }
 MODEL_PATH = Path(__file__).resolve().parents[2] / "gear_sonic_deploy" / "g1" / "g1_29dof_with_hand.xml"
 
@@ -67,8 +67,8 @@ def test_calibrated_targets_pass_middle_and_deploy_limit_contract() -> None:
 
 
 def test_verifier_pins_requested_hardware_contact_margin_band() -> None:
-    assert CONTACT_DISTANCE_MIN_M == -0.00625
-    assert CONTACT_DISTANCE_MAX_M == -0.00525
+    assert CONTACT_DISTANCE_MIN_M == -0.01125
+    assert CONTACT_DISTANCE_MAX_M == -0.01025
 
 
 def test_calibrated_targets_create_bounded_mujoco_contact() -> None:
