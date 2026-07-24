@@ -30,8 +30,9 @@ DEPLOY_HAND_HARD_MAX = {
     "right": np.array([1.05, 0.742, 0.0, 1.57, 1.75, 1.57, 1.75]),
 }
 DISTANCE_TOLERANCE_M = 1e-6
-CONTACT_DISTANCE_MIN_M = -0.01125
-CONTACT_DISTANCE_MAX_M = -0.01025
+CONTACT_DISTANCE_MIN_M = -0.01005
+CONTACT_DISTANCE_MAX_M = -0.00905
+MAX_CONTACT_VERTICAL_MISMATCH_M = 0.0005
 MAX_COMMAND_STEP_RAD = 0.25
 
 
@@ -89,24 +90,27 @@ def _geometry_trace(
     model: mujoco.MjModel,
     side: str,
     states: list[np.ndarray],
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     data = mujoco.MjData(model)
     qpos_addresses, thumb_geom, index_geom = _hand_ids(model, side)
     distances = []
     contact_counts = []
+    vertical_mismatches = []
     for state in states:
         data.qpos[:] = model.qpos0
         data.qpos[qpos_addresses] = state
         mujoco.mj_forward(model, data)
+        closest_points = np.zeros(6, dtype=float)
         distance = mujoco.mj_geomDistance(
             model,
             data,
             thumb_geom,
             index_geom,
             1.0,
-            np.zeros(6, dtype=float),
+            closest_points,
         )
         distances.append(float(distance))
+        vertical_mismatches.append(abs(float(closest_points[2] - closest_points[5])))
         contact_counts.append(
             sum(
                 1
@@ -114,7 +118,11 @@ def _geometry_trace(
                 if {int(contact.geom1), int(contact.geom2)} == {thumb_geom, index_geom}
             )
         )
-    return np.asarray(distances, dtype=float), np.asarray(contact_counts, dtype=int)
+    return (
+        np.asarray(distances, dtype=float),
+        np.asarray(contact_counts, dtype=int),
+        np.asarray(vertical_mismatches, dtype=float),
+    )
 
 
 def idealized_slew_states(target: np.ndarray, max_step: float = MAX_COMMAND_STEP_RAD) -> list[np.ndarray]:
@@ -133,6 +141,7 @@ def _assert_trace(
     name: str,
     distances: np.ndarray,
     contact_counts: np.ndarray,
+    vertical_mismatches: np.ndarray,
     *,
     expected_steps: int,
 ) -> None:
@@ -142,8 +151,14 @@ def _assert_trace(
         raise AssertionError(
             f"{side} {name}: expected {expected_steps} contact samples, got {contact_counts.size}"
         )
+    if vertical_mismatches.shape != (expected_steps,):
+        raise AssertionError(
+            f"{side} {name}: expected {expected_steps} alignment samples, got {vertical_mismatches.size}"
+        )
     if not np.all(np.isfinite(distances)):
         raise AssertionError(f"{side} {name}: non-finite trace {distances.tolist()}")
+    if not np.all(np.isfinite(vertical_mismatches)):
+        raise AssertionError(f"{side} {name}: non-finite vertical mismatch {vertical_mismatches.tolist()}")
     if not np.all(distances[:-1] > 0.0):
         raise AssertionError(f"{side} {name}: pre-final contact {distances.tolist()}")
     if np.any(np.diff(distances) > DISTANCE_TOLERANCE_M):
@@ -155,6 +170,11 @@ def _assert_trace(
         )
     if contact_counts[-1] < 1:
         raise AssertionError(f"{side} {name}: no final distal thumb-index contact")
+    if vertical_mismatches[-1] > MAX_CONTACT_VERTICAL_MISMATCH_M:
+        raise AssertionError(
+            f"{side} {name}: final vertical mismatch {vertical_mismatches[-1]} exceeds "
+            f"{MAX_CONTACT_VERTICAL_MISMATCH_M}"
+        )
 
 
 def verify_pinch(model_path: Path, targets: dict[str, np.ndarray]) -> dict:
@@ -164,32 +184,36 @@ def verify_pinch(model_path: Path, targets: dict[str, np.ndarray]) -> dict:
     alphas = np.linspace(0.0, 1.0, 11)
     for side, target in targets.items():
         scalar_states = [alpha * target for alpha in alphas]
-        scalar_distances, scalar_contacts = _geometry_trace(model, side, scalar_states)
+        scalar_distances, scalar_contacts, scalar_vertical_mismatches = _geometry_trace(model, side, scalar_states)
         _assert_trace(
             side,
             "scalar",
             scalar_distances,
             scalar_contacts,
+            scalar_vertical_mismatches,
             expected_steps=len(scalar_states),
         )
 
         slew_states = idealized_slew_states(target)
         if len(slew_states) != 6:
             raise AssertionError(f"{side} idealized slew: expected 6 recurrence steps, got {len(slew_states)}")
-        slew_distances, slew_contacts = _geometry_trace(model, side, slew_states)
+        slew_distances, slew_contacts, slew_vertical_mismatches = _geometry_trace(model, side, slew_states)
         _assert_trace(
             side,
             "idealized_slew",
             slew_distances,
             slew_contacts,
+            slew_vertical_mismatches,
             expected_steps=6,
         )
         report["sides"][side] = {
             "scalar_distances_m": scalar_distances.tolist(),
             "scalar_final_contact_count": int(scalar_contacts[-1]),
+            "scalar_final_vertical_mismatch_m": float(scalar_vertical_mismatches[-1]),
             "idealized_slew_steps": len(slew_states),
             "idealized_slew_distances_m": slew_distances.tolist(),
             "idealized_slew_final_contact_count": int(slew_contacts[-1]),
+            "idealized_slew_final_vertical_mismatch_m": float(slew_vertical_mismatches[-1]),
         }
     return report
 
