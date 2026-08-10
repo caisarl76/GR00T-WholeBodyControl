@@ -323,6 +323,54 @@ def test_production_dex3_adapter_rejects_out_of_order_indices(
     assert captured.value.error_class == "source_schema_error"
 
 
+def test_production_dex3_adapter_detects_mutation_after_fresh_read(
+    monkeypatch: pytest.MonkeyPatch,
+    smoke_lock,
+    tmp_path: Path,
+) -> None:
+    from gear_sonic.data.unitree_conversion import lerobot_v3_source, pipeline as pipeline_module
+    from gear_sonic.data.unitree_conversion.dex3_adapter import DEX3_FEATURE_NAMES
+
+    source = smoke_lock.dex3
+    rows = tuple(
+        {
+            "episode_index": 0,
+            "frame_index": index,
+            "timestamp": index / 30.0,
+            "task_index": 0,
+            "observation.state": np.zeros(28, dtype=np.float32),
+            "action": np.zeros(28, dtype=np.float32),
+        }
+        for index in range(2)
+    )
+    meta = SimpleNamespace(
+        revision=source.revision,
+        total_episodes=source.episode_count,
+        fps=30,
+        features={
+            "observation.state": {"names": DEX3_FEATURE_NAMES},
+            "action": {"names": DEX3_FEATURE_NAMES},
+        },
+    )
+    fresh = SimpleNamespace(root=tmp_path, revision=source.revision, meta=meta, hf_dataset=rows)
+    original = SimpleNamespace(root=tmp_path, video_segments={})
+    expected = {"data/episode.parquet": "1" * 64}
+    preflight = SimpleNamespace(datasets={0: original}, source_hashes={0: expected})
+    observed_hashes = iter((expected, expected, {"data/episode.parquet": "2" * 64}))
+    monkeypatch.setattr(
+        pipeline_module,
+        "_source_hashes",
+        lambda _dataset, _episode_id: next(observed_hashes),
+    )
+    monkeypatch.setattr(lerobot_v3_source, "load_pinned_v3_episode", lambda *_args, **_kwargs: fresh)
+
+    with pytest.raises(ValueError) as captured:
+        _adapt_dex3(source, 0, preflight, tmp_path)
+
+    assert captured.value.error_class == "provenance_error"
+    assert "during Dex3 adaptation" in str(captured.value)
+
+
 def test_source_mutation_after_preflight_is_provenance_error(monkeypatch: pytest.MonkeyPatch) -> None:
     from gear_sonic.data.unitree_conversion import pipeline as pipeline_module
 
