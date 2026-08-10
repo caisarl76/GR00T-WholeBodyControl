@@ -14,6 +14,7 @@ import numpy as np
 _REVISION_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 _VALID_SCOPES = frozenset({"smoke", "full"})
+_VALID_DIAGNOSTIC_STATUSES = frozenset({"blocked_unverified", "source_schema_error"})
 INSPIRE_GATE_REASONS = (
     "missing_authoritative_29_joint_order",
     "missing_robot_q_desired_semantics",
@@ -58,6 +59,8 @@ def _canonical_dataset_path(value: object) -> str:
     if (
         value.strip() != value
         or "\\" in value
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+        or any(character in "*?[]" for character in value)
         or path.is_absolute()
         or not path.parts
         or any(part in {".", ".."} for part in path.parts)
@@ -258,8 +261,8 @@ class DiagnosticReport:
     camera_map: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.status != "blocked_unverified":
-            raise ValueError("Inspire diagnostic status must be blocked_unverified")
+        if self.status not in _VALID_DIAGNOSTIC_STATUSES:
+            raise ValueError(f"Inspire diagnostic status must be one of {sorted(_VALID_DIAGNOSTIC_STATUSES)}")
         if tuple(self.gate_reasons) != INSPIRE_GATE_REASONS:
             raise ValueError("Inspire diagnostic gate_reasons must equal the exact semantic gate reasons")
         object.__setattr__(self, "gate_reasons", INSPIRE_GATE_REASONS)

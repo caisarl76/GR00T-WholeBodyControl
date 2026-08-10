@@ -29,6 +29,8 @@ _HAND_STATE_KEY = "observation.state.hand_state"
 _HAND_CMD_KEY = "action.hand_cmd"
 _PRIMARY_CAMERA = "observation.images.cam_0"
 _SECONDARY_CAMERA = "observation.images.cam_1"
+_SUPPORTED_REPO_ID = "unitreerobotics/G1_WBT_Inspire_Pickup_Pillow_MainCamOnly"
+_SUPPORTED_DATASET_PATH = "G1_WB_Dex5_Pickup_Pillow"
 
 _SOURCE_SCHEMA = V3DataSchema(
     float_vector_columns=(_CURRENT_KEY, _DESIRED_KEY, _HAND_STATE_KEY, _HAND_CMD_KEY),
@@ -193,6 +195,12 @@ def diagnose_inspire_arrays(
 def _validate_source_spec(source_spec: object, episode_id: object) -> SourceSpec:
     if not isinstance(source_spec, SourceSpec) or not source_spec.approved:
         raise ValueError("source_spec must be an approved SourceSpec")
+    if (
+        source_spec.repo_id != _SUPPORTED_REPO_ID
+        or source_spec.dataset_path != _SUPPORTED_DATASET_PATH
+        or source_spec.label != "inspire"
+    ):
+        raise ValueError("source_spec must match the supported Inspire adapter identity")
     if source_spec.episode_count is None:
         raise ValueError("source_spec must have a pinned episode_count")
     if isinstance(episode_id, bool) or not isinstance(episode_id, int) or episode_id < 0:

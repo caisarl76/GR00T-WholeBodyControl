@@ -145,6 +145,10 @@ def test_dataset_path_round_trips_through_source_lock(tmp_path: Path) -> None:
         "nested//child",
         "nested/",
         r"nested\child",
+        *(f"nested{chr(code)}child" for code in (*range(0x20), 0x7F)),
+        "nested*glob",
+        "nested?glob",
+        "nested[glob]",
     ],
 )
 def test_source_spec_rejects_unsafe_or_noncanonical_dataset_path(dataset_path: str) -> None:
@@ -167,6 +171,27 @@ def test_load_source_lock_rejects_unknown_or_unsafe_dataset_path(tmp_path: Path)
     unknown.write_text(LOCK.read_text().replace("    dataset_path: .\n", "    source_root: nested\n", 1))
     with pytest.raises(ValueError, match="unknown fields.*source_root"):
         load_source_lock(unknown)
+
+
+@pytest.mark.parametrize(
+    "yaml_path",
+    [
+        '"nested*glob"',
+        '"nested?glob"',
+        '"nested[glob]"',
+        '"nested\\0child"',
+        '"nested\\x7fchild"',
+    ],
+)
+def test_load_source_lock_rejects_control_or_glob_dataset_path(
+    tmp_path: Path,
+    yaml_path: str,
+) -> None:
+    candidate = tmp_path / "unsafe-prefix.yaml"
+    candidate.write_text(LOCK.read_text().replace("    dataset_path: .\n", f"    dataset_path: {yaml_path}\n", 1))
+
+    with pytest.raises(ValueError, match="dataset_path"):
+        load_source_lock(candidate)
 
 
 def test_stratified_selection_matches_pinned_counts() -> None:

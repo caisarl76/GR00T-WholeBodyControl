@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields, replace
 import json
 from pathlib import Path
 import subprocess
@@ -9,7 +9,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from gear_sonic.data.unitree_conversion.contracts import SourceSpec
+from gear_sonic.data.unitree_conversion.contracts import DiagnosticReport, SourceSpec
 from gear_sonic.data.unitree_conversion.inspire_diagnostics import (
     INSPIRE_GATE_REASONS,
     diagnose_inspire_arrays,
@@ -104,6 +104,29 @@ def test_report_serializes_deterministically_to_json_primitives() -> None:
     assert len(payload["column_statistics"]["robot_q_current"]) == 36
     encoded = json.dumps(payload, sort_keys=True, allow_nan=False)
     assert encoded == json.dumps(report.to_dict(), sort_keys=True, allow_nan=False)
+
+
+def test_source_schema_error_status_constructs_directly_and_via_replace() -> None:
+    report = diagnose_inspire_arrays(**_motion_arrays(n=2))
+    values = {field.name: getattr(report, field.name) for field in fields(DiagnosticReport)}
+    values["status"] = "source_schema_error"
+
+    direct = DiagnosticReport(**values)
+    replaced = replace(report, status="source_schema_error")
+
+    assert direct.status == "source_schema_error"
+    assert replaced.status == "source_schema_error"
+    assert direct.gate_reasons == INSPIRE_GATE_REASONS
+    assert direct.to_dict()["status"] == "source_schema_error"
+    assert replaced.to_dict()["status"] == "source_schema_error"
+
+
+@pytest.mark.parametrize("status", ["ready", "error", "", None, 1])
+def test_diagnostic_report_rejects_every_other_status(status: object) -> None:
+    report = diagnose_inspire_arrays(**_motion_arrays(n=2))
+
+    with pytest.raises(ValueError, match="diagnostic status"):
+        replace(report, status=status)
 
 
 @pytest.mark.parametrize(
@@ -362,6 +385,32 @@ def test_episode_diagnostic_requires_approved_selected_source(
             root=tmp_path,
             snapshot_downloader=PrefixSnapshotDownloader(),
         )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        _source_spec(repo_id="unitreerobotics/unsupported"),
+        _source_spec(dataset_path="another_dataset"),
+        _source_spec(label="dex3"),
+        _source_spec(label=None),
+    ],
+)
+def test_episode_diagnostic_rejects_unsupported_adapter_identity_before_download(
+    tmp_path: Path,
+    source: SourceSpec,
+) -> None:
+    downloader = PrefixSnapshotDownloader()
+
+    with pytest.raises(ValueError, match="supported Inspire adapter identity"):
+        diagnose_inspire_episode(
+            source,
+            152,
+            root=tmp_path,
+            snapshot_downloader=downloader,
+        )
+
+    assert downloader.calls == []
 
 
 @pytest.mark.parametrize(
