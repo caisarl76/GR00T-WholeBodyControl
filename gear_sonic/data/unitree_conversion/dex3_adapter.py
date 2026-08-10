@@ -17,6 +17,7 @@ from gear_sonic.data.unitree_conversion.lerobot_v3_source import (
     load_pinned_v3_episode,
     revision_scoped_root,
 )
+from gear_sonic.data.unitree_conversion.quaternion import validate_wxyz
 
 _default_lerobot_cache_base = default_lerobot_cache_base
 _revision_scoped_root = revision_scoped_root
@@ -155,7 +156,10 @@ def adapt_dex3_arrays(
 
     left_hand_indices = tuple(names.index(name) for name in DEX3_HAND_NAMES[:7])
     right_hand_indices = tuple(names.index(name) for name in DEX3_HAND_NAMES[7:])
-    identity_roots = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (row_count, 1))
+    observed_identity, _ = validate_wxyz(np.array([1.0, 0.0, 0.0, 0.0]))
+    reference_identity, _ = validate_wxyz(np.array([1.0, 0.0, 0.0, 0.0]))
+    observed_identity_roots = np.tile(observed_identity, (row_count, 1))
+    reference_identity_roots = np.tile(reference_identity, (row_count, 1))
     return CanonicalEpisode(
         source_repo_id=source_repo_id,
         source_revision=source_revision,
@@ -163,8 +167,8 @@ def adapt_dex3_arrays(
         source_fps=30,
         timestamps=timestamps_array,
         task_indices=task_indices_array,
-        observed_root_wxyz=identity_roots,
-        reference_root_wxyz=identity_roots,
+        observed_root_wxyz=observed_identity_roots,
+        reference_root_wxyz=reference_identity_roots,
         observed_body_q=observed_body_q,
         desired_body_q=desired_body_q,
         observed_left_hand=observed_array[:, left_hand_indices],

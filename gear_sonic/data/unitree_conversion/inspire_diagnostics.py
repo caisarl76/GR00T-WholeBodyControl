@@ -22,6 +22,7 @@ from gear_sonic.data.unitree_conversion.lerobot_v3_source import (
     default_lerobot_cache_base,
     load_pinned_v3_episode,
 )
+from gear_sonic.data.unitree_conversion.quaternion import validate_wxyz
 
 _CURRENT_KEY = "observation.state.robot_q_current"
 _DESIRED_KEY = "action.robot_q_desired"
@@ -103,6 +104,17 @@ def _extrema(values: np.ndarray) -> ScalarExtrema:
     return ScalarExtrema(minimum=float(values.min()), maximum=float(values.max()))
 
 
+def _root_quaternions_are_valid(arrays: Mapping[str, np.ndarray]) -> bool:
+    valid = True
+    for field_name in ("robot_q_current", "robot_q_desired"):
+        for quaternion in arrays[field_name][:, 3:7]:
+            try:
+                validate_wxyz(quaternion)
+            except ValueError:
+                valid = False
+    return valid
+
+
 def _diagnose_arrays(
     *,
     current: object,
@@ -139,8 +151,9 @@ def _diagnose_arrays(
 
     current_norms = np.linalg.norm(arrays["robot_q_current"][:, 3:7], axis=1)
     desired_norms = np.linalg.norm(arrays["robot_q_desired"][:, 3:7], axis=1)
+    status = "blocked_unverified" if _root_quaternions_are_valid(arrays) else "source_schema_error"
     return DiagnosticReport(
-        status="blocked_unverified",
+        status=status,
         gate_reasons=INSPIRE_GATE_REASONS,
         encoder_invoked=False,
         source_repo_id=source_repo_id,

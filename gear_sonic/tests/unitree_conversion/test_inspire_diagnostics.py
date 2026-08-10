@@ -29,6 +29,8 @@ SMOKE_LOCK = Path("gear_sonic/data/unitree_conversion/manifests/smoke_sources.ya
 def _motion_arrays(n: int = 5) -> dict[str, np.ndarray]:
     current = np.arange(n * 36, dtype=np.float64).reshape(n, 36) / 10.0
     desired = current + 100.0
+    current[:, 3:7] = (1.0, 0.0, 0.0, 0.0)
+    desired[:, 3:7] = (1.0, 0.0, 0.0, 0.0)
     hand_state = np.arange(n * 12, dtype=np.float64).reshape(n, 12) / 20.0
     hand_cmd = hand_state + 10.0
     return {
