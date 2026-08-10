@@ -1114,6 +1114,76 @@ def test_loader_prefetch_rejects_absolute_or_escaping_rendered_paths(
         )
 
 
+@pytest.mark.parametrize("unsafe", ["*", "?", "[", "]", "\x00", "\x1f", "\x7f"])
+def test_loader_rejects_unsafe_literal_data_template_before_payload_download(
+    tmp_path: Path,
+    unsafe: str,
+) -> None:
+    info = _metadata_info(
+        data_path=f"data/unsafe{unsafe}/chunk-{{chunk_index:03d}}/file-{{file_index:03d}}.parquet"
+    )
+    downloader = FakeSnapshotDownloader(info=info)
+
+    with pytest.raises(ValueError, match="safe literal relative path"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            snapshot_downloader=downloader,
+        )
+
+    assert len(downloader.calls) == 1
+
+
+@pytest.mark.parametrize("unsafe", ["*", "?", "[", "]", "\x00", "\x1f", "\x7f"])
+def test_loader_rejects_unsafe_literal_video_template_before_payload_download(
+    tmp_path: Path,
+    unsafe: str,
+) -> None:
+    info = _metadata_info(
+        video_path=f"videos/unsafe{unsafe}/{{video_key}}/chunk-{{chunk_index:03d}}/file-{{file_index:03d}}.mp4"
+    )
+    downloader = FakeSnapshotDownloader(info=info)
+
+    with pytest.raises(ValueError, match="safe literal relative path"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            snapshot_downloader=downloader,
+        )
+
+    assert len(downloader.calls) == 1
+
+
+@pytest.mark.parametrize("unsafe", ["*", "?", "[", "]", "\x00", "\x1f", "\x7f"])
+def test_loader_rejects_unsafe_interpolated_video_key_before_payload_download(
+    tmp_path: Path,
+    unsafe: str,
+) -> None:
+    unsafe_key = f"observation.images.unsafe{unsafe}camera"
+    info = _metadata_info()
+    features = info["features"]
+    del features[VIDEO_KEYS[-1]]
+    features[unsafe_key] = {"dtype": "video"}
+    episode_row = _episode_row()
+    del episode_row[f"videos/{VIDEO_KEYS[-1]}/chunk_index"]
+    del episode_row[f"videos/{VIDEO_KEYS[-1]}/file_index"]
+    episode_row[f"videos/{unsafe_key}/chunk_index"] = 0
+    episode_row[f"videos/{unsafe_key}/file_index"] = 0
+    downloader = FakeSnapshotDownloader(info=info, episode_rows=[episode_row])
+
+    with pytest.raises(ValueError, match="safe literal relative path"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            snapshot_downloader=downloader,
+        )
+
+    assert len(downloader.calls) == 1
+
+
 def test_loader_prefetch_rejects_missing_episode_metadata_parquet(tmp_path: Path) -> None:
     downloader = FakeSnapshotDownloader(write_episode_metadata=False)
 

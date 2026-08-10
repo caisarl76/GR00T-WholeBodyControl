@@ -319,6 +319,10 @@ def _render_path(
         rendered = template.format(**values)
     except (IndexError, KeyError, ValueError) as error:
         raise ValueError(f"metadata {field_name} template cannot be rendered") from error
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in rendered) or any(
+        character in "*?[]" for character in rendered
+    ):
+        raise ValueError(f"metadata {field_name} template must render a safe literal relative path")
     relative_path = PurePosixPath(rendered)
     if (
         not rendered
