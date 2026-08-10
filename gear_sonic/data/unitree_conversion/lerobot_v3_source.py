@@ -527,10 +527,6 @@ def load_pinned_v3_episode(
                 end_frame=round(to_timestamp * 30.0),
                 frame_count=episode_length,
             )
-        offsets = {(segment.start_frame, segment.end_frame) for segment in video_segments.values()}
-        if len(offsets) > 1:
-            raise ValueError("camera video intervals must use identical frame offsets")
-
     return V3SourceDataset(
         root=dataset_root,
         revision=source_spec.revision,

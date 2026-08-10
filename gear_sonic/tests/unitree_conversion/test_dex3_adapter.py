@@ -1477,17 +1477,43 @@ def test_loader_rejects_invalid_video_interval_metadata(
         )
 
 
-def test_loader_rejects_camera_specific_video_offset_mismatch(tmp_path: Path) -> None:
-    timestamps = {key: (0.0, 2 / 30) for key in VIDEO_KEYS}
-    timestamps[VIDEO_KEYS[-1]] = (10 / 30, 12 / 30)
+def test_loader_accepts_pinned_ep155_camera_local_video_shard_offsets(tmp_path: Path) -> None:
+    expected_offsets = {
+        VIDEO_KEYS[0]: (3563, 4013),
+        VIDEO_KEYS[1]: (63971, 64421),
+        VIDEO_KEYS[2]: (7246, 7696),
+        VIDEO_KEYS[3]: (63971, 64421),
+    }
+    timestamps = {
+        source_key: (start_frame / 30, end_frame / 30)
+        for source_key, (start_frame, end_frame) in expected_offsets.items()
+    }
+    source = _source_spec(episode_count=156, episodes=(155,))
+    downloader = FakeSnapshotDownloader(
+        info=_metadata_info(total_episodes=156),
+        episode_rows=[
+            _episode_row(
+                episode_id=155,
+                length=450,
+                video_timestamps=timestamps,
+            )
+        ],
+        data_rows=_v3_data_rows(episode_id=155, n=450),
+    )
 
-    with pytest.raises(ValueError, match="camera video intervals must use identical frame offsets"):
-        load_dex3_episode(
-            _source_spec(),
-            1,
-            root=tmp_path,
-            snapshot_downloader=FakeSnapshotDownloader(episode_rows=[_episode_row(video_timestamps=timestamps)]),
-        )
+    episode = load_dex3_episode(
+        source,
+        155,
+        root=tmp_path,
+        snapshot_downloader=downloader,
+    )
+
+    assert tuple(episode.video_segments) == tuple(sorted(VIDEO_KEYS))
+    assert {
+        source_key: (segment.start_frame, segment.end_frame)
+        for source_key, segment in episode.video_segments.items()
+    } == expected_offsets
+    assert {segment.frame_count for segment in episode.video_segments.values()} == {450}
 
 
 @pytest.mark.parametrize("missing_path", EXPECTED_EPISODE_PATHS)
