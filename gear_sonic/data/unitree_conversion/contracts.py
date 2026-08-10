@@ -1,4 +1,4 @@
-"""Immutable serialized contracts for Unitree conversion provenance."""
+"""Validated contracts for Unitree conversion provenance and canonical data."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 import re
 from types import MappingProxyType
 from typing import Mapping
+
+import numpy as np
 
 _REVISION_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -32,6 +34,99 @@ def _nonempty_string(value: object, *, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a nonempty string")
     return value
+
+
+def _finite_float64_array(value: object, *, field_name: str) -> np.ndarray:
+    try:
+        source = np.asarray(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field_name} must be a numeric array") from error
+    if source.dtype.kind not in "iuf":
+        raise ValueError(f"{field_name} must be a numeric array")
+    array = np.array(source, dtype=np.float64, order="C", copy=True)
+    if not np.isfinite(array).all():
+        raise ValueError(f"{field_name} must contain only finite values")
+    return array
+
+
+def _task_index_array(value: object) -> np.ndarray:
+    try:
+        source = np.asarray(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("task_indices must contain nonnegative int64-compatible integers") from error
+    if source.dtype.kind not in "iu":
+        raise ValueError("task_indices must contain nonnegative int64-compatible integers")
+    if source.size:
+        if np.any(source < 0) or np.any(source > np.iinfo(np.int64).max):
+            raise ValueError("task_indices must contain nonnegative int64-compatible integers")
+    return np.array(source, dtype=np.int64, order="C", copy=True)
+
+
+@dataclass
+class CanonicalEpisode:
+    """Mutable, array-owning canonical representation of one source episode."""
+
+    source_repo_id: str
+    source_revision: str
+    source_episode_id: int
+    source_fps: int
+    timestamps: np.ndarray
+    task_indices: np.ndarray
+    observed_root_wxyz: np.ndarray
+    reference_root_wxyz: np.ndarray
+    observed_body_q: np.ndarray
+    desired_body_q: np.ndarray
+    observed_left_hand: np.ndarray
+    observed_right_hand: np.ndarray
+    desired_left_hand: np.ndarray
+    desired_right_hand: np.ndarray
+
+    def __post_init__(self) -> None:
+        _nonempty_string(self.source_repo_id, field_name="source_repo_id")
+        validate_revision(self.source_revision, field_name="source_revision")
+        if (
+            isinstance(self.source_episode_id, bool)
+            or not isinstance(self.source_episode_id, int)
+            or self.source_episode_id < 0
+        ):
+            raise ValueError("source_episode_id must be a nonnegative integer")
+        if isinstance(self.source_fps, bool) or not isinstance(self.source_fps, int) or self.source_fps != 30:
+            raise ValueError("source_fps must be exactly integer 30")
+
+        timestamps = _finite_float64_array(self.timestamps, field_name="timestamps")
+        if timestamps.ndim != 1:
+            raise ValueError(f"timestamps must have shape (N,); got {timestamps.shape}")
+        row_count = timestamps.shape[0]
+        if row_count < 2:
+            raise ValueError("canonical episodes require at least two rows")
+        if not np.all(np.diff(timestamps) > 0.0):
+            raise ValueError("timestamps must be strictly increasing")
+
+        task_indices = _task_index_array(self.task_indices)
+        if task_indices.shape != (row_count,):
+            raise ValueError(f"task_indices must have shape ({row_count},); got {task_indices.shape}")
+
+        expected_shapes = {
+            "observed_root_wxyz": (row_count, 4),
+            "reference_root_wxyz": (row_count, 4),
+            "observed_body_q": (row_count, 29),
+            "desired_body_q": (row_count, 29),
+            "observed_left_hand": (row_count, 7),
+            "observed_right_hand": (row_count, 7),
+            "desired_left_hand": (row_count, 7),
+            "desired_right_hand": (row_count, 7),
+        }
+        copied_arrays: dict[str, np.ndarray] = {}
+        for field_name, expected_shape in expected_shapes.items():
+            array = _finite_float64_array(getattr(self, field_name), field_name=field_name)
+            if array.shape != expected_shape:
+                raise ValueError(f"{field_name} must have shape {expected_shape}; got {array.shape}")
+            copied_arrays[field_name] = array
+
+        self.timestamps = timestamps
+        self.task_indices = task_indices
+        for field_name, array in copied_arrays.items():
+            setattr(self, field_name, array)
 
 
 @dataclass(frozen=True)
