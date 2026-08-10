@@ -4,7 +4,10 @@ import math
 import numpy as np
 import pytest
 
-from gear_sonic.data.unitree_conversion.quaternion import quat_slerp_deployment
+from gear_sonic.data.unitree_conversion.quaternion import (
+    quat_slerp_deployment,
+    validate_wxyz,
+)
 from gear_sonic.data.unitree_conversion.resampling import (
     TimestampAuditReport,
     audit_source_timestamps,
@@ -174,6 +177,35 @@ def test_quaternion_resampling_preserves_deployment_shortest_image_path() -> Non
     np.testing.assert_allclose(result[1], _axis_quaternion("z", 0.3 * math.pi), atol=1e-15)
     np.testing.assert_allclose(result[2], end, atol=1e-15)
     assert np.isfinite(result).all()
+
+
+def test_quaternion_resampling_normalizes_each_accepted_source_exactly_once() -> None:
+    source = np.array(
+        [
+            [0.10786321854116837, -0.17541065077178888, 0.09501948660078273, 0.9739498954343064],
+            [0.27093245598157867, 0.9106316038088241, -0.1927022168455699, -0.24540397981421042],
+        ],
+        dtype=np.float64,
+    )
+    expected_single_normalization = np.array(
+        [-0.13725386254852537, -0.7251248288765898, 0.18183958653939178, 0.6498382295074597],
+        dtype=np.float64,
+    )
+    normalized_start, _ = validate_wxyz(source[0])
+    normalized_end, _ = validate_wxyz(source[1])
+    old_double_normalized = quat_slerp_deployment(normalized_start, normalized_end, 0.6)
+
+    result = resample_quaternions(source)[1]
+
+    np.testing.assert_array_equal(
+        result.view(np.uint64),
+        expected_single_normalization.view(np.uint64),
+    )
+    assert not np.array_equal(result.view(np.uint64), old_double_normalized.view(np.uint64))
+    np.testing.assert_array_equal(
+        np.abs(result.view(np.int64) - old_double_normalized.view(np.int64)),
+        [0, 0, 1, 1],
+    )
 
 
 @pytest.mark.parametrize("source_count", [2, 3, 10, 31])
@@ -404,6 +436,96 @@ def test_timestamp_audit_report_is_deterministic_and_frozen() -> None:
     assert isinstance(first, TimestampAuditReport)
     with pytest.raises(FrozenInstanceError):
         first.warning = True  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("frame_count", [True, 0, 1, 2.0, np.int64(2)])
+def test_timestamp_audit_report_rejects_invalid_direct_frame_count(frame_count: object) -> None:
+    with pytest.raises(ValueError, match="frame_count"):
+        TimestampAuditReport(
+            frame_count=frame_count,  # type: ignore[arg-type]
+            max_grid_error_seconds=0.0,
+            warning=False,
+            rejected=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "max_error",
+    [True, -1.0, np.nan, np.inf, -np.inf, "0", 0.0j, np.array(0.0)],
+)
+def test_timestamp_audit_report_rejects_invalid_direct_max_error(max_error: object) -> None:
+    with pytest.raises(ValueError, match="max_grid_error_seconds"):
+        TimestampAuditReport(
+            frame_count=2,
+            max_grid_error_seconds=max_error,  # type: ignore[arg-type]
+            warning=False,
+            rejected=False,
+        )
+
+
+@pytest.mark.parametrize(("warning", "rejected"), [(0, False), (np.bool_(False), False), (False, 0)])
+def test_timestamp_audit_report_requires_builtin_bool_flags(
+    warning: object,
+    rejected: object,
+) -> None:
+    with pytest.raises(ValueError, match="flags"):
+        TimestampAuditReport(
+            frame_count=2,
+            max_grid_error_seconds=0.0,
+            warning=warning,  # type: ignore[arg-type]
+            rejected=rejected,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("max_error", "warning", "rejected"),
+    [
+        (0.0, False, False),
+        (0.001, False, False),
+        (np.nextafter(0.001, np.inf), True, False),
+        (1.0 / 60.0, True, False),
+        (np.nextafter(1.0 / 60.0, np.inf), True, True),
+    ],
+)
+def test_timestamp_audit_report_accepts_exact_strict_threshold_flags(
+    max_error: float,
+    warning: bool,
+    rejected: bool,
+) -> None:
+    report = TimestampAuditReport(
+        frame_count=2,
+        max_grid_error_seconds=max_error,
+        warning=warning,
+        rejected=rejected,
+    )
+
+    assert report.max_grid_error_seconds == max_error
+    assert report.warning is warning
+    assert report.rejected is rejected
+
+
+@pytest.mark.parametrize(
+    ("max_error", "warning", "rejected"),
+    [
+        (0.0, True, False),
+        (0.002, False, False),
+        (0.002, True, True),
+        (0.02, True, False),
+        (0.02, False, True),
+    ],
+)
+def test_timestamp_audit_report_rejects_flags_inconsistent_with_strict_thresholds(
+    max_error: float,
+    warning: bool,
+    rejected: bool,
+) -> None:
+    with pytest.raises(ValueError, match="agree"):
+        TimestampAuditReport(
+            frame_count=2,
+            max_grid_error_seconds=max_error,
+            warning=warning,
+            rejected=rejected,
+        )
 
 
 @pytest.mark.parametrize(

@@ -9,7 +9,7 @@ import numbers
 import numpy as np
 
 from gear_sonic.data.unitree_conversion.quaternion import (
-    quat_slerp_deployment,
+    _quat_slerp_deployment_normalized,
     validate_wxyz,
 )
 
@@ -27,6 +27,26 @@ class TimestampAuditReport:
     max_grid_error_seconds: float
     warning: bool
     rejected: bool
+
+    def __post_init__(self) -> None:
+        if isinstance(self.frame_count, bool) or not isinstance(self.frame_count, int) or self.frame_count < 2:
+            raise ValueError("frame_count must be a non-boolean integer of at least two")
+        if (
+            isinstance(self.max_grid_error_seconds, bool)
+            or not isinstance(self.max_grid_error_seconds, numbers.Real)
+            or not math.isfinite(float(self.max_grid_error_seconds))
+            or self.max_grid_error_seconds < 0.0
+        ):
+            raise ValueError("max_grid_error_seconds must be a finite nonnegative real number")
+        if type(self.warning) is not bool or type(self.rejected) is not bool:
+            raise ValueError("warning and rejected flags must be built-in bool values")
+
+        max_error = float(self.max_grid_error_seconds)
+        expected_rejected = max_error > _TIMESTAMP_REJECTION_SECONDS
+        expected_warning = max_error > _TIMESTAMP_WARNING_SECONDS or expected_rejected
+        if self.warning is not expected_warning or self.rejected is not expected_rejected:
+            raise ValueError("warning and rejected flags must agree with the strict timestamp thresholds")
+        object.__setattr__(self, "max_grid_error_seconds", max_error)
 
 
 def _real_numeric_array(value: object, *, field_name: str) -> tuple[np.ndarray, np.dtype]:
@@ -102,7 +122,7 @@ def resample_quaternions(quaternions: object) -> np.ndarray:
     for target_index, (index_0, index_1, alpha) in enumerate(
         zip(source_index_0, source_index_1, alphas, strict=True)
     ):
-        result[target_index] = quat_slerp_deployment(
+        result[target_index] = _quat_slerp_deployment_normalized(
             normalized[index_0],
             normalized[index_1],
             alpha,

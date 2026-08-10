@@ -107,6 +107,15 @@ def quat_slerp_deployment(q0: object, q1: object, alpha: object) -> np.ndarray:
     """Reproduce deployment ``quat_slerp_d`` on validated unit quaternions."""
     start, _ = validate_wxyz(q0)
     end, _ = validate_wxyz(q1)
+    return _quat_slerp_deployment_normalized(start, end, alpha)
+
+
+def _quat_slerp_deployment_normalized(
+    start: np.ndarray,
+    end: np.ndarray,
+    alpha: object,
+) -> np.ndarray:
+    """Apply deployment SLERP to operands already normalized by the source policy."""
     weight = _alpha(alpha)
 
     dot = float(np.dot(start, end))
