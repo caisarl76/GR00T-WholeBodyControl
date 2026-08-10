@@ -3,11 +3,15 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, replace
 import json
 from pathlib import Path
+import re
 
 import av
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
+from gear_sonic.data.exporter import Gr00tDataExporter
 from gear_sonic.data.unitree_conversion import staging as staging_module
 from gear_sonic.data.unitree_conversion.staging import (
     MergeVerification,
@@ -20,7 +24,11 @@ from gear_sonic.data.unitree_conversion.staging import (
     stage_path,
     write_stage,
 )
-from gear_sonic.data.unitree_conversion.validation import TARGET_FRAME_SCHEMA
+from gear_sonic.data.unitree_conversion.validation import (
+    TARGET_FRAME_SCHEMA,
+    regenerate_eef_state,
+    target_joint_limits,
+)
 
 
 def _write_video(
@@ -67,7 +75,7 @@ def _row(index: int, task: str) -> dict[str, object]:
     row["observation.cpp_rotation_offset"][:] = [1.0, 0.0, 0.0, 0.0]
     row["observation.init_base_quat"][:] = [1.0, 0.0, 0.0, 0.0]
     row["observation.projected_gravity"][:] = [0.0, 0.0, -1.0]
-    row["observation.eef_state"][[3, 10]] = 1.0
+    row["observation.eef_state"] = regenerate_eef_state(row["observation.state"])
     row["teleop.body_quat_w"][:] = [1.0, 0.0, 0.0, 0.0]
     row["teleop.target_body_orientation"][:] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
     row["teleop.planner_facing"][:] = [1.0, 0.0, 0.0]
@@ -141,6 +149,26 @@ def test_write_stage_preserves_exact_arrays_and_resumes_matching_identity(tmp_pa
             assert isinstance(value, np.ndarray)
             assert value.dtype == spec.dtype
             assert value.shape == spec.shape
+
+
+def test_path_video_stage_never_uses_whole_file_secure_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    payload = _payload(tmp_path)
+    real_secure_read = staging_module._secure_read
+
+    def reject_mp4(path: Path) -> bytes:
+        if path.suffix == ".mp4":
+            raise AssertionError("whole MP4 read")
+        return real_secure_read(path)
+
+    monkeypatch.setattr(staging_module, "_secure_read", reject_mp4)
+    result = write_stage(tmp_path, identity, payload)
+    assert can_resume(result.path, identity)
+    episode = staging_module._stage_input(result)
+    frames = list(staging_module._iter_staged_video(next(iter(episode.videos.values()))))
+    assert len(frames) == 2
 
 
 @pytest.mark.parametrize(
@@ -255,6 +283,36 @@ def test_stage_payload_rejects_corrupt_neutral_or_root_semantics(
         )
 
 
+def test_asset_free_target_kinematics_exposes_exact_43_joint_limits_and_fk() -> None:
+    lower, upper = target_joint_limits()
+    assert lower.shape == upper.shape == (43,)
+    assert lower.dtype == upper.dtype == np.dtype(np.float64)
+    assert np.all(lower <= 0.0)
+    assert np.all(upper >= 0.0)
+    eef = regenerate_eef_state(np.zeros(43, dtype=np.float64))
+    assert eef.shape == (14,)
+    assert np.isfinite(eef).all()
+    assert np.linalg.norm(eef[3:7]) == pytest.approx(1.0)
+    assert np.linalg.norm(eef[10:14]) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("field", ("observation.state", "action.wbc"))
+def test_stage_payload_rejects_finite_joint_target_outside_urdf_limits(tmp_path: Path, field: str) -> None:
+    rows = [_row(0, "task"), _row(1, "task")]
+    rows[1][field] = rows[1][field].copy()
+    rows[1][field][0] = 1e100
+    with pytest.raises(ValueError, match=f"{re.escape(field)}.*joint limits"):
+        StagePayload(rows=tuple(rows), videos=_payload(tmp_path).videos)
+
+
+def test_stage_payload_rejects_finite_but_fk_incorrect_eef_translation(tmp_path: Path) -> None:
+    rows = [_row(0, "task"), _row(1, "task")]
+    rows[1]["observation.eef_state"] = rows[1]["observation.eef_state"].copy()
+    rows[1]["observation.eef_state"][0] += 0.01
+    with pytest.raises(ValueError, match="observation.eef_state.*forward kinematics"):
+        StagePayload(rows=tuple(rows), videos=_payload(tmp_path).videos)
+
+
 @pytest.mark.parametrize(
     ("fps", "size", "message"),
     ((30, (640, 480), "fps 50"), (50, (320, 240), "frame size")),
@@ -293,6 +351,22 @@ def test_stage_write_failure_cleans_unique_sibling_temp(tmp_path: Path, monkeypa
     assert not list(final.parent.glob(f".{final.name}.*"))
 
 
+def test_atomic_publication_fails_closed_when_rename_noreplace_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+
+    def unavailable(source: Path, destination: Path) -> None:
+        raise OSError("RENAME_NOREPLACE unavailable")
+
+    monkeypatch.setattr(staging_module, "_rename_noreplace", unavailable)
+    with pytest.raises(OSError, match="unavailable"):
+        write_stage(tmp_path, identity, _payload(tmp_path))
+    final = stage_path(tmp_path, identity)
+    assert not final.exists()
+    assert not list(final.parent.glob(f".{final.name}.*"))
+
+
 class RecordingMergeBackend:
     def __init__(self) -> None:
         self.orders: list[tuple[int, ...]] = []
@@ -303,55 +377,18 @@ class RecordingMergeBackend:
         episode_ids = tuple(episode.identity.source_episode_id for episode in episodes)
         self.orders.append(episode_ids)
         self.task_catalogs.append(task_catalog)
-        task_to_index = {task: index for index, task in enumerate(task_catalog)}
-        global_indices: list[int] = []
-        episode_indices: list[int] = []
-        task_indices: list[int] = []
-        timestamps: list[np.float32] = []
-        video_counts: dict[int, dict[str, int]] = {}
-        cursor = 0
-        for target_episode_index, episode in enumerate(episodes):
-            for row in episode.rows:
-                global_indices.append(cursor)
-                episode_indices.append(target_episode_index)
-                task_indices.append(task_to_index[row["task"]])
-                timestamps.append(row["timestamp"])
-                cursor += 1
-            video_counts[episode.identity.source_episode_id] = {key: len(episode.rows) for key in episode.videos}
+        for episode in episodes:
+            assert not hasattr(episode, "rows")
+            assert len(tuple(staging_module.iter_stage_rows(episode, batch_size=1))) == episode.row_count
         (output / "backend.json").write_text(json.dumps({"episodes": episode_ids}))
-        return MergeVerification(
-            source_episode_ids=episode_ids,
-            episode_lengths=tuple(len(episode.rows) for episode in episodes),
-            global_indices=tuple(global_indices),
-            episode_indices=tuple(episode_indices),
-            task_to_index=task_to_index,
-            frame_task_indices=tuple(task_indices),
-            frame_timestamps=tuple(timestamps),
-            video_frame_counts=video_counts,
-            stats_source_episode_ids=episode_ids,
-        )
+        return self.validate(output, episodes, task_catalog)
+
+    def validate(self, output, episodes, task_catalog) -> MergeVerification:
+        return _exact_verification(episodes, task_catalog)
 
 
 def _exact_verification(episodes, task_catalog: tuple[str, ...]) -> MergeVerification:
-    task_to_index = {task: index for index, task in enumerate(task_catalog)}
-    episode_ids = tuple(episode.identity.source_episode_id for episode in episodes)
-    lengths = tuple(len(episode.rows) for episode in episodes)
-    return MergeVerification(
-        source_episode_ids=episode_ids,
-        episode_lengths=lengths,
-        global_indices=tuple(range(sum(lengths))),
-        episode_indices=tuple(
-            episode_index for episode_index, length in enumerate(lengths) for _ in range(length)
-        ),
-        task_to_index=task_to_index,
-        frame_task_indices=tuple(task_to_index[row["task"]] for episode in episodes for row in episode.rows),
-        frame_timestamps=tuple(row["timestamp"] for episode in episodes for row in episode.rows),
-        video_frame_counts={
-            episode.identity.source_episode_id: {key: len(episode.rows) for key in episode.videos}
-            for episode in episodes
-        },
-        stats_source_episode_ids=episode_ids,
-    )
+    return staging_module._expected_merge_verification(episodes, task_catalog)
 
 
 def _two_stages(tmp_path: Path):
@@ -371,8 +408,10 @@ def _two_stages(tmp_path: Path):
 def test_merge_is_deterministic_and_preregisters_lexicographic_tasks(tmp_path: Path) -> None:
     stages = _two_stages(tmp_path)
     backend = RecordingMergeBackend()
-    first = merge_stages(reversed(stages), tmp_path / "first", merge_backend=backend)
-    second = merge_stages(stages, tmp_path / "second", merge_backend=backend)
+    first = merge_stages(
+        reversed(stages), tmp_path / "first", merge_backend=backend, final_validator=backend.validate
+    )
+    second = merge_stages(stages, tmp_path / "second", merge_backend=backend, final_validator=backend.validate)
 
     assert backend.orders == [(2, 10), (2, 10)]
     assert backend.task_catalogs == [("alpha", "beta", "zeta")] * 2
@@ -412,8 +451,8 @@ def test_default_merge_streams_decoded_video_frames_through_lazy_gr00t_exporter(
     monkeypatch.setattr(staging_module, "_iter_staged_video", decode)
     monkeypatch.setattr(
         staging_module,
-        "_inspect_gr00t_output",
-        lambda exporter, episodes, tasks: _exact_verification(episodes, tasks),
+        "_validate_gr00t_output",
+        lambda output, episodes, tasks: _exact_verification(episodes, tasks),
     )
 
     merge_stages(stages, tmp_path / "default")
@@ -425,8 +464,45 @@ def test_default_merge_streams_decoded_video_frames_through_lazy_gr00t_exporter(
     frames = [value for event, value in calls if event == "frame"]
     assert len(frames) == 4
     assert all("observation.images.ego_view" in frame for frame in frames)
+    assert all(frame["timestamp"].shape == (1,) for frame in frames)
+    assert all(frame["timestamp"].dtype == np.dtype(np.float32) for frame in frames)
     assert [event for event, _ in calls].count("save") == 2
     assert [event for event, _ in calls].count("stop") == 1
+
+
+def test_real_gr00t_exporter_adapts_timestamp_vector_to_exact_scalar_parquet(tmp_path: Path) -> None:
+    output = tmp_path / "real-exporter"
+    exporter = Gr00tDataExporter.create(
+        save_root=output,
+        fps=50,
+        features={
+            "observation.state": {
+                "dtype": "float64",
+                "shape": (2,),
+                "names": ["a", "b"],
+            }
+        },
+        modality_config={"state": {}, "action": {}, "video": {}, "annotation": {}},
+        task="task",
+        script_config={},
+    )
+    for index in range(2):
+        exporter.add_frame(
+            {
+                "observation.state": np.array([index, index + 1], dtype=np.float64),
+                "timestamp": np.array([np.float32(index / 50.0)], dtype=np.float32),
+                "task": "task",
+            }
+        )
+        assert isinstance(exporter.episode_buffer["timestamp"][-1], np.float32)
+
+    exporter.save_episode()
+
+    table = pq.read_table(output / exporter.meta.get_data_file_path(0))
+    timestamp = table.column("timestamp").combine_chunks()
+    assert timestamp.type == pa.float32()
+    assert timestamp.null_count == 0
+    assert timestamp.to_numpy().tobytes() == np.array([0.0, 0.02], dtype=np.float32).tobytes()
 
 
 def test_merge_rejects_mixed_repositories_duplicate_ids_and_conversion_locks(tmp_path: Path) -> None:
@@ -438,9 +514,19 @@ def test_merge_rejects_mixed_repositories_duplicate_ids_and_conversion_locks(tmp
     )
     backend = RecordingMergeBackend()
     with pytest.raises(ValueError, match="source repository"):
-        merge_stages((stages[0], mixed), tmp_path / "mixed", merge_backend=backend)
+        merge_stages(
+            (stages[0], mixed),
+            tmp_path / "mixed",
+            merge_backend=backend,
+            final_validator=backend.validate,
+        )
     with pytest.raises(ValueError, match="duplicate source episode"):
-        merge_stages((stages[0], stages[0]), tmp_path / "duplicate", merge_backend=backend)
+        merge_stages(
+            (stages[0], stages[0]),
+            tmp_path / "duplicate",
+            merge_backend=backend,
+            final_validator=backend.validate,
+        )
 
     changed_lock = write_stage(
         tmp_path,
@@ -448,24 +534,71 @@ def test_merge_rejects_mixed_repositories_duplicate_ids_and_conversion_locks(tmp
         _payload(tmp_path, 21),
     )
     with pytest.raises(ValueError, match="conversion identity"):
-        merge_stages((stages[0], changed_lock), tmp_path / "changed", merge_backend=backend)
+        merge_stages(
+            (stages[0], changed_lock),
+            tmp_path / "changed",
+            merge_backend=backend,
+            final_validator=backend.validate,
+        )
+
+
+def test_merge_rejects_output_inside_stage_or_staging_namespace_without_mutating_inputs(
+    tmp_path: Path,
+) -> None:
+    stages = _two_stages(tmp_path)
+    backend = RecordingMergeBackend()
+    with pytest.raises(ValueError, match="input staging ancestry"):
+        merge_stages(
+            stages,
+            stages[0].path / "nested-output",
+            merge_backend=backend,
+            final_validator=backend.validate,
+        )
+    with pytest.raises(ValueError, match="input staging ancestry"):
+        merge_stages(
+            stages,
+            tmp_path / ".staging" / "unrelated-output",
+            merge_backend=backend,
+            final_validator=backend.validate,
+        )
+    assert all(can_resume(stage.path, stage.identity) for stage in stages)
 
 
 def test_merge_revalidates_stages_and_never_overwrites_existing_output(tmp_path: Path) -> None:
     stages = _two_stages(tmp_path)
     backend = RecordingMergeBackend()
-    output = merge_stages(stages, tmp_path / "dataset", merge_backend=backend)
-    assert merge_stages(stages, output, merge_backend=backend, resume_existing=True) == output
+    output = merge_stages(stages, tmp_path / "dataset", merge_backend=backend, final_validator=backend.validate)
+    assert (
+        merge_stages(
+            stages,
+            output,
+            merge_backend=backend,
+            final_validator=backend.validate,
+            resume_existing=True,
+        )
+        == output
+    )
 
     (output / "backend.json").write_text("corrupt")
     with pytest.raises(FileExistsError, match="existing output"):
-        merge_stages(stages, output, merge_backend=backend, resume_existing=True)
+        merge_stages(
+            stages,
+            output,
+            merge_backend=backend,
+            final_validator=backend.validate,
+            resume_existing=True,
+        )
     with pytest.raises(FileExistsError, match="existing output"):
-        merge_stages(stages, output, merge_backend=backend)
+        merge_stages(stages, output, merge_backend=backend, final_validator=backend.validate)
 
     (stages[0].path / "frame-data.parquet").write_bytes(b"corrupt")
     with pytest.raises(ValueError, match="stage is not complete"):
-        merge_stages(stages, tmp_path / "bad-stage", merge_backend=backend)
+        merge_stages(
+            stages,
+            tmp_path / "bad-stage",
+            merge_backend=backend,
+            final_validator=backend.validate,
+        )
 
 
 def test_merge_failure_cleans_sibling_temp_and_leaves_output_absent(tmp_path: Path) -> None:
@@ -478,24 +611,104 @@ def test_merge_failure_cleans_sibling_temp_and_leaves_output_absent(tmp_path: Pa
 
     final = tmp_path / "dataset"
     with pytest.raises(RuntimeError, match="boom"):
-        merge_stages(stages, final, merge_backend=fail)
+        merge_stages(
+            stages,
+            final,
+            merge_backend=fail,
+            final_validator=lambda output, episodes, tasks: _exact_verification(episodes, tasks),
+        )
     assert not final.exists()
     assert not list(tmp_path.glob(".dataset.*"))
 
 
-def test_merge_rejects_backend_verification_mismatch_and_cleans_temp(tmp_path: Path) -> None:
+def test_merge_rejects_independent_final_validation_mismatch_and_cleans_temp(tmp_path: Path) -> None:
     stages = _two_stages(tmp_path)
 
-    def wrong(output, episodes, tasks):
+    def backend(output, episodes, tasks):
         output.mkdir()
+
+    def wrong_validator(output, episodes, tasks):
         report = _exact_verification(episodes, tasks)
-        return replace(report, global_indices=tuple(reversed(report.global_indices)))
+        return replace(report, frame_content_sha256="0" * 64)
 
     final = tmp_path / "wrong-verification"
     with pytest.raises(ValueError, match="verification differs"):
-        merge_stages(stages, final, merge_backend=wrong)
+        merge_stages(
+            stages,
+            final,
+            merge_backend=backend,
+            final_validator=wrong_validator,
+        )
     assert not final.exists()
     assert not list(tmp_path.glob(".wrong-verification.*"))
+
+
+def test_injected_backend_requires_explicit_independent_final_validator(tmp_path: Path) -> None:
+    stages = _two_stages(tmp_path)
+    with pytest.raises(ValueError, match="independent final_validator"):
+        merge_stages(stages, tmp_path / "unsafe", merge_backend=RecordingMergeBackend())
+
+
+def test_production_merge_reopens_and_validates_real_gr00t_output(tmp_path: Path) -> None:
+    stage = write_stage(tmp_path, _identity(3), _payload(tmp_path, 3))
+
+    output = merge_stages((stage,), tmp_path / "real-dataset")
+
+    assert output.is_dir()
+    assert len(dataset_manifest_digest(output)) == 64
+    validation = json.loads((output / "merge-validation.json").read_text())
+    assert validation["total_frames"] == 2
+    assert validation["source_episode_ids"] == [3]
+
+
+def test_independent_validator_rejects_corrupt_nonvideo_despite_consistent_backend_report(
+    tmp_path: Path,
+) -> None:
+    stage = write_stage(tmp_path, _identity(3), _payload(tmp_path, 3))
+
+    def corrupting_backend(output, episodes, tasks):
+        staging_module._default_merge_backend(output, episodes, tasks)
+        from gear_sonic.data.exporter import Gr00tDatasetMetadata
+
+        meta = Gr00tDatasetMetadata(repo_id="tmp/tmp_dataset", root=output)
+        parquet_path = output / meta.get_data_file_path(0)
+        table = pq.read_table(parquet_path)
+        column = table.column("observation.state").combine_chunks()
+        values = column.values.to_numpy(zero_copy_only=False).copy()
+        values[0] += 1e-6
+        changed = pa.FixedSizeListArray.from_arrays(pa.array(values, type=pa.float64()), 43)
+        table = table.set_column(table.schema.get_field_index("observation.state"), "observation.state", changed)
+        pq.write_table(table, parquet_path)
+        return _exact_verification(episodes, tasks)
+
+    final = tmp_path / "corrupt-dataset"
+    with pytest.raises(ValueError, match="nonvideo value differs"):
+        merge_stages(
+            (stage,),
+            final,
+            merge_backend=corrupting_backend,
+            final_validator=staging_module._validate_gr00t_output,
+        )
+    assert not final.exists()
+
+
+def test_independent_validator_rejects_extra_global_task_catalog_entry(tmp_path: Path) -> None:
+    stage = write_stage(tmp_path, _identity(3), _payload(tmp_path, 3))
+
+    def extra_task_backend(output, episodes, tasks):
+        staging_module._default_merge_backend(output, episodes, tasks)
+        from gear_sonic.data.exporter import Gr00tDatasetMetadata
+
+        meta = Gr00tDatasetMetadata(repo_id="tmp/tmp_dataset", root=output)
+        meta.add_task("unexpected extra task")
+
+    with pytest.raises(ValueError, match="global task catalog"):
+        merge_stages(
+            (stage,),
+            tmp_path / "extra-task",
+            merge_backend=extra_task_backend,
+            final_validator=staging_module._validate_gr00t_output,
+        )
 
 
 def test_empty_merge_and_output_symlink_are_rejected(tmp_path: Path) -> None:

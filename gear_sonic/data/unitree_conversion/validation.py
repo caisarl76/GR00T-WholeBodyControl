@@ -5,11 +5,16 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
+from functools import lru_cache
 import io
+from pathlib import Path
+import threading
 from types import MappingProxyType
+from typing import BinaryIO
 
 import av
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 
 @dataclass(frozen=True)
@@ -65,6 +70,54 @@ TARGET_VIDEO_KEYS = frozenset(
 )
 TARGET_VIDEO_SIZE = (640, 480)
 _QUATERNION_NORM_TOLERANCE = 1e-5
+_JOINT_LIMIT_TOLERANCE = 1e-9
+_EEF_POSITION_TOLERANCE = 1e-9
+_EEF_QUATERNION_TOLERANCE = 1e-8
+TARGET_JOINT_NAMES = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "left_hand_index_0_joint",
+    "left_hand_index_1_joint",
+    "left_hand_middle_0_joint",
+    "left_hand_middle_1_joint",
+    "left_hand_thumb_0_joint",
+    "left_hand_thumb_1_joint",
+    "left_hand_thumb_2_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+    "right_hand_index_0_joint",
+    "right_hand_index_1_joint",
+    "right_hand_middle_0_joint",
+    "right_hand_middle_1_joint",
+    "right_hand_thumb_0_joint",
+    "right_hand_thumb_1_joint",
+    "right_hand_thumb_2_joint",
+)
 _EXACT_NEUTRAL_FIELDS: Mapping[str, np.ndarray] = MappingProxyType(
     {
         "teleop.delta_heading": np.zeros(1, dtype=np.float64),
@@ -84,6 +137,74 @@ _EXACT_NEUTRAL_FIELDS: Mapping[str, np.ndarray] = MappingProxyType(
         "teleop.vr_3pt_orientation": np.zeros(18, dtype=np.float32),
     }
 )
+
+
+@dataclass(frozen=True)
+class _TargetKinematics:
+    model: object
+    lower: np.ndarray
+    upper: np.ndarray
+    left_frame_id: int
+    right_frame_id: int
+
+
+_KINEMATICS_THREAD_LOCAL = threading.local()
+
+
+@lru_cache(maxsize=1)
+def _target_kinematics() -> _TargetKinematics:
+    import pinocchio as pin
+
+    urdf = Path(__file__).resolve().parents[1] / "robot_model" / "model_data" / "g1" / "g1_29dof_with_hand.urdf"
+    model = pin.buildModelFromUrdf(str(urdf))
+    joint_names = tuple(model.names)[1:]
+    if model.nq != 43 or model.nv != 43 or joint_names != TARGET_JOINT_NAMES:
+        raise RuntimeError("asset-free G1 URDF does not match the exact 43-joint target order")
+    lower = np.array(model.lowerPositionLimit, dtype=np.float64, order="C", copy=True)
+    upper = np.array(model.upperPositionLimit, dtype=np.float64, order="C", copy=True)
+    if lower.shape != (43,) or upper.shape != (43,) or not np.all(lower <= upper):
+        raise RuntimeError("asset-free G1 URDF contains invalid target joint limits")
+    lower.setflags(write=False)
+    upper.setflags(write=False)
+    return _TargetKinematics(
+        model=model,
+        lower=lower,
+        upper=upper,
+        left_frame_id=int(model.getFrameId("left_wrist_yaw_link")),
+        right_frame_id=int(model.getFrameId("right_wrist_yaw_link")),
+    )
+
+
+def target_joint_limits() -> tuple[np.ndarray, np.ndarray]:
+    """Return detached exact URDF limits in target RobotModel order."""
+    kinematics = _target_kinematics()
+    return kinematics.lower.copy(), kinematics.upper.copy()
+
+
+def regenerate_eef_state(state: np.ndarray) -> np.ndarray:
+    """Regenerate wrist XYZ + WXYZ from an observed 43D target state."""
+    if not isinstance(state, np.ndarray) or state.dtype != np.dtype(np.float64) or state.shape != (43,):
+        raise ValueError("observation.state must be a float64 ndarray with shape (43,)")
+    if not np.isfinite(state).all():
+        raise ValueError("observation.state must contain only finite values")
+    import pinocchio as pin
+
+    kinematics = _target_kinematics()
+    data_by_model = getattr(_KINEMATICS_THREAD_LOCAL, "data_by_model", None)
+    if data_by_model is None:
+        data_by_model = {}
+        _KINEMATICS_THREAD_LOCAL.data_by_model = data_by_model
+    data = data_by_model.get(id(kinematics.model))
+    if data is None:
+        data = kinematics.model.createData()
+        data_by_model[id(kinematics.model)] = data
+    pin.framesForwardKinematics(kinematics.model, data, state)
+    parts: list[np.ndarray] = []
+    for frame_id in (kinematics.left_frame_id, kinematics.right_frame_id):
+        placement = data.oMf[frame_id]
+        quaternion = R.from_matrix(np.asarray(placement.rotation)).as_quat(scalar_first=True)
+        parts.extend((np.asarray(placement.translation, dtype=np.float64), quaternion))
+    return np.array(np.concatenate(parts), dtype=np.float64, order="C", copy=True)
 
 
 @dataclass(frozen=True)
@@ -126,12 +247,20 @@ class ValidationReport:
         }
 
 
-def validate_target_rows(rows: Sequence[Mapping[str, object]]) -> None:
+def validate_target_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    start_index: int = 0,
+    initial_root_fields: tuple[np.ndarray, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Reject rows that cannot be represented by the exact target schema."""
     if isinstance(rows, (str, bytes)) or len(rows) < 1:
         raise ValueError("stage rows must contain at least one target frame")
+    if type(start_index) is not int or start_index < 0:
+        raise ValueError("start_index must be a nonnegative integer")
     expected_keys = tuple(TARGET_FRAME_SCHEMA)
-    for index, row in enumerate(rows):
+    for local_index, row in enumerate(rows):
+        index = start_index + local_index
         if not isinstance(row, Mapping):
             raise ValueError(f"row {index} must be a target-frame mapping")
         if set(row) != set(expected_keys):
@@ -166,9 +295,22 @@ def validate_target_rows(rows: Sequence[Mapping[str, object]]) -> None:
         assert isinstance(frame_index, np.ndarray)
         if int(frame_index[0]) != index:
             raise ValueError(f"row {index} teleop.smpl_frame_index must equal its episode-local index")
+        if initial_root_fields is None:
+            initial_root_fields = (
+                np.array(row["observation.cpp_rotation_offset"], copy=True),
+                np.array(row["observation.init_base_quat"], copy=True),
+            )
         for key, expected in _EXACT_NEUTRAL_FIELDS.items():
             if not np.array_equal(row[key], expected):
                 raise ValueError(f"row {index} {key} must equal the exact neutral target value")
+        kinematics = _target_kinematics()
+        for key in ("observation.state", "action.wbc"):
+            joint_values = row[key]
+            assert isinstance(joint_values, np.ndarray)
+            if np.any(joint_values < kinematics.lower - _JOINT_LIMIT_TOLERANCE) or np.any(
+                joint_values > kinematics.upper + _JOINT_LIMIT_TOLERANCE
+            ):
+                raise ValueError(f"row {index} {key} must remain within exact target joint limits")
         for key in (
             "observation.root_orientation",
             "observation.cpp_rotation_offset",
@@ -184,6 +326,23 @@ def validate_target_rows(rows: Sequence[Mapping[str, object]]) -> None:
         for start in (3, 10):
             if abs(float(np.linalg.norm(eef_state[start : start + 4])) - 1.0) > _QUATERNION_NORM_TOLERANCE:
                 raise ValueError(f"row {index} observation.eef_state wrist quaternion must be unit WXYZ")
+        regenerated_eef = regenerate_eef_state(row["observation.state"])
+        for start in (0, 7):
+            if not np.allclose(
+                eef_state[start : start + 3],
+                regenerated_eef[start : start + 3],
+                rtol=0.0,
+                atol=_EEF_POSITION_TOLERANCE,
+            ):
+                raise ValueError(f"row {index} observation.eef_state translation differs from forward kinematics")
+            actual_quaternion = eef_state[start + 3 : start + 7]
+            expected_quaternion = regenerated_eef[start + 3 : start + 7]
+            quaternion_error = min(
+                np.max(np.abs(actual_quaternion - expected_quaternion)),
+                np.max(np.abs(actual_quaternion + expected_quaternion)),
+            )
+            if quaternion_error > _EEF_QUATERNION_TOLERANCE:
+                raise ValueError(f"row {index} observation.eef_state quaternion differs from forward kinematics")
         root = row["observation.root_orientation"]
         gravity = row["observation.projected_gravity"]
         assert isinstance(root, np.ndarray) and isinstance(gravity, np.ndarray)
@@ -196,16 +355,19 @@ def validate_target_rows(rows: Sequence[Mapping[str, object]]) -> None:
         if not np.allclose(gravity, expected_gravity, rtol=0.0, atol=1e-10):
             raise ValueError(f"row {index} observation.projected_gravity must match inverse root rotation")
         if index and (
-            not np.array_equal(row["observation.cpp_rotation_offset"], rows[0]["observation.cpp_rotation_offset"])
-            or not np.array_equal(row["observation.init_base_quat"], rows[0]["observation.init_base_quat"])
+            not np.array_equal(row["observation.cpp_rotation_offset"], initial_root_fields[0])
+            or not np.array_equal(row["observation.init_base_quat"], initial_root_fields[1])
         ):
             raise ValueError("episode initial root fields must remain constant across every row")
+    assert initial_root_fields is not None
+    return np.array(initial_root_fields[0], copy=True), np.array(initial_root_fields[1], copy=True)
 
 
-def probe_video_50fps(data: bytes, *, field_name: str) -> tuple[int, tuple[int, int]]:
-    """Decode an owned MP4 blob and return its exact 50 Hz count and size."""
+def probe_video_50fps_stream(stream: BinaryIO, *, field_name: str) -> tuple[int, tuple[int, int]]:
+    """Decode one seekable MP4 stream and return its exact 50 Hz count and size."""
     try:
-        with av.open(io.BytesIO(data), mode="r") as container:
+        stream.seek(0)
+        with av.open(stream, mode="r") as container:
             streams = tuple(container.streams.video)
             if len(streams) != 1:
                 raise ValueError(f"{field_name} must contain exactly one video stream")
@@ -239,21 +401,36 @@ def probe_video_50fps(data: bytes, *, field_name: str) -> tuple[int, tuple[int, 
     return count, dimensions
 
 
+def probe_video_50fps(data: bytes, *, field_name: str) -> tuple[int, tuple[int, int]]:
+    """Decode an owned MP4 blob and return its exact 50 Hz count and size."""
+    return probe_video_50fps_stream(io.BytesIO(data), field_name=field_name)
+
+
 def validate_stage_payload(
     rows: Sequence[Mapping[str, object]],
     videos: Mapping[str, bytes],
 ) -> ValidationReport:
     """Validate an entire detached stage payload before publication."""
+    inspections: dict[str, tuple[int, tuple[int, int]]] = {}
+    for key, data in sorted(videos.items()):
+        inspections[key] = probe_video_50fps(data, field_name=f"video {key}")
+    return validation_report_from_inspections(rows, inspections)
+
+
+def validation_report_from_inspections(
+    rows: Sequence[Mapping[str, object]],
+    inspections: Mapping[str, tuple[int, tuple[int, int]]],
+) -> ValidationReport:
+    """Combine exact row validation with already-decoded video inspections."""
     validate_target_rows(rows)
-    if "observation.images.ego_view" not in videos:
+    if "observation.images.ego_view" not in inspections:
         raise ValueError("stage videos require observation.images.ego_view")
-    unknown = sorted(set(videos) - TARGET_VIDEO_KEYS)
+    unknown = sorted(set(inspections) - TARGET_VIDEO_KEYS)
     if unknown:
         raise ValueError(f"stage videos contain unsupported target keys: {unknown}")
     counts: dict[str, int] = {}
     dimensions: dict[str, tuple[int, int]] = {}
-    for key, data in sorted(videos.items()):
-        count, size = probe_video_50fps(data, field_name=f"video {key}")
+    for key, (count, size) in sorted(inspections.items()):
         if count != len(rows):
             raise ValueError(f"video frame count for {key} is {count}; expected target row count {len(rows)}")
         counts[key] = count

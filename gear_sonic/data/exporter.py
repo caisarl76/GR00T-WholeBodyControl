@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Optional
+from typing import Any
 
 import datasets
 from datasets import load_dataset
@@ -272,7 +272,13 @@ class Gr00tDataExporter(LeRobotDataset):
             self.episode_buffer = self.create_episode_buffer()
 
         frame_index = self.episode_buffer["size"]
-        timestamp = frame.pop("timestamp") if "timestamp" in frame else frame_index / self.fps
+        if "timestamp" in frame:
+            # LeRobot validates DEFAULT_FEATURES.timestamp as an ndarray with
+            # shape (1,), but its Arrow schema stores that single value as a
+            # scalar and timestamp synchronization expects an (N,) vector.
+            timestamp = np.float32(frame.pop("timestamp")[0])
+        else:
+            timestamp = np.float32(frame_index / self.fps)
         self.episode_buffer["frame_index"].append(frame_index)
         self.episode_buffer["timestamp"].append(timestamp)
 
@@ -343,7 +349,13 @@ class Gr00tDataExporter(LeRobotDataset):
         for key, ft in self.features.items():
             if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
                 continue
-            episode_buffer[key] = np.stack(episode_buffer[key])
+            stacked = np.stack(episode_buffer[key])
+            # datasets.Features represents one-element vectors as scalar Arrow
+            # Values. Keep validation-facing frames at shape (1,), then remove
+            # only that trailing singleton before serialization/statistics.
+            if tuple(ft.get("shape", ())) == (1,) and stacked.ndim == 2:
+                stacked = stacked[:, 0]
+            episode_buffer[key] = stacked
 
         self._wait_image_writer()
         self._save_episode_table(episode_buffer, episode_index)
