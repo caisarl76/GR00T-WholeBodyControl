@@ -19,7 +19,9 @@ from gear_sonic.data.unitree_conversion.pipeline import (
     DiagnosticIdentity,
     PipelineComponents,
     RepositoryPreflight,
+    _resolve_source_task,
     _source_load_error_class,
+    _validate_inspire_root_finiteness,
     _write_diagnostic,
     run_dex3_pipeline,
     run_inspire_diagnostics,
@@ -299,6 +301,24 @@ def test_missing_selected_source_episode_is_provenance_not_schema() -> None:
         == "provenance_error"
     )
     assert _source_load_error_class(ValueError("episode metadata parquet is malformed")) == "source_schema_error"
+
+
+def test_nonfinite_inspire_root_is_quaternion_error() -> None:
+    current = [[0.0] * 36, [0.0] * 36]
+    desired = [[0.0] * 36, [0.0] * 36]
+    current[1][3] = float("nan")
+
+    with pytest.raises(ValueError) as captured:
+        _validate_inspire_root_finiteness(current, desired)
+
+    assert captured.value.error_class == "quaternion_error"
+
+
+def test_missing_inspire_task_is_source_schema_error() -> None:
+    with pytest.raises(ValueError) as captured:
+        _resolve_source_task({0: "pick up pillow"}, 9)
+
+    assert captured.value.error_class == "source_schema_error"
 
 
 def test_inspire_smoke_never_constructs_encoder(smoke_lock, tmp_path: Path) -> None:

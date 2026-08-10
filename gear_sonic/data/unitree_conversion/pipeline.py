@@ -385,6 +385,17 @@ def _source_load_error_class(error: BaseException) -> str:
     return "source_schema_error"
 
 
+def _resolve_source_task(tasks: Mapping[int, str], task_index: int) -> str:
+    try:
+        task = tasks[task_index]
+    except KeyError as error:
+        raise _EpisodePreflightError(
+            "source_schema_error",
+            f"source task_index {task_index} is absent from meta/tasks.jsonl",
+        ) from error
+    return task
+
+
 def _pipeline_report(
     *,
     output_root: Path,
@@ -1092,13 +1103,7 @@ def _resample_episode(episode: object, preflight: _RepositoryPreflight) -> objec
     desired_right, _ = resample_positions(episode.desired_right_hand)
     discrete_indices = nearest_image_indices(episode.timestamps.shape[0])
     task_indices = episode.task_indices[discrete_indices]
-    try:
-        task_texts = tuple(preflight.tasks[int(index)] for index in task_indices)
-    except KeyError as error:
-        raise _EpisodePreflightError(
-            "source_schema_error",
-            f"source task_index {error.args[0]} is absent from meta/tasks.jsonl",
-        ) from error
+    task_texts = tuple(_resolve_source_task(preflight.tasks, int(index)) for index in task_indices)
     try:
         observed_roots = resample_quaternions(episode.observed_root_wxyz)
         reference_roots = resample_quaternions(episode.reference_root_wxyz)
@@ -1270,6 +1275,21 @@ def _merge_stages(stages: Sequence[object], target_path: Path, resume: bool) -> 
     return merge_stages(stages, target_path, resume_existing=resume)
 
 
+def _validate_inspire_root_finiteness(current: object, desired: object) -> None:
+    import numpy as np
+
+    for field_name, values in (("robot_q_current", current), ("robot_q_desired", desired)):
+        try:
+            array = np.asarray(values, dtype=np.float64)
+        except (TypeError, ValueError):
+            continue
+        if array.ndim == 2 and array.shape[1] >= 7 and not np.isfinite(array[:, 3:7]).all():
+            raise _EpisodePreflightError(
+                "quaternion_error",
+                f"{field_name} root quaternion contains NaN or Inf",
+            )
+
+
 def _diagnose_inspire(
     source: SourceSpec,
     episode_id: int,
@@ -1319,6 +1339,7 @@ def _diagnose_inspire(
             field_name=f"row {row_number} task_index",
             nonnegative=True,
         )
+        _resolve_source_task(preflight.tasks, task_index)
         current.append(row[_CURRENT_KEY])
         desired.append(row[_DESIRED_KEY])
         hand_state.append(row[_HAND_STATE_KEY])
@@ -1339,6 +1360,7 @@ def _diagnose_inspire(
             "timeline_error",
             "Inspire timestamps must be strictly increasing",
         )
+    _validate_inspire_root_finiteness(current, desired)
     report = _diagnose_arrays(
         current=current,
         desired=desired,
