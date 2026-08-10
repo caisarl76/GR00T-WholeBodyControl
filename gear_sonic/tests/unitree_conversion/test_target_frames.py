@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
+import warnings
 
 import numpy as np
 import pytest
@@ -57,6 +59,16 @@ PRODUCTION_G1_JOINT_NAMES = (
     "right_hand_thumb_1_joint",
     "right_hand_thumb_2_joint",
 )
+G1_MESH_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "data"
+    / "robot_model"
+    / "model_data"
+    / "g1"
+    / "meshes"
+    / "left_hip_pitch_link.STL"
+)
+GIT_LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
 
 
 class FakeRobotModel:
@@ -296,6 +308,29 @@ def test_builder_accepts_encoder_row_views_but_owns_the_float64_output() -> None
 
 
 @pytest.mark.parametrize(
+    ("source_field", "target_field"),
+    [
+        ("desired_left_hand", "teleop.left_hand_joints"),
+        ("desired_right_hand", "teleop.right_hand_joints"),
+    ],
+)
+def test_builder_rejects_finite_desired_hand_values_that_overflow_float32_without_warning(
+    source_field: str,
+    target_field: str,
+) -> None:
+    kwargs = _episode().__dict__.copy()
+    desired_hand = getattr(_episode(), source_field).copy()
+    desired_hand[0, 0] = 1e300
+    kwargs[source_field] = desired_hand
+    episode = ResampledEpisode(**kwargs)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(ValueError, match=rf"{target_field}.*finite"):
+            TargetFrameBuilder(robot_model=FakeRobotModel()).build(episode, 0, _token())
+
+
+@pytest.mark.parametrize(
     ("robot_model", "message"),
     [
         (FakeRobotModel((*PRODUCTION_G1_JOINT_NAMES[:-1], "unexpected_joint")), "semantic joint set"),
@@ -337,10 +372,11 @@ def test_default_builder_requests_the_lower_and_upper_body_model(monkeypatch: py
 
 
 def test_real_g1_model_builds_a_finite_frame_when_assets_are_available() -> None:
-    try:
-        robot_model = target_frames_module.get_g1_robot_model(waist_location="lower_and_upper_body")
-    except (ImportError, OSError, RuntimeError, ValueError) as error:
-        pytest.skip(f"G1 FK assets unavailable: {error}")
+    with G1_MESH_PATH.open("rb") as mesh_file:
+        if mesh_file.read(len(GIT_LFS_POINTER_PREFIX)) == GIT_LFS_POINTER_PREFIX:
+            pytest.skip("G1 mesh is an unmaterialized Git-LFS pointer")
+
+    robot_model = target_frames_module.get_g1_robot_model(waist_location="lower_and_upper_body")
 
     frame = TargetFrameBuilder(robot_model=robot_model).build(_episode(), 0, _token())
 

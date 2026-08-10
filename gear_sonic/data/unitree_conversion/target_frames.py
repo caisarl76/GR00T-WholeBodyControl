@@ -27,8 +27,17 @@ _RIGHT_HAND_NAMES = tuple(name.replace("left_", "right_", 1) for name in _LEFT_H
 _EXPECTED_JOINT_NAMES = frozenset((*G1_MUJOCO_NAMES, *_LEFT_HAND_NAMES, *_RIGHT_HAND_NAMES))
 
 
-def _owned_array(values: object, *, dtype: np.dtype | type) -> np.ndarray:
-    return np.array(values, dtype=dtype, order="C", copy=True)
+def _owned_array(
+    values: object,
+    *,
+    dtype: np.dtype | type,
+    field_name: str,
+) -> np.ndarray:
+    with np.errstate(over="ignore", invalid="ignore"):
+        array = np.array(values, dtype=dtype, order="C", copy=True)
+    if not np.isfinite(array).all():
+        raise ValueError(f"{field_name} must contain only finite values after casting to {array.dtype}")
+    return array
 
 
 def _validate_robot_model(robot_model: object) -> tuple[tuple[str, ...], dict[str, str]]:
@@ -61,6 +70,7 @@ def _validate_robot_model(robot_model: object) -> tuple[tuple[str, ...], dict[st
 
 def _semantic_configuration(
     *,
+    field_name: str,
     joint_names: tuple[str, ...],
     body_names: tuple[str, ...],
     body_values: np.ndarray,
@@ -74,7 +84,11 @@ def _semantic_configuration(
         missing = sorted(set(joint_names) - set(semantic_values))
         extra = sorted(set(semantic_values) - set(joint_names))
         raise ValueError(f"episode semantic joint set differs from RobotModel: missing={missing}, extra={extra}")
-    return _owned_array([semantic_values[name] for name in joint_names], dtype=np.float64)
+    return _owned_array(
+        [semantic_values[name] for name in joint_names],
+        dtype=np.float64,
+        field_name=field_name,
+    )
 
 
 class TargetFrameBuilder:
@@ -110,6 +124,7 @@ class TargetFrameBuilder:
             raise ValueError("motion token must contain only finite values")
 
         observed_state = _semantic_configuration(
+            field_name="observation.state",
             joint_names=self._joint_names,
             body_names=episode.body_joint_names,
             body_values=episode.observed_body_q[frame_index],
@@ -117,6 +132,7 @@ class TargetFrameBuilder:
             right_hand_dds=episode.observed_right_hand[frame_index],
         )
         desired_state = _semantic_configuration(
+            field_name="action.wbc",
             joint_names=self._joint_names,
             body_names=episode.body_joint_names,
             body_values=episode.desired_body_q[frame_index],
@@ -136,17 +152,23 @@ class TargetFrameBuilder:
                 raise ValueError("RobotModel wrist placement must contain only finite values")
             quaternion = R.from_matrix(rotation).as_quat(scalar_first=True)
             eef_parts.append(np.concatenate((translation, quaternion)))
-        eef_state = _owned_array(np.concatenate(eef_parts), dtype=np.float64)
+        eef_state = _owned_array(
+            np.concatenate(eef_parts),
+            dtype=np.float64,
+            field_name="observation.eef_state",
+        )
 
         root_orientation = _owned_array(
             episode.observed_root_wxyz[frame_index],
             dtype=np.float64,
+            field_name="observation.root_orientation",
         )
         projected_gravity = _owned_array(
             R.from_quat(root_orientation, scalar_first=True)
             .inv()
             .apply(np.array([0.0, 0.0, -1.0], dtype=np.float64)),
             dtype=np.float64,
+            field_name="observation.projected_gravity",
         )
 
         return {
@@ -155,16 +177,36 @@ class TargetFrameBuilder:
             "action.wbc": desired_state,
             "observation.root_orientation": root_orientation,
             "observation.projected_gravity": projected_gravity,
-            "observation.cpp_rotation_offset": _owned_array(episode.reference_root_wxyz[0], dtype=np.float64),
-            "observation.init_base_quat": _owned_array(episode.observed_root_wxyz[0], dtype=np.float64),
+            "observation.cpp_rotation_offset": _owned_array(
+                episode.reference_root_wxyz[0],
+                dtype=np.float64,
+                field_name="observation.cpp_rotation_offset",
+            ),
+            "observation.init_base_quat": _owned_array(
+                episode.observed_root_wxyz[0],
+                dtype=np.float64,
+                field_name="observation.init_base_quat",
+            ),
             "teleop.delta_heading": np.zeros(1, dtype=np.float64),
-            "action.motion_token": _owned_array(token, dtype=np.float64),
+            "action.motion_token": _owned_array(
+                token,
+                dtype=np.float64,
+                field_name="action.motion_token",
+            ),
             "teleop.smpl_joints": np.zeros(72, dtype=np.float32),
             "teleop.smpl_pose": np.zeros(63, dtype=np.float32),
             "teleop.body_quat_w": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
             "teleop.target_body_orientation": np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32),
-            "teleop.left_hand_joints": _owned_array(episode.desired_left_hand[frame_index], dtype=np.float32),
-            "teleop.right_hand_joints": _owned_array(episode.desired_right_hand[frame_index], dtype=np.float32),
+            "teleop.left_hand_joints": _owned_array(
+                episode.desired_left_hand[frame_index],
+                dtype=np.float32,
+                field_name="teleop.left_hand_joints",
+            ),
+            "teleop.right_hand_joints": _owned_array(
+                episode.desired_right_hand[frame_index],
+                dtype=np.float32,
+                field_name="teleop.right_hand_joints",
+            ),
             "teleop.smpl_frame_index": np.array([frame_index], dtype=np.int64),
             "teleop.left_wrist_joints": np.zeros(3, dtype=np.float32),
             "teleop.right_wrist_joints": np.zeros(3, dtype=np.float32),
