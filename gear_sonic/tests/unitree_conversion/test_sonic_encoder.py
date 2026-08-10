@@ -4,10 +4,12 @@ import hashlib
 import math
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+import warnings
 
 import numpy as np
 import pytest
 
+from gear_sonic.data.unitree_conversion import sonic_encoder as sonic_encoder_module
 from gear_sonic.data.unitree_conversion.contracts import ArtifactSpec, ResampledEpisode
 from gear_sonic.data.unitree_conversion.joint_mapping import (
     G1_ISAACLAB_NAMES,
@@ -168,6 +170,14 @@ def test_resampled_episode_requires_explicit_unique_body_order_and_frame_metadat
         ResampledEpisode(**kwargs)
 
 
+def test_resampled_episode_rejects_unhashable_body_name_with_contract_error() -> None:
+    kwargs = _episode().__dict__.copy()
+    kwargs["body_joint_names"] = (*G1_MUJOCO_NAMES[:-1], ["not-a-name"])
+
+    with pytest.raises(ValueError, match="body_joint_names.*unique semantic names"):
+        ResampledEpisode(**kwargs)
+
+
 def test_g1_encoder_layout_is_exactly_1247d() -> None:
     positions = np.arange(290, dtype=np.float32).reshape(10, 29)
     velocities = positions + 1000
@@ -235,6 +245,21 @@ def test_builder_rejects_non_numeric_or_nonfinite_window_values() -> None:
     invalid[2, 3] = np.inf
     with pytest.raises(ValueError, match="velocities.*finite"):
         build_g1_encoder_input(valid_positions, invalid, valid_orientations)
+
+
+@pytest.mark.parametrize("field_name", ["positions", "velocities", "orientations"])
+def test_builder_rejects_float32_overflow_without_runtime_warning(field_name: str) -> None:
+    windows = {
+        "positions": np.zeros((10, 29), dtype=np.float64),
+        "velocities": np.zeros((10, 29), dtype=np.float64),
+        "orientations": np.zeros((10, 6), dtype=np.float64),
+    }
+    windows[field_name].flat[0] = np.finfo(np.float64).max
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(ValueError, match=rf"{field_name}.*float32.*finite"):
+            build_g1_encoder_input(**windows)
 
 
 def test_orientation_window_applies_initial_heading_and_current_full_root() -> None:
@@ -358,6 +383,24 @@ def test_frame_builder_clamps_inside_one_episode_and_reorders_by_joint_name() ->
         rtol=0.0,
     )
     np.testing.assert_array_equal(tensor[0, 644:], 0)
+
+
+def test_frame_builder_constructs_only_one_constant_size_future_index_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_full_table(*args: object, **kwargs: object) -> np.ndarray:
+        raise AssertionError("full [T50,10] index table was constructed")
+
+    monkeypatch.setattr(
+        sonic_encoder_module,
+        "clamped_future_indices",
+        reject_full_table,
+        raising=False,
+    )
+
+    tensor = build_frame_encoder_input(_episode(frame_count=12), frame_index=4)
+
+    assert tensor.shape == (1, 1247)
 
 
 @pytest.mark.parametrize("frame_index", [-1, 3, True, 1.0])

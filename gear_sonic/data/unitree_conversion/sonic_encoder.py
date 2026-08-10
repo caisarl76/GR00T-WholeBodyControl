@@ -18,7 +18,6 @@ from gear_sonic.data.unitree_conversion.joint_mapping import (
     reorder_by_name,
 )
 from gear_sonic.data.unitree_conversion.quaternion import validate_wxyz
-from gear_sonic.data.unitree_conversion.resampling import clamped_future_indices
 
 _INPUT_NAME = "obs_dict"
 _INPUT_SHAPE = (1, 1247)
@@ -169,7 +168,11 @@ def _window(value: object, *, field_name: str, shape: tuple[int, int]) -> np.nda
         raise ValueError(f"{field_name} must have shape [{shape[0]},{shape[1]}]; got {source.shape}")
     if not np.isfinite(source).all():
         raise ValueError(f"{field_name} must contain only finite values")
-    return np.array(source, dtype=np.float32, order="C", copy=True)
+    with np.errstate(over="ignore", invalid="ignore"):
+        owned = np.array(source, dtype=np.float32, order="C", copy=True)
+    if not np.isfinite(owned).all():
+        raise ValueError(f"{field_name} float32 conversion must remain finite")
+    return owned
 
 
 def build_g1_encoder_input(
@@ -314,7 +317,10 @@ def build_frame_encoder_input(episode: ResampledEpisode, frame_index: object) ->
     ):
         raise ValueError(f"frame_index must be an integer in [0,{episode.frame_count})")
     index = int(frame_index)
-    future_indices = clamped_future_indices(episode.frame_count, width=_WINDOW_LENGTH)[index]
+    future_indices = np.minimum(
+        index + np.arange(_WINDOW_LENGTH, dtype=np.int64),
+        episode.frame_count - 1,
+    )
     positions = reorder_by_name(
         episode.desired_body_q[future_indices],
         episode.body_joint_names,

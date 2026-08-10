@@ -201,10 +201,12 @@ class ResampledEpisode:
             body_joint_names = tuple(self.body_joint_names)
         except TypeError as error:
             raise ValueError("body_joint_names must contain exactly 29 unique semantic names") from error
-        if len(body_joint_names) != 29 or len(set(body_joint_names)) != 29:
+        if len(body_joint_names) != 29 or any(
+            not isinstance(name, str) or not name.strip() for name in body_joint_names
+        ):
             raise ValueError("body_joint_names must contain exactly 29 unique semantic names")
-        for name in body_joint_names:
-            _nonempty_string(name, field_name="body joint name")
+        if len(set(body_joint_names)) != 29:
+            raise ValueError("body_joint_names must contain exactly 29 unique semantic names")
 
         observed_roots = _finite_float64_array(
             self.observed_root_wxyz,
