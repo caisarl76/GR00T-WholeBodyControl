@@ -377,6 +377,14 @@ def _phase_error_class(phase: str, error: BaseException) -> str:
     }.get(phase, "target_validation_error")
 
 
+def _source_load_error_class(error: BaseException) -> str:
+    if str(error).startswith("no episode metadata row for selected episode "):
+        return "provenance_error"
+    if type(error).__name__ in {"EntryNotFoundError", "RevisionNotFoundError"}:
+        return "provenance_error"
+    return "source_schema_error"
+
+
 def _pipeline_report(
     *,
     output_root: Path,
@@ -858,7 +866,13 @@ def _validate_source_metadata(
             if isinstance(error, _EpisodePreflightError):
                 failures[episode_id] = ClassifiedFailure(error.error_class, str(error))
             else:
-                error_class = "provenance_error" if phase == "hash" else "source_schema_error"
+                error_class = (
+                    "provenance_error"
+                    if phase == "hash"
+                    else _source_load_error_class(error)
+                    if phase == "load"
+                    else "source_schema_error"
+                )
                 failures[episode_id] = _failure(error_class, error)
 
     if task_catalog is None:
@@ -1031,6 +1045,15 @@ def _adapt_dex3(
     rows = dataset.hf_dataset
     if len(rows) < 2:
         raise _EpisodePreflightError("timeline_error", "Dex3 episode contains fewer than two source frames")
+    try:
+        timestamps = np.asarray([row["timestamp"] for row in rows], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as error:
+        raise _EpisodePreflightError("timeline_error", "Dex3 timestamps must be finite numeric values") from error
+    if not np.isfinite(timestamps).all() or not np.all(np.diff(timestamps) > 0.0):
+        raise _EpisodePreflightError(
+            "timeline_error",
+            "Dex3 timestamps must be finite and strictly increasing",
+        )
     return adapt_dex3_arrays(
         source_repo_id=source.repo_id,
         source_revision=source.revision,
@@ -1038,7 +1061,7 @@ def _adapt_dex3(
         observed=np.asarray([row["observation.state"] for row in rows]),
         desired=np.asarray([row["action"] for row in rows]),
         feature_names=DEX3_FEATURE_NAMES,
-        timestamps=np.asarray([row["timestamp"] for row in rows]),
+        timestamps=timestamps,
         task_indices=np.asarray([row["task_index"] for row in rows]),
         video_segments=dataset.video_segments,
     )
@@ -1254,6 +1277,8 @@ def _diagnose_inspire(
     cache_dir: Path | None,
 ) -> object:
     del cache_dir
+    import numpy as np
+
     from gear_sonic.data.unitree_conversion.inspire_diagnostics import (
         _CURRENT_KEY,
         _DESIRED_KEY,
@@ -1298,8 +1323,22 @@ def _diagnose_inspire(
         desired.append(row[_DESIRED_KEY])
         hand_state.append(row[_HAND_STATE_KEY])
         hand_cmd.append(row[_HAND_CMD_KEY])
-        timestamps.append(_timestamp(row["timestamp"], field_name=f"row {row_number} timestamp"))
+        try:
+            timestamp = _timestamp(row["timestamp"], field_name=f"row {row_number} timestamp")
+        except (KeyError, ValueError) as error:
+            raise _EpisodePreflightError("timeline_error", str(error)) from error
+        timestamps.append(timestamp)
         task_indices.append(task_index)
+    if len(timestamps) < 2:
+        raise _EpisodePreflightError(
+            "timeline_error",
+            "Inspire episode contains fewer than two source frames",
+        )
+    if not np.all(np.diff(np.asarray(timestamps, dtype=np.float64)) > 0.0):
+        raise _EpisodePreflightError(
+            "timeline_error",
+            "Inspire timestamps must be strictly increasing",
+        )
     report = _diagnose_arrays(
         current=current,
         desired=desired,

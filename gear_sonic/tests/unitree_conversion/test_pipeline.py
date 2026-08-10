@@ -19,6 +19,7 @@ from gear_sonic.data.unitree_conversion.pipeline import (
     DiagnosticIdentity,
     PipelineComponents,
     RepositoryPreflight,
+    _source_load_error_class,
     _write_diagnostic,
     run_dex3_pipeline,
     run_inspire_diagnostics,
@@ -290,6 +291,14 @@ def test_preflight_failure_is_episode_classified_and_later_episodes_continue(smo
     assert report.episode_reports[1].error_class == "timeline_error"
     assert fake.adapter_ids == [0, 155, 233, 310]
     assert report.target_dataset_paths == ()
+
+
+def test_missing_selected_source_episode_is_provenance_not_schema() -> None:
+    assert (
+        _source_load_error_class(ValueError("no episode metadata row for selected episode 78"))
+        == "provenance_error"
+    )
+    assert _source_load_error_class(ValueError("episode metadata parquet is malformed")) == "source_schema_error"
 
 
 def test_inspire_smoke_never_constructs_encoder(smoke_lock, tmp_path: Path) -> None:
