@@ -21,7 +21,9 @@ from gear_sonic.data.unitree_conversion.pipeline import (
     RepositoryPreflight,
     _resolve_source_task,
     _source_load_error_class,
+    _validate_dex3_row_indices,
     _validate_inspire_root_finiteness,
+    _verify_preflight_source_hashes,
     _write_diagnostic,
     run_dex3_pipeline,
     run_inspire_diagnostics,
@@ -270,6 +272,37 @@ def test_failed_encoder_reports_attempted_invocations(smoke_lock, tmp_path: Path
 
     assert report.episode_reports[0].error_class == "encoder_contract_error"
     assert report.episode_reports[0].encoder_invocation_count == 2
+
+
+def test_dex3_adapter_rejects_out_of_order_source_frame_indices() -> None:
+    rows = (
+        {"episode_index": 7, "frame_index": 0},
+        {"episode_index": 7, "frame_index": 99},
+    )
+
+    with pytest.raises(ValueError) as captured:
+        _validate_dex3_row_indices(rows, 7)
+
+    assert captured.value.error_class == "source_schema_error"
+
+
+def test_source_mutation_after_preflight_is_provenance_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from gear_sonic.data.unitree_conversion import pipeline as pipeline_module
+
+    preflight = SimpleNamespace(
+        datasets={7: object()},
+        source_hashes={7: {"data/episode.parquet": "1" * 64}},
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_source_hashes",
+        lambda _dataset, _episode_id: {"data/episode.parquet": "2" * 64},
+    )
+
+    with pytest.raises(ValueError) as captured:
+        _verify_preflight_source_hashes(preflight, 7, operation="during test")
+
+    assert captured.value.error_class == "provenance_error"
 
 
 def test_preflight_failure_is_episode_classified_and_later_episodes_continue(smoke_lock, tmp_path: Path) -> None:

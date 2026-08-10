@@ -1038,6 +1038,41 @@ def _resume_stage(output_root: Path, identity: object) -> object | None:
     return StageResult(path=path, identity=identity, manifest_digest=manifest_digest, reused=True)
 
 
+def _validate_dex3_row_indices(rows: object, episode_id: int) -> None:
+    import numpy as np
+
+    for row_number, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise _EpisodePreflightError("source_schema_error", f"Dex3 row {row_number} must be a mapping")
+        for field_name, expected in (("episode_index", episode_id), ("frame_index", row_number)):
+            if field_name not in row:
+                raise _EpisodePreflightError(
+                    "source_schema_error",
+                    f"Dex3 row {row_number} is missing {field_name}",
+                )
+            value = np.asarray(row[field_name])
+            if value.shape != () or value.dtype.kind not in "iu" or int(value) != expected:
+                raise _EpisodePreflightError(
+                    "source_schema_error",
+                    f"Dex3 row {row_number} {field_name} must equal {expected}",
+                )
+
+
+def _verify_preflight_source_hashes(
+    preflight: _RepositoryPreflight,
+    episode_id: int,
+    *,
+    operation: str,
+) -> None:
+    dataset = preflight.datasets[episode_id]
+    expected = dict(preflight.source_hashes[episode_id])
+    if dict(_source_hashes(dataset, episode_id)) != expected:
+        raise _EpisodePreflightError(
+            "provenance_error",
+            f"source files changed {operation}",
+        )
+
+
 def _adapt_dex3(
     source: SourceSpec,
     episode_id: int,
@@ -1054,6 +1089,8 @@ def _adapt_dex3(
 
     dataset = preflight.datasets[episode_id]
     rows = dataset.hf_dataset
+    _verify_preflight_source_hashes(preflight, episode_id, operation="before Dex3 adaptation")
+    _validate_dex3_row_indices(rows, episode_id)
     if len(rows) < 2:
         raise _EpisodePreflightError("timeline_error", "Dex3 episode contains fewer than two source frames")
     try:
@@ -1065,7 +1102,7 @@ def _adapt_dex3(
             "timeline_error",
             "Dex3 timestamps must be finite and strictly increasing",
         )
-    return adapt_dex3_arrays(
+    episode = adapt_dex3_arrays(
         source_repo_id=source.repo_id,
         source_revision=source.revision,
         source_episode_id=episode_id,
@@ -1076,6 +1113,8 @@ def _adapt_dex3(
         task_indices=np.asarray([row["task_index"] for row in rows]),
         video_segments=dataset.video_segments,
     )
+    _verify_preflight_source_hashes(preflight, episode_id, operation="during Dex3 adaptation")
+    return episode
 
 
 def _resample_episode(episode: object, preflight: _RepositoryPreflight) -> object:
@@ -1223,6 +1262,11 @@ def _construct_payload(episode: object, encoded: object, preflight: _RepositoryP
     tokens = np.asarray(encoded)
     if tokens.shape != (episode.frame_count, 64) or tokens.dtype != np.dtype(np.float32):
         raise ValueError("encoded episode must have exact float32 shape [T50,64]")
+    _verify_preflight_source_hashes(
+        preflight,
+        episode.source_episode_id,
+        operation="before target/video construction",
+    )
     builder = TargetFrameBuilder()
     rows = tuple(builder.build(episode, index, tokens[index]) for index in range(episode.frame_count))
     timelines = preflight.timelines[episode.source_episode_id]
@@ -1233,11 +1277,24 @@ def _construct_payload(episode: object, encoded: object, preflight: _RepositoryP
             path = _encode_target_video(timelines[source_key])
             temporary.append(path)
             videos[target_key] = path
+        _verify_preflight_source_hashes(
+            preflight,
+            episode.source_episode_id,
+            operation="during target/video construction",
+        )
         payload = StagePayload(rows=rows, videos=videos)
         return _ProductionPayload(payload=payload, temporary_videos=tuple(temporary))
-    except BaseException:
+    except BaseException as error:
         for path in temporary:
             path.unlink(missing_ok=True)
+        try:
+            _verify_preflight_source_hashes(
+                preflight,
+                episode.source_episode_id,
+                operation="during failed target/video construction",
+            )
+        except _EpisodePreflightError as integrity_error:
+            raise integrity_error from error
         raise
 
 
