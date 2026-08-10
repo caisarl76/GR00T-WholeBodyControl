@@ -502,6 +502,8 @@ def _metadata_info(**changes: object) -> dict[str, object]:
     info: dict[str, object] = {
         "codebase_version": "v3.0",
         "chunks_size": 1000,
+        "fps": 30,
+        "total_episodes": 3,
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": {
@@ -538,6 +540,23 @@ def _episode_row(
     return row
 
 
+def _v3_data_rows(episode_id: int = 1, n: int = 2) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for frame_index in range(n):
+        observed = (np.arange(28, dtype=np.float32) + frame_index * 100).tolist()
+        rows.append(
+            {
+                "observation.state": observed,
+                "action": (np.asarray(observed) + 1000).tolist(),
+                "timestamp": frame_index / 30,
+                "task_index": frame_index,
+                "frame_index": frame_index,
+                "episode_index": episode_id,
+            }
+        )
+    return rows
+
+
 class FakeSnapshotDownloader:
     def __init__(
         self,
@@ -547,6 +566,8 @@ class FakeSnapshotDownloader:
         episode_rows: list[dict[str, object]] | None = None,
         raw_episode_metadata: bytes | None = None,
         write_episode_metadata: bool = True,
+        data_rows: list[dict[str, object]] | None = None,
+        raw_data: bytes | None = None,
         missing_patterns: tuple[str, ...] = (),
         wrong_return_call: int | None = None,
     ) -> None:
@@ -555,6 +576,8 @@ class FakeSnapshotDownloader:
         self.episode_rows = [_episode_row()] if episode_rows is None else episode_rows
         self.raw_episode_metadata = raw_episode_metadata
         self.write_episode_metadata = write_episode_metadata
+        self.data_rows = _v3_data_rows() if data_rows is None else data_rows
+        self.raw_data = raw_data
         self.missing_patterns = missing_patterns
         self.wrong_return_call = wrong_return_call
         self.calls: list[dict[str, object]] = []
@@ -583,7 +606,13 @@ class FakeSnapshotDownloader:
                     continue
                 path = local_dir / pattern
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(b"pinned")
+                if pattern.startswith("data/") and pattern.endswith(".parquet"):
+                    if self.raw_data is not None:
+                        path.write_bytes(self.raw_data)
+                    else:
+                        pq.write_table(pa.Table.from_pylist(self.data_rows), path)
+                else:
+                    path.write_bytes(b"pinned")
         if self.wrong_return_call == len(self.calls):
             return str(local_dir.parent / "wrong-snapshot")
         return str(local_dir)
@@ -648,6 +677,106 @@ EXPECTED_EPISODE_PATHS = [
     "videos/observation.images.cam_right_wrist/chunk-000/file-000.mp4",
     "videos/observation.images.cam_right_high/chunk-000/file-000.mp4",
 ]
+
+
+def test_loader_default_reads_prefetched_v3_data_directly_without_v21_lerobot(tmp_path: Path) -> None:
+    downloader = FakeSnapshotDownloader(data_rows=[*_v3_data_rows(0), *_v3_data_rows(1)])
+
+    episode = load_dex3_episode(
+        _source_spec(),
+        1,
+        root=tmp_path,
+        snapshot_downloader=downloader,
+    )
+
+    assert len(downloader.calls) == 2
+    assert downloader.calls[1]["allow_patterns"] == EXPECTED_EPISODE_PATHS
+    np.testing.assert_array_equal(episode.timestamps, [0.0, 1 / 30])
+    np.testing.assert_array_equal(episode.task_indices, [0, 1])
+    np.testing.assert_array_equal(episode.observed_root_wxyz, [[1.0, 0.0, 0.0, 0.0]] * 2)
+    np.testing.assert_array_equal(episode.reference_root_wxyz, [[1.0, 0.0, 0.0, 0.0]] * 2)
+    np.testing.assert_array_equal(episode.observed_left_hand[1], np.arange(100, 128)[14:21])
+    np.testing.assert_array_equal(episode.desired_right_hand[1], np.arange(1100, 1128)[21:28])
+
+
+def test_loader_default_rejects_corrupt_selected_v3_data_parquet(tmp_path: Path) -> None:
+    downloader = FakeSnapshotDownloader(raw_data=b"not parquet")
+
+    with pytest.raises(ValueError, match="selected v3 data parquet must be readable"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            snapshot_downloader=downloader,
+        )
+
+
+@pytest.mark.parametrize(
+    "missing_column",
+    ["observation.state", "action", "timestamp", "task_index", "frame_index", "episode_index"],
+)
+def test_loader_default_rejects_missing_selected_v3_data_columns(
+    tmp_path: Path,
+    missing_column: str,
+) -> None:
+    rows = _v3_data_rows()
+    for row in rows:
+        del row[missing_column]
+    downloader = FakeSnapshotDownloader(data_rows=rows)
+
+    with pytest.raises(ValueError, match="selected v3 data parquet.*required columns"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            snapshot_downloader=downloader,
+        )
+
+
+@pytest.mark.parametrize("source_episode_id", [0, 2])
+def test_loader_default_rejects_selected_shard_without_requested_episode_rows(
+    tmp_path: Path,
+    source_episode_id: int,
+) -> None:
+    downloader = FakeSnapshotDownloader(data_rows=_v3_data_rows(episode_id=source_episode_id))
+
+    with pytest.raises(ValueError, match="selected v3 data contains no rows for episode 1"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            snapshot_downloader=downloader,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("observation.state", ["bad"] * 28),
+        ("action", list(range(28))),
+        ("timestamp", "0.0"),
+        ("task_index", 0.5),
+        ("frame_index", 0.5),
+        ("episode_index", True),
+    ],
+)
+def test_loader_default_rejects_wrong_selected_v3_data_column_types(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+) -> None:
+    rows = _v3_data_rows()
+    for row in rows:
+        row[field_name] = value
+    downloader = FakeSnapshotDownloader(data_rows=rows)
+
+    with pytest.raises(ValueError, match=rf"selected v3 data column {field_name} has incompatible type"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            snapshot_downloader=downloader,
+        )
 
 
 def test_loader_prefetches_exact_commit_files_before_cold_cache_factory(tmp_path: Path) -> None:
@@ -723,7 +852,8 @@ def test_loader_prefetch_uses_selected_v3_row_and_per_video_shard_coordinates(tm
                 data_file_index=7,
                 video_locations=video_locations,
             ),
-        ]
+        ],
+        data_rows=_v3_data_rows(episode_id=310),
     )
     source = _source_spec(episode_count=311, episodes=(310,))
 
@@ -749,7 +879,15 @@ def test_loader_prefetch_uses_selected_v3_row_and_per_video_shard_coordinates(tm
 
 @pytest.mark.parametrize(
     "missing_field",
-    ["codebase_version", "chunks_size", "data_path", "video_path", "features"],
+    [
+        "codebase_version",
+        "chunks_size",
+        "fps",
+        "total_episodes",
+        "data_path",
+        "video_path",
+        "features",
+    ],
 )
 def test_loader_prefetch_rejects_missing_metadata_fields(tmp_path: Path, missing_field: str) -> None:
     info = _metadata_info()
