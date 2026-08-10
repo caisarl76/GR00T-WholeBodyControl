@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 from pathlib import Path
 
@@ -13,6 +13,7 @@ from gear_sonic.data.unitree_conversion.contracts import (
 from gear_sonic.data.unitree_conversion.provenance import (
     discover_collection_lock,
     load_source_lock,
+    load_source_lock_snapshot,
     materialize_artifact,
     source_lock_sha256,
     stratified_episode_ids,
@@ -151,6 +152,27 @@ def test_load_source_lock_rejects_unknown_fields(tmp_path: Path) -> None:
     candidate.write_text(f"{LOCK.read_text()}unexpected: true\n")
 
     with pytest.raises(ValueError, match="unknown fields.*unexpected"):
+        load_source_lock(candidate)
+
+
+@pytest.mark.parametrize(
+    ("yaml_version", "message"),
+    [
+        ("1.0", "source lock version must be an integer"),
+        ('"1"', "source lock version must be an integer"),
+        ("true", "source lock version must be an integer"),
+        ("2", "unsupported source lock version: 2"),
+    ],
+)
+def test_load_source_lock_rejects_invalid_version(
+    tmp_path: Path,
+    yaml_version: str,
+    message: str,
+) -> None:
+    candidate = tmp_path / "invalid-version.yaml"
+    candidate.write_text(LOCK.read_text().replace("version: 1\n", f"version: {yaml_version}\n"))
+
+    with pytest.raises(ValueError, match=message):
         load_source_lock(candidate)
 
 
@@ -442,6 +464,18 @@ def test_full_source_lock_requires_exact_ordered_collection_membership() -> None
         )
 
 
+@pytest.mark.parametrize("repo_ids", ["owner/repository", b"owner/repository"])
+def test_collection_membership_rejects_scalar_repo_ids(repo_ids) -> None:
+    with pytest.raises(
+        ValueError,
+        match="collection repo_ids must be a non-string iterable",
+    ):
+        CollectionMembership(
+            slug=DEX3_COLLECTION,
+            repo_ids=repo_ids,
+        )
+
+
 @pytest.mark.parametrize(
     ("field_name", "different_value"),
     [
@@ -528,3 +562,31 @@ def test_approved_source_contract_rejects_invalid_episode_or_camera_data(
 
 def test_source_lock_sha256_hashes_exact_manifest_bytes() -> None:
     assert source_lock_sha256(LOCK) == hashlib.sha256(LOCK.read_bytes()).hexdigest()
+
+
+def test_source_lock_snapshot_uses_one_exact_byte_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact_bytes = LOCK.read_bytes()
+    expected_lock = load_source_lock(LOCK)
+    virtual_path = Path("virtual-source-lock.yaml")
+    read_paths: list[Path] = []
+
+    def read_bytes_once(path: Path) -> bytes:
+        read_paths.append(path)
+        return exact_bytes
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_once)
+
+    snapshot = load_source_lock_snapshot(virtual_path)
+
+    assert read_paths == [virtual_path]
+    assert snapshot.lock == expected_lock
+    assert snapshot.sha256 == hashlib.sha256(exact_bytes).hexdigest()
+    assert not hasattr(snapshot, "raw_bytes")
+    with pytest.raises(FrozenInstanceError):
+        snapshot.sha256 = "0" * 64
+
+    read_paths.clear()
+    assert load_source_lock(virtual_path) == expected_lock
+    assert read_paths == [virtual_path]

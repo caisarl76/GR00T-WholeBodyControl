@@ -124,6 +124,8 @@ class CollectionMembership:
 
     def __post_init__(self) -> None:
         _nonempty_string(self.slug, field_name="collection slug")
+        if isinstance(self.repo_ids, (str, bytes)):
+            raise ValueError("collection repo_ids must be a non-string iterable")
         try:
             repo_ids = tuple(self.repo_ids)
         except TypeError as error:
@@ -148,7 +150,9 @@ class SourceLock:
     collections: tuple[CollectionMembership, ...] = ()
 
     def __post_init__(self) -> None:
-        if isinstance(self.version, bool) or self.version != 1:
+        if isinstance(self.version, bool) or not isinstance(self.version, int):
+            raise ValueError("source lock version must be an integer")
+        if self.version != 1:
             raise ValueError(f"unsupported source lock version: {self.version!r}")
         if not isinstance(self.scope, str) or self.scope not in _VALID_SCOPES:
             raise ValueError(f"scope must be one of {sorted(_VALID_SCOPES)}, got {self.scope!r}")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,14 @@ HASH_CHUNK_SIZE = 1024 * 1024
 SMOKE_SOURCE_LOCK = Path(__file__).parent / "manifests" / "smoke_sources.yaml"
 
 Downloader = Callable[..., str | Path]
+
+
+@dataclass(frozen=True)
+class SourceLockSnapshot:
+    """Parsed source lock and identity of the exact bytes parsed."""
+
+    lock: SourceLock
+    sha256: str
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -240,10 +249,13 @@ def _parse_collections(value: object) -> tuple[CollectionMembership, ...]:
     return tuple(memberships)
 
 
-def load_source_lock(path: str | Path) -> SourceLock:
-    """Safely parse and validate a source lock without resolving any network state."""
-    lock_path = Path(path)
-    loader = _UniqueKeySafeLoader(lock_path.read_text(encoding="utf-8"))
+def _parse_source_lock_bytes(lock_bytes: bytes) -> SourceLock:
+    try:
+        lock_text = lock_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("source lock must be UTF-8 encoded") from error
+
+    loader = _UniqueKeySafeLoader(lock_text)
     try:
         loaded = loader.get_single_data()
     except yaml.YAMLError as error:
@@ -275,6 +287,20 @@ def load_source_lock(path: str | Path) -> SourceLock:
         sources=_parse_sources(data["sources"]),
         collections=_parse_collections(data.get("collections", ())),
     )
+
+
+def load_source_lock_snapshot(path: str | Path) -> SourceLockSnapshot:
+    """Read one byte snapshot, then parse and hash that exact snapshot."""
+    lock_bytes = Path(path).read_bytes()
+    return SourceLockSnapshot(
+        lock=_parse_source_lock_bytes(lock_bytes),
+        sha256=hashlib.sha256(lock_bytes).hexdigest(),
+    )
+
+
+def load_source_lock(path: str | Path) -> SourceLock:
+    """Safely parse and validate a source lock without resolving network state."""
+    return load_source_lock_snapshot(path).lock
 
 
 def _artifact_to_dict(spec: ArtifactSpec) -> dict[str, object]:
