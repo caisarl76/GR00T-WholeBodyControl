@@ -1064,13 +1064,17 @@ def _verify_preflight_source_hashes(
     *,
     operation: str,
 ) -> None:
-    dataset = preflight.datasets[episode_id]
-    expected = dict(preflight.source_hashes[episode_id])
-    if dict(_source_hashes(dataset, episode_id)) != expected:
+    try:
+        dataset = preflight.datasets[episode_id]
+        expected = dict(preflight.source_hashes[episode_id])
+        observed = dict(_source_hashes(dataset, episode_id))
+    except Exception as error:
         raise _EpisodePreflightError(
             "provenance_error",
-            f"source files changed {operation}",
-        )
+            f"source files could not be reverified {operation}: {type(error).__name__}: {error}",
+        ) from error
+    if observed != expected:
+        raise _EpisodePreflightError("provenance_error", f"source files changed {operation}")
 
 
 def _adapt_dex3(
@@ -1079,17 +1083,40 @@ def _adapt_dex3(
     preflight: _RepositoryPreflight,
     cache_dir: Path | None,
 ) -> object:
-    del cache_dir
     import numpy as np
 
     from gear_sonic.data.unitree_conversion.dex3_adapter import (
         DEX3_FEATURE_NAMES,
         adapt_dex3_arrays,
     )
+    from gear_sonic.data.unitree_conversion.lerobot_v3_source import (
+        default_lerobot_cache_base,
+        load_pinned_v3_episode,
+    )
 
-    dataset = preflight.datasets[episode_id]
-    rows = dataset.hf_dataset
     _verify_preflight_source_hashes(preflight, episode_id, operation="before Dex3 adaptation")
+    cache_base = default_lerobot_cache_base() if cache_dir is None else cache_dir / "lerobot"
+    try:
+        dataset = load_pinned_v3_episode(
+            source,
+            episode_id,
+            cache_base=cache_base,
+            download_videos=False,
+        )
+    except Exception as error:
+        raise _EpisodePreflightError(
+            "provenance_error",
+            f"fresh Dex3 source read failed: {type(error).__name__}: {error}",
+        ) from error
+    original_dataset = preflight.datasets[episode_id]
+    if Path(dataset.root).resolve() != Path(original_dataset.root).resolve():
+        raise _EpisodePreflightError(
+            "provenance_error",
+            "fresh Dex3 read resolved to a different pinned dataset root",
+        )
+    _validate_dex3_metadata(source, dataset)
+    _verify_preflight_source_hashes(preflight, episode_id, operation="during fresh Dex3 read")
+    rows = dataset.hf_dataset
     _validate_dex3_row_indices(rows, episode_id)
     if len(rows) < 2:
         raise _EpisodePreflightError("timeline_error", "Dex3 episode contains fewer than two source frames")
@@ -1111,7 +1138,7 @@ def _adapt_dex3(
         feature_names=DEX3_FEATURE_NAMES,
         timestamps=timestamps,
         task_indices=np.asarray([row["task_index"] for row in rows]),
-        video_segments=dataset.video_segments,
+        video_segments=original_dataset.video_segments,
     )
     _verify_preflight_source_hashes(preflight, episode_id, operation="during Dex3 adaptation")
     return episode

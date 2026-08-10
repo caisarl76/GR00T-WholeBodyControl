@@ -7,6 +7,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from gear_sonic.data.unitree_conversion.contracts import (
@@ -19,6 +20,8 @@ from gear_sonic.data.unitree_conversion.pipeline import (
     DiagnosticIdentity,
     PipelineComponents,
     RepositoryPreflight,
+    _adapt_dex3,
+    _construct_payload,
     _resolve_source_task,
     _source_load_error_class,
     _validate_dex3_row_indices,
@@ -286,6 +289,40 @@ def test_dex3_adapter_rejects_out_of_order_source_frame_indices() -> None:
     assert captured.value.error_class == "source_schema_error"
 
 
+def test_production_dex3_adapter_rejects_out_of_order_indices(
+    monkeypatch: pytest.MonkeyPatch,
+    smoke_lock,
+    tmp_path: Path,
+) -> None:
+    from gear_sonic.data.unitree_conversion import lerobot_v3_source, pipeline as pipeline_module
+    from gear_sonic.data.unitree_conversion.dex3_adapter import DEX3_FEATURE_NAMES
+
+    source = smoke_lock.dex3
+    rows = (
+        {"episode_index": 0, "frame_index": 0},
+        {"episode_index": 0, "frame_index": 99},
+    )
+    meta = SimpleNamespace(
+        revision=source.revision,
+        total_episodes=source.episode_count,
+        fps=30,
+        features={
+            "observation.state": {"names": DEX3_FEATURE_NAMES},
+            "action": {"names": DEX3_FEATURE_NAMES},
+        },
+    )
+    fresh = SimpleNamespace(root=tmp_path, revision=source.revision, meta=meta, hf_dataset=rows)
+    original = SimpleNamespace(root=tmp_path, video_segments={})
+    preflight = SimpleNamespace(datasets={0: original}, source_hashes={0: {"data": "1" * 64}})
+    monkeypatch.setattr(pipeline_module, "_verify_preflight_source_hashes", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(lerobot_v3_source, "load_pinned_v3_episode", lambda *_args, **_kwargs: fresh)
+
+    with pytest.raises(ValueError) as captured:
+        _adapt_dex3(source, 0, preflight, tmp_path)
+
+    assert captured.value.error_class == "source_schema_error"
+
+
 def test_source_mutation_after_preflight_is_provenance_error(monkeypatch: pytest.MonkeyPatch) -> None:
     from gear_sonic.data.unitree_conversion import pipeline as pipeline_module
 
@@ -303,6 +340,93 @@ def test_source_mutation_after_preflight_is_provenance_error(monkeypatch: pytest
         _verify_preflight_source_hashes(preflight, 7, operation="during test")
 
     assert captured.value.error_class == "provenance_error"
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_source_hashes",
+        lambda _dataset, _episode_id: (_ for _ in ()).throw(OSError("source deleted")),
+    )
+    with pytest.raises(ValueError) as captured:
+        _verify_preflight_source_hashes(preflight, 7, operation="during test")
+    assert captured.value.error_class == "provenance_error"
+
+
+def test_fresh_dex3_read_failure_reaches_pipeline_as_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    smoke_lock,
+    tmp_path: Path,
+) -> None:
+    from gear_sonic.data.unitree_conversion import lerobot_v3_source, pipeline as pipeline_module
+
+    fake = FakeComponents()
+    preflight = SimpleNamespace(datasets={}, source_hashes={})
+    components = replace(
+        fake.build(),
+        preflight_repository=lambda *_args: preflight,
+        adapt_dex3_episode=_adapt_dex3,
+    )
+    monkeypatch.setattr(pipeline_module, "_verify_preflight_source_hashes", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        lerobot_v3_source,
+        "load_pinned_v3_episode",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("selected parquet disappeared")),
+    )
+
+    report = run_dex3_pipeline(
+        lock=smoke_lock,
+        output_root=tmp_path,
+        components=components,
+        smoke=True,
+    )
+
+    assert report.failed_episode_count == 5
+    assert {episode.error_class for episode in report.episode_reports} == {"provenance_error"}
+
+
+def test_video_mutation_cleans_temporary_output_and_is_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from gear_sonic.data.unitree_conversion import (
+        pipeline as pipeline_module,
+        target_frames as target_frames_module,
+    )
+
+    class FakeBuilder:
+        def build(self, _episode, _index, _token):
+            return {}
+
+    calls = 0
+
+    def verify(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise pipeline_module._EpisodePreflightError(
+                "provenance_error",
+                "source video changed during construction",
+            )
+
+    temporary_video = tmp_path / "target.mp4"
+
+    def encode(_timeline):
+        temporary_video.write_bytes(b"temporary video")
+        return temporary_video
+
+    monkeypatch.setattr(target_frames_module, "TargetFrameBuilder", FakeBuilder)
+    monkeypatch.setattr(pipeline_module, "_verify_preflight_source_hashes", verify)
+    monkeypatch.setattr(pipeline_module, "_encode_target_video", encode)
+    episode = SimpleNamespace(frame_count=2, source_episode_id=7)
+    preflight = SimpleNamespace(
+        timelines={7: {"camera": object()}},
+        camera_schema=SimpleNamespace(source_to_target={"camera": "observation.images.ego_view"}),
+    )
+
+    with pytest.raises(ValueError) as captured:
+        _construct_payload(episode, np.zeros((2, 64), dtype=np.float32), preflight)
+
+    assert captured.value.error_class == "provenance_error"
+    assert not temporary_video.exists()
 
 
 def test_preflight_failure_is_episode_classified_and_later_episodes_continue(smoke_lock, tmp_path: Path) -> None:
