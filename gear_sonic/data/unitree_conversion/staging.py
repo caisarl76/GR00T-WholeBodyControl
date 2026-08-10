@@ -1580,14 +1580,15 @@ def _expected_final_artifacts(meta: object, episodes: tuple[MergeEpisode, ...]) 
     return artifacts
 
 
-def _read_exact_episode_jsonl(
+def _read_exact_indexed_jsonl(
     output: Path,
     relative: str,
     *,
     expected_count: int,
     expected_fields: frozenset[str],
+    index_field: str,
+    label: str,
 ) -> tuple[Mapping[str, object], ...]:
-    label = "episode statistics" if relative.endswith("episodes_stats.jsonl") else "episode metadata"
     path = _contained_output_artifact(output, relative, field_name=relative)
     _reject_symlink_components(path)
     try:
@@ -1604,16 +1605,16 @@ def _read_exact_episode_jsonl(
             raise ValueError(f"{label} line {line_number} must contain exact valid JSON") from error
         if not isinstance(record, dict) or set(record) != expected_fields:
             raise ValueError(f"{label} records must contain the exact fields {sorted(expected_fields)}")
-        episode_index = record["episode_index"]
-        if type(episode_index) is not int:
-            raise ValueError(f"{label} episode_index values must be exact integers")
+        index = record[index_field]
+        if type(index) is not int:
+            raise ValueError(f"{label} {index_field} values must be exact integers")
         records.append(record)
-    indices = tuple(record["episode_index"] for record in records)
+    indices = tuple(record[index_field] for record in records)
     expected_indices = tuple(range(expected_count))
     if len(set(indices)) != len(indices):
-        raise ValueError(f"{label} contains a duplicate episode_index")
+        raise ValueError(f"{label} contains a duplicate {index_field}")
     if indices != expected_indices:
-        raise ValueError(f"{label} episode_index values must equal the exact contiguous range")
+        raise ValueError(f"{label} {index_field} values must equal the exact contiguous range")
     return tuple(records)
 
 
@@ -1678,19 +1679,34 @@ def _validate_gr00t_output(
         episodes,
         task_catalog,
     )
-    raw_episode_records = _read_exact_episode_jsonl(
+    raw_task_records = _read_exact_indexed_jsonl(
+        output,
+        "meta/tasks.jsonl",
+        expected_count=len(task_catalog),
+        expected_fields=frozenset({"task_index", "task"}),
+        index_field="task_index",
+        label="global task catalog",
+    )
+    expected_task_records = tuple({"task_index": index, "task": task} for index, task in enumerate(task_catalog))
+    if raw_task_records != expected_task_records:
+        raise ValueError("global task catalog must contain the exact lexicographically sorted task values")
+    raw_episode_records = _read_exact_indexed_jsonl(
         output,
         "meta/episodes.jsonl",
         expected_count=len(episodes),
         expected_fields=frozenset({"episode_index", "tasks", "length"}),
+        index_field="episode_index",
+        label="episode metadata",
     )
     if raw_episode_records != _expected_episode_records(episodes):
         raise ValueError("episodes.jsonl records differ from the exact staged episode metadata")
-    raw_episode_stats = _read_exact_episode_jsonl(
+    raw_episode_stats = _read_exact_indexed_jsonl(
         output,
         "meta/episodes_stats.jsonl",
         expected_count=len(episodes),
         expected_fields=frozenset({"episode_index", "stats"}),
+        index_field="episode_index",
+        label="episode statistics",
     )
     nonvideo_features = {key: feature for key, feature in expected_features.items() if feature["dtype"] != "video"}
     _validate_raw_episode_stats_schema(raw_episode_stats, nonvideo_features)

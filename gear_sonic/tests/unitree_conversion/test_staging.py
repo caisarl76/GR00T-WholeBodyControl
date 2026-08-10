@@ -1035,6 +1035,47 @@ def test_independent_validator_rejects_extra_global_task_catalog_entry(tmp_path:
         )
 
 
+def test_resume_rejects_duplicate_valid_task_record_even_with_regenerated_checksum(
+    tmp_path: Path,
+) -> None:
+    stage = write_stage(tmp_path, _identity(3), _payload(tmp_path, 3))
+    output = merge_stages((stage,), tmp_path / "duplicate-task-record")
+    tasks_path = output / "meta" / "tasks.jsonl"
+    first_line = tasks_path.read_text().splitlines()[0]
+    with tasks_path.open("a") as stream:
+        stream.write(first_line + "\n")
+    artifacts = tuple(
+        path for path in staging_module._artifact_paths(output) if path != "dataset-checksums.sha256"
+    )
+    (output / "dataset-checksums.sha256").write_bytes(staging_module._checksums_bytes(output, artifacts))
+
+    episodes = staging_module._validate_merge_inputs((stage,))
+    with pytest.raises(ValueError, match=r"task catalog.*exact record count|duplicate task_index"):
+        staging_module._validate_gr00t_output(output, episodes, ("place", "pour"))
+    with pytest.raises(FileExistsError, match="existing output"):
+        merge_stages((stage,), output, resume_existing=True)
+
+
+@pytest.mark.parametrize("mutation", ("unexpected-field", "wrong-order", "wrong-value"))
+def test_independent_validator_rejects_noncanonical_raw_task_catalog(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    _, episodes, tasks, output = _unpublished_real_output(tmp_path)
+    tasks_path = output / "meta" / "tasks.jsonl"
+    records = [json.loads(line) for line in tasks_path.read_text().splitlines()]
+    if mutation == "unexpected-field":
+        records[0]["unexpected"] = True
+    elif mutation == "wrong-order":
+        records.reverse()
+    else:
+        records[0]["task"] = "unexpected task value"
+    tasks_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    with pytest.raises(ValueError, match=r"task catalog.*exact|task_index.*contiguous|lexicographic"):
+        staging_module._validate_gr00t_output(output, episodes, tasks)
+
+
 @pytest.mark.parametrize("metadata_name", ("episodes.jsonl", "episodes_stats.jsonl"))
 def test_independent_validator_rejects_ghost_episode_metadata_keys(
     tmp_path: Path,
