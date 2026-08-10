@@ -12,20 +12,54 @@ import string
 
 from gear_sonic.data.unitree_conversion.contracts import SourceSpec
 
-_METADATA_PATTERN = ["meta/**"]
-_DATA_COLUMNS = (
-    "observation.state",
-    "action",
-    "timestamp",
-    "task_index",
-    "frame_index",
-    "episode_index",
+
+@dataclass(frozen=True)
+class V3DataSchema:
+    """Typed Parquet columns required by one exact v3 source adapter."""
+
+    float_vector_columns: tuple[str, ...]
+    float_scalar_columns: tuple[str, ...]
+    integer_scalar_columns: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        groups: list[tuple[str, ...]] = []
+        for field_name in (
+            "float_vector_columns",
+            "float_scalar_columns",
+            "integer_scalar_columns",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, (str, bytes)):
+                raise ValueError(f"{field_name} must be a non-string iterable")
+            try:
+                columns = tuple(value)
+            except TypeError as error:
+                raise ValueError(f"{field_name} must be an iterable") from error
+            if any(not isinstance(column, str) or not column for column in columns):
+                raise ValueError("schema column names must be nonempty strings")
+            object.__setattr__(self, field_name, columns)
+            groups.append(columns)
+        columns = tuple(column for group in groups for column in group)
+        if len(columns) != len(set(columns)):
+            raise ValueError("schema column names must be unique")
+        if "episode_index" not in self.integer_scalar_columns:
+            raise ValueError("integer_scalar_columns must include episode_index")
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return self.float_vector_columns + self.float_scalar_columns + self.integer_scalar_columns
+
+
+DEX3_DATA_SCHEMA = V3DataSchema(
+    float_vector_columns=("observation.state", "action"),
+    float_scalar_columns=("timestamp",),
+    integer_scalar_columns=("task_index", "frame_index", "episode_index"),
 )
 
 
 @dataclass(frozen=True)
 class V3SourceMeta:
-    """Metadata surface consumed by the strict Dex3 adapter validation."""
+    """Metadata surface consumed by a strict source-adapter validation."""
 
     revision: str
     total_episodes: object
@@ -107,6 +141,24 @@ def _regular_file_under_root(scoped_root: Path, relative_path: PurePosixPath) ->
     if candidate.is_symlink() or not candidate.is_file():
         raise ValueError(f"materialized file is not a regular file: {relative_path}")
     return candidate
+
+
+def _dataset_root(scoped_root: Path, dataset_path: str) -> Path:
+    candidate = scoped_root if dataset_path == "." else scoped_root.joinpath(*PurePosixPath(dataset_path).parts)
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(scoped_root.resolve())
+    except (FileNotFoundError, OSError, ValueError) as error:
+        raise ValueError("dataset root is missing or outside revision-scoped root") from error
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise ValueError("dataset root must be a safe regular directory")
+    return candidate
+
+
+def _repo_relative_path(dataset_path: str, path: PurePosixPath) -> PurePosixPath:
+    if dataset_path == ".":
+        return path
+    return PurePosixPath(dataset_path) / path
 
 
 def _read_info(scoped_root: Path) -> _V3Info:
@@ -316,15 +368,15 @@ def _selected_paths(scoped_root: Path, episode_id: int, info: _V3Info) -> tuple[
     return tuple(paths)
 
 
-def _validate_data_schema(schema: object) -> None:
+def _validate_data_schema(schema: object, contract: V3DataSchema) -> None:
     import pyarrow as pa
 
     schema_names = tuple(schema.names)
-    invalid_columns = tuple(column for column in _DATA_COLUMNS if schema_names.count(column) != 1)
+    invalid_columns = tuple(column for column in contract.columns if schema_names.count(column) != 1)
     if invalid_columns:
         raise ValueError(f"selected v3 data parquet is missing required columns: {invalid_columns}")
 
-    for column in ("observation.state", "action"):
+    for column in contract.float_vector_columns:
         data_type = schema.field(column).type
         is_list = (
             pa.types.is_list(data_type)
@@ -333,25 +385,30 @@ def _validate_data_schema(schema: object) -> None:
         )
         if not is_list or not pa.types.is_floating(data_type.value_type):
             raise ValueError(f"selected v3 data column {column} has incompatible type")
-    if not pa.types.is_floating(schema.field("timestamp").type):
-        raise ValueError("selected v3 data column timestamp has incompatible type")
-    for column in ("task_index", "frame_index", "episode_index"):
+    for column in contract.float_scalar_columns:
+        if not pa.types.is_floating(schema.field(column).type):
+            raise ValueError(f"selected v3 data column {column} has incompatible type")
+    for column in contract.integer_scalar_columns:
         if not pa.types.is_integer(schema.field(column).type):
             raise ValueError(f"selected v3 data column {column} has incompatible type")
 
 
-def _read_selected_data(data_path: Path, episode_id: int) -> tuple[Mapping[str, object], ...]:
+def _read_selected_data(
+    data_path: Path,
+    episode_id: int,
+    schema_contract: V3DataSchema,
+) -> tuple[Mapping[str, object], ...]:
     import pyarrow.parquet as pq
 
     try:
         schema = pq.read_schema(data_path)
     except Exception as error:
         raise ValueError(f"selected v3 data parquet must be readable: {data_path}") from error
-    _validate_data_schema(schema)
+    _validate_data_schema(schema, schema_contract)
     try:
         table = pq.read_table(
             data_path,
-            columns=list(_DATA_COLUMNS),
+            columns=list(schema_contract.columns),
             filters=[("episode_index", "=", episode_id)],
         )
     except Exception as error:
@@ -361,7 +418,7 @@ def _read_selected_data(data_path: Path, episode_id: int) -> tuple[Mapping[str, 
 
     rows: list[Mapping[str, object]] = []
     for row_index in range(table.num_rows):
-        row = {column: table[column][row_index].as_py() for column in _DATA_COLUMNS}
+        row = {column: table[column][row_index].as_py() for column in schema_contract.columns}
         source_episode_id = row["episode_index"]
         if isinstance(source_episode_id, bool) or source_episode_id != episode_id:
             raise ValueError(f"selected v3 data contains wrong episode row: {source_episode_id!r}")
@@ -375,8 +432,16 @@ def load_pinned_v3_episode(
     *,
     cache_base: str | Path,
     snapshot_downloader: Callable[..., object] | None = None,
+    schema: V3DataSchema = DEX3_DATA_SCHEMA,
+    download_videos: bool = True,
 ) -> V3SourceDataset:
     """Materialize and directly read one exact-revision LeRobot v3 episode."""
+    if not isinstance(source_spec, SourceSpec):
+        raise ValueError("source_spec must be a SourceSpec")
+    if not isinstance(schema, V3DataSchema):
+        raise ValueError("schema must be a V3DataSchema")
+    if not isinstance(download_videos, bool):
+        raise ValueError("download_videos must be a boolean")
     scoped_root = revision_scoped_root(cache_base, source_spec.repo_id, source_spec.revision)
     downloader = _default_snapshot_downloader() if snapshot_downloader is None else snapshot_downloader
     common_kwargs = {
@@ -385,18 +450,24 @@ def load_pinned_v3_episode(
         "revision": source_spec.revision,
         "local_dir": scoped_root,
     }
-    downloaded = downloader(**common_kwargs, allow_patterns=_METADATA_PATTERN)
+    metadata_pattern = _repo_relative_path(source_spec.dataset_path, PurePosixPath("meta/**"))
+    downloaded = downloader(**common_kwargs, allow_patterns=[str(metadata_pattern)])
     _verify_snapshot_location(downloaded, scoped_root)
 
-    info = _read_info(scoped_root)
-    selected_paths = _selected_paths(scoped_root, episode_id, info)
-    downloaded = downloader(**common_kwargs, allow_patterns=[str(path) for path in selected_paths])
+    dataset_root = _dataset_root(scoped_root, source_spec.dataset_path)
+    info = _read_info(dataset_root)
+    selected_paths = _selected_paths(dataset_root, episode_id, info)
+    materialized_selection = selected_paths if download_videos else selected_paths[:1]
+    repository_paths = tuple(
+        _repo_relative_path(source_spec.dataset_path, path) for path in materialized_selection
+    )
+    downloaded = downloader(**common_kwargs, allow_patterns=[str(path) for path in repository_paths])
     _verify_snapshot_location(downloaded, scoped_root)
-    materialized_paths = tuple(_regular_file_under_root(scoped_root, path) for path in selected_paths)
-    rows = _read_selected_data(materialized_paths[0], episode_id)
+    materialized_paths = tuple(_regular_file_under_root(dataset_root, path) for path in materialized_selection)
+    rows = _read_selected_data(materialized_paths[0], episode_id, schema)
 
     return V3SourceDataset(
-        root=scoped_root,
+        root=dataset_root,
         revision=source_spec.revision,
         meta=V3SourceMeta(
             revision=source_spec.revision,

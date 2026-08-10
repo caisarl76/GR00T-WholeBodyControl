@@ -12,6 +12,11 @@ from gear_sonic.data.unitree_conversion import dex3_adapter as dex3_adapter_modu
 from gear_sonic.data.unitree_conversion.contracts import CanonicalEpisode, SourceSpec
 from gear_sonic.data.unitree_conversion.dex3_adapter import adapt_dex3_arrays, load_dex3_episode
 from gear_sonic.data.unitree_conversion.joint_mapping import G1_MUJOCO_NAMES, NOMINAL_G1_MUJOCO
+from gear_sonic.data.unitree_conversion.lerobot_v3_source import (
+    V3DataSchema,
+    load_pinned_v3_episode,
+    revision_scoped_root,
+)
 
 ARM_NAMES = (
     "kLeftShoulderPitch",
@@ -570,6 +575,7 @@ class FakeSnapshotDownloader:
         raw_data: bytes | None = None,
         missing_patterns: tuple[str, ...] = (),
         wrong_return_call: int | None = None,
+        dataset_path: str = ".",
     ) -> None:
         self.info = _metadata_info() if info is None else info
         self.raw_info = raw_info
@@ -580,20 +586,23 @@ class FakeSnapshotDownloader:
         self.raw_data = raw_data
         self.missing_patterns = missing_patterns
         self.wrong_return_call = wrong_return_call
+        self.dataset_path = dataset_path
         self.calls: list[dict[str, object]] = []
 
     def __call__(self, **kwargs: object) -> str:
         self.calls.append(kwargs)
         local_dir = Path(kwargs["local_dir"])
         allow_patterns = kwargs["allow_patterns"]
+        dataset_root = local_dir if self.dataset_path == "." else local_dir / self.dataset_path
+        prefix = "" if self.dataset_path == "." else f"{self.dataset_path}/"
         if len(self.calls) == 1:
-            assert allow_patterns == ["meta/**"]
-            info_path = local_dir / "meta/info.json"
+            assert allow_patterns == [f"{prefix}meta/**"]
+            info_path = dataset_root / "meta/info.json"
             info_path.parent.mkdir(parents=True, exist_ok=True)
             text = self.raw_info if self.raw_info is not None else json.dumps(self.info)
             info_path.write_text(text)
             if self.write_episode_metadata:
-                episodes_path = local_dir / "meta/episodes/chunk-000/file-000.parquet"
+                episodes_path = dataset_root / "meta/episodes/chunk-000/file-000.parquet"
                 episodes_path.parent.mkdir(parents=True, exist_ok=True)
                 if self.raw_episode_metadata is not None:
                     episodes_path.write_bytes(self.raw_episode_metadata)
@@ -606,7 +615,7 @@ class FakeSnapshotDownloader:
                     continue
                 path = local_dir / pattern
                 path.parent.mkdir(parents=True, exist_ok=True)
-                if pattern.startswith("data/") and pattern.endswith(".parquet"):
+                if pattern.startswith(f"{prefix}data/") and pattern.endswith(".parquet"):
                     if self.raw_data is not None:
                         path.write_bytes(self.raw_data)
                     else:
@@ -628,6 +637,7 @@ def _source_spec(**changes: object) -> SourceSpec:
         "approved": True,
         "repo_id": "unitreerobotics/synthetic-dex3",
         "revision": "b" * 40,
+        "dataset_path": ".",
         "episode_count": 3,
         "episodes": (1,),
         "primary_camera": "observation.images.primary",
@@ -677,6 +687,88 @@ EXPECTED_EPISODE_PATHS = [
     "videos/observation.images.cam_right_wrist/chunk-000/file-000.mp4",
     "videos/observation.images.cam_right_high/chunk-000/file-000.mp4",
 ]
+
+
+def test_direct_v3_reader_supports_pinned_nested_dataset_root_without_videos(tmp_path: Path) -> None:
+    dataset_path = "G1_WB_Dex5_Pickup_Pillow"
+    data_rows = [
+        {
+            "observation.state.robot_q_current": [0.0] * 36,
+            "action.robot_q_desired": [1.0] * 36,
+            "observation.state.hand_state": [2.0] * 12,
+            "action.hand_cmd": [3.0] * 12,
+            "timestamp": frame_index / 30,
+            "task_index": 0,
+            "frame_index": frame_index,
+            "episode_index": 1,
+        }
+        for frame_index in range(2)
+    ]
+    info = _metadata_info(
+        features={
+            "observation.state.robot_q_current": {"dtype": "float32"},
+            "action.robot_q_desired": {"dtype": "float32"},
+            "observation.state.hand_state": {"dtype": "float32"},
+            "action.hand_cmd": {"dtype": "float32"},
+            "timestamp": {"dtype": "float32"},
+            "task_index": {"dtype": "int64"},
+            "frame_index": {"dtype": "int64"},
+            "episode_index": {"dtype": "int64"},
+            "observation.images.cam_0": {"dtype": "video"},
+            "observation.images.cam_1": {"dtype": "video"},
+        }
+    )
+    downloader = FakeSnapshotDownloader(
+        info=info,
+        episode_rows=[
+            {
+                "episode_index": 1,
+                "data/chunk_index": 0,
+                "data/file_index": 0,
+                "videos/observation.images.cam_0/chunk_index": 0,
+                "videos/observation.images.cam_0/file_index": 0,
+                "videos/observation.images.cam_1/chunk_index": 0,
+                "videos/observation.images.cam_1/file_index": 0,
+            }
+        ],
+        data_rows=data_rows,
+        dataset_path=dataset_path,
+    )
+    source = _source_spec(dataset_path=dataset_path)
+    schema = V3DataSchema(
+        float_vector_columns=(
+            "observation.state.robot_q_current",
+            "action.robot_q_desired",
+            "observation.state.hand_state",
+            "action.hand_cmd",
+        ),
+        float_scalar_columns=("timestamp",),
+        integer_scalar_columns=("task_index", "frame_index", "episode_index"),
+    )
+
+    dataset = load_pinned_v3_episode(
+        source,
+        1,
+        cache_base=tmp_path,
+        snapshot_downloader=downloader,
+        schema=schema,
+        download_videos=False,
+    )
+
+    scoped_root = revision_scoped_root(tmp_path, source.repo_id, source.revision)
+    assert dataset.root == scoped_root / dataset_path
+    assert downloader.calls[0]["allow_patterns"] == [f"{dataset_path}/meta/**"]
+    assert downloader.calls[1]["allow_patterns"] == [f"{dataset_path}/data/chunk-000/file-000.parquet"]
+    assert tuple(dataset.hf_dataset[0]) == schema.columns
+
+
+def test_direct_v3_reader_rejects_invalid_or_overlapping_schema_columns() -> None:
+    with pytest.raises(ValueError, match="column names must be unique"):
+        V3DataSchema(
+            float_vector_columns=("duplicate",),
+            float_scalar_columns=("duplicate",),
+            integer_scalar_columns=("episode_index",),
+        )
 
 
 def test_loader_default_reads_prefetched_v3_data_directly_without_v21_lerobot(tmp_path: Path) -> None:

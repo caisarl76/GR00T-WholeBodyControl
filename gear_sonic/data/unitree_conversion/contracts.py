@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
+from pathlib import PurePosixPath
 import re
 from types import MappingProxyType
 from typing import Mapping
@@ -12,6 +14,17 @@ import numpy as np
 _REVISION_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 _VALID_SCOPES = frozenset({"smoke", "full"})
+INSPIRE_GATE_REASONS = (
+    "missing_authoritative_29_joint_order",
+    "missing_robot_q_desired_semantics",
+    "missing_inspire_to_dex3_calibration",
+)
+_DIAGNOSTIC_ARRAY_WIDTHS = {
+    "robot_q_current": 36,
+    "robot_q_desired": 36,
+    "hand_state": 12,
+    "hand_cmd": 12,
+}
 
 
 def validate_revision(value: object, *, field_name: str = "revision") -> str:
@@ -33,6 +46,24 @@ def validate_sha256(value: object, *, field_name: str = "sha256") -> str:
 def _nonempty_string(value: object, *, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a nonempty string")
+    return value
+
+
+def _canonical_dataset_path(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("dataset_path must be '.' or a safe canonical POSIX-relative path")
+    if value == ".":
+        return value
+    path = PurePosixPath(value)
+    if (
+        value.strip() != value
+        or "\\" in value
+        or path.is_absolute()
+        or not path.parts
+        or any(part in {".", ".."} for part in path.parts)
+        or path.as_posix() != value
+    ):
+        raise ValueError("dataset_path must be '.' or a safe canonical POSIX-relative path")
     return value
 
 
@@ -129,6 +160,238 @@ class CanonicalEpisode:
             setattr(self, field_name, array)
 
 
+def _finite_number(value: object, *, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(f"{field_name} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{field_name} must be a finite number")
+    return result
+
+
+@dataclass(frozen=True)
+class ColumnStatistics:
+    """Deterministic float64 population statistics for one source column."""
+
+    minimum: float
+    maximum: float
+    mean: float
+    std: float
+
+    def __post_init__(self) -> None:
+        minimum = _finite_number(self.minimum, field_name="column minimum")
+        maximum = _finite_number(self.maximum, field_name="column maximum")
+        mean = _finite_number(self.mean, field_name="column mean")
+        std = _finite_number(self.std, field_name="column std")
+        if minimum > maximum or not minimum <= mean <= maximum:
+            raise ValueError("column statistics must satisfy minimum <= mean <= maximum")
+        if std < 0.0:
+            raise ValueError("column std must be nonnegative")
+        object.__setattr__(self, "minimum", minimum)
+        object.__setattr__(self, "maximum", maximum)
+        object.__setattr__(self, "mean", mean)
+        object.__setattr__(self, "std", std)
+
+
+@dataclass(frozen=True)
+class ScalarExtrema:
+    """Finite minimum and maximum of one audited scalar series."""
+
+    minimum: float
+    maximum: float
+
+    def __post_init__(self) -> None:
+        minimum = _finite_number(self.minimum, field_name="extrema minimum")
+        maximum = _finite_number(self.maximum, field_name="extrema maximum")
+        if minimum > maximum:
+            raise ValueError("extrema minimum must not exceed maximum")
+        object.__setattr__(self, "minimum", minimum)
+        object.__setattr__(self, "maximum", maximum)
+
+
+@dataclass(frozen=True)
+class TimestampAudit:
+    """Audit of an accepted finite, strictly increasing source timeline."""
+
+    finite_count: int
+    strictly_increasing: bool
+    start: float
+    end: float
+    minimum_step: float
+    maximum_step: float
+
+    def __post_init__(self) -> None:
+        if isinstance(self.finite_count, bool) or not isinstance(self.finite_count, int) or self.finite_count < 2:
+            raise ValueError("timestamp finite_count must be an integer of at least two")
+        if self.strictly_increasing is not True:
+            raise ValueError("accepted timestamp audit must be strictly increasing")
+        start = _finite_number(self.start, field_name="timestamp start")
+        end = _finite_number(self.end, field_name="timestamp end")
+        minimum_step = _finite_number(self.minimum_step, field_name="timestamp minimum_step")
+        maximum_step = _finite_number(self.maximum_step, field_name="timestamp maximum_step")
+        if end <= start or minimum_step <= 0.0 or maximum_step < minimum_step:
+            raise ValueError("timestamp audit values are inconsistent with a strictly increasing timeline")
+        object.__setattr__(self, "start", start)
+        object.__setattr__(self, "end", end)
+        object.__setattr__(self, "minimum_step", minimum_step)
+        object.__setattr__(self, "maximum_step", maximum_step)
+
+
+@dataclass(frozen=True)
+class DiagnosticReport:
+    """Immutable, fail-closed audit of one unverified Inspire episode."""
+
+    status: str
+    gate_reasons: tuple[str, ...]
+    encoder_invoked: bool
+    source_repo_id: str | None
+    source_revision: str | None
+    source_episode_id: int | None
+    frame_count: int
+    timestamp_audit: TimestampAudit
+    finite_counts: Mapping[str, int]
+    current_root_quaternion_norm: ScalarExtrema
+    desired_root_quaternion_norm: ScalarExtrema
+    column_statistics: Mapping[str, tuple[ColumnStatistics, ...]]
+    source_task_indices: tuple[int, ...] | None = None
+    primary_camera: str | None = None
+    camera_map: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.status != "blocked_unverified":
+            raise ValueError("Inspire diagnostic status must be blocked_unverified")
+        if tuple(self.gate_reasons) != INSPIRE_GATE_REASONS:
+            raise ValueError("Inspire diagnostic gate_reasons must equal the exact semantic gate reasons")
+        object.__setattr__(self, "gate_reasons", INSPIRE_GATE_REASONS)
+        if self.encoder_invoked is not False:
+            raise ValueError("Inspire diagnostics require encoder_invoked to be false")
+        if isinstance(self.frame_count, bool) or not isinstance(self.frame_count, int) or self.frame_count < 2:
+            raise ValueError("diagnostic frame_count must be an integer of at least two")
+        if not isinstance(self.timestamp_audit, TimestampAudit):
+            raise ValueError("timestamp_audit must be a TimestampAudit")
+        if self.timestamp_audit.finite_count != self.frame_count:
+            raise ValueError("timestamp audit count must equal frame_count")
+        if not isinstance(self.current_root_quaternion_norm, ScalarExtrema) or not isinstance(
+            self.desired_root_quaternion_norm, ScalarExtrema
+        ):
+            raise ValueError("root quaternion audits must be ScalarExtrema values")
+
+        identities = (self.source_repo_id, self.source_revision, self.source_episode_id)
+        if any(value is None for value in identities) and not all(value is None for value in identities):
+            raise ValueError("source identity fields must be either all present or all absent")
+        if self.source_repo_id is not None:
+            _nonempty_string(self.source_repo_id, field_name="source_repo_id")
+            validate_revision(self.source_revision, field_name="source_revision")
+            if (
+                isinstance(self.source_episode_id, bool)
+                or not isinstance(self.source_episode_id, int)
+                or self.source_episode_id < 0
+            ):
+                raise ValueError("source_episode_id must be a nonnegative integer")
+            if self.source_task_indices is None:
+                raise ValueError("source_task_indices are required with source identity")
+        elif self.source_task_indices is not None:
+            raise ValueError("source_task_indices require source identity")
+
+        if self.source_task_indices is not None:
+            if isinstance(self.source_task_indices, (str, bytes)):
+                raise ValueError("source_task_indices must be an integer tuple")
+            try:
+                task_indices = tuple(self.source_task_indices)
+            except TypeError as error:
+                raise ValueError("source_task_indices must be an integer tuple") from error
+            if len(task_indices) != self.frame_count or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in task_indices
+            ):
+                raise ValueError("source_task_indices must contain one nonnegative integer per frame")
+            object.__setattr__(self, "source_task_indices", task_indices)
+
+        if not isinstance(self.finite_counts, Mapping):
+            raise ValueError("finite_counts must be a mapping")
+        finite_counts = dict(self.finite_counts)
+        expected_count_keys = (*_DIAGNOSTIC_ARRAY_WIDTHS, "timestamps")
+        if tuple(finite_counts) != expected_count_keys:
+            raise ValueError("finite_counts must use the exact diagnostic field order")
+        for key, width in _DIAGNOSTIC_ARRAY_WIDTHS.items():
+            if finite_counts[key] != self.frame_count * width:
+                raise ValueError(f"finite count for {key} does not match frame_count")
+        if finite_counts["timestamps"] != self.frame_count:
+            raise ValueError("finite count for timestamps does not match frame_count")
+        object.__setattr__(self, "finite_counts", MappingProxyType(finite_counts))
+
+        if not isinstance(self.column_statistics, Mapping):
+            raise ValueError("column_statistics must be a mapping")
+        statistics = {key: tuple(value) for key, value in self.column_statistics.items()}
+        if tuple(statistics) != tuple(_DIAGNOSTIC_ARRAY_WIDTHS):
+            raise ValueError("column_statistics must use the exact diagnostic field order")
+        for key, width in _DIAGNOSTIC_ARRAY_WIDTHS.items():
+            if len(statistics[key]) != width or not all(
+                isinstance(item, ColumnStatistics) for item in statistics[key]
+            ):
+                raise ValueError(f"column statistics for {key} must contain exactly {width} entries")
+        object.__setattr__(self, "column_statistics", MappingProxyType(statistics))
+
+        if self.primary_camera is None:
+            if self.camera_map:
+                raise ValueError("camera_map must be empty when primary_camera is absent")
+            object.__setattr__(self, "camera_map", MappingProxyType({}))
+        else:
+            _nonempty_string(self.primary_camera, field_name="primary_camera")
+            if not isinstance(self.camera_map, Mapping):
+                raise ValueError("camera_map must be a mapping")
+            camera_map = dict(self.camera_map)
+            if self.primary_camera not in camera_map:
+                raise ValueError("primary_camera must be present in camera_map")
+            for source_key, target_key in camera_map.items():
+                _nonempty_string(source_key, field_name="camera_map source key")
+                _nonempty_string(target_key, field_name="camera_map target key")
+            object.__setattr__(self, "camera_map", MappingProxyType(camera_map))
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a deterministic JSON-safe diagnostic payload."""
+        return {
+            "status": self.status,
+            "gate_reasons": list(self.gate_reasons),
+            "encoder_invoked": self.encoder_invoked,
+            "source_repo_id": self.source_repo_id,
+            "source_revision": self.source_revision,
+            "source_episode_id": self.source_episode_id,
+            "source_task_indices": (None if self.source_task_indices is None else list(self.source_task_indices)),
+            "frame_count": self.frame_count,
+            "timestamp_audit": {
+                "finite_count": self.timestamp_audit.finite_count,
+                "strictly_increasing": self.timestamp_audit.strictly_increasing,
+                "start": self.timestamp_audit.start,
+                "end": self.timestamp_audit.end,
+                "minimum_step": self.timestamp_audit.minimum_step,
+                "maximum_step": self.timestamp_audit.maximum_step,
+            },
+            "finite_counts": dict(self.finite_counts),
+            "current_root_quaternion_norm": {
+                "minimum": self.current_root_quaternion_norm.minimum,
+                "maximum": self.current_root_quaternion_norm.maximum,
+            },
+            "desired_root_quaternion_norm": {
+                "minimum": self.desired_root_quaternion_norm.minimum,
+                "maximum": self.desired_root_quaternion_norm.maximum,
+            },
+            "column_statistics": {
+                key: [
+                    {
+                        "minimum": item.minimum,
+                        "maximum": item.maximum,
+                        "mean": item.mean,
+                        "std": item.std,
+                    }
+                    for item in values
+                ]
+                for key, values in self.column_statistics.items()
+            },
+            "primary_camera": self.primary_camera,
+            "camera_map": dict(self.camera_map),
+        }
+
+
 @dataclass(frozen=True)
 class ArtifactSpec:
     """Byte-exact identity of an artifact in an immutable repository revision."""
@@ -155,6 +418,7 @@ class SourceSpec:
     approved: bool
     repo_id: str
     revision: str
+    dataset_path: str = "."
     episode_count: int | None = None
     episodes: tuple[int, ...] = ()
     primary_camera: str | None = None
@@ -166,6 +430,7 @@ class SourceSpec:
             raise ValueError("approved must be a boolean")
         _nonempty_string(self.repo_id, field_name="repo_id")
         validate_revision(self.revision)
+        object.__setattr__(self, "dataset_path", _canonical_dataset_path(self.dataset_path))
         if self.label is not None:
             _nonempty_string(self.label, field_name="source label")
 

@@ -12,6 +12,7 @@ from gear_sonic.data.unitree_conversion.contracts import (
 )
 from gear_sonic.data.unitree_conversion.provenance import (
     discover_collection_lock,
+    dump_source_lock,
     load_source_lock,
     load_source_lock_snapshot,
     materialize_artifact,
@@ -90,6 +91,7 @@ def test_smoke_lock_is_fully_immutable() -> None:
     assert lock.dex3.label == "dex3"
     assert lock.dex3.repo_id == "unitreerobotics/G1_Dex3_Pouring_Dataset"
     assert lock.dex3.revision == "c9552eb3b1cb610cd6227555e9e98b1bde826a77"
+    assert lock.dex3.dataset_path == "."
     assert lock.dex3.episode_count == 311
     assert lock.dex3.episodes == (0, 78, 155, 233, 310)
     assert lock.dex3.primary_camera == "observation.images.cam_left_high"
@@ -103,6 +105,7 @@ def test_smoke_lock_is_fully_immutable() -> None:
     assert lock.inspire.label == "inspire"
     assert lock.inspire.repo_id == "unitreerobotics/G1_WBT_Inspire_Pickup_Pillow_MainCamOnly"
     assert lock.inspire.revision == "24e3e4d88a5020bdb4b3046ec09b09dc56f8d1f1"
+    assert lock.inspire.dataset_path == "G1_WB_Dex5_Pickup_Pillow"
     assert lock.inspire.episode_count == 609
     assert lock.inspire.episodes == (0, 152, 304, 456, 608)
     assert lock.inspire.primary_camera == "observation.images.cam_0"
@@ -115,6 +118,55 @@ def test_smoke_lock_is_fully_immutable() -> None:
         assert int(source.revision, 16) >= 0
     with pytest.raises(TypeError):
         lock.dex3.camera_map["new.camera"] = "new.target"
+
+
+def test_dataset_path_round_trips_through_source_lock(tmp_path: Path) -> None:
+    lock = load_source_lock(LOCK)
+    candidate = tmp_path / "round-trip.yaml"
+    candidate.write_text(dump_source_lock(lock))
+
+    round_tripped = load_source_lock(candidate)
+
+    assert round_tripped.dex3.dataset_path == "."
+    assert round_tripped.inspire.dataset_path == "G1_WB_Dex5_Pickup_Pillow"
+    assert round_tripped == lock
+
+
+@pytest.mark.parametrize(
+    "dataset_path",
+    [
+        "",
+        " ",
+        "/absolute",
+        "../escape",
+        "nested/../escape",
+        "./nested",
+        "nested/.",
+        "nested//child",
+        "nested/",
+        r"nested\child",
+    ],
+)
+def test_source_spec_rejects_unsafe_or_noncanonical_dataset_path(dataset_path: str) -> None:
+    with pytest.raises(ValueError, match="dataset_path.*safe canonical POSIX-relative"):
+        SourceSpec(
+            approved=False,
+            repo_id="unitreerobotics/example",
+            revision="a" * 40,
+            dataset_path=dataset_path,
+        )
+
+
+def test_load_source_lock_rejects_unknown_or_unsafe_dataset_path(tmp_path: Path) -> None:
+    unsafe = tmp_path / "unsafe.yaml"
+    unsafe.write_text(LOCK.read_text().replace("    dataset_path: .\n", "    dataset_path: ../escape\n", 1))
+    with pytest.raises(ValueError, match="dataset_path.*safe canonical POSIX-relative"):
+        load_source_lock(unsafe)
+
+    unknown = tmp_path / "unknown-source-field.yaml"
+    unknown.write_text(LOCK.read_text().replace("    dataset_path: .\n", "    source_root: nested\n", 1))
+    with pytest.raises(ValueError, match="unknown fields.*source_root"):
+        load_source_lock(unknown)
 
 
 def test_stratified_selection_matches_pinned_counts() -> None:

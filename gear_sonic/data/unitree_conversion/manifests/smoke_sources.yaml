@@ -18,6 +18,7 @@ sources:
     approved: true
     repo_id: unitreerobotics/G1_Dex3_Pouring_Dataset
     revision: c9552eb3b1cb610cd6227555e9e98b1bde826a77
+    dataset_path: .
     episode_count: 311
     episodes: [0, 78, 155, 233, 310]
     primary_camera: observation.images.cam_left_high
@@ -29,6 +30,7 @@ sources:
     approved: true
     repo_id: unitreerobotics/G1_WBT_Inspire_Pickup_Pillow_MainCamOnly
     revision: 24e3e4d88a5020bdb4b3046ec09b09dc56f8d1f1
+    dataset_path: G1_WB_Dex5_Pickup_Pillow
     episode_count: 609
     episodes: [0, 152, 304, 456, 608]
     primary_camera: observation.images.cam_0
