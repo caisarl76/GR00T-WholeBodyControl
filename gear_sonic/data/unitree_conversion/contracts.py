@@ -163,6 +163,117 @@ class CanonicalEpisode:
             setattr(self, field_name, array)
 
 
+@dataclass
+class ResampledEpisode:
+    """Owned 50 Hz representation of one episode, before token generation."""
+
+    source_repo_id: str
+    source_revision: str
+    source_episode_id: int
+    body_joint_names: tuple[str, ...]
+    task_indices: np.ndarray
+    task_texts: tuple[str, ...]
+    observed_root_wxyz: np.ndarray
+    reference_root_wxyz: np.ndarray
+    observed_body_q: np.ndarray
+    desired_body_q: np.ndarray
+    desired_body_velocity: np.ndarray
+    observed_left_hand: np.ndarray
+    observed_right_hand: np.ndarray
+    desired_left_hand: np.ndarray
+    desired_right_hand: np.ndarray
+
+    def __post_init__(self) -> None:
+        from gear_sonic.data.unitree_conversion.quaternion import validate_wxyz
+
+        _nonempty_string(self.source_repo_id, field_name="source_repo_id")
+        validate_revision(self.source_revision, field_name="source_revision")
+        if (
+            isinstance(self.source_episode_id, bool)
+            or not isinstance(self.source_episode_id, int)
+            or self.source_episode_id < 0
+        ):
+            raise ValueError("source_episode_id must be a nonnegative integer")
+
+        if isinstance(self.body_joint_names, (str, bytes)):
+            raise ValueError("body_joint_names must contain exactly 29 unique semantic names")
+        try:
+            body_joint_names = tuple(self.body_joint_names)
+        except TypeError as error:
+            raise ValueError("body_joint_names must contain exactly 29 unique semantic names") from error
+        if len(body_joint_names) != 29 or len(set(body_joint_names)) != 29:
+            raise ValueError("body_joint_names must contain exactly 29 unique semantic names")
+        for name in body_joint_names:
+            _nonempty_string(name, field_name="body joint name")
+
+        observed_roots = _finite_float64_array(
+            self.observed_root_wxyz,
+            field_name="observed_root_wxyz",
+        )
+        if observed_roots.ndim != 2 or observed_roots.shape[1] != 4:
+            raise ValueError(f"observed_root_wxyz must have shape (T50, 4); got {observed_roots.shape}")
+        frame_count = observed_roots.shape[0]
+        if frame_count < 2:
+            raise ValueError("resampled episodes require at least two 50 Hz frames")
+
+        expected_shapes = {
+            "reference_root_wxyz": (frame_count, 4),
+            "observed_body_q": (frame_count, 29),
+            "desired_body_q": (frame_count, 29),
+            "desired_body_velocity": (frame_count, 29),
+            "observed_left_hand": (frame_count, 7),
+            "observed_right_hand": (frame_count, 7),
+            "desired_left_hand": (frame_count, 7),
+            "desired_right_hand": (frame_count, 7),
+        }
+        arrays = {"observed_root_wxyz": observed_roots}
+        for field_name, expected_shape in expected_shapes.items():
+            array = _finite_float64_array(getattr(self, field_name), field_name=field_name)
+            if array.shape != expected_shape:
+                raise ValueError(f"{field_name} must have shape {expected_shape}; got {array.shape}")
+            arrays[field_name] = array
+
+        for field_name in ("observed_root_wxyz", "reference_root_wxyz"):
+            roots = arrays[field_name]
+            for frame_index in range(frame_count):
+                roots[frame_index], _ = validate_wxyz(roots[frame_index])
+
+        task_indices = _task_index_array(self.task_indices)
+        if task_indices.shape != (frame_count,):
+            raise ValueError(f"task_indices must have shape ({frame_count},); got {task_indices.shape}")
+        if isinstance(self.task_texts, (str, bytes)):
+            raise ValueError(f"task_texts must contain exactly {frame_count} strings")
+        try:
+            task_texts = tuple(self.task_texts)
+        except TypeError as error:
+            raise ValueError(f"task_texts must contain exactly {frame_count} strings") from error
+        if len(task_texts) != frame_count:
+            raise ValueError(f"task_texts must contain exactly {frame_count} strings")
+        for text in task_texts:
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("task_texts must contain nonempty UTF-8 strings")
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError("task_texts must contain nonempty UTF-8 strings") from error
+
+        self.body_joint_names = body_joint_names
+        self.task_indices = task_indices
+        self.task_texts = task_texts
+        for field_name, array in arrays.items():
+            setattr(self, field_name, array)
+
+    @property
+    def frame_count(self) -> int:
+        """Number of target frames in this isolated episode."""
+        return int(self.observed_root_wxyz.shape[0])
+
+    @property
+    def target_fps(self) -> int:
+        """The fixed deployment timeline frequency."""
+        return 50
+
+
 def _finite_number(value: object, *, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
         raise ValueError(f"{field_name} must be a finite number")
