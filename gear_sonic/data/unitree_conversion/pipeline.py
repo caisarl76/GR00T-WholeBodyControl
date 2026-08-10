@@ -1,0 +1,929 @@
+"""Fail-closed orchestration for pinned Unitree-to-SONIC conversion cohorts."""
+
+from __future__ import annotations
+
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from fractions import Fraction
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+from types import MappingProxyType
+from typing import Any
+
+from gear_sonic.data.unitree_conversion.contracts import (
+    INSPIRE_GATE_REASONS,
+    SourceLock,
+    SourceSpec,
+)
+from gear_sonic.data.unitree_conversion.provenance import (
+    SourceLockSnapshot,
+    dump_source_lock,
+)
+
+
+@dataclass(frozen=True)
+class EncodedEpisode:
+    """Episode-level encoding result and exact number of ONNX invocations."""
+
+    value: object
+    invocation_count: int
+
+    def __post_init__(self) -> None:
+        if type(self.invocation_count) is not int or self.invocation_count < 0:
+            raise ValueError("invocation_count must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
+class EpisodePipelineReport:
+    """One selected source episode's terminal pipeline classification."""
+
+    source_repo_id: str
+    source_episode_id: int
+    status: str
+    detail: str | None = None
+    artifact_path: Path | None = None
+    encoder_invocation_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.status not in {"validated", "reused", "failed", "blocked_unverified"}:
+            raise ValueError(f"unsupported episode status: {self.status!r}")
+        if type(self.source_episode_id) is not int or self.source_episode_id < 0:
+            raise ValueError("source_episode_id must be a nonnegative integer")
+        if type(self.encoder_invocation_count) is not int or self.encoder_invocation_count < 0:
+            raise ValueError("encoder_invocation_count must be a nonnegative integer")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source_repo_id": self.source_repo_id,
+            "source_episode_id": self.source_episode_id,
+            "status": self.status,
+            "detail": self.detail,
+            "artifact_path": None if self.artifact_path is None else str(self.artifact_path),
+            "encoder_invocation_count": self.encoder_invocation_count,
+        }
+
+
+@dataclass(frozen=True)
+class PipelineReport:
+    """Deterministic summary of one source-specific pipeline invocation."""
+
+    source_episode_ids: tuple[int, ...]
+    validated_episode_count: int
+    failed_episode_count: int
+    status_counts: Mapping[str, int]
+    gate_reasons: frozenset[str]
+    encoder_invocation_count: int
+    target_dataset_paths: tuple[Path, ...]
+    output_root: Path
+    episode_reports: tuple[EpisodePipelineReport, ...]
+
+    def __post_init__(self) -> None:
+        if tuple(report.source_episode_id for report in self.episode_reports) != self.source_episode_ids:
+            raise ValueError("episode_reports must preserve exact source episode order")
+        expected = dict(sorted(Counter(report.status for report in self.episode_reports).items()))
+        if dict(self.status_counts) != expected:
+            raise ValueError("status_counts must exactly summarize episode_reports")
+        validated = sum(report.status in {"validated", "reused"} for report in self.episode_reports)
+        failed = sum(report.status == "failed" for report in self.episode_reports)
+        if self.validated_episode_count != validated or self.failed_episode_count != failed:
+            raise ValueError("episode counts must exactly summarize episode_reports")
+        invocations = sum(report.encoder_invocation_count for report in self.episode_reports)
+        if self.encoder_invocation_count != invocations:
+            raise ValueError("encoder_invocation_count must exactly summarize episode_reports")
+
+    @property
+    def succeeded(self) -> bool:
+        return self.failed_episode_count == 0 and self.validated_episode_count == len(self.source_episode_ids)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source_episode_ids": list(self.source_episode_ids),
+            "validated_episode_count": self.validated_episode_count,
+            "failed_episode_count": self.failed_episode_count,
+            "status_counts": dict(self.status_counts),
+            "gate_reasons": sorted(self.gate_reasons),
+            "encoder_invocation_count": self.encoder_invocation_count,
+            "target_dataset_paths": [str(path) for path in self.target_dataset_paths],
+            "output_root": str(self.output_root),
+            "succeeded": self.succeeded,
+            "episode_reports": [report.to_dict() for report in self.episode_reports],
+        }
+
+    def write_json(self, path: str | Path) -> Path:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        serialized = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+        target.write_text(serialized, encoding="utf-8")
+        return target
+
+
+@dataclass(frozen=True)
+class PipelineComponents:
+    """Injected operations that keep orchestration independently testable."""
+
+    validate_artifacts: Callable[[SourceLock, Path | None], object]
+    preflight_repository: Callable[[SourceSpec, tuple[int, ...], Path | None, str], object]
+    make_stage_identity: Callable[[str, SourceSpec, int, object, object], object]
+    resume_stage: Callable[[Path, object], object | None]
+    adapt_dex3_episode: Callable[[SourceSpec, int, object, Path | None], object]
+    resample_episode: Callable[[object, object], object]
+    encoder_factory: Callable[[object], object]
+    encode_episode: Callable[[object, object], object]
+    construct_payload: Callable[[object, object, object], object]
+    validate_payload: Callable[[object], object]
+    write_stage: Callable[[Path, object, object], object]
+    merge_stages: Callable[[Sequence[object], Path, bool], Path]
+    diagnose_inspire_episode: Callable[[SourceSpec, int, object, Path | None], object]
+    write_diagnostic: Callable[[Path, object], Path]
+
+
+def _lock_and_sha256(lock: SourceLock | SourceLockSnapshot) -> tuple[SourceLock, str]:
+    if isinstance(lock, SourceLockSnapshot):
+        return lock.lock, lock.sha256
+    if not isinstance(lock, SourceLock):
+        raise TypeError("lock must be a SourceLock or SourceLockSnapshot")
+    serialized = dump_source_lock(lock).encode("utf-8")
+    return lock, hashlib.sha256(serialized).hexdigest()
+
+
+def _selected_sources(lock: SourceLock, *, kind: str, smoke: bool) -> tuple[SourceSpec, ...]:
+    if type(smoke) is not bool:
+        raise TypeError("smoke must be a boolean")
+    if lock.scope == "smoke" and not smoke:
+        raise ValueError("a scope: smoke source lock requires smoke=True")
+    selected = tuple(
+        sorted(
+            (
+                source
+                for source in lock.sources
+                if source.label == kind
+                or (isinstance(source.label, str) and source.label.startswith((f"{kind}-", f"{kind}:")))
+            ),
+            key=lambda item: item.repo_id,
+        )
+    )
+    if not selected:
+        raise ValueError(f"source lock has no {kind!r} sources")
+    for source in selected:
+        if not source.approved:
+            raise ValueError(f"source {source.repo_id!r} is not approved")
+        if not source.episodes:
+            raise ValueError(f"source {source.repo_id!r} has no explicitly eligible episodes")
+    return selected
+
+
+def _repo_output_path(output_root: Path, source: SourceSpec) -> Path:
+    safe_repo = source.repo_id.replace("/", "--")
+    return output_root / safe_repo
+
+
+def _encoded_parts(encoded: object) -> tuple[object, int]:
+    if isinstance(encoded, EncodedEpisode):
+        return encoded.value, encoded.invocation_count
+    count = getattr(encoded, "invocation_count", None)
+    if type(count) is not int or count < 0:
+        raise ValueError("encode_episode must return a value with nonnegative invocation_count")
+    return encoded, count
+
+
+def _pipeline_report(
+    *,
+    output_root: Path,
+    episode_reports: list[EpisodePipelineReport],
+    target_paths: list[Path],
+    gate_reasons: frozenset[str] = frozenset(),
+) -> PipelineReport:
+    reports = tuple(episode_reports)
+    return PipelineReport(
+        source_episode_ids=tuple(report.source_episode_id for report in reports),
+        validated_episode_count=sum(report.status in {"validated", "reused"} for report in reports),
+        failed_episode_count=sum(report.status == "failed" for report in reports),
+        status_counts=dict(sorted(Counter(report.status for report in reports).items())),
+        gate_reasons=gate_reasons,
+        encoder_invocation_count=sum(report.encoder_invocation_count for report in reports),
+        target_dataset_paths=tuple(target_paths),
+        output_root=output_root,
+        episode_reports=reports,
+    )
+
+
+def run_dex3_pipeline(
+    *,
+    lock: SourceLock | SourceLockSnapshot,
+    output_root: str | Path,
+    components: PipelineComponents | None = None,
+    smoke: bool = True,
+    cache_dir: str | Path | None = None,
+    resume: bool = True,
+) -> PipelineReport:
+    """Convert every explicitly selected Dex3 episode, grouped by repository."""
+    parsed_lock, lock_sha256 = _lock_and_sha256(lock)
+    sources = _selected_sources(parsed_lock, kind="dex3", smoke=smoke)
+    root = Path(output_root)
+    cache = None if cache_dir is None else Path(cache_dir)
+    operations = _default_dex3_components(parsed_lock, cache) if components is None else components
+
+    artifacts = operations.validate_artifacts(parsed_lock, cache)
+    episode_reports: list[EpisodePipelineReport] = []
+    target_paths: list[Path] = []
+    encoder: object | None = None
+
+    for source in sources:
+        episode_ids = tuple(source.episodes)
+        preflight = operations.preflight_repository(source, episode_ids, cache, "dex3")
+        stages: list[object] = []
+        repository_reports: list[EpisodePipelineReport] = []
+        for episode_id in episode_ids:
+            invocation_count = 0
+            try:
+                identity = operations.make_stage_identity(
+                    lock_sha256,
+                    source,
+                    episode_id,
+                    artifacts,
+                    preflight,
+                )
+                resumed = operations.resume_stage(root, identity) if resume else None
+                if resumed is not None:
+                    stages.append(resumed)
+                    report = EpisodePipelineReport(
+                        source_repo_id=source.repo_id,
+                        source_episode_id=episode_id,
+                        status="reused",
+                        artifact_path=Path(resumed.path),
+                    )
+                else:
+                    canonical = operations.adapt_dex3_episode(source, episode_id, preflight, cache)
+                    resampled = operations.resample_episode(canonical, preflight)
+                    if encoder is None:
+                        encoder = operations.encoder_factory(artifacts)
+                    encoded = operations.encode_episode(encoder, resampled)
+                    encoded_value, invocation_count = _encoded_parts(encoded)
+                    payload = operations.construct_payload(resampled, encoded_value, preflight)
+                    operations.validate_payload(payload)
+                    stage = operations.write_stage(root, identity, payload)
+                    stages.append(stage)
+                    report = EpisodePipelineReport(
+                        source_repo_id=source.repo_id,
+                        source_episode_id=episode_id,
+                        status="validated",
+                        artifact_path=Path(stage.path),
+                        encoder_invocation_count=invocation_count,
+                    )
+            except Exception as error:  # classify per episode and continue the fixed cohort
+                report = EpisodePipelineReport(
+                    source_repo_id=source.repo_id,
+                    source_episode_id=episode_id,
+                    status="failed",
+                    detail=f"{type(error).__name__}: {error}",
+                    encoder_invocation_count=invocation_count,
+                )
+            repository_reports.append(report)
+            episode_reports.append(report)
+
+        if all(report.status in {"validated", "reused"} for report in repository_reports):
+            target = _repo_output_path(root, source)
+            target_paths.append(operations.merge_stages(tuple(stages), target, resume))
+
+    return _pipeline_report(
+        output_root=root,
+        episode_reports=episode_reports,
+        target_paths=target_paths,
+    )
+
+
+def run_inspire_diagnostics(
+    *,
+    lock: SourceLock | SourceLockSnapshot,
+    output_root: str | Path,
+    components: PipelineComponents | None = None,
+    smoke: bool = True,
+    cache_dir: str | Path | None = None,
+) -> PipelineReport:
+    """Audit Inspire sources without importing, constructing, or invoking SONIC."""
+    parsed_lock, _ = _lock_and_sha256(lock)
+    sources = _selected_sources(parsed_lock, kind="inspire", smoke=smoke)
+    root = Path(output_root)
+    cache = None if cache_dir is None else Path(cache_dir)
+    operations = _default_inspire_components() if components is None else components
+
+    episode_reports: list[EpisodePipelineReport] = []
+    for source in sources:
+        episode_ids = tuple(source.episodes)
+        preflight = operations.preflight_repository(source, episode_ids, cache, "inspire")
+        for episode_id in episode_ids:
+            try:
+                diagnostic = operations.diagnose_inspire_episode(source, episode_id, preflight, cache)
+                if getattr(diagnostic, "status", None) != "blocked_unverified":
+                    raise ValueError("Inspire diagnostic must remain blocked_unverified")
+                if getattr(diagnostic, "encoder_invoked", None) is not False:
+                    raise ValueError("Inspire diagnostic must prove encoder_invoked is false")
+                if tuple(getattr(diagnostic, "gate_reasons", ())) != INSPIRE_GATE_REASONS:
+                    raise ValueError("Inspire diagnostic gate reasons differ from the exact contract")
+                artifact = operations.write_diagnostic(root, diagnostic)
+                report = EpisodePipelineReport(
+                    source_repo_id=source.repo_id,
+                    source_episode_id=episode_id,
+                    status="blocked_unverified",
+                    artifact_path=artifact,
+                )
+            except Exception as error:
+                report = EpisodePipelineReport(
+                    source_repo_id=source.repo_id,
+                    source_episode_id=episode_id,
+                    status="failed",
+                    detail=f"{type(error).__name__}: {error}",
+                )
+            episode_reports.append(report)
+
+    return _pipeline_report(
+        output_root=root,
+        episode_reports=episode_reports,
+        target_paths=[],
+        gate_reasons=frozenset(INSPIRE_GATE_REASONS),
+    )
+
+
+def _unavailable(*_args: object, **_kwargs: object) -> Any:
+    raise RuntimeError("operation is unavailable in this source-specific pipeline")
+
+
+@dataclass(frozen=True)
+class _ResolvedArtifacts:
+    encoder_path: Path
+    observation_config_path: Path
+
+
+@dataclass(frozen=True)
+class _RepositoryPreflight:
+    source: SourceSpec
+    datasets: Mapping[int, object]
+    timelines: Mapping[int, Mapping[str, object]]
+    camera_schema: object
+    tasks: Mapping[int, str]
+    source_hashes: Mapping[int, Mapping[str, str]]
+
+
+@dataclass(frozen=True)
+class _ProductionPayload:
+    payload: object
+    temporary_videos: tuple[Path, ...]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _artifact_downloader(cache_dir: Path | None) -> Callable[..., str | Path]:
+    def download(**kwargs: object) -> str | Path:
+        from huggingface_hub import hf_hub_download
+
+        if cache_dir is not None:
+            kwargs["cache_dir"] = str(cache_dir)
+        return hf_hub_download(**kwargs)
+
+    return download
+
+
+def _validate_default_artifacts(lock: SourceLock, cache_dir: Path | None) -> _ResolvedArtifacts:
+    from gear_sonic.data.unitree_conversion.provenance import materialize_artifact
+
+    downloader = _artifact_downloader(cache_dir)
+    return _ResolvedArtifacts(
+        encoder_path=materialize_artifact(lock.encoder, downloader=downloader),
+        observation_config_path=materialize_artifact(lock.observation_config, downloader=downloader),
+    )
+
+
+def _feature_video_size(feature: object, *, key: str) -> tuple[int, int]:
+    if not isinstance(feature, Mapping) or feature.get("dtype") != "video":
+        raise ValueError(f"source camera {key!r} must be a video feature")
+    shape = feature.get("shape")
+    if (
+        not isinstance(shape, Sequence)
+        or isinstance(shape, (str, bytes))
+        or len(shape) != 3
+        or any(type(value) is not int or value <= 0 for value in shape)
+        or shape[2] != 3
+    ):
+        raise ValueError(f"source camera {key!r} must declare positive HWC RGB shape")
+    return int(shape[1]), int(shape[0])
+
+
+def _load_task_catalog(dataset_root: Path) -> Mapping[int, str]:
+    path = dataset_root / "meta" / "tasks.jsonl"
+    tasks: dict[int, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise ValueError("source meta/tasks.jsonl must be readable UTF-8") from error
+    if not lines:
+        raise ValueError("source meta/tasks.jsonl must not be empty")
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"source tasks line {line_number} must be valid JSON") from error
+        if not isinstance(record, dict) or set(record) != {"task_index", "task"}:
+            raise ValueError("source task records must contain exactly task_index and task")
+        index = record["task_index"]
+        text = record["task"]
+        if type(index) is not int or index < 0 or not isinstance(text, str) or not text.strip():
+            raise ValueError("source task records require a nonnegative integer index and nonempty task")
+        if index in tasks:
+            raise ValueError("source task records must have unique task_index values")
+        tasks[index] = text
+    if tuple(sorted(tasks)) != tuple(range(len(tasks))):
+        raise ValueError("source task indices must be contiguous from zero")
+    return MappingProxyType(dict(sorted(tasks.items())))
+
+
+def _selected_source_paths(dataset: object, episode_id: int) -> tuple[Path, ...]:
+    from gear_sonic.data.unitree_conversion.lerobot_v3_source import (
+        _read_info,
+        _selected_episode_row,
+        _selected_paths,
+    )
+
+    root = Path(dataset.root)
+    info = _read_info(root)
+    row = _selected_episode_row(root, episode_id=episode_id, video_keys=info.video_keys)
+    relative = _selected_paths(row, info)
+    paths = tuple((root / path).resolve(strict=True) for path in relative)
+    if any(root.resolve() not in path.parents for path in paths):
+        raise ValueError("selected source artifact escaped the pinned dataset root")
+    return paths
+
+
+def _source_hashes(dataset: object, episode_id: int) -> Mapping[str, str]:
+    root = Path(dataset.root).resolve()
+    selected = _selected_source_paths(dataset, episode_id)
+    metadata_root = root / "meta"
+    metadata = tuple(path for path in sorted(metadata_root.rglob("*")) if path.is_file())
+    if not metadata:
+        raise ValueError("pinned source metadata tree must contain regular files")
+    paths = tuple(dict.fromkeys((*metadata, *selected)))
+    hashes: dict[str, str] = {}
+    for path in paths:
+        if path.is_symlink():
+            raise ValueError("source artifacts must not be symbolic links")
+        resolved = path.resolve(strict=True)
+        if root not in resolved.parents:
+            raise ValueError("source artifact escaped the pinned dataset root")
+        relative = resolved.relative_to(root).as_posix()
+        hashes[relative] = _sha256_file(resolved)
+    return MappingProxyType(dict(sorted(hashes.items())))
+
+
+def _validate_dex3_metadata(source: SourceSpec, dataset: object) -> None:
+    from gear_sonic.data.unitree_conversion.dex3_adapter import DEX3_FEATURE_NAMES
+
+    meta = dataset.meta
+    if dataset.revision != source.revision or meta.revision != source.revision:
+        raise ValueError("loaded source revision differs from the pinned revision")
+    if meta.total_episodes != source.episode_count or meta.fps != 30:
+        raise ValueError("source episode count or fps differs from the pinned contract")
+    for key in ("observation.state", "action"):
+        feature = meta.features.get(key) if isinstance(meta.features, Mapping) else None
+        names = feature.get("names") if isinstance(feature, Mapping) else None
+        if isinstance(names, Sequence) and len(names) == 1 and isinstance(names[0], Sequence):
+            names = names[0]
+        if tuple(names or ()) != DEX3_FEATURE_NAMES:
+            raise ValueError(f"source {key} names differ from the exact Dex3 order")
+
+
+def _preflight_repository(
+    source: SourceSpec,
+    episode_ids: tuple[int, ...],
+    cache_dir: Path | None,
+    kind: str,
+) -> _RepositoryPreflight:
+    from gear_sonic.data.unitree_conversion.lerobot_v3_source import (
+        DEX3_DATA_SCHEMA,
+        default_lerobot_cache_base,
+        load_pinned_v3_episode,
+    )
+    from gear_sonic.data.unitree_conversion.video_timeline import (
+        CameraStreamReport,
+        EpisodeCameraReport,
+        choose_target_camera_schema,
+        inspect_video,
+    )
+
+    if kind not in {"dex3", "inspire"}:
+        raise ValueError(f"unsupported source kind: {kind!r}")
+    schema = DEX3_DATA_SCHEMA
+    if kind == "inspire":
+        from gear_sonic.data.unitree_conversion.inspire_diagnostics import _SOURCE_SCHEMA
+
+        schema = _SOURCE_SCHEMA
+    cache_base = default_lerobot_cache_base() if cache_dir is None else cache_dir / "lerobot"
+    datasets: dict[int, object] = {}
+    timelines: dict[int, Mapping[str, object]] = {}
+    reports: list[object] = []
+    source_hashes: dict[int, Mapping[str, str]] = {}
+    task_catalog: Mapping[int, str] | None = None
+
+    for episode_id in episode_ids:
+        dataset = load_pinned_v3_episode(
+            source,
+            episode_id,
+            cache_base=cache_base,
+            schema=schema,
+            download_videos=True,
+        )
+        if dataset.revision != source.revision or dataset.meta.revision != source.revision:
+            raise ValueError("loaded source revision differs from the pinned revision")
+        if dataset.meta.total_episodes != source.episode_count or dataset.meta.fps != 30:
+            raise ValueError("source episode count or fps differs from the pinned contract")
+        if kind == "dex3":
+            _validate_dex3_metadata(source, dataset)
+        current_tasks = _load_task_catalog(Path(dataset.root))
+        if task_catalog is None:
+            task_catalog = current_tasks
+        elif dict(task_catalog) != dict(current_tasks):
+            raise ValueError("source task catalog changed within one repository preflight")
+
+        streams: dict[str, CameraStreamReport] = {}
+        exact_timelines: dict[str, object] = {}
+        for source_key in source.camera_map:
+            segment = dataset.video_segments.get(source_key)
+            if segment is None:
+                streams[source_key] = CameraStreamReport(status="missing", reason="source stream absent")
+                continue
+            try:
+                size = _feature_video_size(dataset.meta.features.get(source_key), key=source_key)
+                timeline = inspect_video(
+                    segment.path,
+                    expected_frames=len(dataset.hf_dataset),
+                    expected_size=size,
+                    segment=segment,
+                )
+            except ValueError as error:
+                streams[source_key] = CameraStreamReport(status="invalid", reason=str(error))
+            else:
+                streams[source_key] = CameraStreamReport(status="exact", timeline=timeline)
+                exact_timelines[source_key] = timeline
+        reports.append(
+            EpisodeCameraReport(
+                source_repo_id=source.repo_id,
+                source_episode_id=episode_id,
+                source_frame_count=len(dataset.hf_dataset),
+                primary_camera=source.primary_camera,
+                streams=streams,
+            )
+        )
+        datasets[episode_id] = dataset
+        timelines[episode_id] = MappingProxyType(dict(sorted(exact_timelines.items())))
+        source_hashes[episode_id] = _source_hashes(dataset, episode_id)
+
+    camera_schema = choose_target_camera_schema(reports, source.camera_map)
+    assert task_catalog is not None
+    return _RepositoryPreflight(
+        source=source,
+        datasets=MappingProxyType(datasets),
+        timelines=MappingProxyType(timelines),
+        camera_schema=camera_schema,
+        tasks=task_catalog,
+        source_hashes=MappingProxyType(source_hashes),
+    )
+
+
+def _make_stage_identity(
+    lock_sha256: str,
+    source: SourceSpec,
+    episode_id: int,
+    artifacts: _ResolvedArtifacts,
+    preflight: _RepositoryPreflight,
+) -> object:
+    from gear_sonic.data.unitree_conversion.staging import StageIdentity
+
+    conversion_contract = json.dumps(
+        {
+            "body_fps": [30, 50],
+            "encoder_layout": 1247,
+            "motion_token": 64,
+            "source_kind": "dex3",
+            "source_to_target_camera": dict(preflight.camera_schema.source_to_target),
+            "target_schema": "g1-sonic-vla-v1",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return StageIdentity(
+        source_repo_id=source.repo_id,
+        source_revision=source.revision,
+        source_episode_id=episode_id,
+        source_file_sha256=preflight.source_hashes[episode_id],
+        conversion_config_sha256=hashlib.sha256(conversion_contract).hexdigest(),
+        converter_version="unitree-sonic-conversion-v1",
+        encoder_sha256=_sha256_file(artifacts.encoder_path),
+        encoder_config_sha256=_sha256_file(artifacts.observation_config_path),
+        source_lock_sha256=lock_sha256,
+    )
+
+
+def _resume_stage(output_root: Path, identity: object) -> object | None:
+    from gear_sonic.data.unitree_conversion.staging import (
+        StageIdentity,
+        StageResult,
+        can_resume,
+        stage_path,
+    )
+
+    if not isinstance(identity, StageIdentity):
+        raise TypeError("stage identity must be StageIdentity")
+    path = stage_path(output_root, identity)
+    if not can_resume(path, identity):
+        return None
+    manifest_digest = hashlib.sha256((path / "manifest.json").read_bytes()).hexdigest()
+    return StageResult(path=path, identity=identity, manifest_digest=manifest_digest, reused=True)
+
+
+def _adapt_dex3(
+    source: SourceSpec,
+    episode_id: int,
+    preflight: _RepositoryPreflight,
+    cache_dir: Path | None,
+) -> object:
+    del cache_dir
+    import numpy as np
+
+    from gear_sonic.data.unitree_conversion.dex3_adapter import (
+        DEX3_FEATURE_NAMES,
+        adapt_dex3_arrays,
+    )
+
+    dataset = preflight.datasets[episode_id]
+    rows = dataset.hf_dataset
+    return adapt_dex3_arrays(
+        source_repo_id=source.repo_id,
+        source_revision=source.revision,
+        source_episode_id=episode_id,
+        observed=np.asarray([row["observation.state"] for row in rows]),
+        desired=np.asarray([row["action"] for row in rows]),
+        feature_names=DEX3_FEATURE_NAMES,
+        timestamps=np.asarray([row["timestamp"] for row in rows]),
+        task_indices=np.asarray([row["task_index"] for row in rows]),
+        video_segments=dataset.video_segments,
+    )
+
+
+def _resample_episode(episode: object, preflight: _RepositoryPreflight) -> object:
+    import numpy as np
+
+    from gear_sonic.data.unitree_conversion.contracts import CanonicalEpisode, ResampledEpisode
+    from gear_sonic.data.unitree_conversion.joint_mapping import G1_MUJOCO_NAMES
+    from gear_sonic.data.unitree_conversion.resampling import (
+        audit_source_timestamps,
+        nearest_image_indices,
+        resample_positions,
+        resample_quaternions,
+    )
+
+    if not isinstance(episode, CanonicalEpisode):
+        raise TypeError("adapter must return CanonicalEpisode")
+    audit = audit_source_timestamps(episode.timestamps)
+    if audit.rejected:
+        raise ValueError("source timestamps exceed the exact 30 Hz rejection threshold")
+    observed_body, _ = resample_positions(episode.observed_body_q)
+    desired_body, desired_velocity = resample_positions(episode.desired_body_q)
+    observed_left, _ = resample_positions(episode.observed_left_hand)
+    observed_right, _ = resample_positions(episode.observed_right_hand)
+    desired_left, _ = resample_positions(episode.desired_left_hand)
+    desired_right, _ = resample_positions(episode.desired_right_hand)
+    discrete_indices = nearest_image_indices(episode.timestamps.shape[0])
+    task_indices = episode.task_indices[discrete_indices]
+    try:
+        task_texts = tuple(preflight.tasks[int(index)] for index in task_indices)
+    except KeyError as error:
+        raise ValueError(f"source task_index {error.args[0]} is absent from meta/tasks.jsonl") from error
+    return ResampledEpisode(
+        source_repo_id=episode.source_repo_id,
+        source_revision=episode.source_revision,
+        source_episode_id=episode.source_episode_id,
+        body_joint_names=G1_MUJOCO_NAMES,
+        task_indices=np.asarray(task_indices, dtype=np.int64),
+        task_texts=task_texts,
+        observed_root_wxyz=resample_quaternions(episode.observed_root_wxyz),
+        reference_root_wxyz=resample_quaternions(episode.reference_root_wxyz),
+        observed_body_q=observed_body,
+        desired_body_q=desired_body,
+        desired_body_velocity=desired_velocity,
+        observed_left_hand=observed_left,
+        observed_right_hand=observed_right,
+        desired_left_hand=desired_left,
+        desired_right_hand=desired_right,
+    )
+
+
+def _encoder_factory(artifacts: _ResolvedArtifacts) -> object:
+    from gear_sonic.data.unitree_conversion.sonic_encoder import (
+        SonicEncoder,
+        _parse_observation_config,
+    )
+
+    _parse_observation_config(artifacts.observation_config_path)
+    import onnxruntime
+
+    options = onnxruntime.SessionOptions()
+    options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
+    provider = "CPUExecutionProvider"
+    session = onnxruntime.InferenceSession(
+        str(artifacts.encoder_path),
+        providers=[provider],
+        sess_options=options,
+    )
+    return SonicEncoder.from_session(
+        session,
+        encoder_path=artifacts.encoder_path,
+        observation_config_path=artifacts.observation_config_path,
+        provider=provider,
+        runtime_version=str(onnxruntime.__version__),
+    )
+
+
+def _encode_episode(encoder: object, episode: object) -> EncodedEpisode:
+    import numpy as np
+
+    from gear_sonic.data.unitree_conversion.sonic_encoder import build_frame_encoder_input
+
+    tokens: list[np.ndarray] = []
+    for frame_index in range(episode.frame_count):
+        token = encoder.encode(build_frame_encoder_input(episode, frame_index))
+        array = np.asarray(token)
+        if array.shape != (1, 64) or array.dtype != np.dtype(np.float32):
+            raise ValueError("encoder must return exact float32 shape [1,64]")
+        tokens.append(np.array(array[0], dtype=np.float32, copy=True))
+    return EncodedEpisode(
+        value=np.stack(tokens),
+        invocation_count=episode.frame_count,
+    )
+
+
+def _h264_encoder_name() -> str:
+    import av
+
+    for name in ("libx264", "libopenh264", "h264"):
+        try:
+            av.codec.Codec(name, "w")
+        except (av.error.FFmpegError, ValueError):
+            continue
+        return name
+    raise RuntimeError("PyAV has no usable H.264 encoder")
+
+
+def _encode_target_video(timeline: object) -> Path:
+    import av
+
+    from gear_sonic.data.unitree_conversion.video_timeline import iter_resampled_video
+
+    handle = tempfile.NamedTemporaryFile(prefix="unitree-sonic-", suffix=".mp4", delete=False)
+    path = Path(handle.name)
+    handle.close()
+    try:
+        with av.open(str(path), mode="w") as container:
+            stream = container.add_stream(_h264_encoder_name(), rate=50)
+            stream.width = 640
+            stream.height = 480
+            stream.pix_fmt = "yuv420p"
+            stream.time_base = Fraction(1, 50)
+            for frame in iter_resampled_video(timeline):
+                video_frame = av.VideoFrame.from_ndarray(frame.rgb, format="rgb24")
+                video_frame = video_frame.reformat(width=640, height=480, format="yuv420p")
+                video_frame.pts = frame.target_index
+                video_frame.time_base = Fraction(1, 50)
+                for packet in stream.encode(video_frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+        return path
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _construct_payload(episode: object, encoded: object, preflight: _RepositoryPreflight) -> _ProductionPayload:
+    import numpy as np
+
+    from gear_sonic.data.unitree_conversion.staging import StagePayload
+    from gear_sonic.data.unitree_conversion.target_frames import TargetFrameBuilder
+
+    tokens = np.asarray(encoded)
+    if tokens.shape != (episode.frame_count, 64) or tokens.dtype != np.dtype(np.float32):
+        raise ValueError("encoded episode must have exact float32 shape [T50,64]")
+    builder = TargetFrameBuilder()
+    rows = tuple(builder.build(episode, index, tokens[index]) for index in range(episode.frame_count))
+    timelines = preflight.timelines[episode.source_episode_id]
+    videos: dict[str, Path] = {}
+    temporary: list[Path] = []
+    try:
+        for source_key, target_key in preflight.camera_schema.source_to_target.items():
+            path = _encode_target_video(timelines[source_key])
+            temporary.append(path)
+            videos[target_key] = path
+        payload = StagePayload(rows=rows, videos=videos)
+        return _ProductionPayload(payload=payload, temporary_videos=tuple(temporary))
+    except BaseException:
+        for path in temporary:
+            path.unlink(missing_ok=True)
+        raise
+
+
+def _validate_payload(payload: _ProductionPayload) -> object:
+    from gear_sonic.data.unitree_conversion.validation import (
+        probe_video_50fps_stream,
+        validation_report_from_inspections,
+    )
+
+    inspections: dict[str, tuple[int, tuple[int, int]]] = {}
+    for key, path in payload.payload.videos.items():
+        with Path(path).open("rb") as stream:
+            inspections[key] = probe_video_50fps_stream(stream, field_name=f"video {key}")
+    return validation_report_from_inspections(payload.payload.rows, inspections)
+
+
+def _write_stage(output_root: Path, identity: object, payload: _ProductionPayload) -> object:
+    from gear_sonic.data.unitree_conversion.staging import write_stage
+
+    try:
+        return write_stage(output_root, identity, payload.payload)
+    finally:
+        for path in payload.temporary_videos:
+            path.unlink(missing_ok=True)
+
+
+def _merge_stages(stages: Sequence[object], target_path: Path, resume: bool) -> Path:
+    from gear_sonic.data.unitree_conversion.staging import merge_stages
+
+    return merge_stages(stages, target_path, resume_existing=resume)
+
+
+def _diagnose_inspire(
+    source: SourceSpec,
+    episode_id: int,
+    preflight: _RepositoryPreflight,
+    cache_dir: Path | None,
+) -> object:
+    del preflight
+    from gear_sonic.data.unitree_conversion.inspire_diagnostics import diagnose_inspire_episode
+
+    root = None if cache_dir is None else cache_dir / "lerobot"
+    return diagnose_inspire_episode(source, episode_id, root=root)
+
+
+def _write_diagnostic(output_root: Path, report: object) -> Path:
+    safe_repo = report.source_repo_id.replace("/", "--")
+    path = output_root / safe_repo / f"episode-{report.source_episode_id:06d}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
+    path.write_text(data, encoding="utf-8")
+    return path
+
+
+def _default_dex3_components(lock: SourceLock, cache_dir: Path | None) -> PipelineComponents:
+    del lock, cache_dir
+    # Heavy encoder/runtime imports remain inside ``_encoder_factory``.
+    return PipelineComponents(
+        validate_artifacts=_validate_default_artifacts,
+        preflight_repository=_preflight_repository,
+        make_stage_identity=_make_stage_identity,
+        resume_stage=_resume_stage,
+        adapt_dex3_episode=_adapt_dex3,
+        resample_episode=_resample_episode,
+        encoder_factory=_encoder_factory,
+        encode_episode=_encode_episode,
+        construct_payload=_construct_payload,
+        validate_payload=_validate_payload,
+        write_stage=_write_stage,
+        merge_stages=_merge_stages,
+        diagnose_inspire_episode=_unavailable,
+        write_diagnostic=_unavailable,
+    )
+
+
+def _default_inspire_components() -> PipelineComponents:
+    # No ONNX or SonicEncoder import is reachable from this constructor or path.
+    return PipelineComponents(
+        validate_artifacts=_unavailable,
+        preflight_repository=_preflight_repository,
+        make_stage_identity=_unavailable,
+        resume_stage=_unavailable,
+        adapt_dex3_episode=_unavailable,
+        resample_episode=_unavailable,
+        encoder_factory=_unavailable,
+        encode_episode=_unavailable,
+        construct_payload=_unavailable,
+        validate_payload=_unavailable,
+        write_stage=_unavailable,
+        merge_stages=_unavailable,
+        diagnose_inspire_episode=_diagnose_inspire,
+        write_diagnostic=_write_diagnostic,
+    )
