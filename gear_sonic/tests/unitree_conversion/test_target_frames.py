@@ -12,21 +12,55 @@ from gear_sonic.data.unitree_conversion.contracts import ResampledEpisode
 from gear_sonic.data.unitree_conversion.joint_mapping import G1_MUJOCO_NAMES
 from gear_sonic.data.unitree_conversion.target_frames import TargetFrameBuilder
 
-LEFT_HAND_NAMES = (
+PRODUCTION_G1_JOINT_NAMES = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "left_hand_index_0_joint",
+    "left_hand_index_1_joint",
+    "left_hand_middle_0_joint",
+    "left_hand_middle_1_joint",
     "left_hand_thumb_0_joint",
     "left_hand_thumb_1_joint",
     "left_hand_thumb_2_joint",
-    "left_hand_middle_0_joint",
-    "left_hand_middle_1_joint",
-    "left_hand_index_0_joint",
-    "left_hand_index_1_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+    "right_hand_index_0_joint",
+    "right_hand_index_1_joint",
+    "right_hand_middle_0_joint",
+    "right_hand_middle_1_joint",
+    "right_hand_thumb_0_joint",
+    "right_hand_thumb_1_joint",
+    "right_hand_thumb_2_joint",
 )
-RIGHT_HAND_NAMES = tuple(name.replace("left_", "right_", 1) for name in LEFT_HAND_NAMES)
-ROBOT_MODEL_NAMES = (*G1_MUJOCO_NAMES, *LEFT_HAND_NAMES, *RIGHT_HAND_NAMES)
 
 
 class FakeRobotModel:
-    def __init__(self, joint_names: tuple[str, ...] = ROBOT_MODEL_NAMES) -> None:
+    def __init__(self, joint_names: tuple[str, ...] = PRODUCTION_G1_JOINT_NAMES) -> None:
         self.joint_names = list(joint_names)
         self.num_joints = len(self.joint_names)
         self.num_dofs = len(self.joint_names)
@@ -124,28 +158,51 @@ def test_builder_assembles_observed_and_desired_states_by_semantic_joint_name() 
     robot_model = FakeRobotModel()
     frame = TargetFrameBuilder(robot_model=robot_model).build(episode, 0, _token())
 
-    # The source body order is reversed, while the target RobotModel body order is canonical.
-    np.testing.assert_array_equal(frame["observation.state"][:29], np.arange(128.0, 99.0, -1.0))
-    np.testing.assert_array_equal(frame["action.wbc"][:29], np.arange(1128.0, 1099.0, -1.0))
+    # Pinocchio interleaves the left hand before the right arm and orders each
+    # hand index,middle,thumb. The source body order is independently reversed.
+    observed_body_by_name = dict(zip(episode.body_joint_names, episode.observed_body_q[0], strict=True))
+    desired_body_by_name = dict(zip(episode.body_joint_names, episode.desired_body_q[0], strict=True))
+    for name in G1_MUJOCO_NAMES:
+        target_index = PRODUCTION_G1_JOINT_NAMES.index(name)
+        assert frame["observation.state"][target_index] == observed_body_by_name[name]
+        assert frame["action.wbc"][target_index] == desired_body_by_name[name]
 
-    # Left DDS already uses the RobotModel's thumb,middle,index order.
-    np.testing.assert_array_equal(
-        frame["observation.state"][29:36],
-        [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0],
-    )
-    np.testing.assert_array_equal(
-        frame["action.wbc"][29:36],
-        [210.0, 211.0, 212.0, 213.0, 214.0, 215.0, 216.0],
-    )
-    # Right DDS is thumb,index,middle and must reorder into thumb,middle,index.
-    np.testing.assert_array_equal(
-        frame["observation.state"][36:],
-        [20.0, 21.0, 22.0, 25.0, 26.0, 23.0, 24.0],
-    )
-    np.testing.assert_array_equal(
-        frame["action.wbc"][36:],
-        [320.0, 321.0, 322.0, 325.0, 326.0, 323.0, 324.0],
-    )
+    observed_hands_by_name = {
+        "left_hand_thumb_0_joint": 10.0,
+        "left_hand_thumb_1_joint": 11.0,
+        "left_hand_thumb_2_joint": 12.0,
+        "left_hand_middle_0_joint": 13.0,
+        "left_hand_middle_1_joint": 14.0,
+        "left_hand_index_0_joint": 15.0,
+        "left_hand_index_1_joint": 16.0,
+        "right_hand_thumb_0_joint": 20.0,
+        "right_hand_thumb_1_joint": 21.0,
+        "right_hand_thumb_2_joint": 22.0,
+        "right_hand_index_0_joint": 23.0,
+        "right_hand_index_1_joint": 24.0,
+        "right_hand_middle_0_joint": 25.0,
+        "right_hand_middle_1_joint": 26.0,
+    }
+    desired_hands_by_name = {
+        "left_hand_thumb_0_joint": 210.0,
+        "left_hand_thumb_1_joint": 211.0,
+        "left_hand_thumb_2_joint": 212.0,
+        "left_hand_middle_0_joint": 213.0,
+        "left_hand_middle_1_joint": 214.0,
+        "left_hand_index_0_joint": 215.0,
+        "left_hand_index_1_joint": 216.0,
+        "right_hand_thumb_0_joint": 320.0,
+        "right_hand_thumb_1_joint": 321.0,
+        "right_hand_thumb_2_joint": 322.0,
+        "right_hand_index_0_joint": 323.0,
+        "right_hand_index_1_joint": 324.0,
+        "right_hand_middle_0_joint": 325.0,
+        "right_hand_middle_1_joint": 326.0,
+    }
+    for name, expected in observed_hands_by_name.items():
+        target_index = PRODUCTION_G1_JOINT_NAMES.index(name)
+        assert frame["observation.state"][target_index] == expected
+        assert frame["action.wbc"][target_index] == desired_hands_by_name[name]
 
     # Raw teleop values remain the unchanged desired DDS arrays.
     np.testing.assert_array_equal(frame["teleop.left_hand_joints"], episode.desired_left_hand[0])
@@ -241,9 +298,12 @@ def test_builder_accepts_encoder_row_views_but_owns_the_float64_output() -> None
 @pytest.mark.parametrize(
     ("robot_model", "message"),
     [
-        (FakeRobotModel((*ROBOT_MODEL_NAMES[:-1], "unexpected_joint")), "semantic joint set"),
-        (FakeRobotModel((*ROBOT_MODEL_NAMES[:-1], ROBOT_MODEL_NAMES[0])), "unique"),
-        (FakeRobotModel(ROBOT_MODEL_NAMES[:-1]), "exactly 43"),
+        (FakeRobotModel((*PRODUCTION_G1_JOINT_NAMES[:-1], "unexpected_joint")), "semantic joint set"),
+        (
+            FakeRobotModel((*PRODUCTION_G1_JOINT_NAMES[:-1], PRODUCTION_G1_JOINT_NAMES[0])),
+            "unique",
+        ),
+        (FakeRobotModel(PRODUCTION_G1_JOINT_NAMES[:-1]), "exactly 43"),
     ],
 )
 def test_builder_rejects_robot_models_without_the_exact_semantic_joint_contract(
