@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 import hashlib
+import json
 import math
 import numbers
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import string
 from typing import Any
 
 import numpy as np
@@ -229,6 +231,12 @@ def _default_lerobot_dataset_factory() -> Callable[..., Any]:
     return LeRobotDataset
 
 
+def _default_snapshot_downloader() -> Callable[..., str]:
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download
+
+
 def _default_lerobot_cache_base() -> Path:
     """Mirror LeRobot's Hugging Face cache-base convention without importing LeRobot."""
     lerobot_home = os.getenv("HF_LEROBOT_HOME")
@@ -248,12 +256,177 @@ def _revision_scoped_root(cache_base: str | Path, repo_id: str, revision: str) -
     return base / f"repo-{repository_identity}" / f"revision-{revision}"
 
 
+def _verify_snapshot_location(downloaded: object, scoped_root: Path) -> None:
+    try:
+        downloaded_root = Path(downloaded).expanduser().resolve()
+    except TypeError as error:
+        raise ValueError("snapshot downloader must return the revision-scoped root") from error
+    if downloaded_root != scoped_root.resolve():
+        raise ValueError("snapshot downloader must return the revision-scoped root")
+
+
+def _reject_duplicate_metadata_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate metadata key: {key}")
+        result[key] = value
+    return result
+
+
+def _regular_file_under_root(scoped_root: Path, relative_path: PurePosixPath) -> Path:
+    candidate = scoped_root.joinpath(*relative_path.parts)
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(scoped_root.resolve())
+    except (FileNotFoundError, OSError, ValueError) as error:
+        message = f"materialized file is missing or outside revision-scoped root: {relative_path}"
+        raise ValueError(message) from error
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ValueError(f"materialized file is not a regular file: {relative_path}")
+    return candidate
+
+
+def _read_prefetch_metadata(scoped_root: Path) -> tuple[int, str, str, tuple[str, ...]]:
+    info_path = _regular_file_under_root(scoped_root, PurePosixPath("meta/info.json"))
+    try:
+        with info_path.open(encoding="utf-8") as stream:
+            info = json.load(stream, object_pairs_hook=_reject_duplicate_metadata_keys)
+    except json.JSONDecodeError as error:
+        raise ValueError("metadata info.json must contain valid JSON") from error
+    if not isinstance(info, dict):
+        raise ValueError("metadata info.json must contain a JSON object")
+
+    for field_name in ("chunks_size", "data_path", "video_path", "features"):
+        if field_name not in info:
+            raise ValueError(f"metadata is missing required field {field_name}")
+
+    chunks_size = info["chunks_size"]
+    if isinstance(chunks_size, bool) or not isinstance(chunks_size, int) or chunks_size <= 0:
+        raise ValueError("metadata chunks_size must be a positive integer")
+    data_path = info["data_path"]
+    if not isinstance(data_path, str) or not data_path:
+        raise ValueError("metadata data_path must be a nonempty string")
+    video_path = info["video_path"]
+    if not isinstance(video_path, str) or not video_path:
+        raise ValueError("metadata video_path must be a nonempty string")
+
+    features = info["features"]
+    if not isinstance(features, dict) or not features:
+        raise ValueError("metadata features must be a nonempty mapping")
+    video_keys: list[str] = []
+    for feature_key, feature in features.items():
+        if not isinstance(feature_key, str) or not feature_key:
+            raise ValueError("metadata features keys must be nonempty strings")
+        if not isinstance(feature, dict):
+            raise ValueError(f"metadata features entry {feature_key!r} must be a mapping")
+        dtype = feature.get("dtype")
+        if not isinstance(dtype, str) or not dtype:
+            raise ValueError(f"metadata features entry {feature_key!r} dtype must be a nonempty string")
+        if dtype == "video":
+            video_keys.append(feature_key)
+    return chunks_size, data_path, video_path, tuple(video_keys)
+
+
+def _render_metadata_path(
+    template: str,
+    *,
+    field_name: str,
+    required_fields: frozenset[str],
+    values: Mapping[str, object],
+) -> PurePosixPath:
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError as error:
+        raise ValueError(f"metadata {field_name} template is malformed") from error
+
+    fields: list[str] = []
+    for _, template_field, format_spec, conversion in parsed:
+        if template_field is None:
+            continue
+        if template_field not in required_fields or conversion is not None or "{" in format_spec:
+            raise ValueError(f"metadata {field_name} template contains unsupported fields")
+        fields.append(template_field)
+    if len(fields) != len(set(fields)) or set(fields) != required_fields:
+        raise ValueError(f"metadata {field_name} template must contain each required field exactly once")
+
+    try:
+        rendered = template.format(**values)
+    except (IndexError, KeyError, ValueError) as error:
+        raise ValueError(f"metadata {field_name} template cannot be rendered") from error
+    relative_path = PurePosixPath(rendered)
+    if (
+        not rendered
+        or "\\" in rendered
+        or relative_path.is_absolute()
+        or not relative_path.parts
+        or ".." in relative_path.parts
+    ):
+        raise ValueError(f"metadata {field_name} template must render a safe relative path")
+    return relative_path
+
+
+def _selected_episode_paths(scoped_root: Path, episode_id: int) -> tuple[PurePosixPath, ...]:
+    chunks_size, data_template, video_template, video_keys = _read_prefetch_metadata(scoped_root)
+    template_values: dict[str, object] = {
+        "episode_chunk": episode_id // chunks_size,
+        "episode_index": episode_id,
+    }
+    data_path = _render_metadata_path(
+        data_template,
+        field_name="data_path",
+        required_fields=frozenset({"episode_chunk", "episode_index"}),
+        values=template_values,
+    )
+    if data_path.suffix != ".parquet":
+        raise ValueError("metadata data_path template must render a parquet path")
+
+    paths = [data_path]
+    for video_key in video_keys:
+        paths.append(
+            _render_metadata_path(
+                video_template,
+                field_name="video_path",
+                required_fields=frozenset({"episode_chunk", "episode_index", "video_key"}),
+                values={**template_values, "video_key": video_key},
+            )
+        )
+    if len(paths) != len(set(paths)):
+        raise ValueError("metadata templates render duplicate selected episode paths")
+    return tuple(paths)
+
+
+def _prefetch_exact_revision(
+    *,
+    source_spec: SourceSpec,
+    episode_id: int,
+    scoped_root: Path,
+    snapshot_downloader: Callable[..., object],
+) -> None:
+    common_kwargs = {
+        "repo_id": source_spec.repo_id,
+        "repo_type": "dataset",
+        "revision": source_spec.revision,
+        "local_dir": scoped_root,
+    }
+    downloaded = snapshot_downloader(**common_kwargs, allow_patterns=["meta/**"])
+    _verify_snapshot_location(downloaded, scoped_root)
+
+    selected_paths = _selected_episode_paths(scoped_root, episode_id)
+    selected_patterns = [str(path) for path in selected_paths]
+    downloaded = snapshot_downloader(**common_kwargs, allow_patterns=selected_patterns)
+    _verify_snapshot_location(downloaded, scoped_root)
+    for relative_path in selected_paths:
+        _regular_file_under_root(scoped_root, relative_path)
+
+
 def load_dex3_episode(
     source_spec: SourceSpec,
     episode_id: int,
     root: str | Path | None = None,
     *,
     dataset_factory: Callable[..., Any] | None = None,
+    snapshot_downloader: Callable[..., object] | None = None,
 ) -> CanonicalEpisode:
     """Load one selected episode from an approved, revision-pinned Dex3 source."""
     if not isinstance(source_spec, SourceSpec) or not source_spec.approved:
@@ -269,6 +442,13 @@ def load_dex3_episode(
 
     cache_base = _default_lerobot_cache_base() if root is None else root
     scoped_root = _revision_scoped_root(cache_base, source_spec.repo_id, source_spec.revision)
+    downloader = _default_snapshot_downloader() if snapshot_downloader is None else snapshot_downloader
+    _prefetch_exact_revision(
+        source_spec=source_spec,
+        episode_id=episode_id,
+        scoped_root=scoped_root,
+        snapshot_downloader=downloader,
+    )
     factory = _default_lerobot_dataset_factory() if dataset_factory is None else dataset_factory
     dataset = factory(
         repo_id=source_spec.repo_id,

@@ -1,5 +1,6 @@
 from dataclasses import fields
 import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -71,6 +72,11 @@ CANONICAL_ARRAY_FIELDS = (
     "desired_left_hand",
     "desired_right_hand",
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_lerobot_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot-cache"))
 
 
 def _adapter_kwargs(n: int = 3) -> dict[str, object]:
@@ -482,6 +488,71 @@ class FakeDataset:
         raise AssertionError("top-level LeRobotDataset iteration may decode video or task strings")
 
 
+def _metadata_info(**changes: object) -> dict[str, object]:
+    info: dict[str, object] = {
+        "chunks_size": 1000,
+        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "features": {
+            "observation.state": {"dtype": "float32", "names": list(FEATURE_NAMES)},
+            "action": {"dtype": "float32", "names": list(FEATURE_NAMES)},
+            "timestamp": {"dtype": "float32"},
+            "task_index": {"dtype": "int64"},
+            "frame_index": {"dtype": "int64"},
+            "episode_index": {"dtype": "int64"},
+            "observation.images.cam_left_high": {"dtype": "video"},
+            "observation.images.cam_left_wrist": {"dtype": "video"},
+            "observation.images.cam_right_wrist": {"dtype": "video"},
+            "observation.images.cam_right_high": {"dtype": "video"},
+        },
+    }
+    info.update(changes)
+    return info
+
+
+class FakeSnapshotDownloader:
+    def __init__(
+        self,
+        *,
+        info: dict[str, object] | None = None,
+        raw_info: str | None = None,
+        missing_patterns: tuple[str, ...] = (),
+        wrong_return_call: int | None = None,
+    ) -> None:
+        self.info = _metadata_info() if info is None else info
+        self.raw_info = raw_info
+        self.missing_patterns = missing_patterns
+        self.wrong_return_call = wrong_return_call
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, **kwargs: object) -> str:
+        self.calls.append(kwargs)
+        local_dir = Path(kwargs["local_dir"])
+        allow_patterns = kwargs["allow_patterns"]
+        if len(self.calls) == 1:
+            assert allow_patterns == ["meta/**"]
+            info_path = local_dir / "meta/info.json"
+            info_path.parent.mkdir(parents=True, exist_ok=True)
+            text = self.raw_info if self.raw_info is not None else json.dumps(self.info)
+            info_path.write_text(text)
+        else:
+            assert isinstance(allow_patterns, list)
+            for pattern in allow_patterns:
+                if pattern in self.missing_patterns:
+                    continue
+                path = local_dir / pattern
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"pinned")
+        if self.wrong_return_call == len(self.calls):
+            return str(local_dir.parent / "wrong-snapshot")
+        return str(local_dir)
+
+
+def _load_episode(*args: object, snapshot_downloader: FakeSnapshotDownloader | None = None, **kwargs: object):
+    downloader = FakeSnapshotDownloader() if snapshot_downloader is None else snapshot_downloader
+    return load_dex3_episode(*args, snapshot_downloader=downloader, **kwargs)
+
+
 def _source_spec(**changes: object) -> SourceSpec:
     values = {
         "approved": True,
@@ -529,12 +600,245 @@ def _recording_factory(dataset: FakeDataset, calls: list[dict[str, object]]):
     return factory
 
 
+EXPECTED_EPISODE_PATHS = [
+    "data/chunk-000/episode_000001.parquet",
+    "videos/chunk-000/observation.images.cam_left_high/episode_000001.mp4",
+    "videos/chunk-000/observation.images.cam_left_wrist/episode_000001.mp4",
+    "videos/chunk-000/observation.images.cam_right_wrist/episode_000001.mp4",
+    "videos/chunk-000/observation.images.cam_right_high/episode_000001.mp4",
+]
+
+
+def test_loader_prefetches_exact_commit_files_before_cold_cache_factory(tmp_path: Path) -> None:
+    downloader = FakeSnapshotDownloader()
+    factory_calls: list[dict[str, object]] = []
+
+    def pinned_cold_cache_factory(**kwargs: object) -> FakeDataset:
+        factory_calls.append(kwargs)
+        assert len(downloader.calls) == 2, "factory was called before exact-revision prefetch completed"
+        root = Path(kwargs["root"])
+        for relative_path in EXPECTED_EPISODE_PATHS:
+            if not (root / relative_path).is_file():
+                raise ValueError("InvalidVersion: pinned SHA reached LeRobot's cold-cache compatibility path")
+        return FakeDataset(_rows())
+
+    episode = load_dex3_episode(
+        _source_spec(),
+        1,
+        root=tmp_path,
+        dataset_factory=pinned_cold_cache_factory,
+        snapshot_downloader=downloader,
+    )
+
+    assert episode.source_episode_id == 1
+    assert len(factory_calls) == 1
+
+
+def test_loader_prefetch_uses_exact_two_revision_pinned_snapshot_calls(tmp_path: Path) -> None:
+    downloader = FakeSnapshotDownloader()
+
+    load_dex3_episode(
+        _source_spec(),
+        1,
+        root=tmp_path,
+        dataset_factory=lambda **_: FakeDataset(_rows()),
+        snapshot_downloader=downloader,
+    )
+
+    scoped_root = (
+        tmp_path / f"repo-{hashlib.sha256(b'unitreerobotics/synthetic-dex3').hexdigest()}" / f"revision-{'b' * 40}"
+    )
+    assert downloader.calls == [
+        {
+            "repo_id": "unitreerobotics/synthetic-dex3",
+            "repo_type": "dataset",
+            "revision": "b" * 40,
+            "local_dir": scoped_root,
+            "allow_patterns": ["meta/**"],
+        },
+        {
+            "repo_id": "unitreerobotics/synthetic-dex3",
+            "repo_type": "dataset",
+            "revision": "b" * 40,
+            "local_dir": scoped_root,
+            "allow_patterns": EXPECTED_EPISODE_PATHS,
+        },
+    ]
+    assert all("000000" not in pattern and "000002" not in pattern for pattern in EXPECTED_EPISODE_PATHS)
+
+
+@pytest.mark.parametrize("missing_field", ["chunks_size", "data_path", "video_path", "features"])
+def test_loader_prefetch_rejects_missing_metadata_fields(tmp_path: Path, missing_field: str) -> None:
+    info = _metadata_info()
+    del info[missing_field]
+
+    with pytest.raises(ValueError, match=rf"metadata.*{missing_field}"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=FakeSnapshotDownloader(info=info),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("chunks_size", 0),
+        ("chunks_size", -1),
+        ("chunks_size", True),
+        ("chunks_size", 1000.0),
+        ("data_path", None),
+        ("video_path", 7),
+        ("features", []),
+        ("features", {"camera": []}),
+        ("features", {"camera": {}}),
+        ("features", {"camera": {"dtype": 1}}),
+    ],
+)
+def test_loader_prefetch_rejects_malformed_metadata_fields(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+) -> None:
+    info = _metadata_info(**{field_name: value})
+
+    with pytest.raises(ValueError, match=rf"metadata.*{field_name}"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=FakeSnapshotDownloader(info=info),
+        )
+
+
+def test_loader_prefetch_rejects_duplicate_json_metadata_keys(tmp_path: Path) -> None:
+    raw_info = json.dumps(_metadata_info()).replace(
+        '"chunks_size": 1000',
+        '"chunks_size": 1000, "chunks_size": 1000',
+        1,
+    )
+
+    with pytest.raises(ValueError, match="duplicate metadata key.*chunks_size"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=FakeSnapshotDownloader(raw_info=raw_info),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "template"),
+    [
+        ("data_path", "data/episode_{episode_index:06d}.parquet"),
+        (
+            "data_path",
+            "data/{episode_chunk:03d}/episode_{episode_index:06d}_{episode_index:06d}.parquet",
+        ),
+        ("data_path", "data/{unknown}/episode_{episode_index:06d}.parquet"),
+        ("data_path", "data/{episode_chunk/episode_{episode_index}.parquet"),
+        ("video_path", "videos/{episode_chunk:03d}/episode_{episode_index:06d}.mp4"),
+        (
+            "video_path",
+            "videos/{episode_chunk:03d}/{video_key}/{video_key}/episode_{episode_index:06d}.mp4",
+        ),
+        ("video_path", "videos/{unknown}/{video_key}/episode_{episode_index:06d}.mp4"),
+        ("video_path", "videos/{episode_chunk}/{video_key/{episode_index}.mp4"),
+    ],
+)
+def test_loader_prefetch_rejects_missing_duplicate_unknown_or_malformed_template_fields(
+    tmp_path: Path,
+    field_name: str,
+    template: str,
+) -> None:
+    info = _metadata_info(**{field_name: template})
+
+    with pytest.raises(ValueError, match=rf"metadata {field_name} template"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=FakeSnapshotDownloader(info=info),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "template"),
+    [
+        ("data_path", "/absolute/chunk-{episode_chunk}/episode_{episode_index}.parquet"),
+        ("data_path", "data/../../escape-{episode_chunk}-{episode_index}.parquet"),
+        (
+            "video_path",
+            "/absolute/{episode_chunk}/{video_key}/episode_{episode_index}.mp4",
+        ),
+        (
+            "video_path",
+            "videos/../../../escape-{episode_chunk}-{video_key}-{episode_index}.mp4",
+        ),
+    ],
+)
+def test_loader_prefetch_rejects_absolute_or_escaping_rendered_paths(
+    tmp_path: Path,
+    field_name: str,
+    template: str,
+) -> None:
+    info = _metadata_info(**{field_name: template})
+
+    with pytest.raises(ValueError, match="must render a safe relative path"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=FakeSnapshotDownloader(info=info),
+        )
+
+
+@pytest.mark.parametrize("missing_path", EXPECTED_EPISODE_PATHS)
+def test_loader_prefetch_rejects_missing_materialized_episode_files(
+    tmp_path: Path,
+    missing_path: str,
+) -> None:
+    downloader = FakeSnapshotDownloader(missing_patterns=(missing_path,))
+
+    with pytest.raises(ValueError, match=rf"materialized file.*{missing_path}"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=downloader,
+        )
+
+
+@pytest.mark.parametrize("wrong_return_call", [1, 2])
+def test_loader_prefetch_rejects_wrong_downloader_return_location(
+    tmp_path: Path,
+    wrong_return_call: int,
+) -> None:
+    downloader = FakeSnapshotDownloader(wrong_return_call=wrong_return_call)
+
+    with pytest.raises(ValueError, match="snapshot downloader must return the revision-scoped root"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=downloader,
+        )
+
+
 def test_loader_uses_exact_pinned_lerobot_constructor_and_adapts_torch_like_rows() -> None:
     calls: list[dict[str, object]] = []
     rows = _rows()
     dataset = FakeDataset(rows)
 
-    episode = load_dex3_episode(
+    episode = _load_episode(
         _source_spec(),
         1,
         root=Path("/tmp/pinned-dex3"),
@@ -612,7 +916,7 @@ def test_loader_scopes_roots_by_both_repo_identity_and_full_revision(tmp_path: P
         _source_spec(repo_id="other/repository", revision="a" * 40),
     )
     for source in sources:
-        load_dex3_episode(source, 1, root=tmp_path, dataset_factory=factory)
+        _load_episode(source, 1, root=tmp_path, dataset_factory=factory)
 
     roots = [call["root"] for call in calls]
     assert len(set(roots)) == 3
@@ -635,7 +939,7 @@ def test_loader_repo_identity_cannot_escape_or_add_segments_to_cache_base(
     calls: list[dict[str, object]] = []
     source = _source_spec(repo_id=repo_id)
 
-    load_dex3_episode(
+    _load_episode(
         source,
         1,
         root=tmp_path,
@@ -655,7 +959,7 @@ def test_loader_none_root_uses_lerobot_cache_convention_without_importing_lerobo
     calls: list[dict[str, object]] = []
     monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path))
 
-    load_dex3_episode(
+    _load_episode(
         _source_spec(),
         1,
         dataset_factory=_recording_factory(FakeDataset(_rows()), calls),
@@ -688,13 +992,13 @@ def test_loader_rejects_dataset_or_metadata_revision_mismatch(
     )
 
     with pytest.raises(ValueError, match=message):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 def test_loader_iterates_only_raw_hf_dataset_rows() -> None:
     dataset = FakeDataset(_rows())
 
-    episode = load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+    episode = _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
     assert episode.source_episode_id == 1
     assert dataset.top_level_iteration_attempts == 0
@@ -705,7 +1009,7 @@ def test_loader_rejects_missing_raw_hf_dataset() -> None:
     del dataset.hf_dataset
 
     with pytest.raises(ValueError, match="dataset.hf_dataset must be a non-mapping iterable of raw rows"):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 @pytest.mark.parametrize("hf_dataset", [None, "rows", b"rows", {"frame": 0}, 7])
@@ -714,7 +1018,7 @@ def test_loader_rejects_malformed_raw_hf_dataset(hf_dataset: object) -> None:
     dataset.hf_dataset = hf_dataset
 
     with pytest.raises(ValueError, match="dataset.hf_dataset must be a non-mapping iterable of raw rows"):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 @pytest.mark.parametrize("total_episodes", [2, 4, True, 3.0])
@@ -722,7 +1026,7 @@ def test_loader_rejects_total_episode_metadata_mismatch(total_episodes: object) 
     dataset = FakeDataset(_rows(), total_episodes=total_episodes)
 
     with pytest.raises(ValueError, match="total_episodes must exactly match pinned episode_count"):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 @pytest.mark.parametrize("fps", [29, 30.5, True, "30", np.nan])
@@ -730,7 +1034,7 @@ def test_loader_rejects_non_30_hz_metadata(fps: object) -> None:
     dataset = FakeDataset(_rows(), fps=fps)
 
     with pytest.raises(ValueError, match="dataset metadata fps must be numeric 30"):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 @pytest.mark.parametrize("feature_key", ["observation.state", "action"])
@@ -743,7 +1047,7 @@ def test_loader_rejects_mismatched_feature_names(feature_key: str) -> None:
     dataset = FakeDataset(_rows(), features=features)
 
     with pytest.raises(ValueError, match=rf"{feature_key} metadata must contain the exact Dex3 feature names"):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 @pytest.mark.parametrize(
@@ -760,21 +1064,21 @@ def test_loader_rejects_undocumented_feature_metadata_schemas(features: object) 
     dataset.meta.features = features
 
     with pytest.raises(ValueError, match="dataset meta.features"):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 def test_loader_rejects_episode_id_remapped_to_zero() -> None:
     dataset = FakeDataset(_rows(episode_id=0))
 
     with pytest.raises(ValueError, match="source episode_index 0 does not match requested episode 1"):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 def test_loader_rejects_no_requested_rows() -> None:
     dataset = FakeDataset([])
 
     with pytest.raises(ValueError, match="no rows for requested episode 1"):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 @pytest.mark.parametrize(
@@ -795,7 +1099,7 @@ def test_loader_rejects_duplicate_gapped_or_out_of_order_frame_indices(
     dataset = FakeDataset(rows)
 
     with pytest.raises(ValueError, match=message):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 @pytest.mark.parametrize(
@@ -808,7 +1112,7 @@ def test_loader_requires_every_documented_row_key(missing_key: str) -> None:
     dataset = FakeDataset(rows)
 
     with pytest.raises(ValueError, match=rf"row 0 is missing required key {missing_key}"):
-        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 @pytest.mark.parametrize(
@@ -829,4 +1133,4 @@ def test_loader_rejects_unapproved_unpinned_or_ineligible_sources(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        load_dex3_episode(source_spec, episode_id, dataset_factory=lambda **_: FakeDataset(_rows()))
+        _load_episode(source_spec, episode_id, dataset_factory=lambda **_: FakeDataset(_rows()))
