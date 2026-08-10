@@ -15,7 +15,11 @@ from gear_sonic.data.unitree_conversion.contracts import (
     SourceLock,
 )
 from gear_sonic.data.unitree_conversion.pipeline import (
+    ClassifiedFailure,
+    DiagnosticIdentity,
     PipelineComponents,
+    RepositoryPreflight,
+    _write_diagnostic,
     run_dex3_pipeline,
     run_inspire_diagnostics,
 )
@@ -37,6 +41,7 @@ class FakeComponents:
     def build(self) -> PipelineComponents:
         return PipelineComponents(
             validate_artifacts=self.validate_artifacts,
+            validate_source_metadata=self.validate_source_metadata,
             preflight_repository=self.preflight_repository,
             make_stage_identity=self.make_stage_identity,
             resume_stage=self.resume_stage,
@@ -49,6 +54,7 @@ class FakeComponents:
             write_stage=self.write_stage,
             merge_stages=self.merge_stages,
             diagnose_inspire_episode=self.diagnose_inspire_episode,
+            make_diagnostic_identity=self.make_diagnostic_identity,
             write_diagnostic=self.write_diagnostic,
         )
 
@@ -56,7 +62,12 @@ class FakeComponents:
         self.calls.append(("artifacts", cache_dir))
         return SimpleNamespace(lock=lock)
 
-    def preflight_repository(self, source, episode_ids, cache_dir, kind):
+    def validate_source_metadata(self, source, episode_ids, cache_dir, kind):
+        self.calls.append(("metadata", source.repo_id, episode_ids, kind))
+        return SimpleNamespace(source=source, episode_ids=episode_ids)
+
+    def preflight_repository(self, source, episode_ids, metadata, cache_dir, kind):
+        assert metadata.source is source
         self.calls.append(("preflight", source.repo_id, episode_ids, kind))
         return SimpleNamespace(source=source, episode_ids=episode_ids)
 
@@ -123,7 +134,12 @@ class FakeComponents:
             },
         )
 
-    def write_diagnostic(self, output_root, report):
+    def make_diagnostic_identity(self, lock_sha256, source, episode_id, preflight):
+        self.calls.append(("diagnostic_identity", episode_id))
+        return (lock_sha256, source.repo_id, episode_id)
+
+    def write_diagnostic(self, output_root, identity, report):
+        assert identity[2] == report.source_episode_id
         self.calls.append(("write_diagnostic", report.source_episode_id))
         path = output_root / f"episode-{report.source_episode_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +180,7 @@ def test_dex3_pipeline_preserves_required_order(smoke_lock, tmp_path: Path) -> N
     )
 
     names = [call[0] for call in fake.calls]
-    assert names[:2] == ["artifacts", "preflight"]
+    assert names[:3] == ["artifacts", "metadata", "preflight"]
     for episode_id in (0, 78, 155, 233, 310):
         indices = {
             name: fake.calls.index((name, episode_id))
@@ -212,9 +228,68 @@ def test_episode_failure_is_classified_and_prevents_merge(smoke_lock, tmp_path: 
     assert report.validated_episode_count == 4
     assert report.failed_episode_count == 1
     assert report.status_counts == {"failed": 1, "validated": 4}
+    assert report.episode_reports[1].error_class == "source_schema_error"
     assert report.target_dataset_paths == ()
     assert all(call[0] != "merge" for call in fake.calls)
     assert fake.adapter_ids == [0, 155, 233, 310]
+
+
+def test_failed_encoder_reports_attempted_invocations(smoke_lock, tmp_path: Path) -> None:
+    fake = FakeComponents()
+
+    class FailingEncoder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def encode(self, _tensor):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("inference failed")
+            return object()
+
+    def encode_twice(encoder, episode):
+        encoder.encode(object())
+        encoder.encode(object())
+        raise AssertionError("unreachable")
+
+    components = replace(
+        fake.build(),
+        encoder_factory=lambda _artifacts: FailingEncoder(),
+        encode_episode=encode_twice,
+    )
+
+    report = run_dex3_pipeline(
+        lock=smoke_lock,
+        output_root=tmp_path,
+        components=components,
+        smoke=True,
+    )
+
+    assert report.episode_reports[0].error_class == "encoder_contract_error"
+    assert report.episode_reports[0].encoder_invocation_count == 2
+
+
+def test_preflight_failure_is_episode_classified_and_later_episodes_continue(smoke_lock, tmp_path: Path) -> None:
+    fake = FakeComponents()
+    original = fake.preflight_repository
+
+    def fail_one(source, episode_ids, metadata, cache_dir, kind):
+        context = original(source, episode_ids, metadata, cache_dir, kind)
+        return RepositoryPreflight(
+            context=context,
+            episode_failures={78: ClassifiedFailure("timeline_error", "required primary camera frame mismatch")},
+        )
+
+    report = run_dex3_pipeline(
+        lock=smoke_lock,
+        output_root=tmp_path,
+        components=replace(fake.build(), preflight_repository=fail_one),
+        smoke=True,
+    )
+
+    assert report.episode_reports[1].error_class == "timeline_error"
+    assert fake.adapter_ids == [0, 155, 233, 310]
+    assert report.target_dataset_paths == ()
 
 
 def test_inspire_smoke_never_constructs_encoder(smoke_lock, tmp_path: Path) -> None:
@@ -236,7 +311,41 @@ def test_inspire_smoke_never_constructs_encoder(smoke_lock, tmp_path: Path) -> N
     assert report.encoder_invocation_count == 0
     assert report.target_dataset_paths == ()
     assert report.gate_reasons == frozenset(INSPIRE_GATE_REASONS)
+    assert report.succeeded is True
     assert fake.encoder_constructions == 0
+
+
+def test_diagnostic_stage_is_immutable_and_provenance_bound(tmp_path: Path) -> None:
+    identity = DiagnosticIdentity(
+        source_repo_id="unitreerobotics/inspire",
+        source_revision="1" * 40,
+        source_episode_id=7,
+        source_file_sha256={"data/episode.parquet": "2" * 64},
+        source_lock_sha256="3" * 64,
+        diagnostic_contract_sha256="4" * 64,
+    )
+    report = SimpleNamespace(
+        source_repo_id=identity.source_repo_id,
+        source_revision=identity.source_revision,
+        source_episode_id=identity.source_episode_id,
+        to_dict=lambda: {"status": "blocked_unverified", "value": 1},
+    )
+
+    first = _write_diagnostic(tmp_path, identity, report)
+    second = _write_diagnostic(tmp_path, identity, report)
+
+    assert first == second
+    assert first.name == "diagnostic.json"
+    assert (first.parent / "identity.json").is_file()
+    assert (first.parent / "checksums.sha256").is_file()
+    changed = SimpleNamespace(
+        source_repo_id=identity.source_repo_id,
+        source_revision=identity.source_revision,
+        source_episode_id=identity.source_episode_id,
+        to_dict=lambda: {"status": "blocked_unverified", "value": 2},
+    )
+    with pytest.raises(FileExistsError, match="immutable"):
+        _write_diagnostic(tmp_path, identity, changed)
 
 
 def test_smoke_lock_rejects_full_mode_and_unapproved_sources(smoke_lock, tmp_path: Path) -> None:
@@ -252,6 +361,26 @@ def test_smoke_lock_rejects_full_mode_and_unapproved_sources(smoke_lock, tmp_pat
     unapproved = replace(smoke_lock.dex3, approved=False)
     bad_lock = replace(smoke_lock, sources=(unapproved, smoke_lock.inspire))
     with pytest.raises(ValueError, match="not approved"):
+        run_dex3_pipeline(
+            lock=bad_lock,
+            output_root=tmp_path,
+            components=fake.build(),
+            smoke=True,
+        )
+
+    unrelated_unapproved = replace(smoke_lock.inspire, approved=False)
+    bad_lock = replace(smoke_lock, sources=(smoke_lock.dex3, unrelated_unapproved))
+    with pytest.raises(ValueError, match="not approved"):
+        run_dex3_pipeline(
+            lock=bad_lock,
+            output_root=tmp_path,
+            components=fake.build(),
+            smoke=True,
+        )
+
+    wrong_cohort = replace(smoke_lock.dex3, episodes=(0, 1, 2, 3, 4))
+    bad_lock = replace(smoke_lock, sources=(wrong_cohort, smoke_lock.inspire))
+    with pytest.raises(ValueError, match="deterministic cohort"):
         run_dex3_pipeline(
             lock=bad_lock,
             output_root=tmp_path,

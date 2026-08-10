@@ -34,18 +34,20 @@ class ConvertConfig:
     workers: int = 1
 
 
-def _validate_config(config: ConvertConfig) -> None:
+def _validate_config(config: ConvertConfig, snapshot=None):
     if type(config.workers) is not int or config.workers < 1:
         raise ValueError("workers must be an integer of at least one")
-    snapshot = load_source_lock_snapshot(config.source_lock)
+    if snapshot is None:
+        snapshot = load_source_lock_snapshot(config.source_lock)
     if snapshot.lock.scope == "smoke" and not config.smoke:
         raise ValueError("a scope: smoke source lock requires --smoke")
+    return snapshot
 
 
 def run(config: ConvertConfig) -> tuple[PipelineReport, Path]:
     """Execute one source-specific mode and persist its canonical report."""
-    _validate_config(config)
     snapshot = load_source_lock_snapshot(config.source_lock)
+    snapshot = _validate_config(config, snapshot)
     if config.kind == "dex3":
         report_root = config.output_root
         report = run_dex3_pipeline(
@@ -73,7 +75,7 @@ def main() -> None:
     config = tyro.cli(ConvertConfig)
     report, report_path = run(config)
     print(json.dumps({"report_path": str(report_path)}, sort_keys=True))
-    if config.kind == "dex3" and not report.succeeded:
+    if not report.succeeded:
         raise SystemExit(1)
 
 
