@@ -41,6 +41,19 @@ _STAGE_SCHEMA_VERSION = "unitree-sonic-stage-v1"
 _MERGE_SCHEMA_VERSION = "unitree-sonic-merge-v1"
 _VIDEO_KEY_PATTERN = re.compile(r"^observation\.images\.[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _REPO_PART_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_CANONICAL_DATA_PATH = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+_CANONICAL_VIDEO_PATH = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+_CONVERSION_SCRIPT_CONFIG = {"unitree_conversion_schema": _MERGE_SCHEMA_VERSION}
+_VIDEO_FEATURE_INFO = {
+    "video.height": 480,
+    "video.width": 640,
+    "video.codec": "h264",
+    "video.pix_fmt": "yuv420p",
+    "video.is_depth_map": False,
+    "video.fps": 50,
+    "video.channels": 3,
+    "has_audio": False,
+}
 
 
 def _canonical_json(value: object) -> bytes:
@@ -405,6 +418,36 @@ def _copy_bound_file(source: Path, destination: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _replace_with_bound_file(source: StagedVideoArtifact, destination: Path) -> None:
+    """Atomically replace an exporter video with its checksum-bound stage artifact."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with _open_bound_file(source.path) as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+                size += len(block)
+                view = memoryview(block)
+                while view:
+                    written = os.write(descriptor, view)
+                    view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        if digest.hexdigest() != source.sha256 or size != source.size:
+            raise ValueError("staged video changed during immutable publication copy")
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if os.path.lexists(temporary):
+            temporary.unlink()
+
+
 def _inspect_bound_video(path: Path, *, expected_sha256: str, field_name: str) -> tuple[int, tuple[int, int]]:
     with _open_bound_file(path) as stream:
         if _hash_stream(stream) != expected_sha256:
@@ -413,6 +456,34 @@ def _inspect_bound_video(path: Path, *, expected_sha256: str, field_name: str) -
         if _hash_stream(stream) != expected_sha256:
             raise ValueError(f"{field_name} checksum differs after decode")
         return inspection
+
+
+def _inspect_bound_video_media_info(path: Path, *, expected_sha256: str) -> dict[str, object]:
+    """Read the LeRobot video-info fields from one checksum-bound video inode."""
+    try:
+        with _open_bound_file(path) as stream:
+            if _hash_stream(stream) != expected_sha256:
+                raise ValueError("exported video checksum differs before media-info inspection")
+            with av.open(stream, mode="r") as container:
+                video_streams = tuple(container.streams.video)
+                if len(video_streams) != 1:
+                    raise ValueError("exported video media info requires exactly one video stream")
+                video = video_streams[0]
+                info = {
+                    "video.height": int(video.height),
+                    "video.width": int(video.width),
+                    "video.codec": video.codec.canonical_name,
+                    "video.pix_fmt": video.pix_fmt,
+                    "video.is_depth_map": False,
+                    "video.fps": int(video.base_rate),
+                    "video.channels": 3 if video.pix_fmt == "yuv420p" else None,
+                    "has_audio": bool(container.streams.audio),
+                }
+            if _hash_stream(stream) != expected_sha256:
+                raise ValueError("exported video checksum differs after media-info inspection")
+            return info
+    except av.error.FFmpegError as error:
+        raise ValueError("exported video media info is unreadable") from error
 
 
 def _write_file(path: Path, data: bytes) -> None:
@@ -1160,21 +1231,20 @@ def merge_stages(
     temp = Path(tempfile.mkdtemp(prefix=f".{final.name}.", dir=final.parent))
     temp.rmdir()
     try:
-        if merge_backend is None:
-            backend = _default_merge_backend
-            validator = _validate_gr00t_output
-        else:
-            if final_validator is None:
-                raise ValueError("injected merge_backend requires an independent final_validator")
-            backend = merge_backend
-            validator = final_validator
+        backend = _default_merge_backend if merge_backend is None else merge_backend
         backend(temp, episodes, tasks)
-        report = validator(temp, episodes, tasks)
+        report = _validate_gr00t_output(temp, episodes, tasks)
         if not isinstance(report, MergeVerification):
-            raise ValueError("final validator must return a MergeVerification")
+            raise ValueError("built-in final validator must return a MergeVerification")
         actual_validation = _verification_to_dict(report)
         if actual_validation != expected_validation:
             raise ValueError("merge backend verification differs from exact requested dataset")
+        if final_validator is not None:
+            hook_report = final_validator(temp, episodes, tasks)
+            if not isinstance(hook_report, MergeVerification):
+                raise ValueError("additional final validation hook must return a MergeVerification")
+            if _verification_to_dict(hook_report) != expected_validation:
+                raise ValueError("additional final validation hook differs from exact requested dataset")
         if not temp.exists() or not stat.S_ISDIR(temp.lstat().st_mode):
             raise ValueError("merge backend did not create a real output directory")
         _write_file(temp / "source-manifest.json", _canonical_json(expected_manifest))
@@ -1269,7 +1339,7 @@ def _create_gr00t_exporter(
         features=features,
         modality_config=modality,
         task=task_catalog[0],
-        script_config={"unitree_conversion_schema": _MERGE_SCHEMA_VERSION},
+        script_config=dict(_CONVERSION_SCRIPT_CONFIG),
         robot_type="g1",
         overwrite_existing=False,
     )
@@ -1331,7 +1401,7 @@ def _default_merge_backend(
     exporter = _create_gr00t_exporter(output, video_keys, task_catalog)
     completed = False
     try:
-        for episode in episodes:
+        for target_episode_index, episode in enumerate(episodes):
             iterators = {key: iter(_iter_staged_video(artifact)) for key, artifact in episode.videos.items()}
             for row in iter_stage_rows(episode):
                 frame = dict(row)
@@ -1351,6 +1421,9 @@ def _default_merge_backend(
                     continue
                 raise ValueError(f"staged video {key} contains more frames than its frame rows")
             exporter.save_episode()
+            for key, artifact in episode.videos.items():
+                destination = output / exporter.meta.get_video_file_path(target_episode_index, key)
+                _replace_with_bound_file(artifact, destination)
         _close_unused_video_writers(exporter)
         completed = True
     finally:
@@ -1428,30 +1501,32 @@ class _StreamingStats:
     def __init__(self, features: Mapping[str, Mapping[str, object]]) -> None:
         self.features = features
         self.count = 0
-        self.minimum: dict[str, np.ndarray] = {}
-        self.maximum: dict[str, np.ndarray] = {}
-        self.mean: dict[str, np.ndarray] = {}
-        self.m2: dict[str, np.ndarray] = {}
+        self.values: dict[str, list[np.ndarray]] = {key: [] for key in features}
 
     def update(self, values: Mapping[str, object]) -> None:
         self.count += 1
         for key, feature in self.features.items():
-            value = np.asarray(values[key], dtype=np.float64).reshape(tuple(feature["shape"]))
-            if key not in self.minimum:
-                self.minimum[key] = value.copy()
-                self.maximum[key] = value.copy()
-                self.mean[key] = value.copy()
-                self.m2[key] = np.zeros_like(value)
-                continue
-            self.minimum[key] = np.minimum(self.minimum[key], value)
-            self.maximum[key] = np.maximum(self.maximum[key], value)
-            delta = value - self.mean[key]
-            self.mean[key] += delta / self.count
-            self.m2[key] += delta * (value - self.mean[key])
+            dtype = np.dtype(feature["dtype"])
+            value = np.asarray(values[key], dtype=dtype).reshape(tuple(feature["shape"]))
+            self.values[key].append(np.array(value, order="C", copy=True))
+
+    def _expected(self) -> Mapping[str, object]:
+        from lerobot.common.datasets.lerobot_dataset import compute_episode_stats
+
+        if self.count < 1:
+            raise ValueError("exported episode statistics require at least one frame")
+        arrays: dict[str, np.ndarray] = {}
+        for key, feature in self.features.items():
+            values = np.stack(self.values[key])
+            if tuple(feature["shape"]) == (1,) and values.ndim == 2:
+                values = values[:, 0]
+            arrays[key] = values
+        return compute_episode_stats(arrays, dict(self.features))
 
     def verify(self, actual: Mapping[str, object]) -> None:
         if set(actual) != set(self.features) or self.count < 1:
             raise ValueError("exported episode statistics feature keys differ")
+        expected_by_feature = self._expected()
         for key, feature in self.features.items():
             statistics = actual[key]
             if not isinstance(statistics, Mapping) or set(statistics) != {
@@ -1462,24 +1537,80 @@ class _StreamingStats:
                 "count",
             }:
                 raise ValueError(f"exported episode statistics structure differs for {key}")
-            dtype = np.dtype(feature["dtype"])
-            tolerance = 2e-6 if dtype == np.dtype(np.float32) else 1e-12
-            expected = {
-                "min": self.minimum[key],
-                "max": self.maximum[key],
-                "mean": self.mean[key],
-                "std": np.sqrt(np.maximum(self.m2[key] / self.count, 0.0)),
-                "count": np.array([self.count], dtype=np.int64),
-            }
-            for statistic, expected_value in expected.items():
+            for statistic, expected_value in expected_by_feature[key].items():
                 actual_value = np.asarray(statistics[statistic])
-                if not np.isfinite(actual_value).all() or not np.allclose(
-                    actual_value,
-                    expected_value,
-                    rtol=0.0,
-                    atol=0.0 if statistic in {"min", "max", "count"} else tolerance,
+                if (
+                    actual_value.shape != np.asarray(expected_value).shape
+                    or not np.isfinite(actual_value).all()
+                    or not np.array_equal(actual_value, expected_value)
                 ):
                     raise ValueError(f"exported episode statistics differ for {key}.{statistic}")
+
+
+def _json_equivalent(value: object) -> object:
+    """Normalize tuples and NumPy-free metadata through its JSON representation."""
+    return json.loads(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def _validate_exact_gr00t_metadata(
+    info: Mapping[str, object],
+    modality_config: Mapping[str, object],
+    episodes: tuple[MergeEpisode, ...],
+    task_catalog: tuple[str, ...],
+) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+    from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION
+    from lerobot.common.datasets.utils import DEFAULT_CHUNK_SIZE, DEFAULT_FEATURES
+
+    video_keys = tuple(episodes[0].videos)
+    target_features, target_modality = _target_dataset_contract(video_keys)
+    expected_features = {**target_features, **DEFAULT_FEATURES}
+    for key in video_keys:
+        expected_features[key] = {**expected_features[key], "info": dict(_VIDEO_FEATURE_INFO)}
+    expected_total_frames = sum(episode.row_count for episode in episodes)
+    expected_info = {
+        "codebase_version": CODEBASE_VERSION,
+        "robot_type": "g1",
+        "total_episodes": len(episodes),
+        "total_frames": expected_total_frames,
+        "total_tasks": len(task_catalog),
+        "total_videos": len(episodes) * len(video_keys),
+        "total_chunks": (len(episodes) + DEFAULT_CHUNK_SIZE - 1) // DEFAULT_CHUNK_SIZE,
+        "chunks_size": DEFAULT_CHUNK_SIZE,
+        "fps": 50,
+        "splits": {"train": f"0:{len(episodes)}"},
+        "data_path": _CANONICAL_DATA_PATH,
+        "video_path": _CANONICAL_VIDEO_PATH,
+        "features": expected_features,
+        "script_config": dict(_CONVERSION_SCRIPT_CONFIG),
+        "discarded_episode_indices": [],
+    }
+    if _json_equivalent(info) != _json_equivalent(expected_info):
+        raise ValueError("exported metadata differs from the exact G1 SONIC dataset contract")
+    if _json_equivalent(modality_config) != _json_equivalent(target_modality):
+        raise ValueError("exported modality metadata differs from the exact G1 SONIC contract")
+    return expected_features, target_modality
+
+
+def _contained_output_artifact(output: Path, relative: str | Path, *, field_name: str) -> Path:
+    """Resolve one canonical metadata-derived artifact and fail closed on escape."""
+    relative_text = Path(relative).as_posix()
+    posix = PurePosixPath(relative_text)
+    if (
+        not relative_text
+        or posix.is_absolute()
+        or posix.as_posix() != relative_text
+        or any(part in {"", ".", ".."} for part in posix.parts)
+    ):
+        raise ValueError(f"{field_name} must be a canonical relative output path")
+    candidate = output.joinpath(*posix.parts)
+    try:
+        root = output.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"{field_name} must resolve to an existing output artifact") from error
+    if root != resolved and root not in resolved.parents:
+        raise ValueError(f"{field_name} resolved path must remain contained under output")
+    return candidate
 
 
 def _validate_gr00t_output(
@@ -1488,11 +1619,29 @@ def _validate_gr00t_output(
     task_catalog: tuple[str, ...],
 ) -> MergeVerification:
     """Independently reopen and validate every final LeRobot dataset artifact."""
-    from lerobot.common.datasets.utils import DEFAULT_FEATURES
-
     from gear_sonic.data.exporter import Gr00tDatasetMetadata
 
+    metadata: dict[str, Mapping[str, object]] = {}
+    for relative in ("meta/info.json", "meta/modality.json"):
+        metadata_path = _contained_output_artifact(output, relative, field_name=relative)
+        try:
+            value = json.loads(_secure_read(metadata_path))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError(f"{relative} must contain valid JSON metadata") from error
+        if not isinstance(value, dict):
+            raise ValueError(f"{relative} must contain a JSON metadata object")
+        metadata[relative] = value
+    expected_features, _ = _validate_exact_gr00t_metadata(
+        metadata["meta/info.json"],
+        metadata["meta/modality.json"],
+        episodes,
+        task_catalog,
+    )
     meta = Gr00tDatasetMetadata(repo_id="tmp/tmp_dataset", root=output)
+    if _json_equivalent(meta.info) != _json_equivalent(metadata["meta/info.json"]) or _json_equivalent(
+        meta.modality_config
+    ) != _json_equivalent(metadata["meta/modality.json"]):
+        raise ValueError("exported metadata changed during independent validation")
     if meta.total_episodes != len(episodes):
         raise ValueError("exported episode count differs from requested merge")
     expected_total = sum(episode.row_count for episode in episodes)
@@ -1507,8 +1656,6 @@ def _validate_gr00t_output(
         or dict(meta.tasks) != expected_index_to_task
     ):
         raise ValueError("exported global task catalog is not lexicographic")
-    expected_features, _ = _target_dataset_contract(tuple(episodes[0].videos))
-    expected_features = {**expected_features, **DEFAULT_FEATURES}
     if set(meta.features) != set(expected_features) or any(
         _normalize_feature(meta.features[key]) != _normalize_feature(expected_features[key])
         for key in expected_features
@@ -1523,7 +1670,11 @@ def _validate_gr00t_output(
     content = hashlib.sha256()
     global_index = 0
     for target_index, episode in enumerate(episodes):
-        parquet_path = output / meta.get_data_file_path(target_index)
+        parquet_path = _contained_output_artifact(
+            output,
+            meta.get_data_file_path(target_index),
+            field_name="exported data path",
+        )
         staged_rows = iter(iter_stage_rows(episode))
         local_index = 0
         episode_tasks: list[str] = []
@@ -1593,8 +1744,16 @@ def _validate_gr00t_output(
         episode_lengths.append(local_index)
         counts: dict[str, int] = {}
         for key in episode.videos:
-            video_path = output / meta.get_video_file_path(target_index, key)
+            video_path = _contained_output_artifact(
+                output,
+                meta.get_video_file_path(target_index, key),
+                field_name=f"exported video path {key}",
+            )
             video_digest = _hash_secure_file(video_path)
+            if video_digest != episode.videos[key].sha256:
+                raise ValueError(f"exported video content differs from staged video for {key}")
+            if _inspect_bound_video_media_info(video_path, expected_sha256=video_digest) != _VIDEO_FEATURE_INFO:
+                raise ValueError(f"exported video media info differs from metadata for {key}")
             count, _ = _inspect_bound_video(
                 video_path,
                 expected_sha256=video_digest,

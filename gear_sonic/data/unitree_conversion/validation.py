@@ -155,13 +155,28 @@ _KINEMATICS_THREAD_LOCAL = threading.local()
 def _target_kinematics() -> _TargetKinematics:
     import pinocchio as pin
 
+    from gear_sonic.data.robot_model.supplemental_info.g1.g1_supplemental_info import (
+        G1SupplementalInfo,
+    )
+
     urdf = Path(__file__).resolve().parents[1] / "robot_model" / "model_data" / "g1" / "g1_29dof_with_hand.urdf"
     model = pin.buildModelFromUrdf(str(urdf))
     joint_names = tuple(model.names)[1:]
     if model.nq != 43 or model.nv != 43 or joint_names != TARGET_JOINT_NAMES:
         raise RuntimeError("asset-free G1 URDF does not match the exact 43-joint target order")
-    lower = np.array(model.lowerPositionLimit, dtype=np.float64, order="C", copy=True)
-    upper = np.array(model.upperPositionLimit, dtype=np.float64, order="C", copy=True)
+    supplemental = G1SupplementalInfo()
+    if set(supplemental.joint_limits) != set(TARGET_JOINT_NAMES):
+        raise RuntimeError("G1 supplemental limits do not match the exact 43-joint target model")
+    lower = np.array(
+        [supplemental.joint_limits[name][0] for name in TARGET_JOINT_NAMES],
+        dtype=np.float64,
+        order="C",
+    )
+    upper = np.array(
+        [supplemental.joint_limits[name][1] for name in TARGET_JOINT_NAMES],
+        dtype=np.float64,
+        order="C",
+    )
     if lower.shape != (43,) or upper.shape != (43,) or not np.all(lower <= upper):
         raise RuntimeError("asset-free G1 URDF contains invalid target joint limits")
     lower.setflags(write=False)
@@ -176,7 +191,7 @@ def _target_kinematics() -> _TargetKinematics:
 
 
 def target_joint_limits() -> tuple[np.ndarray, np.ndarray]:
-    """Return detached exact URDF limits in target RobotModel order."""
+    """Return detached supplemental-adjusted RobotModel limits in target order."""
     kinematics = _target_kinematics()
     return kinematics.lower.copy(), kinematics.upper.copy()
 
