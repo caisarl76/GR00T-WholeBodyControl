@@ -7,9 +7,12 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 import hashlib
 import numbers
+import os
 from pathlib import Path
+import stat
 import string
 from types import MappingProxyType
+from typing import BinaryIO
 
 import av
 import numpy as np
@@ -55,25 +58,54 @@ def _rgb_size(value: object, *, field_name: str) -> tuple[int, int]:
     return int(size[0]), int(size[1])
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_handle(stream: BinaryIO) -> str:
     digest = hashlib.sha256()
     try:
-        with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-    except OSError as error:
-        raise ValueError(f"cannot read video file {path}") from error
+        stream.seek(0)
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+        stream.seek(0)
+    except (OSError, ValueError) as error:
+        raise ValueError("cannot hash the owned video file handle") from error
     return digest.hexdigest()
 
 
 def _file_identity(path: Path) -> tuple[int, int, int, int]:
     try:
-        stat = path.stat()
+        metadata = path.stat()
     except OSError as error:
         raise ValueError("video path must be an existing regular file") from error
-    if not path.is_file():
+    if not stat.S_ISREG(metadata.st_mode):
         raise ValueError("video path must be an existing regular file")
-    return stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino
+    return metadata.st_size, metadata.st_mtime_ns, metadata.st_dev, metadata.st_ino
+
+
+def _handle_identity(stream: BinaryIO) -> tuple[int, int, int, int]:
+    try:
+        metadata = os.fstat(stream.fileno())
+    except (OSError, ValueError) as error:
+        raise ValueError("owned video file handle is not readable") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("owned video file handle must reference a regular file")
+    return metadata.st_size, metadata.st_mtime_ns, metadata.st_dev, metadata.st_ino
+
+
+def _verify_bound_resource(
+    stream: BinaryIO,
+    path: Path,
+    *,
+    expected_identity: tuple[int, int, int, int],
+    expected_sha256: str,
+    error_message: str,
+) -> None:
+    try:
+        handle_identity = _handle_identity(stream)
+        digest = _sha256_handle(stream)
+        path_identity = _file_identity(path)
+    except ValueError as error:
+        raise ValueError(error_message) from error
+    if handle_identity != expected_identity or path_identity != expected_identity or digest != expected_sha256:
+        raise ValueError(error_message)
 
 
 @dataclass(frozen=True)
@@ -158,6 +190,8 @@ class CameraStreamReport:
     reason: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.status, str):
+            raise ValueError("camera report status must be a string")
         if self.status not in _VALID_CAMERA_STATUSES:
             raise ValueError(f"camera report status must be one of {sorted(_VALID_CAMERA_STATUSES)}")
         if self.status == "exact":
@@ -194,13 +228,14 @@ class EpisodeCameraReport:
         if not isinstance(self.streams, Mapping):
             raise ValueError("streams must be a mapping")
         streams: dict[str, CameraStreamReport] = {}
-        for camera, report in sorted(self.streams.items()):
+        for camera, report in self.streams.items():
             _nonempty_string(camera, field_name="stream camera key")
             if not isinstance(report, CameraStreamReport):
                 raise ValueError("every stream value must be a CameraStreamReport")
             if report.status == "exact" and report.timeline.decoded_frames != frame_count:
                 raise ValueError("exact timeline decoded_frames must equal source_frame_count")
             streams[camera] = report
+        streams = dict(sorted(streams.items()))
         object.__setattr__(self, "source_episode_id", episode_id)
         object.__setattr__(self, "source_frame_count", frame_count)
         object.__setattr__(self, "streams", MappingProxyType(streams))
@@ -290,25 +325,30 @@ def inspect_video(
         resolved_path = Path(path).expanduser().resolve(strict=True)
     except (OSError, TypeError, ValueError) as error:
         raise ValueError("video path must be an existing regular file") from error
-    identity = _file_identity(resolved_path)
-    digest = _sha256_file(resolved_path)
-    if _file_identity(resolved_path) != identity:
-        raise ValueError("video file changed during inspection")
-
     decoded_frames = 0
     try:
-        with av.open(str(resolved_path), mode="r") as container:
-            stream = _video_stream(container)
-            for frame in container.decode(stream):
-                _decode_rgb(frame, expected_size=size, frame_index=decoded_frames)
-                decoded_frames += 1
+        with resolved_path.open("rb") as source_handle:
+            identity = _handle_identity(source_handle)
+            digest = _sha256_handle(source_handle)
+            if _file_identity(resolved_path) != identity:
+                raise ValueError("video file changed during inspection")
+            with av.open(source_handle, mode="r") as container:
+                stream = _video_stream(container)
+                for frame in container.decode(stream):
+                    _decode_rgb(frame, expected_size=size, frame_index=decoded_frames)
+                    decoded_frames += 1
+            _verify_bound_resource(
+                source_handle,
+                resolved_path,
+                expected_identity=identity,
+                expected_sha256=digest,
+                error_message="video file changed during inspection",
+            )
     except ValueError:
         raise
     except (av.error.FFmpegError, OSError) as error:
         raise ValueError(f"video decode failed for {resolved_path}") from error
 
-    if _file_identity(resolved_path) != identity:
-        raise ValueError("video file changed during inspection")
     if decoded_frames != frame_count:
         raise ValueError(f"decoded frame count {decoded_frames} != data frame count {frame_count}")
 
@@ -326,28 +366,16 @@ def inspect_video(
     )
 
 
-def _assert_unchanged(timeline: VideoTimeline) -> None:
-    expected_identity = (
-        timeline.file_size,
-        timeline.mtime_ns,
-        timeline.device,
-        timeline.inode,
-    )
-    if _file_identity(timeline.path) != expected_identity or _sha256_file(timeline.path) != timeline.sha256:
-        raise ValueError("video file changed after inspection")
-
-
 def iter_resampled_video(
     timeline: VideoTimeline,
     *,
     target_fps: object = _TARGET_FPS,
 ) -> Iterator[ResampledVideoFrame]:
-    """Open a second decoder and stream the exact nearest-index 50 Hz RGB timeline."""
+    """Stream exact nearest-index RGB; callers must exhaust this integrity-checked iterator."""
     if not isinstance(timeline, VideoTimeline):
         raise ValueError("timeline must be a VideoTimeline")
     if type(target_fps) is not int or target_fps != _TARGET_FPS:
         raise ValueError("target_fps must be integer 50")
-    _assert_unchanged(timeline)
     identity = (
         timeline.file_size,
         timeline.mtime_ns,
@@ -359,45 +387,59 @@ def iter_resampled_video(
     current_rgb: np.ndarray | None = None
 
     try:
-        with av.open(str(timeline.path), mode="r") as container:
-            stream = _video_stream(container)
-            decoder = iter(container.decode(stream))
-            for target_index, requested_source_index in enumerate(selected_indices):
-                while current_source_index < int(requested_source_index):
-                    try:
-                        frame = next(decoder)
-                    except StopIteration as error:
-                        raise ValueError(
-                            f"second-pass decoded frame count {current_source_index + 1} "
-                            f"!= inspected frame count {timeline.decoded_frames}"
-                        ) from error
-                    current_source_index += 1
-                    current_rgb = _decode_rgb(
-                        frame,
-                        expected_size=timeline.rgb_size,
-                        frame_index=current_source_index,
+        with timeline.path.open("rb") as source_handle:
+            _verify_bound_resource(
+                source_handle,
+                timeline.path,
+                expected_identity=identity,
+                expected_sha256=timeline.sha256,
+                error_message="video file changed after inspection",
+            )
+            with av.open(source_handle, mode="r") as container:
+                stream = _video_stream(container)
+                decoder = iter(container.decode(stream))
+                for target_index, requested_source_index in enumerate(selected_indices):
+                    while current_source_index < int(requested_source_index):
+                        try:
+                            frame = next(decoder)
+                        except StopIteration as error:
+                            raise ValueError(
+                                f"second-pass decoded frame count {current_source_index + 1} "
+                                f"!= inspected frame count {timeline.decoded_frames}"
+                            ) from error
+                        current_source_index += 1
+                        current_rgb = _decode_rgb(
+                            frame,
+                            expected_size=timeline.rgb_size,
+                            frame_index=current_source_index,
+                        )
+                    if current_rgb is None:
+                        raise ValueError("second-pass decoder produced no selected frame")
+                    yield ResampledVideoFrame(
+                        target_index=target_index,
+                        source_index=int(requested_source_index),
+                        rgb=current_rgb,
                     )
-                if current_rgb is None:
-                    raise ValueError("second-pass decoder produced no selected frame")
-                yield ResampledVideoFrame(
-                    target_index=target_index,
-                    source_index=int(requested_source_index),
-                    rgb=current_rgb,
-                )
 
-            try:
-                next(decoder)
-            except StopIteration:
-                pass
-            else:
-                raise ValueError(f"second-pass decoded more than inspected frame count {timeline.decoded_frames}")
+                try:
+                    next(decoder)
+                except StopIteration:
+                    pass
+                else:
+                    raise ValueError(
+                        f"second-pass decoded more than inspected frame count {timeline.decoded_frames}"
+                    )
+            _verify_bound_resource(
+                source_handle,
+                timeline.path,
+                expected_identity=identity,
+                expected_sha256=timeline.sha256,
+                error_message="video file changed after inspection",
+            )
     except ValueError:
         raise
     except (av.error.FFmpegError, OSError) as error:
         raise ValueError(f"second-pass video decode failed for {timeline.path}") from error
-
-    if _file_identity(timeline.path) != identity:
-        raise ValueError("video file changed after inspection")
 
 
 def _camera_map(value: object, *, primary_camera: str) -> dict[str, str]:

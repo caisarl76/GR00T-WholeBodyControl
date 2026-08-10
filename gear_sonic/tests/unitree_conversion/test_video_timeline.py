@@ -171,6 +171,28 @@ def test_second_pass_rejects_a_truncated_file(rgb_video: Path) -> None:
         list(iter_resampled_video(timeline))
 
 
+def test_second_pass_rejects_same_identity_mutation_after_first_yield(rgb_video: Path) -> None:
+    timeline = inspect_video(rgb_video, expected_frames=3, expected_size=_SIZE)
+    frames = iter_resampled_video(timeline)
+    first = next(frames)
+    original_stat = rgb_video.stat()
+    with rgb_video.open("r+b") as stream:
+        stream.seek(-1, os.SEEK_END)
+        final_byte = stream.read(1)
+        stream.seek(-1, os.SEEK_END)
+        stream.write(bytes([final_byte[0] ^ 0x01]))
+    os.utime(
+        rgb_video,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    assert first.target_index == 0
+    assert rgb_video.stat().st_size == timeline.file_size
+    assert rgb_video.stat().st_mtime_ns == timeline.mtime_ns
+
+    with pytest.raises(ValueError, match="video file changed after inspection"):
+        list(frames)
+
+
 @pytest.mark.parametrize("target_fps", [True, 49, 50.0, "50", None])
 def test_resampling_accepts_only_the_exact_integer_target_fps(
     rgb_video: Path,
@@ -447,6 +469,18 @@ def test_episode_camera_report_is_deeply_immutable_and_requires_exact_count(rgb_
         replace(report, source_frame_count=4)
 
 
+def test_episode_camera_report_rejects_mixed_nonstr_stream_keys_before_sorting(rgb_video: Path) -> None:
+    timeline = inspect_video(rgb_video, expected_frames=3, expected_size=_SIZE)
+    exact = _exact_stream(timeline)
+
+    with pytest.raises(ValueError, match="stream camera key must be a nonempty string"):
+        _episode_report(
+            timeline,
+            episode_id=0,
+            streams={_PRIMARY: exact, ("not", "a", "string"): exact},
+        )
+
+
 @pytest.mark.parametrize(
     ("status", "timeline_present", "reason", "message"),
     [
@@ -473,3 +507,9 @@ def test_camera_stream_report_validates_status_payload(
             timeline=timeline if timeline_present else None,
             reason=reason,
         )
+
+
+@pytest.mark.parametrize("status", [None, True, 1, [], {}])
+def test_camera_stream_report_rejects_nonstr_status_as_value_error(status: object) -> None:
+    with pytest.raises(ValueError, match="camera report status must be a string"):
+        CameraStreamReport(status=status, reason="invalid status")
