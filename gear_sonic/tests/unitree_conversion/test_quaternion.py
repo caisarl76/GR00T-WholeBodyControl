@@ -45,6 +45,22 @@ def _inspire_arrays(n: int = 3) -> dict[str, np.ndarray]:
     }
 
 
+def _deployment_heading_reference(quaternion: np.ndarray) -> np.ndarray:
+    normalized, _ = validate_wxyz(quaternion)
+    w, x, y, z = normalized
+    scale_a = 2.0 * w * w - 1.0
+    a0 = scale_a
+    b0 = 0.0
+    c0 = x * x * 2.0
+    rotated_x = (a0 + b0) + c0
+    a1 = 0.0
+    b1 = z * w * 2.0
+    c1 = y * x * 2.0
+    rotated_y = (a1 + b1) + c1
+    result, _ = validate_wxyz(_axis_quat("z", math.atan2(rotated_y, rotated_x)))
+    return result
+
+
 def test_validate_wxyz_rejects_norm_outside_one_e_minus_five() -> None:
     with pytest.raises(ValueError, match="unit-norm tolerance"):
         validate_wxyz(np.array([1.00002, 0.0, 0.0, 0.0], dtype=np.float64))
@@ -149,6 +165,43 @@ def test_heading_extracts_deployment_projected_x_yaw_with_roll_and_pitch() -> No
     np.testing.assert_allclose(result, _axis_quat("z", yaw), atol=1e-15)
     assert result.flags.owndata
     assert result.flags.c_contiguous
+
+
+@pytest.mark.parametrize("pitch_sign", [1.0, -1.0])
+def test_heading_matches_deployment_arithmetic_at_ninety_degree_pitch_singularity(
+    pitch_sign: float,
+) -> None:
+    half = math.sqrt(0.5)
+    quaternion = np.array([half, 0.0, pitch_sign * half, 0.0], dtype=np.float64)
+    expected = _deployment_heading_reference(quaternion)
+
+    result = heading_quat(quaternion)
+
+    np.testing.assert_array_equal(expected.view(np.uint64), IDENTITY.view(np.uint64))
+    np.testing.assert_array_equal(result.view(np.uint64), expected.view(np.uint64))
+
+
+@pytest.mark.parametrize(
+    ("pitch", "expected_heading"),
+    [
+        (math.pi / 2.0 - 1e-8, 0.0),
+        (math.pi / 2.0 + 1e-8, math.pi),
+    ],
+)
+def test_heading_matches_deployment_arithmetic_near_pitch_singularity(
+    pitch: float,
+    expected_heading: float,
+) -> None:
+    quaternion = _axis_quat("y", pitch)
+    expected = _deployment_heading_reference(quaternion)
+
+    result = heading_quat(quaternion)
+
+    np.testing.assert_array_equal(
+        expected.view(np.uint64),
+        _axis_quat("z", expected_heading).view(np.uint64),
+    )
+    np.testing.assert_array_equal(result.view(np.uint64), expected.view(np.uint64))
 
 
 def test_slerp_uses_shortest_quaternion_image_for_antipodes() -> None:

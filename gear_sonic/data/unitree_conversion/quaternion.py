@@ -78,8 +78,15 @@ def heading_quat(value: object) -> np.ndarray:
     """Extract deployment yaw by projecting the rotated positive-X direction."""
     quaternion, _ = validate_wxyz(value)
     w, x, y, z = quaternion
-    rotated_x = 1.0 - 2.0 * (y * y + z * z)
-    rotated_y = 2.0 * (x * y + w * z)
+    scale_a = 2.0 * w * w - 1.0
+    a0 = scale_a
+    b0 = 0.0
+    c0 = x * x * 2.0
+    rotated_x = (a0 + b0) + c0
+    a1 = 0.0
+    b1 = z * w * 2.0
+    c1 = y * x * 2.0
+    rotated_y = (a1 + b1) + c1
     heading = math.atan2(rotated_y, rotated_x)
     half = heading / 2.0
     result = np.array([math.cos(half), 0.0, 0.0, math.sin(half)], dtype=np.float64)
