@@ -325,13 +325,27 @@ class FinalValidator(Protocol):
     ) -> MergeVerification: ...
 
 
+def _canonical_path(value: str | Path, *, field_name: str, strict: bool) -> Path:
+    raw = Path(value)
+    if ".." in raw.parts:
+        raise ValueError(f"{field_name} must be canonical and must not contain '..' aliases")
+    absolute = raw.absolute()
+    try:
+        resolved = absolute.resolve(strict=strict)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{field_name} must resolve to a canonical path") from error
+    if resolved != absolute:
+        raise ValueError(f"{field_name} must be canonical and must not contain path aliases")
+    return resolved
+
+
 def stage_path(output_root: str | Path, identity: StageIdentity) -> Path:
     """Return the deterministic immutable path for an episode identity."""
     if not isinstance(identity, StageIdentity):
         raise TypeError("identity must be a StageIdentity")
     repo_safe = quote(identity.source_repo_id, safe="-._")
     return (
-        Path(output_root).absolute()
+        _canonical_path(output_root, field_name="stage output root", strict=False)
         / ".staging"
         / repo_safe
         / identity.source_revision
@@ -963,10 +977,10 @@ def load_stage_rows(path: str | Path) -> tuple[Mapping[str, object], ...]:
 
 def _stage_input(value: StageResult | str | Path) -> MergeEpisode:
     if isinstance(value, StageResult):
-        path = value.path.absolute()
+        path = _canonical_path(value.path, field_name="stage input path", strict=True)
         expected_identity = value.identity
     elif isinstance(value, (str, Path)):
-        path = Path(value).absolute()
+        path = _canonical_path(value, field_name="stage input path", strict=True)
         expected_identity = None
     else:
         raise TypeError("merge stage inputs must be StageResult or paths")
@@ -1143,20 +1157,21 @@ def _validate_merge_inputs(
 
 
 def _reject_output_input_overlap(final: Path, episodes: tuple[MergeEpisode, ...]) -> None:
+    resolved_final = final.resolve(strict=False)
     for episode in episodes:
-        stage = episode.path
-        if final == stage or stage in final.parents or final in stage.parents:
+        stage = episode.path.resolve(strict=True)
+        if resolved_final == stage or stage in resolved_final.parents or resolved_final in stage.parents:
             raise ValueError("merge output overlaps input staging ancestry")
         staging_roots = [parent for parent in (stage, *stage.parents) if parent.name == ".staging"]
-        if any(final == root or root in final.parents for root in staging_roots):
+        if any(resolved_final == root or root in resolved_final.parents for root in staging_roots):
             raise ValueError("merge output overlaps input staging ancestry")
 
 
 def _canonical_output_path(output: str | Path) -> Path:
-    raw = Path(output)
-    if ".." in raw.parts:
-        raise ValueError("merge output must be canonical and must not contain '..' aliases")
-    return raw.absolute()
+    absolute = Path(output).absolute()
+    if os.path.lexists(absolute) and stat.S_ISLNK(absolute.lstat().st_mode):
+        raise FileExistsError(f"existing output is immutable, incomplete, or mismatched: {absolute}")
+    return _canonical_path(output, field_name="merge output", strict=False)
 
 
 def merge_stages(
@@ -1565,6 +1580,80 @@ def _expected_final_artifacts(meta: object, episodes: tuple[MergeEpisode, ...]) 
     return artifacts
 
 
+def _read_exact_episode_jsonl(
+    output: Path,
+    relative: str,
+    *,
+    expected_count: int,
+    expected_fields: frozenset[str],
+) -> tuple[Mapping[str, object], ...]:
+    label = "episode statistics" if relative.endswith("episodes_stats.jsonl") else "episode metadata"
+    path = _contained_output_artifact(output, relative, field_name=relative)
+    _reject_symlink_components(path)
+    try:
+        lines = _secure_read(path).decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{label} must contain exact UTF-8 JSON lines") from error
+    if len(lines) != expected_count:
+        raise ValueError(f"{label} must contain the exact record count {expected_count}")
+    records: list[Mapping[str, object]] = []
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{label} line {line_number} must contain exact valid JSON") from error
+        if not isinstance(record, dict) or set(record) != expected_fields:
+            raise ValueError(f"{label} records must contain the exact fields {sorted(expected_fields)}")
+        episode_index = record["episode_index"]
+        if type(episode_index) is not int:
+            raise ValueError(f"{label} episode_index values must be exact integers")
+        records.append(record)
+    indices = tuple(record["episode_index"] for record in records)
+    expected_indices = tuple(range(expected_count))
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"{label} contains a duplicate episode_index")
+    if indices != expected_indices:
+        raise ValueError(f"{label} episode_index values must equal the exact contiguous range")
+    return tuple(records)
+
+
+def _expected_episode_records(episodes: tuple[MergeEpisode, ...]) -> tuple[dict[str, object], ...]:
+    records: list[dict[str, object]] = []
+    for episode_index, episode in enumerate(episodes):
+        tasks: list[str] = []
+        seen: set[str] = set()
+        for row in iter_stage_rows(episode):
+            task = row["task"]
+            if task not in seen:
+                seen.add(task)
+                tasks.append(task)
+        records.append(
+            {
+                "episode_index": episode_index,
+                "tasks": tasks,
+                "length": episode.row_count,
+            }
+        )
+    return tuple(records)
+
+
+def _validate_raw_episode_stats_schema(
+    records: tuple[Mapping[str, object], ...],
+    nonvideo_features: Mapping[str, object],
+) -> None:
+    expected_features = set(nonvideo_features)
+    expected_statistics = {"min", "max", "mean", "std", "count"}
+    for record in records:
+        stats = record["stats"]
+        if not isinstance(stats, Mapping) or set(stats) != expected_features:
+            raise ValueError("episodes_stats.jsonl records must contain the exact feature fields")
+        if any(
+            not isinstance(feature_stats, Mapping) or set(feature_stats) != expected_statistics
+            for feature_stats in stats.values()
+        ):
+            raise ValueError("episodes_stats.jsonl feature records must contain the exact statistic fields")
+
+
 def _validate_gr00t_output(
     output: Path,
     episodes: tuple[MergeEpisode, ...],
@@ -1589,6 +1678,22 @@ def _validate_gr00t_output(
         episodes,
         task_catalog,
     )
+    raw_episode_records = _read_exact_episode_jsonl(
+        output,
+        "meta/episodes.jsonl",
+        expected_count=len(episodes),
+        expected_fields=frozenset({"episode_index", "tasks", "length"}),
+    )
+    if raw_episode_records != _expected_episode_records(episodes):
+        raise ValueError("episodes.jsonl records differ from the exact staged episode metadata")
+    raw_episode_stats = _read_exact_episode_jsonl(
+        output,
+        "meta/episodes_stats.jsonl",
+        expected_count=len(episodes),
+        expected_fields=frozenset({"episode_index", "stats"}),
+    )
+    nonvideo_features = {key: feature for key, feature in expected_features.items() if feature["dtype"] != "video"}
+    _validate_raw_episode_stats_schema(raw_episode_stats, nonvideo_features)
     meta = Gr00tDatasetMetadata(repo_id="tmp/tmp_dataset", root=output)
     if _json_equivalent(meta.info) != _json_equivalent(metadata["meta/info.json"]) or _json_equivalent(
         meta.modality_config
@@ -1621,7 +1726,6 @@ def _validate_gr00t_output(
     ):
         raise ValueError("exported feature metadata differs from the exact SONIC VLA schema")
     expected_arrow_schema = _expected_output_arrow_schema(expected_features)
-    nonvideo_features = {key: feature for key, feature in expected_features.items() if feature["dtype"] != "video"}
 
     episode_lengths: list[int] = []
     video_counts: dict[int, dict[str, int]] = {}
@@ -1700,7 +1804,7 @@ def _validate_gr00t_output(
                     raise ValueError("exported parquet has fewer rows than staged episode")
                 if _hash_stream(stream) != before_digest:
                     raise ValueError("exported parquet changed during independent validation")
-            stats.verify(meta.episodes_stats[target_index])
+            stats.verify(raw_episode_stats[target_index]["stats"])
         episode_lengths.append(local_index)
         counts: dict[str, int] = {}
         for key in episode.videos:
@@ -1724,7 +1828,11 @@ def _validate_gr00t_output(
         if target_index not in meta.episodes or target_index not in meta.episodes_stats:
             raise ValueError("exported episode metadata or statistics are missing")
         episode_metadata = meta.episodes[target_index]
-        if episode_metadata.get("length") != local_index or episode_metadata.get("tasks") != episode_tasks:
+        if (
+            episode_metadata != raw_episode_records[target_index]
+            or episode_metadata.get("length") != local_index
+            or episode_metadata.get("tasks") != episode_tasks
+        ):
             raise ValueError("exported episode length or first-occurrence task order differs")
         stats_ids.append(episode.identity.source_episode_id)
     return MergeVerification(

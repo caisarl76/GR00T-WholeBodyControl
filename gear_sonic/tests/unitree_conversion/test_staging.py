@@ -136,6 +136,19 @@ def test_stage_identity_is_deeply_immutable_and_path_is_safe(tmp_path: Path) -> 
         replace(identity, source_file_sha256={"../escape": "b" * 64})
 
 
+def test_stage_root_rejects_dotdot_alias_before_writing(tmp_path: Path) -> None:
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    aliased_root = decoy / ".." / "real-root"
+
+    with pytest.raises(ValueError, match=r"stage output.*canonical|\.\."):
+        stage_path(aliased_root, _identity())
+    with pytest.raises(ValueError, match=r"stage output.*canonical|\.\."):
+        write_stage(aliased_root, _identity(), _payload(tmp_path))
+
+    assert not (tmp_path / "real-root").exists()
+
+
 def test_write_stage_preserves_exact_arrays_and_resumes_matching_identity(tmp_path: Path) -> None:
     identity = _identity()
     result = write_stage(tmp_path, identity, _payload(tmp_path))
@@ -676,6 +689,25 @@ def test_merge_rejects_dotdot_output_alias_before_overlap_checks(tmp_path: Path)
     assert all(can_resume(stage.path, stage.identity) for stage in stages)
 
 
+def test_merge_rejects_legacy_dotdot_stage_alias_before_resolved_ancestry_checks(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real-root"
+    stage = write_stage(real_root, _identity(), _payload(tmp_path))
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    aliased_stage_path = decoy / ".." / "real-root" / stage.path.relative_to(real_root)
+    legacy_aliased_stage = replace(stage, path=aliased_stage_path)
+
+    with pytest.raises(ValueError, match=r"stage.*canonical|\.\."):
+        merge_stages(
+            (legacy_aliased_stage,),
+            real_root / ".staging" / "merged-dataset",
+        )
+
+    assert can_resume(stage.path, stage.identity)
+
+
 def test_merge_revalidates_stages_and_never_overwrites_existing_output(tmp_path: Path) -> None:
     stages = _two_stages(tmp_path)
     backend = RecordingMergeBackend()
@@ -1019,6 +1051,36 @@ def test_independent_validator_rejects_ghost_episode_metadata_keys(
 
     with pytest.raises(ValueError, match="episode metadata.*exact|statistics.*exact"):
         staging_module._validate_gr00t_output(output, episodes, ("place", "pour"))
+
+
+@pytest.mark.parametrize("metadata_name", ("episodes.jsonl", "episodes_stats.jsonl"))
+def test_independent_validator_rejects_duplicate_valid_episode_metadata_line(
+    tmp_path: Path,
+    metadata_name: str,
+) -> None:
+    _, episodes, tasks, output = _unpublished_real_output(tmp_path)
+    metadata_path = output / "meta" / metadata_name
+    line = metadata_path.read_text().splitlines()[0]
+    with metadata_path.open("a") as stream:
+        stream.write(line + "\n")
+
+    with pytest.raises(ValueError, match=r"exact record count|duplicate episode_index"):
+        staging_module._validate_gr00t_output(output, episodes, tasks)
+
+
+@pytest.mark.parametrize("metadata_name", ("episodes.jsonl", "episodes_stats.jsonl"))
+def test_independent_validator_rejects_unexpected_episode_metadata_field(
+    tmp_path: Path,
+    metadata_name: str,
+) -> None:
+    _, episodes, tasks, output = _unpublished_real_output(tmp_path)
+    metadata_path = output / "meta" / metadata_name
+    record = json.loads(metadata_path.read_text())
+    record["unexpected"] = True
+    metadata_path.write_text(json.dumps(record) + "\n")
+
+    with pytest.raises(ValueError, match=r"exact fields|unexpected"):
+        staging_module._validate_gr00t_output(output, episodes, tasks)
 
 
 def test_independent_validator_rejects_unexpected_regular_artifact(tmp_path: Path) -> None:
