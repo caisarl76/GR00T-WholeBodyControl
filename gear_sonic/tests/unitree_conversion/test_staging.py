@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import shutil
+import threading
 
 import av
 import numpy as np
@@ -44,6 +45,7 @@ def _write_video(
     size: tuple[int, int] = (640, 480),
     value_offset: int = 0,
     codec_name: str | None = None,
+    pixel_format: str = "yuv420p",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     for codec in (codec_name,) if codec_name is not None else ("libx264", "libopenh264", "h264"):
@@ -57,7 +59,7 @@ def _write_video(
     with av.open(str(path), "w") as container:
         stream = container.add_stream(codec, rate=fps)
         stream.width, stream.height = size
-        stream.pix_fmt = "yuv420p"
+        stream.pix_fmt = pixel_format
         for index in range(frame_count):
             rgb = np.full((size[1], size[0], 3), index * 50 + value_offset, dtype=np.uint8)
             for packet in stream.encode(av.VideoFrame.from_ndarray(rgb, format="rgb24")):
@@ -177,8 +179,15 @@ def test_path_video_stage_never_uses_whole_file_secure_read(
     result = write_stage(tmp_path, identity, payload)
     assert can_resume(result.path, identity)
     episode = staging_module._stage_input(result)
-    frames = list(staging_module._iter_staged_video(next(iter(episode.videos.values()))))
-    assert len(frames) == 2
+    artifact = next(iter(episode.videos.values()))
+    assert (
+        staging_module._inspect_bound_video(
+            artifact.path,
+            expected_sha256=artifact.sha256,
+            field_name="staged video",
+        )[0]
+        == 2
+    )
 
 
 @pytest.mark.parametrize(
@@ -372,6 +381,27 @@ def test_stage_rejects_wrong_target_video_fps_or_dimensions(
         write_stage(tmp_path, _identity(), payload)
 
 
+@pytest.mark.parametrize(
+    ("codec_name", "pixel_format", "message"),
+    (("mpeg4", "yuv420p", "H264"), ("libx264", "yuv444p", "yuv420p")),
+)
+def test_stage_rejects_incompatible_video_codec_or_pixel_format(
+    tmp_path: Path,
+    codec_name: str,
+    pixel_format: str,
+    message: str,
+) -> None:
+    video = tmp_path / f"{codec_name}-{pixel_format}.mp4"
+    _write_video(video, codec_name=codec_name, pixel_format=pixel_format)
+    payload = StagePayload(
+        rows=(_row(0, "task"), _row(1, "task")),
+        videos={"observation.images.ego_view": video},
+    )
+
+    with pytest.raises(ValueError, match=message):
+        write_stage(tmp_path, _identity(), payload)
+
+
 def test_stage_write_failure_cleans_unique_sibling_temp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     identity = _identity()
     payload = _payload(tmp_path)
@@ -414,7 +444,7 @@ class RecordingMergeBackend:
         self.orders: list[tuple[int, ...]] = []
         self.task_catalogs: list[tuple[str, ...]] = []
 
-    def __call__(self, output: Path, episodes, task_catalog: tuple[str, ...]) -> MergeVerification:
+    def __call__(self, output: Path, episodes, task_catalog: tuple[str, ...]) -> None:
         episode_ids = tuple(episode.identity.source_episode_id for episode in episodes)
         self.orders.append(episode_ids)
         self.task_catalogs.append(task_catalog)
@@ -422,8 +452,6 @@ class RecordingMergeBackend:
             assert not hasattr(episode, "rows")
             assert len(tuple(staging_module.iter_stage_rows(episode, batch_size=1))) == episode.row_count
         staging_module._default_merge_backend(output, episodes, task_catalog)
-        (output / "backend.json").write_text(json.dumps({"episodes": episode_ids}))
-        return self.validate(output, episodes, task_catalog)
 
     def validate(self, output, episodes, task_catalog) -> MergeVerification:
         return _exact_verification(episodes, task_catalog)
@@ -452,7 +480,7 @@ def _unpublished_real_output(tmp_path: Path, *, episode_id: int = 3):
     episodes = staging_module._validate_merge_inputs((stage,))
     tasks = tuple(sorted({row["task"] for row in staging_module.iter_stage_rows(episodes[0])}))
     output = tmp_path / f"candidate-{episode_id}"
-    staging_module._default_merge_backend(output, episodes, tasks)
+    merge_stages((stage,), output)
     return stage, episodes, tasks, output
 
 
@@ -472,56 +500,35 @@ def test_merge_is_deterministic_and_preregisters_lexicographic_tasks(tmp_path: P
     assert manifest["task_catalog"] == ["alpha", "beta", "zeta"]
 
 
-def test_default_merge_streams_decoded_video_frames_through_lazy_gr00t_exporter(
+def test_default_merge_uses_pre_encoded_video_mode_without_video_writer_or_thread_lifecycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    stages = _two_stages(tmp_path)
-    calls: list[tuple[str, object]] = []
+    from gear_sonic.data import exporter as exporter_module
 
-    class FakeExporter:
-        class Meta:
-            @staticmethod
-            def get_video_file_path(episode_index, key):
-                return Path("videos") / str(episode_index) / f"{key}.mp4"
-
-        meta = Meta()
-
-        def add_frame(self, frame):
-            calls.append(("frame", frame))
-
-        def save_episode(self):
-            calls.append(("save", None))
-
-        def stop_video_writers(self):
-            calls.append(("stop", None))
-
-    def create(output, video_keys, task_catalog):
-        output.mkdir()
-        calls.append(("create", (tuple(video_keys), task_catalog)))
-        return FakeExporter()
-
-    def decode(artifact):
-        calls.append(("decode", artifact.path.name))
-        yield np.zeros((480, 640, 3), dtype=np.uint8)
-        yield np.ones((480, 640, 3), dtype=np.uint8)
-
-    monkeypatch.setattr(staging_module, "_create_gr00t_exporter", create)
-    monkeypatch.setattr(staging_module, "_iter_staged_video", decode)
-    episodes = staging_module._validate_merge_inputs(stages)
+    stage = write_stage(tmp_path, _identity(31), _payload(tmp_path, 31))
+    episodes = staging_module._validate_merge_inputs((stage,))
     tasks = tuple(sorted({row["task"] for episode in episodes for row in staging_module.iter_stage_rows(episode)}))
-    staging_module._default_merge_backend(tmp_path / "default", episodes, tasks)
+    calls = 0
 
-    assert calls[0] == (
-        "create",
-        (("observation.images.ego_view",), ("alpha", "beta", "zeta")),
-    )
-    frames = [value for event, value in calls if event == "frame"]
-    assert len(frames) == 4
-    assert all("observation.images.ego_view" in frame for frame in frames)
-    assert all(frame["timestamp"].shape == (1,) for frame in frames)
-    assert all(frame["timestamp"].dtype == np.dtype(np.float32) for frame in frames)
-    assert [event for event, _ in calls].count("save") == 2
-    assert [event for event, _ in calls].count("stop") == 1
+    class ForbiddenVideoWriter:
+        def __init__(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("conversion merge must not construct VideoWriter")
+
+    monkeypatch.setattr(exporter_module, "VideoWriter", ForbiddenVideoWriter)
+    before_threads = {thread.ident for thread in threading.enumerate()}
+    output = tmp_path / "pre-encoded"
+    staging_module._default_merge_backend(output, episodes, tasks)
+
+    from gear_sonic.data.exporter import Gr00tDatasetMetadata
+
+    key = "observation.images.ego_view"
+    exported = output / Gr00tDatasetMetadata(repo_id="tmp/tmp_dataset", root=output).get_video_file_path(0, key)
+    assert calls == 0
+    new_threads = [thread for thread in threading.enumerate() if thread.ident not in before_threads]
+    assert all(hasattr(thread, "tqdm_cls") for thread in new_threads)
+    assert staging_module._hash_secure_file(exported) == episodes[0].videos[key].sha256
 
 
 def test_default_backend_preserves_exact_immutable_staged_video_bytes(tmp_path: Path) -> None:
@@ -551,23 +558,18 @@ def test_independent_validator_rejects_unrelated_same_structure_video(tmp_path: 
         staging_module._validate_gr00t_output(output, episodes, tasks)
 
 
-def test_final_video_metadata_must_describe_the_exact_published_media(tmp_path: Path) -> None:
+def test_stage_rejects_non_h264_media_before_final_publication(tmp_path: Path) -> None:
     video = tmp_path / "mpeg4.mp4"
     _write_video(video, codec_name="mpeg4")
-    stage = write_stage(
-        tmp_path,
-        _identity(33),
-        StagePayload(
-            rows=(_row(0, "task"), _row(1, "task")),
-            videos={"observation.images.ego_view": video},
-        ),
-    )
-    episodes = staging_module._validate_merge_inputs((stage,))
-    output = tmp_path / "mpeg4-output"
-    staging_module._default_merge_backend(output, episodes, ("task",))
-
-    with pytest.raises(ValueError, match="video media info"):
-        staging_module._validate_gr00t_output(output, episodes, ("task",))
+    with pytest.raises(ValueError, match="H264"):
+        write_stage(
+            tmp_path,
+            _identity(33),
+            StagePayload(
+                rows=(_row(0, "task"), _row(1, "task")),
+                videos={"observation.images.ego_view": video},
+            ),
+        )
 
 
 def test_real_gr00t_exporter_adapts_timestamp_vector_to_exact_scalar_parquet(tmp_path: Path) -> None:
@@ -664,6 +666,16 @@ def test_merge_rejects_output_inside_stage_or_staging_namespace_without_mutating
     assert all(can_resume(stage.path, stage.identity) for stage in stages)
 
 
+def test_merge_rejects_dotdot_output_alias_before_overlap_checks(tmp_path: Path) -> None:
+    stages = _two_stages(tmp_path)
+    aliased_output = stages[0].path / "nested" / ".." / "dataset"
+
+    with pytest.raises(ValueError, match=r"canonical.*output|\.\."):
+        merge_stages(stages, aliased_output)
+
+    assert all(can_resume(stage.path, stage.identity) for stage in stages)
+
+
 def test_merge_revalidates_stages_and_never_overwrites_existing_output(tmp_path: Path) -> None:
     stages = _two_stages(tmp_path)
     backend = RecordingMergeBackend()
@@ -679,7 +691,7 @@ def test_merge_revalidates_stages_and_never_overwrites_existing_output(tmp_path:
         == output
     )
 
-    (output / "backend.json").write_text("corrupt")
+    (output / "unexpected.bin").write_bytes(b"corrupt")
     with pytest.raises(FileExistsError, match="existing output"):
         merge_stages(
             stages,
@@ -699,6 +711,31 @@ def test_merge_revalidates_stages_and_never_overwrites_existing_output(tmp_path:
             merge_backend=backend,
             final_validator=backend.validate,
         )
+
+
+def test_resume_revalidates_semantics_even_when_corruption_checksums_are_regenerated(
+    tmp_path: Path,
+) -> None:
+    stages = _two_stages(tmp_path)
+    output = merge_stages(stages, tmp_path / "dataset")
+    from gear_sonic.data.exporter import Gr00tDatasetMetadata
+
+    meta = Gr00tDatasetMetadata(repo_id="tmp/tmp_dataset", root=output)
+    parquet_path = output / meta.get_data_file_path(0)
+    table = pq.read_table(parquet_path)
+    column = table.column("observation.state").combine_chunks()
+    values = column.values.to_numpy(zero_copy_only=False).copy()
+    values[0] += 1e-6
+    changed = pa.FixedSizeListArray.from_arrays(pa.array(values, type=pa.float64()), 43)
+    table = table.set_column(table.schema.get_field_index("observation.state"), "observation.state", changed)
+    pq.write_table(table, parquet_path)
+    artifacts = tuple(
+        path for path in staging_module._artifact_paths(output) if path != "dataset-checksums.sha256"
+    )
+    (output / "dataset-checksums.sha256").write_bytes(staging_module._checksums_bytes(output, artifacts))
+
+    with pytest.raises(FileExistsError, match="existing output"):
+        merge_stages(stages, output, resume_existing=True)
 
 
 def test_merge_failure_cleans_sibling_temp_and_leaves_output_absent(tmp_path: Path) -> None:
@@ -757,6 +794,45 @@ def test_custom_final_hook_cannot_replace_mandatory_builtin_output_validation(tm
             merge_backend=backend_json_only,
             final_validator=lambda output, episodes, tasks: _exact_verification(episodes, tasks),
         )
+
+
+def test_mutating_final_hook_runs_after_fsync_but_before_mandatory_builtin_validation(
+    tmp_path: Path,
+) -> None:
+    stage = write_stage(tmp_path, _identity(3), _payload(tmp_path, 3))
+
+    def mutating_hook(output, episodes, tasks):
+        assert (output / "source-manifest.json").is_file()
+        assert (output / "merge-validation.json").is_file()
+        assert (output / "dataset-checksums.sha256").is_file()
+        from gear_sonic.data.exporter import Gr00tDatasetMetadata
+
+        meta = Gr00tDatasetMetadata(repo_id="tmp/tmp_dataset", root=output)
+        parquet_path = output / meta.get_data_file_path(0)
+        table = pq.read_table(parquet_path)
+        column = table.column("observation.state").combine_chunks()
+        values = column.values.to_numpy(zero_copy_only=False).copy()
+        values[0] += 1e-6
+        changed = pa.FixedSizeListArray.from_arrays(pa.array(values, type=pa.float64()), 43)
+        pq.write_table(
+            table.set_column(
+                table.schema.get_field_index("observation.state"),
+                "observation.state",
+                changed,
+            ),
+            parquet_path,
+        )
+        artifacts = tuple(
+            path for path in staging_module._artifact_paths(output) if path != "dataset-checksums.sha256"
+        )
+        (output / "dataset-checksums.sha256").write_bytes(staging_module._checksums_bytes(output, artifacts))
+        return _exact_verification(episodes, tasks)
+
+    final = tmp_path / "mutated-by-hook"
+    with pytest.raises(ValueError, match="nonvideo value differs"):
+        merge_stages((stage,), final, final_validator=mutating_hook)
+
+    assert not final.exists()
 
 
 def test_final_metadata_contract_is_exact_including_full_video_info(tmp_path: Path) -> None:
@@ -838,21 +914,25 @@ def test_final_artifact_resolved_path_must_remain_inside_output(tmp_path: Path) 
         staging_module._validate_gr00t_output(output, episodes, tasks)
 
 
-def test_statistics_match_exporter_reduction_for_long_float32_and_reject_small_corruption() -> None:
+def test_statistics_are_memmap_bounded_match_long_float32_and_clean_up() -> None:
     from lerobot.common.datasets.lerobot_dataset import compute_episode_stats
 
     features = {"x": {"dtype": "float32", "shape": (1,), "names": None}}
     values = np.linspace(-1000.0, 1000.0, 5000, dtype=np.float32)
-    verifier = staging_module._StreamingStats(features)
-    for value in values:
-        verifier.update({"x": np.array([value], dtype=np.float32)})
-    expected = compute_episode_stats({"x": values}, features)
+    with staging_module._StreamingStats(features, expected_count=len(values)) as verifier:
+        temporary_root = verifier.temporary_root
+        assert isinstance(verifier.values["x"], np.memmap)
+        for value in values:
+            verifier.update({"x": np.array([value], dtype=np.float32)})
+        expected = compute_episode_stats({"x": values}, features)
 
-    verifier.verify(expected)
-    corrupted = deepcopy(expected)
-    corrupted["x"]["mean"] = corrupted["x"]["mean"] + np.float32(1e-6)
-    with pytest.raises(ValueError, match="x.mean"):
-        verifier.verify(corrupted)
+        verifier.verify(expected)
+        corrupted = deepcopy(expected)
+        corrupted["x"]["mean"] = corrupted["x"]["mean"] + np.float32(1e-6)
+        with pytest.raises(ValueError, match="x.mean"):
+            verifier.verify(corrupted)
+
+    assert not temporary_root.exists()
 
 
 def test_injected_backend_without_hook_still_runs_builtin_final_validation(tmp_path: Path) -> None:
@@ -921,6 +1001,34 @@ def test_independent_validator_rejects_extra_global_task_catalog_entry(tmp_path:
             merge_backend=extra_task_backend,
             final_validator=staging_module._validate_gr00t_output,
         )
+
+
+@pytest.mark.parametrize("metadata_name", ("episodes.jsonl", "episodes_stats.jsonl"))
+def test_independent_validator_rejects_ghost_episode_metadata_keys(
+    tmp_path: Path,
+    metadata_name: str,
+) -> None:
+    stage = write_stage(tmp_path, _identity(3), _payload(tmp_path, 3))
+    output = merge_stages((stage,), tmp_path / f"ghost-{metadata_name}")
+    metadata_path = output / "meta" / metadata_name
+    first = json.loads(metadata_path.read_text().splitlines()[0])
+    first["episode_index"] = 999
+    with metadata_path.open("a") as stream:
+        stream.write(json.dumps(first) + "\n")
+    episodes = staging_module._validate_merge_inputs((stage,))
+
+    with pytest.raises(ValueError, match="episode metadata.*exact|statistics.*exact"):
+        staging_module._validate_gr00t_output(output, episodes, ("place", "pour"))
+
+
+def test_independent_validator_rejects_unexpected_regular_artifact(tmp_path: Path) -> None:
+    stage = write_stage(tmp_path, _identity(3), _payload(tmp_path, 3))
+    output = merge_stages((stage,), tmp_path / "unexpected-artifact")
+    (output / "ghost.bin").write_bytes(b"ghost")
+    episodes = staging_module._validate_merge_inputs((stage,))
+
+    with pytest.raises(ValueError, match="unexpected.*artifact|canonical.*tree"):
+        staging_module._validate_gr00t_output(output, episodes, ("place", "pour"))
 
 
 def test_empty_merge_and_output_symlink_are_rejected(tmp_path: Path) -> None:

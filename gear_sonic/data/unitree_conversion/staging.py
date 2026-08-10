@@ -7,7 +7,6 @@ from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
 import errno
-from fractions import Fraction
 import hashlib
 import json
 import os
@@ -314,7 +313,7 @@ class MergeBackend(Protocol):
         output: Path,
         episodes: tuple[MergeEpisode, ...],
         task_catalog: tuple[str, ...],
-    ) -> object: ...
+    ) -> None: ...
 
 
 class FinalValidator(Protocol):
@@ -386,15 +385,6 @@ def _secure_read(path: Path) -> bytes:
 def _hash_secure_file(path: Path) -> str:
     with _open_bound_file(path) as stream:
         return _hash_stream(stream)
-
-
-def _read_video_source(source: Path | bytes, *, key: str) -> bytes:
-    if isinstance(source, bytes):
-        return source
-    try:
-        return _secure_read(source)
-    except ValueError as error:
-        raise ValueError(f"video target {key} source changed or became unreadable") from error
 
 
 def _copy_bound_file(source: Path, destination: Path) -> tuple[str, int]:
@@ -618,45 +608,6 @@ def _rows_to_parquet(rows: Sequence[Mapping[str, object]]) -> bytes:
     sink = pa.BufferOutputStream()
     pq.write_table(table, sink, compression="NONE", use_dictionary=False, write_statistics=True)
     return sink.getvalue().to_pybytes()
-
-
-def _parquet_to_rows(data: bytes) -> tuple[Mapping[str, object], ...]:
-    try:
-        table = pq.read_table(pa.BufferReader(data))
-    except (pa.ArrowException, OSError, ValueError) as error:
-        raise ValueError("frame-data.parquet must be a readable Arrow parquet file") from error
-    if table.schema != _expected_stage_arrow_schema():
-        raise ValueError("frame-data.parquet schema must match deterministic target order and types")
-    if table.num_rows < 1:
-        raise ValueError("frame-data.parquet must contain at least one row")
-    columns: dict[str, object] = {}
-    for key, spec in TARGET_FRAME_SCHEMA.items():
-        column = table.column(key).combine_chunks()
-        expected_type = pa.string() if key == "task" else pa.float32() if key == "timestamp" else _arrow_type(spec)
-        if column.type != expected_type or column.null_count:
-            raise ValueError(f"frame-data.parquet column {key} has the wrong exact Arrow type")
-        if key == "task":
-            columns[key] = column.to_pylist()
-        elif key == "timestamp":
-            columns[key] = column.to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
-        else:
-            assert spec is not None
-            values = column.values.to_numpy(zero_copy_only=False).reshape(table.num_rows, *spec.shape)
-            columns[key] = values.astype(spec.dtype, copy=False)
-    rows: list[Mapping[str, object]] = []
-    for index in range(table.num_rows):
-        row: dict[str, object] = {}
-        for key in TARGET_FRAME_SCHEMA:
-            values = columns[key]
-            if key == "task":
-                row[key] = values[index]
-            elif key == "timestamp":
-                row[key] = np.float32(values[index])
-            else:
-                row[key] = np.array(values[index], copy=True)
-        rows.append(MappingProxyType(row))
-    validate_target_rows(rows)
-    return tuple(rows)
 
 
 def _arrow_batch_to_rows(batch: pa.RecordBatch) -> tuple[Mapping[str, object], ...]:
@@ -1201,6 +1152,13 @@ def _reject_output_input_overlap(final: Path, episodes: tuple[MergeEpisode, ...]
             raise ValueError("merge output overlaps input staging ancestry")
 
 
+def _canonical_output_path(output: str | Path) -> Path:
+    raw = Path(output)
+    if ".." in raw.parts:
+        raise ValueError("merge output must be canonical and must not contain '..' aliases")
+    return raw.absolute()
+
+
 def merge_stages(
     stages: Iterable[StageResult | str | Path],
     output: str | Path,
@@ -1215,12 +1173,15 @@ def merge_stages(
     expected_manifest = _merge_manifest(episodes, tasks)
     expected_report = _expected_merge_verification(episodes, tasks)
     expected_validation = _verification_to_dict(expected_report)
-    final = Path(output).absolute()
+    final = _canonical_output_path(output)
     _reject_output_input_overlap(final, episodes)
     _ensure_safe_directory(final.parent)
     if os.path.lexists(final):
         if resume_existing:
             try:
+                resumed_report = _validate_gr00t_output(final, episodes, tasks)
+                if _verification_to_dict(resumed_report) != expected_validation:
+                    raise ValueError("resumed output validation differs from exact requested dataset")
                 _verify_merged_output(final, expected_manifest, expected_validation)
             except (OSError, TypeError, ValueError):
                 pass
@@ -1233,25 +1194,24 @@ def merge_stages(
     try:
         backend = _default_merge_backend if merge_backend is None else merge_backend
         backend(temp, episodes, tasks)
-        report = _validate_gr00t_output(temp, episodes, tasks)
-        if not isinstance(report, MergeVerification):
-            raise ValueError("built-in final validator must return a MergeVerification")
-        actual_validation = _verification_to_dict(report)
-        if actual_validation != expected_validation:
-            raise ValueError("merge backend verification differs from exact requested dataset")
+        if not temp.exists() or not stat.S_ISDIR(temp.lstat().st_mode):
+            raise ValueError("merge backend did not create a real output directory")
+        _write_file(temp / "source-manifest.json", _canonical_json(expected_manifest))
+        _write_file(temp / "merge-validation.json", _canonical_json(expected_validation))
+        artifacts = _artifact_paths(temp)
+        _write_file(temp / "dataset-checksums.sha256", _checksums_bytes(temp, artifacts))
+        _fsync_tree(temp)
         if final_validator is not None:
             hook_report = final_validator(temp, episodes, tasks)
             if not isinstance(hook_report, MergeVerification):
                 raise ValueError("additional final validation hook must return a MergeVerification")
             if _verification_to_dict(hook_report) != expected_validation:
                 raise ValueError("additional final validation hook differs from exact requested dataset")
-        if not temp.exists() or not stat.S_ISDIR(temp.lstat().st_mode):
-            raise ValueError("merge backend did not create a real output directory")
-        _write_file(temp / "source-manifest.json", _canonical_json(expected_manifest))
-        _write_file(temp / "merge-validation.json", _canonical_json(actual_validation))
-        artifacts = _artifact_paths(temp)
-        _write_file(temp / "dataset-checksums.sha256", _checksums_bytes(temp, artifacts))
-        _fsync_tree(temp)
+        report = _validate_gr00t_output(temp, episodes, tasks)
+        if not isinstance(report, MergeVerification):
+            raise ValueError("built-in final validator must return a MergeVerification")
+        if _verification_to_dict(report) != expected_validation:
+            raise ValueError("merge backend verification differs from exact requested dataset")
         _verify_merged_output(temp, expected_manifest, expected_validation)
         _atomic_publish(temp, final)
         _fsync_directory(final.parent)
@@ -1342,6 +1302,7 @@ def _create_gr00t_exporter(
         script_config=dict(_CONVERSION_SCRIPT_CONFIG),
         robot_type="g1",
         overwrite_existing=False,
+        pre_encoded_videos=True,
     )
     for expected_index, task in enumerate(task_catalog):
         exporter.meta.add_task(task)
@@ -1350,88 +1311,26 @@ def _create_gr00t_exporter(
     return exporter
 
 
-def _iter_staged_video(artifact: StagedVideoArtifact):
-    """Yield detached RGB frames from one already-validated stage MP4."""
-    try:
-        with _open_bound_file(artifact.path) as stream:
-            if _hash_stream(stream) != artifact.sha256:
-                raise ValueError("staged video changed before merge decode")
-            if os.fstat(stream.fileno()).st_size != artifact.size:
-                raise ValueError("staged video size changed before merge decode")
-            with av.open(stream, mode="r") as container:
-                streams = tuple(container.streams.video)
-                if len(streams) != 1 or streams[0].average_rate is None:
-                    raise ValueError("staged video must contain exactly one video stream")
-                if Fraction(streams[0].average_rate) != 50:
-                    raise ValueError("staged video must have nominal fps 50")
-                expected_position = 0
-                for frame in container.decode(streams[0]):
-                    if frame.pts is None or frame.time_base is None:
-                        raise ValueError("staged video frames require PTS and time_base")
-                    position = Fraction(frame.pts) * Fraction(frame.time_base) * 50
-                    if position != expected_position:
-                        raise ValueError("staged video PTS must be consecutive at 50 Hz")
-                    rgb = frame.to_ndarray(format="rgb24")
-                    if rgb.shape != (480, 640, 3) or rgb.dtype != np.dtype(np.uint8):
-                        raise ValueError("staged video must decode as 640x480 RGB uint8")
-                    yield np.array(rgb, order="C", copy=True)
-                    expected_position += 1
-            if _hash_stream(stream) != artifact.sha256:
-                raise ValueError("staged video changed after merge decode")
-    except av.error.FFmpegError as error:
-        raise ValueError("staged video became unreadable during merge") from error
-
-
-def _close_unused_video_writers(exporter: object) -> None:
-    writers = getattr(exporter, "video_writers", None)
-    if isinstance(writers, Mapping) and writers and all(hasattr(writer, "cancel") for writer in writers.values()):
-        for writer in writers.values():
-            writer.cancel()
-    else:
-        exporter.stop_video_writers()
-
-
 def _default_merge_backend(
     output: Path,
     episodes: tuple[MergeEpisode, ...],
     task_catalog: tuple[str, ...],
 ) -> None:
-    """Stream staged rows and decoded video frames through Gr00tDataExporter."""
+    """Stream staged rows and register immutable pre-encoded videos."""
     video_keys = tuple(episodes[0].videos)
     exporter = _create_gr00t_exporter(output, video_keys, task_catalog)
-    completed = False
-    try:
-        for target_episode_index, episode in enumerate(episodes):
-            iterators = {key: iter(_iter_staged_video(artifact)) for key, artifact in episode.videos.items()}
-            for row in iter_stage_rows(episode):
-                frame = dict(row)
-                timestamp = frame["timestamp"]
-                assert isinstance(timestamp, np.float32)
-                frame["timestamp"] = np.array([timestamp], dtype=np.float32)
-                for key, iterator in iterators.items():
-                    try:
-                        frame[key] = next(iterator)
-                    except StopIteration as error:
-                        raise ValueError(f"staged video {key} ended before its frame rows") from error
-                exporter.add_frame(frame)
-            for key, iterator in iterators.items():
-                try:
-                    next(iterator)
-                except StopIteration:
-                    continue
-                raise ValueError(f"staged video {key} contains more frames than its frame rows")
-            exporter.save_episode()
-            for key, artifact in episode.videos.items():
-                destination = output / exporter.meta.get_video_file_path(target_episode_index, key)
-                _replace_with_bound_file(artifact, destination)
-        _close_unused_video_writers(exporter)
-        completed = True
-    finally:
-        if not completed:
-            writers = getattr(exporter, "video_writers", {})
-            for writer in writers.values() if isinstance(writers, Mapping) else ():
-                if hasattr(writer, "cancel"):
-                    writer.cancel()
+    for target_episode_index, episode in enumerate(episodes):
+        for key, artifact in episode.videos.items():
+            destination = output / exporter.meta.get_video_file_path(target_episode_index, key)
+            _replace_with_bound_file(artifact, destination)
+            exporter.register_pre_encoded_video(key, destination)
+        for row in iter_stage_rows(episode):
+            frame = dict(row)
+            timestamp = frame["timestamp"]
+            assert isinstance(timestamp, np.float32)
+            frame["timestamp"] = np.array([timestamp], dtype=np.float32)
+            exporter.add_frame(frame)
+        exporter.save_episode()
 
 
 def _normalize_feature(feature: Mapping[str, object]) -> dict[str, object]:
@@ -1498,33 +1397,68 @@ def _output_batch_rows(batch: pa.RecordBatch) -> tuple[dict[str, object], ...]:
 
 
 class _StreamingStats:
-    def __init__(self, features: Mapping[str, Mapping[str, object]]) -> None:
+    def __init__(
+        self,
+        features: Mapping[str, Mapping[str, object]],
+        *,
+        expected_count: int,
+    ) -> None:
+        if type(expected_count) is not int or expected_count < 1:
+            raise ValueError("expected_count must be a positive integer")
         self.features = features
+        self.expected_count = expected_count
         self.count = 0
-        self.values: dict[str, list[np.ndarray]] = {key: [] for key in features}
+        self._temporary = tempfile.TemporaryDirectory(prefix="unitree-sonic-stats-")
+        self.temporary_root = Path(self._temporary.name)
+        self.values: dict[str, np.memmap] = {}
+        for index, (key, feature) in enumerate(features.items()):
+            shape = (expected_count, *tuple(feature["shape"]))
+            self.values[key] = np.memmap(
+                self.temporary_root / f"feature-{index:04d}.bin",
+                dtype=np.dtype(feature["dtype"]),
+                mode="w+",
+                shape=shape,
+            )
+
+    def __enter__(self) -> _StreamingStats:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        for values in self.values.values():
+            values.flush()
+            mmap = getattr(values, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+        self.values.clear()
+        self._temporary.cleanup()
 
     def update(self, values: Mapping[str, object]) -> None:
-        self.count += 1
+        if self.count >= self.expected_count:
+            raise ValueError("exported episode statistics received more frames than expected")
         for key, feature in self.features.items():
             dtype = np.dtype(feature["dtype"])
             value = np.asarray(values[key], dtype=dtype).reshape(tuple(feature["shape"]))
-            self.values[key].append(np.array(value, order="C", copy=True))
+            self.values[key][self.count] = value
+        self.count += 1
 
     def _expected(self) -> Mapping[str, object]:
         from lerobot.common.datasets.lerobot_dataset import compute_episode_stats
 
-        if self.count < 1:
-            raise ValueError("exported episode statistics require at least one frame")
+        if self.count != self.expected_count:
+            raise ValueError("exported episode statistics frame count differs")
         arrays: dict[str, np.ndarray] = {}
         for key, feature in self.features.items():
-            values = np.stack(self.values[key])
+            values = self.values[key][: self.count]
             if tuple(feature["shape"]) == (1,) and values.ndim == 2:
                 values = values[:, 0]
             arrays[key] = values
         return compute_episode_stats(arrays, dict(self.features))
 
     def verify(self, actual: Mapping[str, object]) -> None:
-        if set(actual) != set(self.features) or self.count < 1:
+        if set(actual) != set(self.features) or self.count != self.expected_count:
             raise ValueError("exported episode statistics feature keys differ")
         expected_by_feature = self._expected()
         for key, feature in self.features.items():
@@ -1613,6 +1547,24 @@ def _contained_output_artifact(output: Path, relative: str | Path, *, field_name
     return candidate
 
 
+def _expected_final_artifacts(meta: object, episodes: tuple[MergeEpisode, ...]) -> set[str]:
+    artifacts = {
+        "meta/info.json",
+        "meta/modality.json",
+        "meta/tasks.jsonl",
+        "meta/episodes.jsonl",
+        "meta/episodes_stats.jsonl",
+        "source-manifest.json",
+        "merge-validation.json",
+        "dataset-checksums.sha256",
+    }
+    for target_index, episode in enumerate(episodes):
+        artifacts.add(Path(meta.get_data_file_path(target_index)).as_posix())
+        for key in episode.videos:
+            artifacts.add(Path(meta.get_video_file_path(target_index, key)).as_posix())
+    return artifacts
+
+
 def _validate_gr00t_output(
     output: Path,
     episodes: tuple[MergeEpisode, ...],
@@ -1647,6 +1599,13 @@ def _validate_gr00t_output(
     expected_total = sum(episode.row_count for episode in episodes)
     if meta.total_frames != expected_total:
         raise ValueError("exported global frame count differs from requested merge")
+    expected_episode_indices = set(range(len(episodes)))
+    if set(meta.episodes) != expected_episode_indices:
+        raise ValueError("exported episode metadata keys must equal the exact requested episode set")
+    if set(meta.episodes_stats) != expected_episode_indices:
+        raise ValueError("exported episode statistics keys must equal the exact requested episode set")
+    if set(_artifact_paths(output)) != _expected_final_artifacts(meta, episodes):
+        raise ValueError("exported dataset contains an unexpected artifact or differs from the canonical tree")
     task_to_index = {task: meta.get_task_index(task) for task in task_catalog}
     expected_task_to_index = {task: index for index, task in enumerate(task_catalog)}
     expected_index_to_task = {index: task for index, task in enumerate(task_catalog)}
@@ -1679,68 +1638,69 @@ def _validate_gr00t_output(
         local_index = 0
         episode_tasks: list[str] = []
         seen_tasks: set[str] = set()
-        stats = _StreamingStats(nonvideo_features)
-        with _open_bound_file(parquet_path) as stream:
-            before_digest = _hash_stream(stream)
-            parquet = pq.ParquetFile(stream)
-            if parquet.schema_arrow.remove_metadata() != expected_arrow_schema:
-                raise ValueError("exported parquet Arrow schema, types, order, or nullability differ")
-            if parquet.metadata.num_rows != episode.row_count:
-                raise ValueError("exported parquet row count differs from staged episode")
-            for batch in parquet.iter_batches(batch_size=128):
-                if any(batch.column(index).null_count for index in range(batch.num_columns)):
-                    raise ValueError("exported parquet must not contain null values")
-                for actual in _output_batch_rows(batch):
-                    try:
-                        expected = next(staged_rows)
-                    except StopIteration as error:
-                        raise ValueError("exported parquet has more rows than staged episode") from error
-                    for key in TARGET_FRAME_SCHEMA:
-                        if key == "task":
-                            continue
-                        expected_value = expected[key]
-                        actual_value = actual[key]
-                        if isinstance(expected_value, np.ndarray):
-                            if not isinstance(actual_value, np.ndarray) or not np.array_equal(
-                                actual_value, expected_value
+        with _StreamingStats(nonvideo_features, expected_count=episode.row_count) as stats:
+            with _open_bound_file(parquet_path) as stream:
+                before_digest = _hash_stream(stream)
+                parquet = pq.ParquetFile(stream)
+                if parquet.schema_arrow.remove_metadata() != expected_arrow_schema:
+                    raise ValueError("exported parquet Arrow schema, types, order, or nullability differ")
+                if parquet.metadata.num_rows != episode.row_count:
+                    raise ValueError("exported parquet row count differs from staged episode")
+                for batch in parquet.iter_batches(batch_size=128):
+                    if any(batch.column(index).null_count for index in range(batch.num_columns)):
+                        raise ValueError("exported parquet must not contain null values")
+                    for actual in _output_batch_rows(batch):
+                        try:
+                            expected = next(staged_rows)
+                        except StopIteration as error:
+                            raise ValueError("exported parquet has more rows than staged episode") from error
+                        for key in TARGET_FRAME_SCHEMA:
+                            if key == "task":
+                                continue
+                            expected_value = expected[key]
+                            actual_value = actual[key]
+                            if isinstance(expected_value, np.ndarray):
+                                if not isinstance(actual_value, np.ndarray) or not np.array_equal(
+                                    actual_value, expected_value
+                                ):
+                                    raise ValueError(f"exported nonvideo value differs for {key}")
+                            elif not isinstance(actual_value, np.float32) or (
+                                actual_value.tobytes() != expected_value.tobytes()
                             ):
-                                raise ValueError(f"exported nonvideo value differs for {key}")
-                        elif not isinstance(actual_value, np.float32) or (
-                            actual_value.tobytes() != expected_value.tobytes()
+                                raise ValueError("exported timestamp differs bitwise from staged scalar")
+                        task = expected["task"]
+                        task_index = task_to_index[task]
+                        if (
+                            actual["frame_index"] != local_index
+                            or actual["episode_index"] != target_index
+                            or actual["index"] != global_index
+                            or actual["task_index"] != task_index
                         ):
-                            raise ValueError("exported timestamp differs bitwise from staged scalar")
-                    task = expected["task"]
-                    task_index = task_to_index[task]
-                    if (
-                        actual["frame_index"] != local_index
-                        or actual["episode_index"] != target_index
-                        or actual["index"] != global_index
-                        or actual["task_index"] != task_index
-                    ):
-                        raise ValueError("exported frame, episode, global, or task index differs")
-                    if task not in seen_tasks:
-                        seen_tasks.add(task)
-                        episode_tasks.append(task)
-                    _update_frame_content_digest(
-                        content,
-                        row=expected,
-                        source_episode_id=episode.identity.source_episode_id,
-                        target_episode_index=target_index,
-                        local_index=local_index,
-                        global_index=global_index,
-                        task_index=task_index,
-                    )
-                    stats.update(actual)
-                    local_index += 1
-                    global_index += 1
-            try:
-                next(staged_rows)
-            except StopIteration:
-                pass
-            else:
-                raise ValueError("exported parquet has fewer rows than staged episode")
-            if _hash_stream(stream) != before_digest:
-                raise ValueError("exported parquet changed during independent validation")
+                            raise ValueError("exported frame, episode, global, or task index differs")
+                        if task not in seen_tasks:
+                            seen_tasks.add(task)
+                            episode_tasks.append(task)
+                        _update_frame_content_digest(
+                            content,
+                            row=expected,
+                            source_episode_id=episode.identity.source_episode_id,
+                            target_episode_index=target_index,
+                            local_index=local_index,
+                            global_index=global_index,
+                            task_index=task_index,
+                        )
+                        stats.update(actual)
+                        local_index += 1
+                        global_index += 1
+                try:
+                    next(staged_rows)
+                except StopIteration:
+                    pass
+                else:
+                    raise ValueError("exported parquet has fewer rows than staged episode")
+                if _hash_stream(stream) != before_digest:
+                    raise ValueError("exported parquet changed during independent validation")
+            stats.verify(meta.episodes_stats[target_index])
         episode_lengths.append(local_index)
         counts: dict[str, int] = {}
         for key in episode.videos:
@@ -1766,7 +1726,6 @@ def _validate_gr00t_output(
         episode_metadata = meta.episodes[target_index]
         if episode_metadata.get("length") != local_index or episode_metadata.get("tasks") != episode_tasks:
             raise ValueError("exported episode length or first-occurrence task order differs")
-        stats.verify(meta.episodes_stats[target_index])
         stats_ids.append(episode.identity.source_episode_id)
     return MergeVerification(
         source_episode_ids=tuple(episode.identity.source_episode_id for episode in episodes),

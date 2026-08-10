@@ -384,9 +384,13 @@ def probe_video_50fps_stream(stream: BinaryIO, *, field_name: str) -> tuple[int,
         stream.seek(0)
         with av.open(stream, mode="r") as container:
             streams = tuple(container.streams.video)
-            if len(streams) != 1:
-                raise ValueError(f"{field_name} must contain exactly one video stream")
+            if len(container.streams) != 1 or len(streams) != 1:
+                raise ValueError(f"{field_name} must contain exactly one video stream and no other streams")
             stream = streams[0]
+            if stream.codec_context.name != "h264":
+                raise ValueError(f"{field_name} video codec must be H264")
+            if stream.pix_fmt != "yuv420p":
+                raise ValueError(f"{field_name} pixel format must be yuv420p")
             if stream.average_rate is None or Fraction(stream.average_rate) != 50:
                 raise ValueError(f"{field_name} must have nominal fps 50")
             count = 0
