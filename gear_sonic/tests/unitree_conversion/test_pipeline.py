@@ -323,6 +323,7 @@ def test_diagnostic_stage_is_immutable_and_provenance_bound(tmp_path: Path) -> N
         source_file_sha256={"data/episode.parquet": "2" * 64},
         source_lock_sha256="3" * 64,
         diagnostic_contract_sha256="4" * 64,
+        converter_version="test-v1",
     )
     report = SimpleNamespace(
         source_repo_id=identity.source_repo_id,
@@ -388,6 +389,20 @@ def test_smoke_lock_rejects_full_mode_and_unapproved_sources(smoke_lock, tmp_pat
             smoke=True,
         )
 
+    extra_source = replace(
+        smoke_lock.dex3,
+        repo_id="unitreerobotics/extra",
+        label="dex3-extra",
+    )
+    bad_lock = replace(smoke_lock, sources=(*smoke_lock.sources, extra_source))
+    with pytest.raises(ValueError, match="exactly one Dex3"):
+        run_dex3_pipeline(
+            lock=bad_lock,
+            output_root=tmp_path,
+            components=fake.build(),
+            smoke=True,
+        )
+
 
 def test_full_lock_merges_repositories_independently_in_repo_order(smoke_lock, tmp_path: Path) -> None:
     source_z = replace(
@@ -413,7 +428,7 @@ def test_full_lock_merges_repositories_independently_in_repo_order(smoke_lock, t
         sources=(source_z, source_a),
         collections=(
             CollectionMembership(
-                slug="unitreerobotics/test",
+                slug="unitreerobotics/unifolm-g1-dex3-dataset",
                 repo_ids=(source_z.repo_id, source_a.repo_id),
             ),
         ),

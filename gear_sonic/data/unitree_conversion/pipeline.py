@@ -88,6 +88,7 @@ class DiagnosticIdentity:
     source_file_sha256: Mapping[str, str]
     source_lock_sha256: str
     diagnostic_contract_sha256: str
+    converter_version: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_repo_id, str) or "/" not in self.source_repo_id:
@@ -109,6 +110,8 @@ class DiagnosticIdentity:
             validate_sha256(digest, field_name=f"diagnostic source hash {source_path}")
         validate_sha256(self.source_lock_sha256, field_name="diagnostic source_lock_sha256")
         validate_sha256(self.diagnostic_contract_sha256, field_name="diagnostic contract SHA-256")
+        if not isinstance(self.converter_version, str) or not self.converter_version.strip():
+            raise ValueError("diagnostic converter_version must be nonempty")
         object.__setattr__(self, "source_file_sha256", MappingProxyType(hashes))
 
     def to_dict(self) -> dict[str, object]:
@@ -119,6 +122,7 @@ class DiagnosticIdentity:
             "source_file_sha256": dict(sorted(self.source_file_sha256.items())),
             "source_lock_sha256": self.source_lock_sha256,
             "diagnostic_contract_sha256": self.diagnostic_contract_sha256,
+            "converter_version": self.converter_version,
         }
 
     @property
@@ -289,6 +293,10 @@ def _selected_sources(lock: SourceLock, *, kind: str, smoke: bool) -> tuple[Sour
         raise ValueError("a scope: smoke source lock requires smoke=True")
     if lock.scope == "full" and smoke:
         raise ValueError("a scope: full source lock requires smoke=False")
+    if lock.scope == "smoke" and (
+        len(lock.sources) != 2 or {source.label for source in lock.sources} != {"dex3", "inspire"}
+    ):
+        raise ValueError("scope: smoke source lock must contain exactly one Dex3 and one Inspire source")
     for source in lock.sources:
         if not source.approved:
             raise ValueError(f"source {source.repo_id!r} is not approved")
@@ -300,17 +308,25 @@ def _selected_sources(lock: SourceLock, *, kind: str, smoke: bool) -> tuple[Sour
                 raise ValueError(
                     f"scope: smoke source {source.repo_id!r} episodes must equal deterministic cohort {expected}"
                 )
-    selected = tuple(
-        sorted(
-            (
-                source
-                for source in lock.sources
-                if source.label == kind
-                or (isinstance(source.label, str) and source.label.startswith((f"{kind}-", f"{kind}:")))
-            ),
-            key=lambda item: item.repo_id,
+    if lock.scope == "full":
+        collection_slug = {
+            "dex3": "unitreerobotics/unifolm-g1-dex3-dataset",
+            "inspire": "unitreerobotics/unifolm-wbt-dataset",
+        }[kind]
+        selected_repo_ids = {
+            repo_id
+            for membership in lock.collections
+            if membership.slug == collection_slug
+            for repo_id in membership.repo_ids
+        }
+        selected = tuple(
+            sorted(
+                (source for source in lock.sources if source.repo_id in selected_repo_ids),
+                key=lambda item: item.repo_id,
+            )
         )
-    )
+    else:
+        selected = tuple(source for source in lock.sources if source.label == kind)
     if not selected:
         raise ValueError(f"source lock has no {kind!r} sources")
     for source in selected:
@@ -347,9 +363,8 @@ def _failure(error_class: str, error: BaseException) -> ClassifiedFailure:
 
 
 def _phase_error_class(phase: str, error: BaseException) -> str:
-    message = str(error).lower()
-    if "quaternion" in message or "wxyz" in message:
-        return "quaternion_error"
+    if isinstance(error, _EpisodePreflightError):
+        return error.error_class
     return {
         "identity": "provenance_error",
         "resume": "provenance_error",
@@ -547,6 +562,11 @@ def run_inspire_diagnostics(
                 phase = "diagnose"
                 diagnostic = operations.diagnose_inspire_episode(source, episode_id, preflight, cache)
                 phase = "semantic_gate"
+                if getattr(diagnostic, "status", None) == "source_schema_error":
+                    raise _EpisodePreflightError(
+                        "quaternion_error",
+                        "Inspire root quaternion validation failed",
+                    )
                 if getattr(diagnostic, "status", None) != "blocked_unverified":
                     raise ValueError("Inspire diagnostic must remain blocked_unverified")
                 if getattr(diagnostic, "encoder_invoked", None) is not False:
@@ -563,17 +583,22 @@ def run_inspire_diagnostics(
                     artifact_path=artifact,
                 )
             except Exception as error:
+                error_class = (
+                    error.error_class
+                    if isinstance(error, _EpisodePreflightError)
+                    else {
+                        "identity": "provenance_error",
+                        "diagnose": "source_schema_error",
+                        "semantic_gate": "semantic_gate_error",
+                        "write": "target_validation_error",
+                    }[phase]
+                )
                 report = EpisodePipelineReport(
                     source_repo_id=source.repo_id,
                     source_episode_id=episode_id,
                     status="failed",
                     detail=f"{type(error).__name__}: {error}",
-                    error_class={
-                        "identity": "provenance_error",
-                        "diagnose": "source_schema_error",
-                        "semantic_gate": "semantic_gate_error",
-                        "write": "target_validation_error",
-                    }[phase],
+                    error_class=error_class,
                 )
             episode_reports.append(report)
 
@@ -746,16 +771,27 @@ def _validate_dex3_metadata(source: SourceSpec, dataset: object) -> None:
 
     meta = dataset.meta
     if dataset.revision != source.revision or meta.revision != source.revision:
-        raise ValueError("loaded source revision differs from the pinned revision")
-    if meta.total_episodes != source.episode_count or meta.fps != 30:
-        raise ValueError("source episode count or fps differs from the pinned contract")
+        raise _EpisodePreflightError(
+            "provenance_error",
+            "loaded source revision differs from the pinned revision",
+        )
+    if meta.total_episodes != source.episode_count:
+        raise _EpisodePreflightError(
+            "provenance_error",
+            "source episode count differs from the pinned contract",
+        )
+    if meta.fps != 30:
+        raise _EpisodePreflightError("timeline_error", "source fps differs from exact 30 Hz")
     for key in ("observation.state", "action"):
         feature = meta.features.get(key) if isinstance(meta.features, Mapping) else None
         names = feature.get("names") if isinstance(feature, Mapping) else None
         if isinstance(names, Sequence) and len(names) == 1 and isinstance(names[0], Sequence):
             names = names[0]
         if tuple(names or ()) != DEX3_FEATURE_NAMES:
-            raise ValueError(f"source {key} names differ from the exact Dex3 order")
+            raise _EpisodePreflightError(
+                "source_schema_error",
+                f"source {key} names differ from the exact Dex3 order",
+            )
 
 
 def _validate_source_metadata(
@@ -784,6 +820,7 @@ def _validate_source_metadata(
     failures: dict[int, ClassifiedFailure] = {}
 
     for episode_id in episode_ids:
+        phase = "load"
         try:
             dataset = load_pinned_v3_episode(
                 source,
@@ -792,12 +829,22 @@ def _validate_source_metadata(
                 schema=schema,
                 download_videos=True,
             )
+            phase = "identity"
             if dataset.revision != source.revision or dataset.meta.revision != source.revision:
-                raise ValueError("loaded source revision differs from the pinned revision")
-            if dataset.meta.total_episodes != source.episode_count or dataset.meta.fps != 30:
-                raise ValueError("source episode count or fps differs from the pinned contract")
+                raise _EpisodePreflightError(
+                    "provenance_error",
+                    "loaded source revision differs from the pinned revision",
+                )
+            if dataset.meta.total_episodes != source.episode_count:
+                raise _EpisodePreflightError(
+                    "provenance_error",
+                    "source episode count differs from the pinned contract",
+                )
+            if dataset.meta.fps != 30:
+                raise _EpisodePreflightError("timeline_error", "source fps differs from exact 30 Hz")
             if kind == "dex3":
                 _validate_dex3_metadata(source, dataset)
+            phase = "tasks"
             current_tasks = _load_task_catalog(Path(dataset.root))
             if task_catalog is None:
                 task_catalog = current_tasks
@@ -805,19 +852,13 @@ def _validate_source_metadata(
                 raise ValueError("source task catalog changed within one repository preflight")
 
             datasets[episode_id] = dataset
+            phase = "hash"
             source_hashes[episode_id] = _source_hashes(dataset, episode_id)
         except Exception as error:
             if isinstance(error, _EpisodePreflightError):
                 failures[episode_id] = ClassifiedFailure(error.error_class, str(error))
             else:
-                message = str(error).lower()
-                error_class = (
-                    "provenance_error"
-                    if any(word in message for word in ("revision", "episode count", "hash", "pinned"))
-                    else "timeline_error"
-                    if any(word in message for word in ("frame count", "timestamp", "fps"))
-                    else "source_schema_error"
-                )
+                error_class = "provenance_error" if phase == "hash" else "source_schema_error"
                 failures[episode_id] = _failure(error_class, error)
 
     if task_catalog is None:
@@ -881,8 +922,11 @@ def _preflight_repository(
             primary = streams.get(source.primary_camera)
             if primary is None or primary.status != "exact":
                 reason = "source stream absent" if primary is None else primary.reason
+                error_class = (
+                    "source_schema_error" if primary is None or primary.status == "missing" else "timeline_error"
+                )
                 raise _EpisodePreflightError(
-                    "timeline_error",
+                    error_class,
                     f"required primary camera {source.primary_camera!r} failed: {reason}",
                 )
             reports.append(
@@ -985,6 +1029,8 @@ def _adapt_dex3(
 
     dataset = preflight.datasets[episode_id]
     rows = dataset.hf_dataset
+    if len(rows) < 2:
+        raise _EpisodePreflightError("timeline_error", "Dex3 episode contains fewer than two source frames")
     return adapt_dex3_arrays(
         source_repo_id=source.repo_id,
         source_revision=source.revision,
@@ -1011,7 +1057,7 @@ def _resample_episode(episode: object, preflight: _RepositoryPreflight) -> objec
     )
 
     if not isinstance(episode, CanonicalEpisode):
-        raise TypeError("adapter must return CanonicalEpisode")
+        raise _EpisodePreflightError("source_schema_error", "adapter must return CanonicalEpisode")
     audit = audit_source_timestamps(episode.timestamps)
     if audit.rejected:
         raise ValueError("source timestamps exceed the exact 30 Hz rejection threshold")
@@ -1026,7 +1072,15 @@ def _resample_episode(episode: object, preflight: _RepositoryPreflight) -> objec
     try:
         task_texts = tuple(preflight.tasks[int(index)] for index in task_indices)
     except KeyError as error:
-        raise ValueError(f"source task_index {error.args[0]} is absent from meta/tasks.jsonl") from error
+        raise _EpisodePreflightError(
+            "source_schema_error",
+            f"source task_index {error.args[0]} is absent from meta/tasks.jsonl",
+        ) from error
+    try:
+        observed_roots = resample_quaternions(episode.observed_root_wxyz)
+        reference_roots = resample_quaternions(episode.reference_root_wxyz)
+    except ValueError as error:
+        raise _EpisodePreflightError("quaternion_error", str(error)) from error
     return ResampledEpisode(
         source_repo_id=episode.source_repo_id,
         source_revision=episode.source_revision,
@@ -1034,8 +1088,8 @@ def _resample_episode(episode: object, preflight: _RepositoryPreflight) -> objec
         body_joint_names=G1_MUJOCO_NAMES,
         task_indices=np.asarray(task_indices, dtype=np.int64),
         task_texts=task_texts,
-        observed_root_wxyz=resample_quaternions(episode.observed_root_wxyz),
-        reference_root_wxyz=resample_quaternions(episode.reference_root_wxyz),
+        observed_root_wxyz=observed_roots,
+        reference_root_wxyz=reference_roots,
         observed_body_q=observed_body,
         desired_body_q=desired_body,
         desired_body_velocity=desired_velocity,
@@ -1199,11 +1253,72 @@ def _diagnose_inspire(
     preflight: _RepositoryPreflight,
     cache_dir: Path | None,
 ) -> object:
-    del preflight
-    from gear_sonic.data.unitree_conversion.inspire_diagnostics import diagnose_inspire_episode
+    del cache_dir
+    from gear_sonic.data.unitree_conversion.inspire_diagnostics import (
+        _CURRENT_KEY,
+        _DESIRED_KEY,
+        _HAND_CMD_KEY,
+        _HAND_STATE_KEY,
+        _diagnose_arrays,
+        _integer,
+        _timestamp,
+        _validate_metadata,
+        _validate_source_spec,
+    )
 
-    root = None if cache_dir is None else cache_dir / "lerobot"
-    return diagnose_inspire_episode(source, episode_id, root=root)
+    source = _validate_source_spec(source, episode_id)
+    dataset = preflight.datasets[episode_id]
+    _validate_metadata(source, dataset.meta)
+    expected_hashes = dict(preflight.source_hashes[episode_id])
+    if dict(_source_hashes(dataset, episode_id)) != expected_hashes:
+        raise _EpisodePreflightError(
+            "provenance_error",
+            "Inspire source files changed after preflight",
+        )
+
+    current: list[object] = []
+    desired: list[object] = []
+    hand_state: list[object] = []
+    hand_cmd: list[object] = []
+    timestamps: list[float] = []
+    task_indices: list[int] = []
+    for row_number, row in enumerate(dataset.hf_dataset):
+        source_episode_id = _integer(row["episode_index"], field_name=f"row {row_number} episode_index")
+        if source_episode_id != episode_id:
+            raise ValueError(f"row {row_number} episode_index does not match requested episode")
+        frame_index = _integer(row["frame_index"], field_name=f"row {row_number} frame_index")
+        if frame_index != row_number:
+            raise ValueError(f"expected frame_index {row_number}, got {frame_index}")
+        task_index = _integer(
+            row["task_index"],
+            field_name=f"row {row_number} task_index",
+            nonnegative=True,
+        )
+        current.append(row[_CURRENT_KEY])
+        desired.append(row[_DESIRED_KEY])
+        hand_state.append(row[_HAND_STATE_KEY])
+        hand_cmd.append(row[_HAND_CMD_KEY])
+        timestamps.append(_timestamp(row["timestamp"], field_name=f"row {row_number} timestamp"))
+        task_indices.append(task_index)
+    report = _diagnose_arrays(
+        current=current,
+        desired=desired,
+        hand_state=hand_state,
+        hand_cmd=hand_cmd,
+        timestamps=timestamps,
+        source_repo_id=source.repo_id,
+        source_revision=source.revision,
+        source_episode_id=episode_id,
+        source_task_indices=tuple(task_indices),
+        primary_camera=source.primary_camera,
+        camera_map=source.camera_map,
+    )
+    if dict(_source_hashes(dataset, episode_id)) != expected_hashes:
+        raise _EpisodePreflightError(
+            "provenance_error",
+            "Inspire source files changed during diagnostics",
+        )
+    return report
 
 
 def _make_diagnostic_identity(
@@ -1229,6 +1344,7 @@ def _make_diagnostic_identity(
         source_file_sha256=preflight.source_hashes[episode_id],
         source_lock_sha256=lock_sha256,
         diagnostic_contract_sha256=hashlib.sha256(contract).hexdigest(),
+        converter_version="unitree-sonic-conversion-v1",
     )
 
 
