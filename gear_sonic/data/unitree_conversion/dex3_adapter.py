@@ -10,7 +10,11 @@ from typing import Any
 
 import numpy as np
 
-from gear_sonic.data.unitree_conversion.contracts import CanonicalEpisode, SourceSpec
+from gear_sonic.data.unitree_conversion.contracts import (
+    CanonicalEpisode,
+    SourceSpec,
+    SourceVideoSegment,
+)
 from gear_sonic.data.unitree_conversion.joint_mapping import G1_MUJOCO_NAMES, NOMINAL_G1_MUJOCO
 from gear_sonic.data.unitree_conversion.lerobot_v3_source import (
     default_lerobot_cache_base,
@@ -121,6 +125,7 @@ def adapt_dex3_arrays(
     feature_names: Sequence[str],
     timestamps: object,
     task_indices: object,
+    video_segments: Mapping[str, SourceVideoSegment] | None = None,
 ) -> CanonicalEpisode:
     """Map documented 28D Dex3 state/action arrays into one canonical episode."""
     names = _exact_feature_names(feature_names)
@@ -175,6 +180,7 @@ def adapt_dex3_arrays(
         observed_right_hand=observed_array[:, right_hand_indices],
         desired_left_hand=desired_array[:, left_hand_indices],
         desired_right_hand=desired_array[:, right_hand_indices],
+        video_segments={} if video_segments is None else video_segments,
     )
 
 
@@ -294,6 +300,14 @@ def load_dex3_episode(
     action_names = _feature_names_from_meta(features, "action")
     if observation_names != action_names:
         raise ValueError("observation.state and action feature names must match exactly")
+    expected_video_keys = tuple(
+        key
+        for key, feature in direct_dataset.meta.features.items()
+        if isinstance(feature, Mapping) and feature.get("dtype") == "video"
+    )
+    video_segments = direct_dataset.video_segments
+    if set(video_segments) != set(expected_video_keys):
+        raise ValueError("approved Dex3 source must carry exact segment metadata for every video key")
 
     observed_rows: list[np.ndarray] = []
     desired_rows: list[np.ndarray] = []
@@ -351,4 +365,5 @@ def load_dex3_episode(
         feature_names=observation_names,
         timestamps=np.asarray(timestamps, dtype=np.float64),
         task_indices=np.asarray(task_indices),
+        video_segments=video_segments,
     )

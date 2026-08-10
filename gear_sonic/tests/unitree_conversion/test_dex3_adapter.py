@@ -9,7 +9,11 @@ import pyarrow.parquet as pq
 import pytest
 
 from gear_sonic.data.unitree_conversion import dex3_adapter as dex3_adapter_module
-from gear_sonic.data.unitree_conversion.contracts import CanonicalEpisode, SourceSpec
+from gear_sonic.data.unitree_conversion.contracts import (
+    CanonicalEpisode,
+    SourceSpec,
+    SourceVideoSegment,
+)
 from gear_sonic.data.unitree_conversion.dex3_adapter import adapt_dex3_arrays, load_dex3_episode
 from gear_sonic.data.unitree_conversion.joint_mapping import G1_MUJOCO_NAMES, NOMINAL_G1_MUJOCO
 from gear_sonic.data.unitree_conversion.lerobot_v3_source import (
@@ -304,6 +308,7 @@ def test_canonical_episode_has_exact_mutable_contract_fields() -> None:
         "observed_right_hand",
         "desired_left_hand",
         "desired_right_hand",
+        "video_segments",
     )
     episode = CanonicalEpisode(**_canonical_kwargs())
     episode.observed_body_q[0, 0] = 123.0
@@ -316,6 +321,111 @@ def test_canonical_episode_requires_builtin_integer_30_hz(source_fps: object) ->
     kwargs["source_fps"] = source_fps
 
     with pytest.raises(ValueError, match="source_fps must be exactly integer 30"):
+        CanonicalEpisode(**kwargs)
+
+
+def test_source_video_segment_matches_actual_pinned_episode_78_rounding(tmp_path: Path) -> None:
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"pinned")
+
+    segment = SourceVideoSegment(
+        source_key=VIDEO_KEYS[0],
+        path=path,
+        from_timestamp=1033.3666666666668,
+        to_timestamp=1045.6666666666667,
+        start_frame=31001,
+        end_frame=31370,
+        frame_count=369,
+    )
+
+    assert segment.path == path.resolve()
+    assert segment.start_frame == 31001
+    assert segment.end_frame == 31370
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"from_timestamp": -1 / 30}, "from_timestamp"),
+        ({"to_timestamp": 0.0}, "strictly larger"),
+        ({"from_timestamp": 0.01}, "30 Hz frame index"),
+        ({"to_timestamp": 3 / 30 + 0.01}, "30 Hz frame index"),
+        ({"start_frame": 1}, "start_frame"),
+        ({"end_frame": 4}, "end_frame"),
+        ({"frame_count": 2}, "frame_count"),
+    ],
+)
+def test_source_video_segment_rejects_invalid_offset_duration_or_count(
+    tmp_path: Path,
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"pinned")
+    values: dict[str, object] = {
+        "source_key": VIDEO_KEYS[0],
+        "path": path,
+        "from_timestamp": 0.0,
+        "to_timestamp": 3 / 30,
+        "start_frame": 0,
+        "end_frame": 3,
+        "frame_count": 3,
+    }
+    values.update(changes)
+
+    with pytest.raises(ValueError, match=message):
+        SourceVideoSegment(**values)
+
+
+def test_canonical_episode_owns_frozen_deterministic_video_segments(tmp_path: Path) -> None:
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"pinned")
+    first = SourceVideoSegment(
+        source_key="camera.z",
+        path=path,
+        from_timestamp=0.0,
+        to_timestamp=3 / 30,
+        start_frame=0,
+        end_frame=3,
+        frame_count=3,
+    )
+    second = SourceVideoSegment(
+        source_key="camera.a",
+        path=path,
+        from_timestamp=0.0,
+        to_timestamp=3 / 30,
+        start_frame=0,
+        end_frame=3,
+        frame_count=3,
+    )
+    caller = {first.source_key: first, second.source_key: second}
+    kwargs = _canonical_kwargs()
+    kwargs["video_segments"] = caller
+
+    episode = CanonicalEpisode(**kwargs)
+    caller.clear()
+
+    assert tuple(episode.video_segments) == ("camera.a", "camera.z")
+    with pytest.raises(TypeError):
+        episode.video_segments["new"] = first
+
+
+def test_canonical_episode_rejects_video_segment_count_or_key_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"pinned")
+    segment = SourceVideoSegment(
+        source_key="camera.actual",
+        path=path,
+        from_timestamp=0.0,
+        to_timestamp=2 / 30,
+        start_frame=0,
+        end_frame=2,
+        frame_count=2,
+    )
+    kwargs = _canonical_kwargs()
+    kwargs["video_segments"] = {"camera.wrong": segment}
+
+    with pytest.raises(ValueError, match="video segment key"):
         CanonicalEpisode(**kwargs)
 
 
@@ -531,17 +641,28 @@ def _episode_row(
     data_chunk_index: object = 0,
     data_file_index: object = 0,
     video_locations: dict[str, tuple[object, object]] | None = None,
+    length: object = 2,
+    video_timestamps: dict[str, tuple[object, object]] | None = None,
 ) -> dict[str, object]:
     locations = {key: (0, 0) for key in VIDEO_KEYS} if video_locations is None else video_locations
+    timestamps = (
+        {key: (0.0, float(length) / 30.0) for key in VIDEO_KEYS}
+        if video_timestamps is None and isinstance(length, int) and not isinstance(length, bool)
+        else video_timestamps
+    )
     row: dict[str, object] = {
         "episode_index": episode_id,
         "data/chunk_index": data_chunk_index,
         "data/file_index": data_file_index,
+        "length": length,
     }
     for video_key in VIDEO_KEYS:
         chunk_index, file_index = locations[video_key]
         row[f"videos/{video_key}/chunk_index"] = chunk_index
         row[f"videos/{video_key}/file_index"] = file_index
+        from_timestamp, to_timestamp = (0.0, 2 / 30) if timestamps is None else timestamps[video_key]
+        row[f"videos/{video_key}/from_timestamp"] = from_timestamp
+        row[f"videos/{video_key}/to_timestamp"] = to_timestamp
     return row
 
 
@@ -725,10 +846,15 @@ def test_direct_v3_reader_supports_pinned_nested_dataset_root_without_videos(tmp
                 "episode_index": 1,
                 "data/chunk_index": 0,
                 "data/file_index": 0,
+                "length": 2,
                 "videos/observation.images.cam_0/chunk_index": 0,
                 "videos/observation.images.cam_0/file_index": 0,
+                "videos/observation.images.cam_0/from_timestamp": 0.0,
+                "videos/observation.images.cam_0/to_timestamp": 2 / 30,
                 "videos/observation.images.cam_1/chunk_index": 0,
                 "videos/observation.images.cam_1/file_index": 0,
+                "videos/observation.images.cam_1/from_timestamp": 0.0,
+                "videos/observation.images.cam_1/to_timestamp": 2 / 30,
             }
         ],
         data_rows=data_rows,
@@ -760,6 +886,7 @@ def test_direct_v3_reader_supports_pinned_nested_dataset_root_without_videos(tmp
     assert downloader.calls[0]["allow_patterns"] == [f"{dataset_path}/meta/**"]
     assert downloader.calls[1]["allow_patterns"] == [f"{dataset_path}/data/chunk-000/file-000.parquet"]
     assert tuple(dataset.hf_dataset[0]) == schema.columns
+    assert dict(dataset.video_segments) == {}
 
 
 def test_direct_v3_reader_rejects_invalid_or_overlapping_schema_columns() -> None:
@@ -789,6 +916,15 @@ def test_loader_default_reads_prefetched_v3_data_directly_without_v21_lerobot(tm
     np.testing.assert_array_equal(episode.reference_root_wxyz, [[1.0, 0.0, 0.0, 0.0]] * 2)
     np.testing.assert_array_equal(episode.observed_left_hand[1], np.arange(100, 128)[14:21])
     np.testing.assert_array_equal(episode.desired_right_hand[1], np.arange(1100, 1128)[21:28])
+    assert tuple(episode.video_segments) == tuple(sorted(VIDEO_KEYS))
+    for source_key, segment in episode.video_segments.items():
+        assert segment.source_key == source_key
+        assert segment.path.is_absolute()
+        assert segment.path.is_file()
+        assert segment.from_timestamp == 0.0
+        assert segment.to_timestamp == 2 / 30
+        assert segment.start_frame == 0
+        assert segment.end_frame == segment.frame_count == 2
 
 
 def test_loader_default_rejects_corrupt_selected_v3_data_parquet(tmp_path: Path) -> None:
@@ -1169,8 +1305,12 @@ def test_loader_rejects_unsafe_interpolated_video_key_before_payload_download(
     episode_row = _episode_row()
     del episode_row[f"videos/{VIDEO_KEYS[-1]}/chunk_index"]
     del episode_row[f"videos/{VIDEO_KEYS[-1]}/file_index"]
+    del episode_row[f"videos/{VIDEO_KEYS[-1]}/from_timestamp"]
+    del episode_row[f"videos/{VIDEO_KEYS[-1]}/to_timestamp"]
     episode_row[f"videos/{unsafe_key}/chunk_index"] = 0
     episode_row[f"videos/{unsafe_key}/file_index"] = 0
+    episode_row[f"videos/{unsafe_key}/from_timestamp"] = 0.0
+    episode_row[f"videos/{unsafe_key}/to_timestamp"] = 2 / 30
     downloader = FakeSnapshotDownloader(info=info, episode_rows=[episode_row])
 
     with pytest.raises(ValueError, match="safe literal relative path"):
@@ -1252,8 +1392,11 @@ def test_loader_prefetch_rejects_duplicate_episode_metadata_rows(
         "episode_index",
         "data/chunk_index",
         "data/file_index",
+        "length",
         f"videos/{VIDEO_KEYS[0]}/chunk_index",
         f"videos/{VIDEO_KEYS[0]}/file_index",
+        f"videos/{VIDEO_KEYS[0]}/from_timestamp",
+        f"videos/{VIDEO_KEYS[0]}/to_timestamp",
     ],
 )
 def test_loader_prefetch_rejects_missing_episode_metadata_columns(
@@ -1303,6 +1446,47 @@ def test_loader_prefetch_rejects_invalid_episode_metadata_values(
             root=tmp_path,
             dataset_factory=lambda **_: pytest.fail("factory must not be called"),
             snapshot_downloader=downloader,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("length", 3, "length.*selected data row count"),
+        (f"videos/{VIDEO_KEYS[0]}/from_timestamp", -0.1, "from_timestamp"),
+        (f"videos/{VIDEO_KEYS[0]}/from_timestamp", float("nan"), "finite nonnegative"),
+        (f"videos/{VIDEO_KEYS[0]}/to_timestamp", 0.0, "strictly larger"),
+        (f"videos/{VIDEO_KEYS[0]}/to_timestamp", 0.07, "30 Hz frame index"),
+    ],
+)
+def test_loader_rejects_invalid_video_interval_metadata(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+    message: str,
+) -> None:
+    row = _episode_row()
+    row[field_name] = value
+
+    with pytest.raises(ValueError, match=message):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            snapshot_downloader=FakeSnapshotDownloader(episode_rows=[row]),
+        )
+
+
+def test_loader_rejects_camera_specific_video_offset_mismatch(tmp_path: Path) -> None:
+    timestamps = {key: (0.0, 2 / 30) for key in VIDEO_KEYS}
+    timestamps[VIDEO_KEYS[-1]] = (10 / 30, 12 / 30)
+
+    with pytest.raises(ValueError, match="camera video intervals must use identical frame offsets"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            snapshot_downloader=FakeSnapshotDownloader(episode_rows=[_episode_row(video_timestamps=timestamps)]),
         )
 
 

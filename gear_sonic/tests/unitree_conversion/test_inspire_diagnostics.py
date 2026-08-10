@@ -243,15 +243,21 @@ def _metadata_info(**changes: object) -> dict[str, object]:
     return info
 
 
-def _episode_metadata_row(episode_id: int = 152) -> dict[str, int]:
+def _episode_metadata_row(episode_id: int = 152) -> dict[str, object]:
     return {
         "episode_index": episode_id,
         "data/chunk_index": 0,
         "data/file_index": 3,
+        "length": 3,
         **{
             f"videos/{camera}/{part}": value
             for camera in CAMERAS
-            for part, value in (("chunk_index", 0), ("file_index", 4))
+            for part, value in (
+                ("chunk_index", 0),
+                ("file_index", 4),
+                ("from_timestamp", 0.0),
+                ("to_timestamp", 3 / 30),
+            )
         },
     }
 

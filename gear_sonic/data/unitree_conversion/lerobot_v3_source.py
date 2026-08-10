@@ -6,11 +6,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import string
+from types import MappingProxyType
 
-from gear_sonic.data.unitree_conversion.contracts import SourceSpec
+from gear_sonic.data.unitree_conversion.contracts import SourceSpec, SourceVideoSegment
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,19 @@ class V3SourceDataset:
     revision: str
     meta: V3SourceMeta
     hf_dataset: tuple[Mapping[str, object], ...]
+    video_segments: Mapping[str, SourceVideoSegment]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.video_segments, Mapping):
+            raise ValueError("video_segments must be a mapping")
+        segments: dict[str, SourceVideoSegment] = {}
+        for source_key, segment in self.video_segments.items():
+            if not isinstance(source_key, str) or not source_key:
+                raise ValueError("video segment keys must be nonempty strings")
+            if not isinstance(segment, SourceVideoSegment) or segment.source_key != source_key:
+                raise ValueError("video segment values must match their source keys")
+            segments[source_key] = segment
+        object.__setattr__(self, "video_segments", MappingProxyType(dict(sorted(segments.items()))))
 
 
 @dataclass(frozen=True)
@@ -251,22 +266,36 @@ def _metadata_integer(value: object, *, field_name: str) -> int:
     return value
 
 
+def _metadata_timestamp(value: object, *, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"episode metadata {field_name} must be finite nonnegative")
+    timestamp = float(value)
+    if not math.isfinite(timestamp) or timestamp < 0.0:
+        raise ValueError(f"episode metadata {field_name} must be finite nonnegative")
+    return timestamp
+
+
 def _selected_episode_row(
     scoped_root: Path,
     *,
     episode_id: int,
     video_keys: tuple[str, ...],
-) -> dict[str, int]:
+) -> dict[str, int | float]:
     import pyarrow.parquet as pq
 
-    required_columns = (
+    integer_columns = (
         "episode_index",
         "data/chunk_index",
         "data/file_index",
+        "length",
         *(f"videos/{key}/{part}" for key in video_keys for part in ("chunk_index", "file_index")),
     )
+    timestamp_columns = tuple(
+        f"videos/{key}/{part}" for key in video_keys for part in ("from_timestamp", "to_timestamp")
+    )
+    required_columns = integer_columns + timestamp_columns
     seen_episode_ids: set[int] = set()
-    selected: dict[str, int] | None = None
+    selected: dict[str, int | float] | None = None
     for metadata_path in _episode_metadata_files(scoped_root):
         try:
             table = pq.read_table(metadata_path)
@@ -277,10 +306,16 @@ def _selected_episode_row(
             raise ValueError(f"episode metadata parquet is missing required columns: {missing}")
 
         for row_index in range(table.num_rows):
-            row = {
+            row: dict[str, int | float] = {
                 column: _metadata_integer(table[column][row_index].as_py(), field_name=column)
-                for column in required_columns
+                for column in integer_columns
             }
+            row.update(
+                {
+                    column: _metadata_timestamp(table[column][row_index].as_py(), field_name=column)
+                    for column in timestamp_columns
+                }
+            )
             source_episode_id = row["episode_index"]
             if source_episode_id in seen_episode_ids:
                 raise ValueError(f"duplicate episode_index in episode metadata: {source_episode_id}")
@@ -335,12 +370,10 @@ def _render_path(
     return relative_path
 
 
-def _selected_paths(scoped_root: Path, episode_id: int, info: _V3Info) -> tuple[PurePosixPath, ...]:
-    episode_row = _selected_episode_row(
-        scoped_root,
-        episode_id=episode_id,
-        video_keys=info.video_keys,
-    )
+def _selected_paths(
+    episode_row: Mapping[str, int | float],
+    info: _V3Info,
+) -> tuple[PurePosixPath, ...]:
     data_path = _render_path(
         info.data_path,
         field_name="data_path",
@@ -460,7 +493,12 @@ def load_pinned_v3_episode(
 
     dataset_root = _dataset_root(scoped_root, source_spec.dataset_path)
     info = _read_info(dataset_root)
-    selected_paths = _selected_paths(dataset_root, episode_id, info)
+    episode_row = _selected_episode_row(
+        dataset_root,
+        episode_id=episode_id,
+        video_keys=info.video_keys,
+    )
+    selected_paths = _selected_paths(episode_row, info)
     materialized_selection = selected_paths if download_videos else selected_paths[:1]
     repository_paths = tuple(
         _repo_relative_path(source_spec.dataset_path, path) for path in materialized_selection
@@ -469,6 +507,29 @@ def load_pinned_v3_episode(
     _verify_snapshot_location(downloaded, scoped_root)
     materialized_paths = tuple(_regular_file_under_root(dataset_root, path) for path in materialized_selection)
     rows = _read_selected_data(materialized_paths[0], episode_id, schema)
+    episode_length = episode_row["length"]
+    if not isinstance(episode_length, int) or episode_length != len(rows):
+        raise ValueError("episode metadata length must equal selected data row count")
+
+    video_segments: dict[str, SourceVideoSegment] = {}
+    if download_videos:
+        for source_key, video_path in zip(info.video_keys, materialized_paths[1:], strict=True):
+            from_timestamp = episode_row[f"videos/{source_key}/from_timestamp"]
+            to_timestamp = episode_row[f"videos/{source_key}/to_timestamp"]
+            if not isinstance(from_timestamp, float) or not isinstance(to_timestamp, float):
+                raise ValueError("episode video timestamps must be floating-point metadata")
+            video_segments[source_key] = SourceVideoSegment(
+                source_key=source_key,
+                path=video_path,
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp,
+                start_frame=round(from_timestamp * 30.0),
+                end_frame=round(to_timestamp * 30.0),
+                frame_count=episode_length,
+            )
+        offsets = {(segment.start_frame, segment.end_frame) for segment in video_segments.values()}
+        if len(offsets) > 1:
+            raise ValueError("camera video intervals must use identical frame offsets")
 
     return V3SourceDataset(
         root=dataset_root,
@@ -480,4 +541,5 @@ def load_pinned_v3_episode(
             features=info.features,
         ),
         hf_dataset=rows,
+        video_segments=video_segments,
     )

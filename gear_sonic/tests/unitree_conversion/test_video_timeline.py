@@ -7,6 +7,7 @@ import av
 import numpy as np
 import pytest
 
+from gear_sonic.data.unitree_conversion.contracts import SourceVideoSegment
 from gear_sonic.data.unitree_conversion.video_timeline import (
     CameraStreamReport,
     EpisodeCameraReport,
@@ -82,6 +83,58 @@ def test_streams_exact_target_count_with_nearest_indices(rgb_video: Path) -> Non
     assert np.mean(frames[0].rgb, axis=(0, 1)).argmax() == 0
     assert np.mean(frames[1].rgb, axis=(0, 1)).argmax() == 1
     assert np.mean(frames[-1].rgb, axis=(0, 1)).argmax() == 2
+
+
+def test_decodes_nonzero_episode_interval_from_shared_h264_shard(tmp_path: Path) -> None:
+    path = tmp_path / "two_episodes.mp4"
+    _write_rgb_video(
+        path,
+        colors=((255, 0, 0),) * 3 + ((0, 0, 255),) * 3,
+    )
+    segment = SourceVideoSegment(
+        source_key="observation.images.cam_left_high",
+        path=path,
+        from_timestamp=3 / 30,
+        to_timestamp=6 / 30,
+        start_frame=3,
+        end_frame=6,
+        frame_count=3,
+    )
+
+    timeline = inspect_video(
+        path,
+        expected_frames=3,
+        expected_size=_SIZE,
+        segment=segment,
+    )
+    frames = list(iter_resampled_video(timeline))
+
+    assert timeline.source_key == segment.source_key
+    assert timeline.from_timestamp == 3 / 30
+    assert timeline.to_timestamp == 6 / 30
+    assert timeline.start_frame == 3
+    assert timeline.end_frame == 6
+    assert [frame.source_index for frame in frames] == [0, 1, 1, 2, 2]
+    assert all(np.mean(frame.rgb, axis=(0, 1)).argmax() == 2 for frame in frames)
+
+
+def test_inspection_rejects_segment_path_or_count_mismatch(rgb_video: Path, tmp_path: Path) -> None:
+    other_path = tmp_path / "other.mp4"
+    other_path.write_bytes(rgb_video.read_bytes())
+    segment = SourceVideoSegment(
+        source_key="camera",
+        path=other_path,
+        from_timestamp=0.0,
+        to_timestamp=3 / 30,
+        start_frame=0,
+        end_frame=3,
+        frame_count=3,
+    )
+
+    with pytest.raises(ValueError, match="segment path must equal video path"):
+        inspect_video(rgb_video, expected_frames=3, expected_size=_SIZE, segment=segment)
+    with pytest.raises(ValueError, match="segment frame_count must equal expected_frames"):
+        inspect_video(other_path, expected_frames=4, expected_size=_SIZE, segment=segment)
 
 
 def test_resampled_frames_are_independent_deeply_immutable_rgb_copies(rgb_video: Path) -> None:
@@ -189,8 +242,22 @@ def test_second_pass_rejects_same_identity_mutation_after_first_yield(rgb_video:
     assert rgb_video.stat().st_size == timeline.file_size
     assert rgb_video.stat().st_mtime_ns == timeline.mtime_ns
 
+    delivered = [first]
     with pytest.raises(ValueError, match="video file changed after inspection"):
-        list(frames)
+        while True:
+            delivered.append(next(frames))
+    assert len(delivered) == 4
+
+
+def test_receiving_exact_target_count_proves_iterator_finalized(rgb_video: Path) -> None:
+    timeline = inspect_video(rgb_video, expected_frames=3, expected_size=_SIZE)
+    frames = iter_resampled_video(timeline)
+
+    delivered = [next(frames) for _ in range(5)]
+
+    assert [frame.target_index for frame in delivered] == list(range(5))
+    with pytest.raises(StopIteration):
+        next(frames)
 
 
 @pytest.mark.parametrize("target_fps", [True, 49, 50.0, "50", None])

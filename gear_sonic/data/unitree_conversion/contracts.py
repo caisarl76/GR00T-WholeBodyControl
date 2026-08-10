@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 from types import MappingProxyType
 from typing import Mapping
@@ -96,6 +96,71 @@ def _task_index_array(value: object) -> np.ndarray:
     return np.array(source, dtype=np.int64, order="C", copy=True)
 
 
+@dataclass(frozen=True)
+class SourceVideoSegment:
+    """One exact episode interval inside a materialized LeRobot v3 video shard."""
+
+    source_key: str
+    path: Path
+    from_timestamp: float
+    to_timestamp: float
+    start_frame: int
+    end_frame: int
+    frame_count: int
+
+    def __post_init__(self) -> None:
+        _nonempty_string(self.source_key, field_name="video segment source_key")
+        try:
+            candidate = Path(self.path).expanduser()
+            if candidate.is_symlink():
+                raise ValueError("video segment path must be a materialized regular file")
+            path = candidate.resolve(strict=True)
+        except (OSError, TypeError, ValueError) as error:
+            raise ValueError("video segment path must be a materialized regular file") from error
+        if not path.is_file():
+            raise ValueError("video segment path must be a materialized regular file")
+
+        timestamps: list[float] = []
+        for field_name in ("from_timestamp", "to_timestamp"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+                raise ValueError(f"video segment {field_name} must be finite nonnegative")
+            timestamp = float(value)
+            if not math.isfinite(timestamp) or timestamp < 0.0:
+                raise ValueError(f"video segment {field_name} must be finite nonnegative")
+            timestamps.append(timestamp)
+        from_timestamp, to_timestamp = timestamps
+        if to_timestamp <= from_timestamp:
+            raise ValueError("video segment to_timestamp must be strictly larger than from_timestamp")
+
+        indices: list[int] = []
+        for field_name in ("start_frame", "end_frame", "frame_count"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"video segment {field_name} must be a nonnegative integer")
+            indices.append(value)
+        start_frame, end_frame, frame_count = indices
+        if end_frame <= start_frame:
+            raise ValueError("video segment end_frame must be strictly larger than start_frame")
+        if frame_count <= 0 or end_frame - start_frame != frame_count:
+            raise ValueError("video segment frame_count must equal end_frame - start_frame")
+
+        rounded_start = round(from_timestamp * 30.0)
+        rounded_end = round(to_timestamp * 30.0)
+        if abs(from_timestamp * 30.0 - rounded_start) > 1e-6:
+            raise ValueError("video segment from_timestamp must map to an exact 30 Hz frame index")
+        if abs(to_timestamp * 30.0 - rounded_end) > 1e-6:
+            raise ValueError("video segment to_timestamp must map to an exact 30 Hz frame index")
+        if start_frame != rounded_start:
+            raise ValueError("video segment start_frame must match from_timestamp at 30 Hz")
+        if end_frame != rounded_end:
+            raise ValueError("video segment end_frame must match to_timestamp at 30 Hz")
+
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "from_timestamp", from_timestamp)
+        object.__setattr__(self, "to_timestamp", to_timestamp)
+
+
 @dataclass
 class CanonicalEpisode:
     """Mutable, array-owning canonical representation of one source episode."""
@@ -114,6 +179,7 @@ class CanonicalEpisode:
     observed_right_hand: np.ndarray
     desired_left_hand: np.ndarray
     desired_right_hand: np.ndarray
+    video_segments: Mapping[str, SourceVideoSegment] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _nonempty_string(self.source_repo_id, field_name="source_repo_id")
@@ -157,8 +223,22 @@ class CanonicalEpisode:
                 raise ValueError(f"{field_name} must have shape {expected_shape}; got {array.shape}")
             copied_arrays[field_name] = array
 
+        if not isinstance(self.video_segments, Mapping):
+            raise ValueError("video_segments must be a mapping")
+        video_segments: dict[str, SourceVideoSegment] = {}
+        for source_key, segment in self.video_segments.items():
+            _nonempty_string(source_key, field_name="video segment key")
+            if not isinstance(segment, SourceVideoSegment):
+                raise ValueError("every video segment must be a SourceVideoSegment")
+            if source_key != segment.source_key:
+                raise ValueError("video segment key must equal segment.source_key")
+            if segment.frame_count != row_count:
+                raise ValueError("video segment frame_count must equal canonical episode row count")
+            video_segments[source_key] = segment
+
         self.timestamps = timestamps
         self.task_indices = task_indices
+        self.video_segments = MappingProxyType(dict(sorted(video_segments.items())))
         for field_name, array in copied_arrays.items():
             setattr(self, field_name, array)
 

@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
 import hashlib
+import math
 import numbers
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import BinaryIO
 import av
 import numpy as np
 
+from gear_sonic.data.unitree_conversion.contracts import SourceVideoSegment
 from gear_sonic.data.unitree_conversion.resampling import nearest_image_indices
 
 _SOURCE_FPS = 30
@@ -122,6 +124,11 @@ class VideoTimeline:
     mtime_ns: int
     device: int
     inode: int
+    source_key: str | None
+    from_timestamp: float
+    to_timestamp: float
+    start_frame: int
+    end_frame: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path) or not self.path.is_absolute():
@@ -144,6 +151,30 @@ class VideoTimeline:
         mtime_ns = _nonnegative_integer(self.mtime_ns, field_name="mtime_ns")
         device = _nonnegative_integer(self.device, field_name="device")
         inode = _nonnegative_integer(self.inode, field_name="inode")
+        if self.source_key is not None:
+            _nonempty_string(self.source_key, field_name="source_key")
+        timestamps: list[float] = []
+        for field_name in ("from_timestamp", "to_timestamp"):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, numbers.Real)
+                or not math.isfinite(float(value))
+                or value < 0.0
+            ):
+                raise ValueError(f"{field_name} must be finite nonnegative")
+            timestamps.append(float(value))
+        from_timestamp, to_timestamp = timestamps
+        if to_timestamp <= from_timestamp:
+            raise ValueError("to_timestamp must be strictly larger than from_timestamp")
+        start_frame = _nonnegative_integer(self.start_frame, field_name="start_frame")
+        end_frame = _nonnegative_integer(self.end_frame, field_name="end_frame")
+        if end_frame - start_frame != decoded:
+            raise ValueError("video interval end_frame - start_frame must equal decoded_frames")
+        if abs(from_timestamp * _SOURCE_FPS - start_frame) > 1e-6:
+            raise ValueError("from_timestamp must match start_frame on the 30 Hz grid")
+        if abs(to_timestamp * _SOURCE_FPS - end_frame) > 1e-6:
+            raise ValueError("to_timestamp must match end_frame on the 30 Hz grid")
         object.__setattr__(self, "expected_frames", expected)
         object.__setattr__(self, "decoded_frames", decoded)
         object.__setattr__(self, "rgb_size", size)
@@ -151,6 +182,10 @@ class VideoTimeline:
         object.__setattr__(self, "mtime_ns", mtime_ns)
         object.__setattr__(self, "device", device)
         object.__setattr__(self, "inode", inode)
+        object.__setattr__(self, "from_timestamp", from_timestamp)
+        object.__setattr__(self, "to_timestamp", to_timestamp)
+        object.__setattr__(self, "start_frame", start_frame)
+        object.__setattr__(self, "end_frame", end_frame)
 
 
 @dataclass(frozen=True)
@@ -255,15 +290,22 @@ class TargetCameraSchema:
         _nonempty_string(self.primary_target, field_name="primary_target")
         if not isinstance(self.source_to_target, Mapping) or not self.source_to_target:
             raise ValueError("source_to_target must be a nonempty mapping")
-        included = dict(self.source_to_target)
-        for source, target in included.items():
+        source_to_target = dict(self.source_to_target)
+        for source, target in source_to_target.items():
             _nonempty_string(source, field_name="source camera key")
             _nonempty_string(target, field_name="target camera key")
+        if source_to_target.get(self.primary_source) != self.primary_target:
+            raise ValueError("source_to_target must contain the exact primary mapping")
+        included = {
+            self.primary_source: source_to_target[self.primary_source],
+            **{
+                source: source_to_target[source]
+                for source in sorted(source_to_target)
+                if source != self.primary_source
+            },
+        }
         if len(set(included.values())) != len(included):
             raise ValueError("target camera keys must be unique")
-        if included.get(self.primary_source) != self.primary_target:
-            raise ValueError("source_to_target must contain the exact primary mapping")
-
         if not isinstance(self.omission_reasons, Mapping):
             raise ValueError("omission_reasons must be a mapping")
         omissions: dict[str, tuple[str, ...]] = {}
@@ -278,6 +320,7 @@ class TargetCameraSchema:
             if not reasons or any(not isinstance(reason, str) or not reason for reason in reasons):
                 raise ValueError("omitted cameras must contain nonempty reason tuples")
             omissions[source] = reasons
+        omissions = dict(sorted(omissions.items()))
         object.__setattr__(self, "source_to_target", MappingProxyType(included))
         object.__setattr__(self, "omission_reasons", MappingProxyType(omissions))
 
@@ -312,11 +355,69 @@ def _decode_rgb(frame: av.VideoFrame, *, expected_size: tuple[int, int], frame_i
     return rgb
 
 
+def _frame_global_index(frame: av.VideoFrame) -> int:
+    if frame.pts is None or frame.time_base is None:
+        raise ValueError("video frame PTS and time_base are required")
+    try:
+        frame_position = Fraction(frame.pts) * Fraction(frame.time_base) * _SOURCE_FPS
+    except (TypeError, ValueError, ZeroDivisionError) as error:
+        raise ValueError("video frame PTS must map to the nominal 30 Hz grid") from error
+    nearest = round(frame_position)
+    if abs(float(frame_position - nearest)) > 1e-6:
+        raise ValueError("video frame PTS must map to the nominal 30 Hz grid")
+    return int(nearest)
+
+
+def _segment_rgb_frames(
+    container: av.container.InputContainer,
+    stream: av.video.stream.VideoStream,
+    *,
+    start_frame: int,
+    end_frame: int,
+    expected_size: tuple[int, int],
+) -> Iterator[np.ndarray]:
+    if stream.time_base is None:
+        raise ValueError("video stream time_base is required")
+    seek_position = Fraction(start_frame, _SOURCE_FPS) / Fraction(stream.time_base)
+    container.seek(math.floor(seek_position), backward=True, any_frame=False, stream=stream)
+
+    previous_global_index: int | None = None
+    expected_global_index = start_frame
+    decoded_frames = 0
+    for frame in container.decode(stream):
+        global_index = _frame_global_index(frame)
+        if previous_global_index is not None:
+            if global_index <= previous_global_index:
+                raise ValueError("video frame PTS must be strictly increasing without duplicates")
+            if global_index != previous_global_index + 1:
+                raise ValueError("video frame PTS must be consecutive on the nominal 30 Hz grid")
+        previous_global_index = global_index
+        if global_index < start_frame:
+            continue
+        if global_index >= end_frame:
+            break
+        if global_index != expected_global_index:
+            raise ValueError(f"video interval frame offset {global_index} != expected {expected_global_index}")
+        rgb = _decode_rgb(
+            frame,
+            expected_size=expected_size,
+            frame_index=decoded_frames,
+        )
+        decoded_frames += 1
+        expected_global_index += 1
+        yield rgb
+
+    expected_frames = end_frame - start_frame
+    if decoded_frames != expected_frames:
+        raise ValueError(f"decoded frame count {decoded_frames} != data frame count {expected_frames}")
+
+
 def inspect_video(
     path: str | Path,
     *,
     expected_frames: object,
     expected_size: object,
+    segment: SourceVideoSegment | None = None,
 ) -> VideoTimeline:
     """Decode an entire pinned 30 Hz source video and return immutable metadata."""
     frame_count = _integer_at_least(expected_frames, field_name="expected_frames", minimum=2)
@@ -325,6 +426,24 @@ def inspect_video(
         resolved_path = Path(path).expanduser().resolve(strict=True)
     except (OSError, TypeError, ValueError) as error:
         raise ValueError("video path must be an existing regular file") from error
+    if segment is not None:
+        if not isinstance(segment, SourceVideoSegment):
+            raise ValueError("segment must be a SourceVideoSegment")
+        if segment.path != resolved_path:
+            raise ValueError("segment path must equal video path")
+        if segment.frame_count != frame_count:
+            raise ValueError("segment frame_count must equal expected_frames")
+        source_key = segment.source_key
+        from_timestamp = segment.from_timestamp
+        to_timestamp = segment.to_timestamp
+        start_frame = segment.start_frame
+        end_frame = segment.end_frame
+    else:
+        source_key = None
+        from_timestamp = 0.0
+        to_timestamp = frame_count / _SOURCE_FPS
+        start_frame = 0
+        end_frame = frame_count
     decoded_frames = 0
     try:
         with resolved_path.open("rb") as source_handle:
@@ -334,8 +453,13 @@ def inspect_video(
                 raise ValueError("video file changed during inspection")
             with av.open(source_handle, mode="r") as container:
                 stream = _video_stream(container)
-                for frame in container.decode(stream):
-                    _decode_rgb(frame, expected_size=size, frame_index=decoded_frames)
+                for _ in _segment_rgb_frames(
+                    container,
+                    stream,
+                    start_frame=start_frame,
+                    end_frame=end_frame,
+                    expected_size=size,
+                ):
                     decoded_frames += 1
             _verify_bound_resource(
                 source_handle,
@@ -363,6 +487,11 @@ def inspect_video(
         mtime_ns=identity[1],
         device=identity[2],
         inode=identity[3],
+        source_key=source_key,
+        from_timestamp=from_timestamp,
+        to_timestamp=to_timestamp,
+        start_frame=start_frame,
+        end_frame=end_frame,
     )
 
 
@@ -385,6 +514,7 @@ def iter_resampled_video(
     selected_indices = nearest_image_indices(timeline.decoded_frames)
     current_source_index = -1
     current_rgb: np.ndarray | None = None
+    pending_frame: ResampledVideoFrame | None = None
 
     try:
         with timeline.path.open("rb") as source_handle:
@@ -397,29 +527,35 @@ def iter_resampled_video(
             )
             with av.open(source_handle, mode="r") as container:
                 stream = _video_stream(container)
-                decoder = iter(container.decode(stream))
+                decoder = iter(
+                    _segment_rgb_frames(
+                        container,
+                        stream,
+                        start_frame=timeline.start_frame,
+                        end_frame=timeline.end_frame,
+                        expected_size=timeline.rgb_size,
+                    )
+                )
                 for target_index, requested_source_index in enumerate(selected_indices):
                     while current_source_index < int(requested_source_index):
                         try:
-                            frame = next(decoder)
+                            current_rgb = next(decoder)
                         except StopIteration as error:
                             raise ValueError(
                                 f"second-pass decoded frame count {current_source_index + 1} "
                                 f"!= inspected frame count {timeline.decoded_frames}"
                             ) from error
                         current_source_index += 1
-                        current_rgb = _decode_rgb(
-                            frame,
-                            expected_size=timeline.rgb_size,
-                            frame_index=current_source_index,
-                        )
                     if current_rgb is None:
                         raise ValueError("second-pass decoder produced no selected frame")
-                    yield ResampledVideoFrame(
+                    next_output = ResampledVideoFrame(
                         target_index=target_index,
                         source_index=int(requested_source_index),
                         rgb=current_rgb,
                     )
+                    if pending_frame is not None:
+                        yield pending_frame
+                    pending_frame = next_output
 
                 try:
                     next(decoder)
@@ -440,6 +576,9 @@ def iter_resampled_video(
         raise
     except (av.error.FFmpegError, OSError) as error:
         raise ValueError(f"second-pass video decode failed for {timeline.path}") from error
+    if pending_frame is None:
+        raise ValueError("second-pass decoder produced no target frames")
+    yield pending_frame
 
 
 def _camera_map(value: object, *, primary_camera: str) -> dict[str, str]:
