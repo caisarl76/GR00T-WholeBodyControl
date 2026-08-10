@@ -1,10 +1,15 @@
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 
 import pytest
 
 from gear_sonic.data.unitree_conversion import provenance as provenance_module
-from gear_sonic.data.unitree_conversion.contracts import ArtifactSpec, SourceSpec
+from gear_sonic.data.unitree_conversion.contracts import (
+    ArtifactSpec,
+    CollectionMembership,
+    SourceSpec,
+)
 from gear_sonic.data.unitree_conversion.provenance import (
     discover_collection_lock,
     load_source_lock,
@@ -65,10 +70,45 @@ class FakeHfApi:
 def test_smoke_lock_is_fully_immutable() -> None:
     lock = load_source_lock(LOCK)
 
+    assert lock.version == 1
+    assert lock.scope == "smoke"
+    assert lock.semantic_repo_commit == "6220f4e210e14c7f804f727da94c8886850d513b"
+    assert lock.encoder.repo_id == "nvidia/GEAR-SONIC"
     assert lock.encoder.revision == "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2"
+    assert lock.encoder.filename == "low_latency/model_encoder.onnx"
+    assert lock.encoder.size == 45933505
     assert lock.encoder.sha256 == "60be43157f57d812f38bdbb740a5de5d5d070e8840d9edc16f02a91a6d06255b"
+
+    assert lock.observation_config.repo_id == "nvidia/GEAR-SONIC"
+    assert lock.observation_config.revision == "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2"
+    assert lock.observation_config.filename == "low_latency/observation_config.yaml"
+    assert lock.observation_config.size == 3258
+    assert lock.observation_config.sha256 == "582b9a273a3d69fbf49ae59b39295a3be2b4a295e195ef4cf674b5e2571c90ab"
+
+    assert lock.dex3.approved is True
+    assert lock.dex3.label == "dex3"
+    assert lock.dex3.repo_id == "unitreerobotics/G1_Dex3_Pouring_Dataset"
+    assert lock.dex3.revision == "c9552eb3b1cb610cd6227555e9e98b1bde826a77"
+    assert lock.dex3.episode_count == 311
     assert lock.dex3.episodes == (0, 78, 155, 233, 310)
+    assert lock.dex3.primary_camera == "observation.images.cam_left_high"
+    assert dict(lock.dex3.camera_map) == {
+        "observation.images.cam_left_high": "observation.images.ego_view",
+        "observation.images.cam_left_wrist": "observation.images.left_wrist",
+        "observation.images.cam_right_wrist": "observation.images.right_wrist",
+    }
+
+    assert lock.inspire.approved is True
+    assert lock.inspire.label == "inspire"
+    assert lock.inspire.repo_id == "unitreerobotics/G1_WBT_Inspire_Pickup_Pillow_MainCamOnly"
+    assert lock.inspire.revision == "24e3e4d88a5020bdb4b3046ec09b09dc56f8d1f1"
+    assert lock.inspire.episode_count == 609
     assert lock.inspire.episodes == (0, 152, 304, 456, 608)
+    assert lock.inspire.primary_camera == "observation.images.cam_0"
+    assert dict(lock.inspire.camera_map) == {"observation.images.cam_0": "diagnostic.primary_camera"}
+
+    assert lock.sources == (lock.dex3, lock.inspire)
+    assert lock.collections == ()
     for source in lock.sources:
         assert len(source.revision) == 40
         assert int(source.revision, 16) >= 0
@@ -82,12 +122,18 @@ def test_stratified_selection_matches_pinned_counts() -> None:
 
 
 def test_stratified_selection_uses_half_up_rounding() -> None:
-    assert stratified_episode_ids(3) == (0, 1, 1, 2, 2)
+    assert stratified_episode_ids(7) == (0, 2, 3, 5, 6)
 
 
 @pytest.mark.parametrize("episode_count", [0, -1, True, 1.5])
 def test_stratified_selection_rejects_invalid_counts(episode_count) -> None:
-    with pytest.raises(ValueError, match="positive integer"):
+    with pytest.raises(ValueError, match="integer of at least 5"):
+        stratified_episode_ids(episode_count)
+
+
+@pytest.mark.parametrize("episode_count", range(1, 5))
+def test_stratified_selection_rejects_counts_too_small(episode_count: int) -> None:
+    with pytest.raises(ValueError, match="integer of at least 5"):
         stratified_episode_ids(episode_count)
 
 
@@ -105,6 +151,43 @@ def test_load_source_lock_rejects_unknown_fields(tmp_path: Path) -> None:
     candidate.write_text(f"{LOCK.read_text()}unexpected: true\n")
 
     with pytest.raises(ValueError, match="unknown fields.*unexpected"):
+        load_source_lock(candidate)
+
+
+@pytest.mark.parametrize(
+    ("duplicate_key", "lock_text"),
+    [
+        ("scope", f"{LOCK.read_text()}scope: smoke\n"),
+        (
+            "revision",
+            LOCK.read_text().replace(
+                "  revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2\n  filename: low_latency/model_encoder.onnx",
+                "  revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2\n"
+                "  revision: 9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2\n"
+                "  filename: low_latency/model_encoder.onnx",
+            ),
+        ),
+        (
+            "approved",
+            LOCK.read_text().replace(
+                "  dex3:\n    approved: true",
+                "  dex3:\n    approved: true\n    approved: true",
+            ),
+        ),
+    ],
+)
+def test_load_source_lock_rejects_duplicate_yaml_keys_recursively(
+    tmp_path: Path,
+    duplicate_key: str,
+    lock_text: str,
+) -> None:
+    candidate = tmp_path / "duplicate.yaml"
+    candidate.write_text(lock_text)
+
+    with pytest.raises(
+        ValueError,
+        match=f"duplicate YAML mapping key.*{duplicate_key}",
+    ):
         load_source_lock(candidate)
 
 
@@ -232,6 +315,55 @@ def test_collection_discovery_rejects_duplicate_repositories() -> None:
         )
 
 
+@pytest.mark.parametrize("malformed_items", [None, 7, "not-an-item-sequence"])
+def test_collection_discovery_rejects_malformed_items(
+    malformed_items,
+) -> None:
+    api = FakeHfApi()
+    api.collections[DEX3_COLLECTION] = type(
+        "MalformedCollection",
+        (),
+        {"items": malformed_items},
+    )()
+
+    with pytest.raises(
+        ValueError,
+        match="unifolm-g1-dex3-dataset.*items.*non-string iterable",
+    ):
+        discover_collection_lock(
+            api=api,
+            collection_slugs=(DEX3_COLLECTION, WBT_COLLECTION),
+        )
+
+
+def test_collection_discovery_rejects_missing_items() -> None:
+    api = FakeHfApi()
+    api.collections[DEX3_COLLECTION] = type("CollectionWithoutItems", (), {})()
+
+    with pytest.raises(
+        ValueError,
+        match="unifolm-g1-dex3-dataset.*items.*non-string iterable",
+    ):
+        discover_collection_lock(
+            api=api,
+            collection_slugs=(DEX3_COLLECTION, WBT_COLLECTION),
+        )
+
+
+def test_collection_discovery_rejects_collection_without_datasets() -> None:
+    api = FakeHfApi()
+    api.collections[DEX3_COLLECTION] = api._collection(api._item("model", "unitreerobotics/not-a-dataset"))
+
+    with pytest.raises(
+        ValueError,
+        match="unifolm-g1-dex3-dataset.*at least one dataset item",
+    ):
+        discover_collection_lock(
+            api=api,
+            collection_slugs=(DEX3_COLLECTION, WBT_COLLECTION),
+        )
+
+
 def test_discovery_draft_round_trips_and_overwrite_is_fail_closed(
     tmp_path: Path,
 ) -> None:
@@ -252,6 +384,86 @@ def test_discovery_draft_round_trips_and_overwrite_is_fail_closed(
     assert write_discovered_lock(lock, output_lock, force=True) == output_lock.resolve()
     assert load_source_lock(output_lock) == lock
     assert list(tmp_path.glob(f".{output_lock.name}.*.tmp")) == []
+
+
+@pytest.mark.parametrize("collections_yaml", ["", "collections: []\n"])
+def test_full_source_lock_requires_collection_membership(
+    tmp_path: Path,
+    collections_yaml: str,
+) -> None:
+    candidate = tmp_path / "full.yaml"
+    candidate.write_text(LOCK.read_text().replace("scope: smoke", "scope: full") + collections_yaml)
+
+    with pytest.raises(ValueError, match="full source locks require at least one collection"):
+        load_source_lock(candidate)
+
+
+@pytest.mark.parametrize(
+    "collections",
+    [
+        (),
+        (
+            CollectionMembership(
+                slug=DEX3_COLLECTION,
+                repo_ids=(),
+            ),
+        ),
+    ],
+)
+def test_full_source_lock_requires_at_least_one_source(collections) -> None:
+    smoke_lock = load_source_lock(LOCK)
+
+    with pytest.raises(ValueError, match="full source locks require at least one source"):
+        replace(
+            smoke_lock,
+            scope="full",
+            sources=(),
+            collections=collections,
+        )
+
+
+def test_full_source_lock_requires_exact_ordered_collection_membership() -> None:
+    smoke_lock = load_source_lock(LOCK)
+    reversed_repo_ids = tuple(source.repo_id for source in reversed(smoke_lock.sources))
+
+    with pytest.raises(
+        ValueError,
+        match="ordered collection membership must exactly match ordered sources",
+    ):
+        replace(
+            smoke_lock,
+            scope="full",
+            collections=(
+                CollectionMembership(
+                    slug=DEX3_COLLECTION,
+                    repo_ids=reversed_repo_ids,
+                ),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "different_value"),
+    [
+        ("repo_id", "nvidia/a-different-model"),
+        ("revision", "f" * 40),
+    ],
+)
+def test_source_lock_requires_one_model_source(
+    field_name: str,
+    different_value: str,
+) -> None:
+    smoke_lock = load_source_lock(LOCK)
+    mismatched_config = replace(
+        smoke_lock.observation_config,
+        **{field_name: different_value},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"encoder and observation_config must share the same {field_name}",
+    ):
+        replace(smoke_lock, observation_config=mismatched_config)
 
 
 @pytest.mark.parametrize(

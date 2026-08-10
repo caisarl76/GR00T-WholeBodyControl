@@ -160,6 +160,9 @@ class SourceLock:
             raise ValueError("encoder must be an ArtifactSpec")
         if not isinstance(self.observation_config, ArtifactSpec):
             raise ValueError("observation_config must be an ArtifactSpec")
+        for field_name in ("repo_id", "revision"):
+            if getattr(self.encoder, field_name) != getattr(self.observation_config, field_name):
+                raise ValueError(f"encoder and observation_config must share the same {field_name}")
 
         try:
             sources = tuple(self.sources)
@@ -176,6 +179,12 @@ class SourceLock:
         labels = tuple(source.label for source in sources if source.label is not None)
         if len(set(labels)) != len(labels):
             raise ValueError("source lock contains duplicate source labels")
+
+        if self.scope == "full":
+            if not sources:
+                raise ValueError("full source locks require at least one source")
+            if not collections:
+                raise ValueError("full source locks require at least one collection membership")
 
         if collections:
             collection_slugs = tuple(membership.slug for membership in collections)

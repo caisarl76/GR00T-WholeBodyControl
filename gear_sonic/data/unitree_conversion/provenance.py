@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 import hashlib
 from pathlib import Path
 from typing import Any
@@ -23,10 +23,49 @@ SMOKE_SOURCE_LOCK = Path(__file__).parent / "manifests" / "smoke_sources.yaml"
 Downloader = Callable[..., str | Path]
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """SafeLoader variant that rejects ambiguous mappings at every depth."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeySafeLoader,
+    node: yaml.MappingNode,
+    deep: bool = False,
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as error:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable YAML mapping key",
+                key_node.start_mark,
+            ) from error
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"duplicate YAML mapping key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
 def stratified_episode_ids(episode_count: int) -> tuple[int, ...]:
     """Select five deterministic IDs using exact half-up integer rounding."""
-    if isinstance(episode_count, bool) or not isinstance(episode_count, int) or episode_count <= 0:
-        raise ValueError("episode_count must be a positive integer")
+    if isinstance(episode_count, bool) or not isinstance(episode_count, int) or episode_count < 5:
+        raise ValueError("episode_count must be an integer of at least 5")
     last_episode = episode_count - 1
     denominator = 4
     return tuple((2 * k * last_episode + denominator) // (2 * denominator) for k in range(5))
@@ -204,10 +243,13 @@ def _parse_collections(value: object) -> tuple[CollectionMembership, ...]:
 def load_source_lock(path: str | Path) -> SourceLock:
     """Safely parse and validate a source lock without resolving any network state."""
     lock_path = Path(path)
+    loader = _UniqueKeySafeLoader(lock_path.read_text(encoding="utf-8"))
     try:
-        loaded = yaml.safe_load(lock_path.read_text(encoding="utf-8"))
+        loaded = loader.get_single_data()
     except yaml.YAMLError as error:
         raise ValueError(f"malformed source lock YAML: {error}") from error
+    finally:
+        loader.dispose()
     data = _as_mapping(loaded, context="source lock")
     fields = {
         "version",
@@ -317,8 +359,11 @@ def discover_collection_lock(
         if not isinstance(collection_slug, str) or not collection_slug.strip():
             raise ValueError("every collection slug must be a nonempty string")
         collection = api.get_collection(collection_slug)
+        items = getattr(collection, "items", None)
+        if not isinstance(items, Iterable) or isinstance(items, (str, bytes, Mapping)):
+            raise ValueError(f"collection {collection_slug!r} items must be a non-string iterable")
         collection_repositories: list[str] = []
-        for item in getattr(collection, "items", ()):
+        for item in items:
             if not _is_dataset_item(item):
                 continue
             repo_id = getattr(item, "item_id", None)
@@ -337,6 +382,8 @@ def discover_collection_lock(
             )
             collection_repositories.append(repo_id)
             seen_repositories.add(repo_id)
+        if not collection_repositories:
+            raise ValueError(f"collection {collection_slug!r} must contain at least one dataset item")
         memberships.append(
             CollectionMembership(
                 slug=collection_slug,
