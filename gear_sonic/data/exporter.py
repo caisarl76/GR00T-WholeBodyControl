@@ -325,7 +325,7 @@ class Gr00tDataExporter(LeRobotDataset):
 
         episode_length = episode_buffer.pop("size")
         tasks = episode_buffer.pop("task")
-        episode_tasks = list(set(tasks))
+        episode_tasks = list(dict.fromkeys(tasks))
         episode_index = episode_buffer["episode_index"]
 
         episode_buffer["index"] = np.arange(
