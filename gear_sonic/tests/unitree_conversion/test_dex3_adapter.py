@@ -1,9 +1,11 @@
 from dataclasses import fields
+import hashlib
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from gear_sonic.data.unitree_conversion import dex3_adapter as dex3_adapter_module
 from gear_sonic.data.unitree_conversion.contracts import CanonicalEpisode, SourceSpec
 from gear_sonic.data.unitree_conversion.dex3_adapter import adapt_dex3_arrays, load_dex3_episode
 from gear_sonic.data.unitree_conversion.joint_mapping import G1_MUJOCO_NAMES, NOMINAL_G1_MUJOCO
@@ -453,6 +455,8 @@ class FakeDataset:
         total_episodes: object = 3,
         fps: object = 30,
         features: object | None = None,
+        dataset_revision: object = "b" * 40,
+        meta_revision: object = "b" * 40,
     ) -> None:
         if features is None:
             features = {
@@ -462,12 +466,20 @@ class FakeDataset:
         self.meta = type(
             "FakeMeta",
             (),
-            {"total_episodes": total_episodes, "fps": fps, "features": features},
+            {
+                "total_episodes": total_episodes,
+                "fps": fps,
+                "features": features,
+                "revision": meta_revision,
+            },
         )()
-        self._rows = rows
+        self.revision = dataset_revision
+        self.hf_dataset = rows
+        self.top_level_iteration_attempts = 0
 
     def __iter__(self):
-        return iter(self._rows)
+        self.top_level_iteration_attempts += 1
+        raise AssertionError("top-level LeRobotDataset iteration may decode video or task strings")
 
 
 def _source_spec(**changes: object) -> SourceSpec:
@@ -532,7 +544,9 @@ def test_loader_uses_exact_pinned_lerobot_constructor_and_adapts_torch_like_rows
     assert calls == [
         {
             "repo_id": "unitreerobotics/synthetic-dex3",
-            "root": Path("/tmp/pinned-dex3"),
+            "root": Path("/tmp/pinned-dex3")
+            / f"repo-{hashlib.sha256(b'unitreerobotics/synthetic-dex3').hexdigest()}"
+            / f"revision-{'b' * 40}",
             "episodes": [1],
             "revision": "b" * 40,
             "download_videos": True,
@@ -547,6 +561,160 @@ def test_loader_uses_exact_pinned_lerobot_constructor_and_adapts_torch_like_rows
     np.testing.assert_array_equal(episode.task_indices, [0, 1])
     np.testing.assert_array_equal(episode.observed_left_hand[1], rows[1]["observation.state"].numpy()[14:21])
     np.testing.assert_array_equal(episode.desired_right_hand[1], rows[1]["action"].numpy()[21:28])
+    assert dataset.top_level_iteration_attempts == 0
+
+
+def test_revision_scoped_root_is_deterministic_repo_and_revision_identity(tmp_path: Path) -> None:
+    same = dex3_adapter_module._revision_scoped_root(tmp_path, "org/repo", "a" * 40)
+    same_again = dex3_adapter_module._revision_scoped_root(tmp_path, "org/repo", "a" * 40)
+    other_revision = dex3_adapter_module._revision_scoped_root(tmp_path, "org/repo", "b" * 40)
+    other_repo = dex3_adapter_module._revision_scoped_root(tmp_path, "other/repo", "a" * 40)
+
+    assert same == same_again
+    assert len({same, other_revision, other_repo}) == 3
+    assert same.parent == other_revision.parent
+    assert same.parent != other_repo.parent
+    assert same.name != other_revision.name
+    assert same.name == other_repo.name
+
+
+@pytest.mark.parametrize("repo_id", ["../escape", "/absolute/repo", "a/../../outside", "odd ☃/repo"])
+def test_revision_scoped_root_encodes_repo_as_one_safe_segment(tmp_path: Path, repo_id: str) -> None:
+    scoped = dex3_adapter_module._revision_scoped_root(tmp_path, repo_id, "b" * 40)
+
+    relative = scoped.relative_to(tmp_path)
+    assert relative.parts == (
+        f"repo-{hashlib.sha256(repo_id.encode()).hexdigest()}",
+        f"revision-{'b' * 40}",
+    )
+
+
+def test_default_lerobot_cache_base_matches_hf_lerobot_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path))
+
+    assert dex3_adapter_module._default_lerobot_cache_base() == tmp_path
+
+
+def test_loader_scopes_roots_by_both_repo_identity_and_full_revision(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    def factory(**kwargs: object) -> FakeDataset:
+        calls.append(kwargs)
+        revision = kwargs["revision"]
+        return FakeDataset(_rows(), dataset_revision=revision, meta_revision=revision)
+
+    sources = (
+        _source_spec(revision="a" * 40),
+        _source_spec(revision="c" * 40),
+        _source_spec(repo_id="other/repository", revision="a" * 40),
+    )
+    for source in sources:
+        load_dex3_episode(source, 1, root=tmp_path, dataset_factory=factory)
+
+    roots = [call["root"] for call in calls]
+    assert len(set(roots)) == 3
+    for root in roots:
+        relative = Path(root).relative_to(tmp_path)
+        assert len(relative.parts) == 2
+        assert relative.parts[0].startswith("repo-")
+        assert relative.parts[1].startswith("revision-")
+    assert roots[0].parent == roots[1].parent
+    assert roots[0].parent != roots[2].parent
+    assert roots[0].name != roots[1].name
+    assert roots[0].name == roots[2].name
+
+
+@pytest.mark.parametrize("repo_id", ["../escape", "/absolute/repo", "a/../../outside", "odd ☃/repo"])
+def test_loader_repo_identity_cannot_escape_or_add_segments_to_cache_base(
+    tmp_path: Path,
+    repo_id: str,
+) -> None:
+    calls: list[dict[str, object]] = []
+    source = _source_spec(repo_id=repo_id)
+
+    load_dex3_episode(
+        source,
+        1,
+        root=tmp_path,
+        dataset_factory=_recording_factory(FakeDataset(_rows()), calls),
+    )
+
+    relative = Path(calls[0]["root"]).relative_to(tmp_path)
+    assert len(relative.parts) == 2
+    assert relative.parts[0] == f"repo-{hashlib.sha256(repo_id.encode()).hexdigest()}"
+    assert relative.parts[1] == f"revision-{'b' * 40}"
+
+
+def test_loader_none_root_uses_lerobot_cache_convention_without_importing_lerobot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path))
+
+    load_dex3_episode(
+        _source_spec(),
+        1,
+        dataset_factory=_recording_factory(FakeDataset(_rows()), calls),
+    )
+
+    assert Path(calls[0]["root"]).relative_to(tmp_path).parts == (
+        f"repo-{hashlib.sha256(b'unitreerobotics/synthetic-dex3').hexdigest()}",
+        f"revision-{'b' * 40}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("dataset_revision", "meta_revision", "message"),
+    [
+        ("c" * 40, "b" * 40, "dataset.revision must equal pinned source revision"),
+        ("b" * 40, "c" * 40, "dataset.meta.revision must equal pinned source revision"),
+        (None, "b" * 40, "dataset.revision must equal pinned source revision"),
+        ("b" * 40, None, "dataset.meta.revision must equal pinned source revision"),
+    ],
+)
+def test_loader_rejects_dataset_or_metadata_revision_mismatch(
+    dataset_revision: object,
+    meta_revision: object,
+    message: str,
+) -> None:
+    dataset = FakeDataset(
+        _rows(),
+        dataset_revision=dataset_revision,
+        meta_revision=meta_revision,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+
+
+def test_loader_iterates_only_raw_hf_dataset_rows() -> None:
+    dataset = FakeDataset(_rows())
+
+    episode = load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+
+    assert episode.source_episode_id == 1
+    assert dataset.top_level_iteration_attempts == 0
+
+
+def test_loader_rejects_missing_raw_hf_dataset() -> None:
+    dataset = FakeDataset(_rows())
+    del dataset.hf_dataset
+
+    with pytest.raises(ValueError, match="dataset.hf_dataset must be a non-mapping iterable of raw rows"):
+        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+
+
+@pytest.mark.parametrize("hf_dataset", [None, "rows", b"rows", {"frame": 0}, 7])
+def test_loader_rejects_malformed_raw_hf_dataset(hf_dataset: object) -> None:
+    dataset = FakeDataset(_rows())
+    dataset.hf_dataset = hf_dataset
+
+    with pytest.raises(ValueError, match="dataset.hf_dataset must be a non-mapping iterable of raw rows"):
+        load_dex3_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
 @pytest.mark.parametrize("total_episodes", [2, 4, True, 3.0])

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import hashlib
 import math
 import numbers
+import os
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +76,7 @@ _ROW_KEYS = (
     "frame_index",
     "episode_index",
 )
+_MISSING = object()
 
 
 def _finite_float_array(value: object, *, field_name: str) -> np.ndarray:
@@ -226,6 +229,25 @@ def _default_lerobot_dataset_factory() -> Callable[..., Any]:
     return LeRobotDataset
 
 
+def _default_lerobot_cache_base() -> Path:
+    """Mirror LeRobot's Hugging Face cache-base convention without importing LeRobot."""
+    lerobot_home = os.getenv("HF_LEROBOT_HOME")
+    if lerobot_home is not None:
+        return Path(lerobot_home).expanduser()
+
+    default_home = Path.home() / ".cache"
+    xdg_cache_home = os.getenv("XDG_CACHE_HOME", str(default_home))
+    hf_home = os.getenv("HF_HOME", str(Path(xdg_cache_home) / "huggingface"))
+    return Path(os.path.expandvars(hf_home)).expanduser() / "lerobot"
+
+
+def _revision_scoped_root(cache_base: str | Path, repo_id: str, revision: str) -> Path:
+    """Return a cache-contained path unique to one repository identity and revision."""
+    base = Path(cache_base).expanduser().resolve()
+    repository_identity = hashlib.sha256(repo_id.encode("utf-8")).hexdigest()
+    return base / f"repo-{repository_identity}" / f"revision-{revision}"
+
+
 def load_dex3_episode(
     source_spec: SourceSpec,
     episode_id: int,
@@ -245,16 +267,22 @@ def load_dex3_episode(
     if episode_id not in source_spec.episodes:
         raise ValueError("episode_id must be selected in source_spec.episodes")
 
+    cache_base = _default_lerobot_cache_base() if root is None else root
+    scoped_root = _revision_scoped_root(cache_base, source_spec.repo_id, source_spec.revision)
     factory = _default_lerobot_dataset_factory() if dataset_factory is None else dataset_factory
     dataset = factory(
         repo_id=source_spec.repo_id,
-        root=root,
+        root=scoped_root,
         episodes=[episode_id],
         revision=source_spec.revision,
         download_videos=True,
         video_backend="pyav",
     )
     meta = getattr(dataset, "meta", None)
+    if getattr(dataset, "revision", None) != source_spec.revision:
+        raise ValueError("dataset.revision must equal pinned source revision")
+    if getattr(meta, "revision", None) != source_spec.revision:
+        raise ValueError("dataset.meta.revision must equal pinned source revision")
     total_episodes = getattr(meta, "total_episodes", None)
     if (
         isinstance(total_episodes, bool)
@@ -276,7 +304,15 @@ def load_dex3_episode(
     desired_rows: list[np.ndarray] = []
     timestamps: list[float] = []
     task_indices: list[int] = []
-    for row_number, row in enumerate(dataset):
+    raw_rows = getattr(dataset, "hf_dataset", _MISSING)
+    if raw_rows is _MISSING or isinstance(raw_rows, (str, bytes, Mapping)):
+        raise ValueError("dataset.hf_dataset must be a non-mapping iterable of raw rows")
+    try:
+        row_iterator = iter(raw_rows)
+    except TypeError as error:
+        raise ValueError("dataset.hf_dataset must be a non-mapping iterable of raw rows") from error
+
+    for row_number, row in enumerate(row_iterator):
         if not isinstance(row, Mapping):
             raise ValueError(f"row {row_number} must be a mapping")
         for key in _ROW_KEYS:
