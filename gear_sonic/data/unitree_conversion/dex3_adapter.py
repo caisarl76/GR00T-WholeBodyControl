@@ -220,7 +220,9 @@ def _feature_names_from_meta(features: object, key: str) -> tuple[str, ...]:
         names_tuple = tuple(names)
     except TypeError as error:
         raise ValueError(f"{key} metadata must contain the exact Dex3 feature names") from error
-    if names_tuple != DEX3_FEATURE_NAMES:
+    if len(names_tuple) == 1 and isinstance(names_tuple[0], (list, tuple)):
+        names_tuple = tuple(names_tuple[0])
+    if names_tuple != DEX3_FEATURE_NAMES or not all(isinstance(name, str) for name in names_tuple):
         raise ValueError(f"{key} metadata must contain the exact Dex3 feature names")
     return names_tuple
 
@@ -287,7 +289,7 @@ def _regular_file_under_root(scoped_root: Path, relative_path: PurePosixPath) ->
     return candidate
 
 
-def _read_prefetch_metadata(scoped_root: Path) -> tuple[int, str, str, tuple[str, ...]]:
+def _read_prefetch_metadata(scoped_root: Path) -> tuple[str, str, tuple[str, ...]]:
     info_path = _regular_file_under_root(scoped_root, PurePosixPath("meta/info.json"))
     try:
         with info_path.open(encoding="utf-8") as stream:
@@ -297,10 +299,12 @@ def _read_prefetch_metadata(scoped_root: Path) -> tuple[int, str, str, tuple[str
     if not isinstance(info, dict):
         raise ValueError("metadata info.json must contain a JSON object")
 
-    for field_name in ("chunks_size", "data_path", "video_path", "features"):
+    for field_name in ("codebase_version", "chunks_size", "data_path", "video_path", "features"):
         if field_name not in info:
             raise ValueError(f"metadata is missing required field {field_name}")
 
+    if info["codebase_version"] != "v3.0":
+        raise ValueError("metadata codebase_version must be exactly 'v3.0'")
     chunks_size = info["chunks_size"]
     if isinstance(chunks_size, bool) or not isinstance(chunks_size, int) or chunks_size <= 0:
         raise ValueError("metadata chunks_size must be a positive integer")
@@ -325,7 +329,82 @@ def _read_prefetch_metadata(scoped_root: Path) -> tuple[int, str, str, tuple[str
             raise ValueError(f"metadata features entry {feature_key!r} dtype must be a nonempty string")
         if dtype == "video":
             video_keys.append(feature_key)
-    return chunks_size, data_path, video_path, tuple(video_keys)
+    return data_path, video_path, tuple(video_keys)
+
+
+def _episode_metadata_files(scoped_root: Path) -> tuple[Path, ...]:
+    episodes_root = scoped_root / "meta/episodes"
+    try:
+        resolved_root = episodes_root.resolve(strict=True)
+        resolved_root.relative_to(scoped_root.resolve())
+    except (FileNotFoundError, OSError, ValueError) as error:
+        raise ValueError("episode metadata must contain at least one parquet file") from error
+    if episodes_root.is_symlink() or not episodes_root.is_dir():
+        raise ValueError("episode metadata directory must be a safe regular directory")
+
+    try:
+        candidates = sorted(episodes_root.rglob("*.parquet"))
+    except OSError as error:
+        raise ValueError("episode metadata parquet files must be readable") from error
+    if not candidates:
+        raise ValueError("episode metadata must contain at least one parquet file")
+
+    files: list[Path] = []
+    for candidate in candidates:
+        relative_path = PurePosixPath(candidate.relative_to(scoped_root).as_posix())
+        files.append(_regular_file_under_root(scoped_root, relative_path))
+    return tuple(files)
+
+
+def _episode_metadata_integer(value: object, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"episode metadata {field_name} must be a nonnegative integer")
+    return value
+
+
+def _selected_episode_row(
+    scoped_root: Path,
+    *,
+    episode_id: int,
+    video_keys: tuple[str, ...],
+) -> dict[str, int]:
+    import pyarrow.parquet as pq
+
+    required_columns = (
+        "episode_index",
+        "data/chunk_index",
+        "data/file_index",
+        *(f"videos/{video_key}/{suffix}" for video_key in video_keys for suffix in ("chunk_index", "file_index")),
+    )
+    seen_episode_ids: set[int] = set()
+    selected: dict[str, int] | None = None
+    for metadata_path in _episode_metadata_files(scoped_root):
+        try:
+            table = pq.read_table(metadata_path)
+        except Exception as error:
+            raise ValueError(f"episode metadata parquet must be readable: {metadata_path}") from error
+        missing_columns = tuple(column for column in required_columns if column not in table.column_names)
+        if missing_columns:
+            raise ValueError(f"episode metadata parquet is missing required columns: {missing_columns}")
+
+        for row_index in range(table.num_rows):
+            row = {
+                column: _episode_metadata_integer(
+                    table[column][row_index].as_py(),
+                    field_name=column,
+                )
+                for column in required_columns
+            }
+            source_episode_id = row["episode_index"]
+            if source_episode_id in seen_episode_ids:
+                raise ValueError(f"duplicate episode_index in episode metadata: {source_episode_id}")
+            seen_episode_ids.add(source_episode_id)
+            if source_episode_id == episode_id:
+                selected = row
+
+    if selected is None:
+        raise ValueError(f"no episode metadata row for selected episode {episode_id}")
+    return selected
 
 
 def _render_metadata_path(
@@ -367,16 +446,20 @@ def _render_metadata_path(
 
 
 def _selected_episode_paths(scoped_root: Path, episode_id: int) -> tuple[PurePosixPath, ...]:
-    chunks_size, data_template, video_template, video_keys = _read_prefetch_metadata(scoped_root)
-    template_values: dict[str, object] = {
-        "episode_chunk": episode_id // chunks_size,
-        "episode_index": episode_id,
-    }
+    data_template, video_template, video_keys = _read_prefetch_metadata(scoped_root)
+    episode_row = _selected_episode_row(
+        scoped_root,
+        episode_id=episode_id,
+        video_keys=video_keys,
+    )
     data_path = _render_metadata_path(
         data_template,
         field_name="data_path",
-        required_fields=frozenset({"episode_chunk", "episode_index"}),
-        values=template_values,
+        required_fields=frozenset({"chunk_index", "file_index"}),
+        values={
+            "chunk_index": episode_row["data/chunk_index"],
+            "file_index": episode_row["data/file_index"],
+        },
     )
     if data_path.suffix != ".parquet":
         raise ValueError("metadata data_path template must render a parquet path")
@@ -387,8 +470,12 @@ def _selected_episode_paths(scoped_root: Path, episode_id: int) -> tuple[PurePos
             _render_metadata_path(
                 video_template,
                 field_name="video_path",
-                required_fields=frozenset({"episode_chunk", "episode_index", "video_key"}),
-                values={**template_values, "video_key": video_key},
+                required_fields=frozenset({"chunk_index", "file_index", "video_key"}),
+                values={
+                    "chunk_index": episode_row[f"videos/{video_key}/chunk_index"],
+                    "file_index": episode_row[f"videos/{video_key}/file_index"],
+                    "video_key": video_key,
+                },
             )
         )
     if len(paths) != len(set(paths)):

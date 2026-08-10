@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from gear_sonic.data.unitree_conversion import dex3_adapter as dex3_adapter_module
@@ -466,8 +468,8 @@ class FakeDataset:
     ) -> None:
         if features is None:
             features = {
-                "observation.state": {"names": list(FEATURE_NAMES)},
-                "action": {"names": list(FEATURE_NAMES)},
+                "observation.state": {"names": [list(FEATURE_NAMES)]},
+                "action": {"names": [list(FEATURE_NAMES)]},
             }
         self.meta = type(
             "FakeMeta",
@@ -488,26 +490,52 @@ class FakeDataset:
         raise AssertionError("top-level LeRobotDataset iteration may decode video or task strings")
 
 
+VIDEO_KEYS = (
+    "observation.images.cam_left_high",
+    "observation.images.cam_left_wrist",
+    "observation.images.cam_right_wrist",
+    "observation.images.cam_right_high",
+)
+
+
 def _metadata_info(**changes: object) -> dict[str, object]:
     info: dict[str, object] = {
+        "codebase_version": "v3.0",
         "chunks_size": 1000,
-        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "features": {
-            "observation.state": {"dtype": "float32", "names": list(FEATURE_NAMES)},
-            "action": {"dtype": "float32", "names": list(FEATURE_NAMES)},
+            "observation.state": {"dtype": "float32", "names": [list(FEATURE_NAMES)]},
+            "action": {"dtype": "float32", "names": [list(FEATURE_NAMES)]},
             "timestamp": {"dtype": "float32"},
             "task_index": {"dtype": "int64"},
             "frame_index": {"dtype": "int64"},
             "episode_index": {"dtype": "int64"},
-            "observation.images.cam_left_high": {"dtype": "video"},
-            "observation.images.cam_left_wrist": {"dtype": "video"},
-            "observation.images.cam_right_wrist": {"dtype": "video"},
-            "observation.images.cam_right_high": {"dtype": "video"},
+            **{key: {"dtype": "video"} for key in VIDEO_KEYS},
         },
     }
     info.update(changes)
     return info
+
+
+def _episode_row(
+    episode_id: object = 1,
+    *,
+    data_chunk_index: object = 0,
+    data_file_index: object = 0,
+    video_locations: dict[str, tuple[object, object]] | None = None,
+) -> dict[str, object]:
+    locations = {key: (0, 0) for key in VIDEO_KEYS} if video_locations is None else video_locations
+    row: dict[str, object] = {
+        "episode_index": episode_id,
+        "data/chunk_index": data_chunk_index,
+        "data/file_index": data_file_index,
+    }
+    for video_key in VIDEO_KEYS:
+        chunk_index, file_index = locations[video_key]
+        row[f"videos/{video_key}/chunk_index"] = chunk_index
+        row[f"videos/{video_key}/file_index"] = file_index
+    return row
 
 
 class FakeSnapshotDownloader:
@@ -516,11 +544,17 @@ class FakeSnapshotDownloader:
         *,
         info: dict[str, object] | None = None,
         raw_info: str | None = None,
+        episode_rows: list[dict[str, object]] | None = None,
+        raw_episode_metadata: bytes | None = None,
+        write_episode_metadata: bool = True,
         missing_patterns: tuple[str, ...] = (),
         wrong_return_call: int | None = None,
     ) -> None:
         self.info = _metadata_info() if info is None else info
         self.raw_info = raw_info
+        self.episode_rows = [_episode_row()] if episode_rows is None else episode_rows
+        self.raw_episode_metadata = raw_episode_metadata
+        self.write_episode_metadata = write_episode_metadata
         self.missing_patterns = missing_patterns
         self.wrong_return_call = wrong_return_call
         self.calls: list[dict[str, object]] = []
@@ -535,6 +569,13 @@ class FakeSnapshotDownloader:
             info_path.parent.mkdir(parents=True, exist_ok=True)
             text = self.raw_info if self.raw_info is not None else json.dumps(self.info)
             info_path.write_text(text)
+            if self.write_episode_metadata:
+                episodes_path = local_dir / "meta/episodes/chunk-000/file-000.parquet"
+                episodes_path.parent.mkdir(parents=True, exist_ok=True)
+                if self.raw_episode_metadata is not None:
+                    episodes_path.write_bytes(self.raw_episode_metadata)
+                else:
+                    pq.write_table(pa.Table.from_pylist(self.episode_rows), episodes_path)
         else:
             assert isinstance(allow_patterns, list)
             for pattern in allow_patterns:
@@ -601,11 +642,11 @@ def _recording_factory(dataset: FakeDataset, calls: list[dict[str, object]]):
 
 
 EXPECTED_EPISODE_PATHS = [
-    "data/chunk-000/episode_000001.parquet",
-    "videos/chunk-000/observation.images.cam_left_high/episode_000001.mp4",
-    "videos/chunk-000/observation.images.cam_left_wrist/episode_000001.mp4",
-    "videos/chunk-000/observation.images.cam_right_wrist/episode_000001.mp4",
-    "videos/chunk-000/observation.images.cam_right_high/episode_000001.mp4",
+    "data/chunk-000/file-000.parquet",
+    "videos/observation.images.cam_left_high/chunk-000/file-000.mp4",
+    "videos/observation.images.cam_left_wrist/chunk-000/file-000.mp4",
+    "videos/observation.images.cam_right_wrist/chunk-000/file-000.mp4",
+    "videos/observation.images.cam_right_high/chunk-000/file-000.mp4",
 ]
 
 
@@ -664,10 +705,52 @@ def test_loader_prefetch_uses_exact_two_revision_pinned_snapshot_calls(tmp_path:
             "allow_patterns": EXPECTED_EPISODE_PATHS,
         },
     ]
-    assert all("000000" not in pattern and "000002" not in pattern for pattern in EXPECTED_EPISODE_PATHS)
 
 
-@pytest.mark.parametrize("missing_field", ["chunks_size", "data_path", "video_path", "features"])
+def test_loader_prefetch_uses_selected_v3_row_and_per_video_shard_coordinates(tmp_path: Path) -> None:
+    video_locations = {
+        VIDEO_KEYS[0]: (4, 11),
+        VIDEO_KEYS[1]: (4, 12),
+        VIDEO_KEYS[2]: (5, 1),
+        VIDEO_KEYS[3]: (5, 9),
+    }
+    downloader = FakeSnapshotDownloader(
+        episode_rows=[
+            _episode_row(0, data_chunk_index=9, data_file_index=9),
+            _episode_row(
+                310,
+                data_chunk_index=3,
+                data_file_index=7,
+                video_locations=video_locations,
+            ),
+        ]
+    )
+    source = _source_spec(episode_count=311, episodes=(310,))
+
+    load_dex3_episode(
+        source,
+        310,
+        root=tmp_path,
+        dataset_factory=lambda **_: FakeDataset(
+            _rows(episode_id=310),
+            total_episodes=311,
+        ),
+        snapshot_downloader=downloader,
+    )
+
+    assert downloader.calls[1]["allow_patterns"] == [
+        "data/chunk-003/file-007.parquet",
+        "videos/observation.images.cam_left_high/chunk-004/file-011.mp4",
+        "videos/observation.images.cam_left_wrist/chunk-004/file-012.mp4",
+        "videos/observation.images.cam_right_wrist/chunk-005/file-001.mp4",
+        "videos/observation.images.cam_right_high/chunk-005/file-009.mp4",
+    ]
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["codebase_version", "chunks_size", "data_path", "video_path", "features"],
+)
 def test_loader_prefetch_rejects_missing_metadata_fields(tmp_path: Path, missing_field: str) -> None:
     info = _metadata_info()
     del info[missing_field]
@@ -689,6 +772,8 @@ def test_loader_prefetch_rejects_missing_metadata_fields(tmp_path: Path, missing
         ("chunks_size", -1),
         ("chunks_size", True),
         ("chunks_size", 1000.0),
+        ("codebase_version", "v2.1"),
+        ("codebase_version", 3),
         ("data_path", None),
         ("video_path", 7),
         ("features", []),
@@ -734,20 +819,20 @@ def test_loader_prefetch_rejects_duplicate_json_metadata_keys(tmp_path: Path) ->
 @pytest.mark.parametrize(
     ("field_name", "template"),
     [
-        ("data_path", "data/episode_{episode_index:06d}.parquet"),
+        ("data_path", "data/file-{file_index:03d}.parquet"),
         (
             "data_path",
-            "data/{episode_chunk:03d}/episode_{episode_index:06d}_{episode_index:06d}.parquet",
+            "data/{chunk_index:03d}/file-{file_index:03d}-{file_index:03d}.parquet",
         ),
-        ("data_path", "data/{unknown}/episode_{episode_index:06d}.parquet"),
-        ("data_path", "data/{episode_chunk/episode_{episode_index}.parquet"),
-        ("video_path", "videos/{episode_chunk:03d}/episode_{episode_index:06d}.mp4"),
+        ("data_path", "data/{unknown}/file-{file_index:03d}.parquet"),
+        ("data_path", "data/{chunk_index/file-{file_index}.parquet"),
+        ("video_path", "videos/{chunk_index:03d}/file-{file_index:03d}.mp4"),
         (
             "video_path",
-            "videos/{episode_chunk:03d}/{video_key}/{video_key}/episode_{episode_index:06d}.mp4",
+            "videos/{chunk_index:03d}/{video_key}/{video_key}/file-{file_index:03d}.mp4",
         ),
-        ("video_path", "videos/{unknown}/{video_key}/episode_{episode_index:06d}.mp4"),
-        ("video_path", "videos/{episode_chunk}/{video_key/{episode_index}.mp4"),
+        ("video_path", "videos/{unknown}/{video_key}/file-{file_index:03d}.mp4"),
+        ("video_path", "videos/{chunk_index}/{video_key/{file_index}.mp4"),
     ],
 )
 def test_loader_prefetch_rejects_missing_duplicate_unknown_or_malformed_template_fields(
@@ -770,15 +855,15 @@ def test_loader_prefetch_rejects_missing_duplicate_unknown_or_malformed_template
 @pytest.mark.parametrize(
     ("field_name", "template"),
     [
-        ("data_path", "/absolute/chunk-{episode_chunk}/episode_{episode_index}.parquet"),
-        ("data_path", "data/../../escape-{episode_chunk}-{episode_index}.parquet"),
+        ("data_path", "/absolute/chunk-{chunk_index}/file-{file_index}.parquet"),
+        ("data_path", "data/../../escape-{chunk_index}-{file_index}.parquet"),
         (
             "video_path",
-            "/absolute/{episode_chunk}/{video_key}/episode_{episode_index}.mp4",
+            "/absolute/{chunk_index}/{video_key}/file-{file_index}.mp4",
         ),
         (
             "video_path",
-            "videos/../../../escape-{episode_chunk}-{video_key}-{episode_index}.mp4",
+            "videos/../../../escape-{chunk_index}-{video_key}-{file_index}.mp4",
         ),
     ],
 )
@@ -796,6 +881,128 @@ def test_loader_prefetch_rejects_absolute_or_escaping_rendered_paths(
             root=tmp_path,
             dataset_factory=lambda **_: pytest.fail("factory must not be called"),
             snapshot_downloader=FakeSnapshotDownloader(info=info),
+        )
+
+
+def test_loader_prefetch_rejects_missing_episode_metadata_parquet(tmp_path: Path) -> None:
+    downloader = FakeSnapshotDownloader(write_episode_metadata=False)
+
+    with pytest.raises(ValueError, match="episode metadata must contain at least one parquet file"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=downloader,
+        )
+
+
+def test_loader_prefetch_rejects_unreadable_episode_metadata_parquet(tmp_path: Path) -> None:
+    downloader = FakeSnapshotDownloader(raw_episode_metadata=b"not parquet")
+
+    with pytest.raises(ValueError, match="episode metadata parquet.*readable"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=downloader,
+        )
+
+
+def test_loader_prefetch_rejects_no_selected_episode_metadata_row(tmp_path: Path) -> None:
+    downloader = FakeSnapshotDownloader(episode_rows=[_episode_row(0), _episode_row(2)])
+
+    with pytest.raises(ValueError, match="no episode metadata row for selected episode 1"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=downloader,
+        )
+
+
+@pytest.mark.parametrize(
+    "episode_rows",
+    [
+        [_episode_row(1), _episode_row(1)],
+        [_episode_row(0), _episode_row(0), _episode_row(1)],
+    ],
+)
+def test_loader_prefetch_rejects_duplicate_episode_metadata_rows(
+    tmp_path: Path,
+    episode_rows: list[dict[str, object]],
+) -> None:
+    downloader = FakeSnapshotDownloader(episode_rows=episode_rows)
+
+    with pytest.raises(ValueError, match="duplicate episode_index in episode metadata"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=downloader,
+        )
+
+
+@pytest.mark.parametrize(
+    "missing_column",
+    [
+        "episode_index",
+        "data/chunk_index",
+        "data/file_index",
+        f"videos/{VIDEO_KEYS[0]}/chunk_index",
+        f"videos/{VIDEO_KEYS[0]}/file_index",
+    ],
+)
+def test_loader_prefetch_rejects_missing_episode_metadata_columns(
+    tmp_path: Path,
+    missing_column: str,
+) -> None:
+    row = _episode_row()
+    del row[missing_column]
+    downloader = FakeSnapshotDownloader(episode_rows=[row])
+
+    with pytest.raises(ValueError, match="episode metadata parquet.*required columns"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=downloader,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("episode_index", True),
+        ("episode_index", -1),
+        ("episode_index", 1.0),
+        ("data/chunk_index", True),
+        ("data/chunk_index", -1),
+        ("data/file_index", "0"),
+        (f"videos/{VIDEO_KEYS[0]}/chunk_index", -1),
+        (f"videos/{VIDEO_KEYS[0]}/file_index", False),
+    ],
+)
+def test_loader_prefetch_rejects_invalid_episode_metadata_values(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+) -> None:
+    row = _episode_row()
+    row[field_name] = value
+    downloader = FakeSnapshotDownloader(episode_rows=[row])
+
+    with pytest.raises(ValueError, match=rf"episode metadata {field_name} must be a nonnegative integer"):
+        load_dex3_episode(
+            _source_spec(),
+            1,
+            root=tmp_path,
+            dataset_factory=lambda **_: pytest.fail("factory must not be called"),
+            snapshot_downloader=downloader,
         )
 
 
@@ -1040,13 +1247,45 @@ def test_loader_rejects_non_30_hz_metadata(fps: object) -> None:
 @pytest.mark.parametrize("feature_key", ["observation.state", "action"])
 def test_loader_rejects_mismatched_feature_names(feature_key: str) -> None:
     features = {
-        "observation.state": {"names": list(FEATURE_NAMES)},
-        "action": {"names": list(FEATURE_NAMES)},
+        "observation.state": {"names": [list(FEATURE_NAMES)]},
+        "action": {"names": [list(FEATURE_NAMES)]},
     }
-    features[feature_key] = {"names": [f"generic_{index}" for index in range(28)]}
+    features[feature_key] = {"names": [[f"generic_{index}" for index in range(28)]]}
     dataset = FakeDataset(_rows(), features=features)
 
     with pytest.raises(ValueError, match=rf"{feature_key} metadata must contain the exact Dex3 feature names"):
+        _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+
+
+def test_loader_accepts_exact_flat_feature_names_if_lerobot_flattens_v3_metadata() -> None:
+    features = {
+        "observation.state": {"names": list(FEATURE_NAMES)},
+        "action": {"names": list(FEATURE_NAMES)},
+    }
+    dataset = FakeDataset(_rows(), features=features)
+
+    episode = _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
+
+    assert episode.source_episode_id == 1
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        [list(FEATURE_NAMES), list(FEATURE_NAMES)],
+        [[list(FEATURE_NAMES)]],
+        [list(FEATURE_NAMES[:-1])],
+        [[FEATURE_NAMES[1], FEATURE_NAMES[0], *FEATURE_NAMES[2:]]],
+    ],
+)
+def test_loader_rejects_all_other_nested_feature_name_shapes(names: object) -> None:
+    features = {
+        "observation.state": {"names": names},
+        "action": {"names": [list(FEATURE_NAMES)]},
+    }
+    dataset = FakeDataset(_rows(), features=features)
+
+    with pytest.raises(ValueError, match="observation.state metadata must contain the exact Dex3 feature names"):
         _load_episode(_source_spec(), 1, dataset_factory=lambda **_: dataset)
 
 
