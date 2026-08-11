@@ -1082,8 +1082,10 @@ def test_g1_debug_ack_requires_new_token_hands_and_controller_action() -> None:
         "control_loop_type": "cpp",
         "index": 8,
         "token_state": frame.motion_token.astype(np.float64),
-        "last_left_hand_action": frame.left_hand.astype(np.float64),
-        "last_right_hand_action": frame.right_hand.astype(np.float64),
+        "left_hand_q_measured": frame.left_hand.astype(np.float64),
+        "right_hand_q_measured": frame.right_hand.astype(np.float64),
+        "last_left_hand_action": np.zeros(7),
+        "last_right_hand_action": np.zeros(7),
         "last_action": np.zeros(29),
     }
 
@@ -1096,14 +1098,32 @@ def test_g1_debug_ack_requires_new_token_hands_and_controller_action() -> None:
         validate_state_ack(message, frame, last_index=7)
 
 
+def test_g1_debug_ack_uses_current_tick_hand_buffers_not_stale_logged_actions() -> None:
+    frame = action_frame(0.25)
+    message = {
+        "control_loop_type": "cpp",
+        "index": 8,
+        "token_state": frame.motion_token.astype(np.float64),
+        "left_hand_q_measured": frame.left_hand.astype(np.float64),
+        "right_hand_q_measured": frame.right_hand.astype(np.float64),
+        "last_left_hand_action": np.full(7, -0.5),
+        "last_right_hand_action": np.full(7, 0.5),
+        "last_action": np.zeros(29),
+    }
+
+    assert validate_state_ack(message, frame, last_index=7) == 8
+    message["left_hand_q_measured"] = np.zeros(7)
+    assert validate_state_ack(message, frame, last_index=7) is None
+
+
 def test_runtime_ack_also_requires_all_three_simulator_command_receipts() -> None:
     frame = action_frame(0.25)
     message = {
         "control_loop_type": "cpp",
         "index": 8,
         "token_state": frame.motion_token.astype(np.float64),
-        "last_left_hand_action": frame.left_hand.astype(np.float64),
-        "last_right_hand_action": frame.right_hand.astype(np.float64),
+        "left_hand_q_measured": frame.left_hand.astype(np.float64),
+        "right_hand_q_measured": frame.right_hand.astype(np.float64),
         "last_action": np.zeros(29),
     }
 
@@ -1286,6 +1306,62 @@ def test_runtime_holds_nominal_state_only_until_first_controller_ack() -> None:
     np.testing.assert_array_equal(events[1][3], [0.0])
     assert events[1][4] == 0.0
     np.testing.assert_array_equal(events[2][0], [8.0, 8.0])
+
+
+def test_runtime_restores_exact_nominal_state_after_prime_before_measured_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = SimpleNamespace(
+        qpos=np.array([9.0, 9.0]),
+        qvel=np.array([4.0]),
+        qacc=np.array([5.0]),
+        ctrl=np.array([6.0]),
+        time=7.0,
+    )
+    forward_calls: list[object] = []
+    runtime = object.__new__(MujocoZmqRuntime)
+    runtime._process = object()
+    runtime.collector = SimpleNamespace(sim_dt=0.005)
+    runtime._simulator = SimpleNamespace(
+        sim_env=SimpleNamespace(mj_model="model", mj_data=data),
+    )
+    runtime._initial_qpos = np.array([1.0, 2.0])
+    runtime._mujoco = SimpleNamespace(mj_forward=lambda model, value: forward_calls.append((model, value.time)))
+    runtime._controller_acknowledged = False
+
+    def complete_prime(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        data.qpos[:] = 8.0
+        data.qvel[:] = 3.0
+        data.qacc[:] = 2.0
+        data.ctrl[:] = 1.0
+        data.time = 3.0
+        runtime._controller_acknowledged = True
+        return 600
+
+    monkeypatch.setattr(replay_cli, "prime_controller", complete_prime)
+
+    runtime.prime(action_frame(0.0), timeout_s=60.0, pace=lambda delay: None)
+
+    np.testing.assert_array_equal(data.qpos, [1.0, 2.0])
+    np.testing.assert_array_equal(data.qvel, [0.0])
+    np.testing.assert_array_equal(data.qacc, [0.0])
+    np.testing.assert_array_equal(data.ctrl, [0.0])
+    assert data.time == 0.0
+    assert forward_calls == [("model", 0.0)]
+
+
+def test_authenticated_parquet_decode_failure_is_target_validation_error(tmp_path: Path) -> None:
+    parquet = tmp_path / "episode.parquet"
+    parquet.write_bytes(b"invalid parquet")
+    digest = hashlib.sha256(parquet.read_bytes()).hexdigest()
+
+    with pytest.raises(TargetValidationError, match="cannot be decoded"):
+        replay_cli._read_authenticated_replay_table(
+            parquet,
+            digest,
+            lambda path: (_ for _ in ()).throw(OSError("decode failed")),
+        )
 
 
 def test_priming_waits_through_three_second_cpp_init_and_requires_real_ack() -> None:

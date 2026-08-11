@@ -398,6 +398,19 @@ def _arrow_column_values(table: object, name: str) -> list[object]:
         raise TargetValidationError(f"replay Parquet is missing or cannot decode column {name}") from error
 
 
+def _read_authenticated_replay_table(
+    parquet_path: Path,
+    expected_digest: str,
+    reader: Callable[[Path], object],
+) -> object:
+    try:
+        return guarded_authenticated_read(parquet_path, expected_digest, reader)
+    except ProvenanceError:
+        raise
+    except Exception as error:
+        raise TargetValidationError("replay Parquet cannot be decoded") from error
+
+
 def load_episode_frames(
     dataset_root: Path,
     episode: SourceEpisodeRef,
@@ -427,7 +440,7 @@ def load_episode_frames(
     expected_digest = verified.artifact_sha256.get(relative_text)
     if expected_digest is None:
         raise ProvenanceError("resolved replay Parquet is absent from the authenticated checksum tree")
-    table = guarded_authenticated_read(
+    table = _read_authenticated_replay_table(
         parquet_path,
         expected_digest,
         lambda path: pq.read_table(path, columns=list(REPLAY_COLUMNS)),
@@ -506,7 +519,7 @@ def validate_state_ack(
     *,
     last_index: int,
 ) -> int | None:
-    """Validate a fresh g1_debug echo of token, hands, and controller output."""
+    """Validate a fresh same-tick token/hand echo and controller output."""
 
     if not isinstance(message, Mapping):
         raise RuntimeError("g1_debug acknowledgement must be a mapping")
@@ -514,8 +527,8 @@ def validate_state_ack(
         "control_loop_type",
         "index",
         "token_state",
-        "last_left_hand_action",
-        "last_right_hand_action",
+        "left_hand_q_measured",
+        "right_hand_q_measured",
         "last_action",
     }
     if not required.issubset(message):
@@ -526,8 +539,8 @@ def validate_state_ack(
     arrays: dict[str, np.ndarray] = {}
     for name, shape in (
         ("token_state", (64,)),
-        ("last_left_hand_action", (7,)),
-        ("last_right_hand_action", (7,)),
+        ("left_hand_q_measured", (7,)),
+        ("right_hand_q_measured", (7,)),
         ("last_action", (29,)),
     ):
         value = np.asarray(message[name])
@@ -538,8 +551,8 @@ def validate_state_ack(
         return None
     if not (
         np.array_equal(arrays["token_state"].astype(np.float32), frame.motion_token)
-        and np.array_equal(arrays["last_left_hand_action"].astype(np.float32), frame.left_hand)
-        and np.array_equal(arrays["last_right_hand_action"].astype(np.float32), frame.right_hand)
+        and np.array_equal(arrays["left_hand_q_measured"].astype(np.float32), frame.left_hand)
+        and np.array_equal(arrays["right_hand_q_measured"].astype(np.float32), frame.right_hand)
     ):
         return None
     return int(index)
@@ -900,16 +913,20 @@ class MujocoZmqRuntime:
         self._controller_acknowledged = True
         return True
 
+    def _reset_simulator_to_nominal(self) -> None:
+        env = self._simulator.sim_env
+        data = env.mj_data
+        data.qpos[:] = self._initial_qpos
+        data.qvel[:] = 0.0
+        data.qacc[:] = 0.0
+        data.ctrl[:] = 0.0
+        data.time = 0.0
+        self._mujoco.mj_forward(env.mj_model, data)
+
     def _step_unmeasured(self) -> None:
         env = self._simulator.sim_env
         if not self._controller_acknowledged:
-            data = env.mj_data
-            data.qpos[:] = self._initial_qpos
-            data.qvel[:] = 0.0
-            data.qacc[:] = 0.0
-            data.ctrl[:] = 0.0
-            data.time = 0.0
-            self._mujoco.mj_forward(env.mj_model, data)
+            self._reset_simulator_to_nominal()
         env.sim_step()
 
     def prime(
@@ -932,6 +949,10 @@ class MujocoZmqRuntime:
             acknowledged=self._poll_ack,
             pace=pace,
         )
+        # Priming advances dynamics while the C++ policy transitions out of
+        # INIT.  Measured warm-up must nevertheless begin at the exact
+        # deterministic nominal state required by the replay contract.
+        self._reset_simulator_to_nominal()
 
     def publish(
         self,
