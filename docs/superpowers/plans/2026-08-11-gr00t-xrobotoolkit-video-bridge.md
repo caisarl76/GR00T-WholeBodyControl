@@ -657,7 +657,7 @@ uncertainty_ms = round_trip_ms / 2
 conservative_clock_offset_bound_ms = abs(estimated_remote_minus_local_ms) + uncertainty_ms
 ```
 
-Use the lowest-round-trip sample from 20 attempts. Tests must accept a bound equal to 50 ms and reject a bound greater than 50 ms, unsynchronized `timedatectl` state on either host, fewer than 20 successful samples, camera-host mismatch, evidence older than 600 seconds, altered evidence hashes, and non-finite values.
+Use the lowest-round-trip sample from 20 attempts. Tests must accept a bound equal to 50 ms and reject a bound greater than 50 ms, unsynchronized `timedatectl` state on either host, fewer than 20 successful samples, camera-host mismatch, evidence more than 600 seconds old at exporter startup, altered evidence hashes, and non-finite values.
 
 - [ ] Implement `verify_camera_clock_sync.py` using only the standard library. It must require local and remote `timedatectl show --property=NTPSynchronized --value` to return `yes`, collect exactly 20 successful SSH midpoint samples, enforce `conservative_clock_offset_bound_ms <= 50.0`, and atomically write JSON evidence with:
 
@@ -707,7 +707,17 @@ class CameraFreshnessEvent:
 
 - [ ] Implement the monitor with injected wall and monotonic clocks. Consume the explicit client read status. A cached message produces `is_new_message=False`; a network-received message with a duplicate or regressed source timestamp is a validation failure rather than being relabeled cached. Only network-received, strictly advancing timestamps update new-message cadence statistics.
 
-- [ ] Wire `read_with_status()` and the monitor at the actual exporter read boundary in `run_data_exporter.py`. Preserve the returned image message and collection timing. Add `--camera-clock-sync-evidence PATH`; when supplied, validate the evidence before initializing collection, require its `camera_host` to equal `--camera-host`, require age no greater than 600 seconds and conservative offset bound no greater than 50 ms, then copy it to `<dataset-root>/meta/camera_clock_sync.json`. Refuse startup on missing, stale, mismatched, or out-of-bound evidence. Record each new `timestamps["ego_view"]` with its exact client monotonic receive time, expose a compact end-of-episode summary, and rate-limit warnings for stale, duplicate, regressed, or gapped frames.
+- [ ] Wire `read_with_status()` and the monitor at the actual exporter read boundary in `run_data_exporter.py`. Preserve the returned image message and collection timing. Add `--camera-clock-sync-evidence PATH`; when supplied, read its exact bytes and validate before initializing collection. Require its `camera_host` to equal `--camera-host`, conservative offset bound no greater than 50 ms, and startup age `exporter_start_wall_time - measured_at_utc` in the closed interval `[0, 600]` seconds. Refuse startup on missing, future-dated, stale, mismatched, or out-of-bound evidence.
+
+Compute the lowercase SHA-256 of the exact input bytes and store them immutably at:
+
+```text
+<dataset-root>/meta/camera_clock_sync/<sha256>.json
+```
+
+Create a temporary file in that directory, write and `fsync` it, then atomically publish with a no-replace operation such as `os.link(temp_path, final_path)`. If `final_path` already exists, verify its exact bytes and hash and reuse it; never truncate, replace, rename over, or delete an existing evidence object. A hash/path collision with different bytes is fatal. Always remove the private temporary file. This behavior must be safe when `Gr00tDataExporter.create()` resumes an existing dataset and appends later episodes.
+
+Record each new `timestamps["ego_view"]` with its exact client monotonic receive time, expose a compact end-of-episode summary, and rate-limit warnings for stale, duplicate, regressed, or gapped frames.
 
 Do not change `ComposedCameraClientSensor` caching behavior as part of this feature; expose and correctly identify that existing behavior.
 
@@ -719,21 +729,30 @@ Add a focused exporter integration test with a fake image subscriber returning o
 <dataset-root>/meta/camera_freshness/episode_<six-digit-index>.jsonl
 ```
 
-Each line must contain schema version, episode index, episode frame index, mount, source wall timestamp, client receive monotonic time, exporter observation wall/monotonic times, raw cross-host source age, clock-corrected upper source-age bound, clock-evidence SHA-256, `is_new_message`, and current new-message gap. For remote cameras, compute the conservative upper age as `workstation_observation_time - pc2_source_timestamp + estimated_remote_minus_local + uncertainty`; the SHA-256 is the lowercase hexadecimal digest of the exact copied evidence-file bytes. Without evidence, write null corrected-age/hash fields and never describe raw wall-clock subtraction as authoritative age. Flush on episode save/discard and process cleanup; reject an attempt to append a different episode to an open writer. Add temporary-directory tests proving line count and frame indices match exported-frame calls, including cached frames, that one episode cannot overwrite another, and that the correction uses the signed estimated offset plus uncertainty.
+Each line must contain schema version, episode index, episode frame index, camera host, mount, source wall timestamp, client receive monotonic time, exporter observation wall/monotonic times, raw cross-host source age, clock-corrected upper source-age bound, clock-evidence SHA-256, `is_new_message`, and current new-message gap. For remote cameras, compute the conservative upper age as `workstation_observation_time - pc2_source_timestamp + estimated_remote_minus_local + uncertainty`; the SHA-256 is the immutable evidence object's filename stem. Without evidence, write null corrected-age/hash fields and never describe raw wall-clock subtraction as authoritative age. Flush on episode save/discard and process cleanup; reject an attempt to append a different episode to an open writer. Add temporary-directory tests proving line count and frame indices match exported-frame calls, including cached frames, that one episode cannot overwrite another, and that the correction uses the signed estimated offset plus uncertainty.
 
 - [ ] Add a progression validator with a pure library entry point and CLI:
 
 ```text
 ./.venv_data_collection/bin/python gear_sonic/scripts/validate_episode_camera_progression.py \
   --dataset-root PATH --episode-index N --mount ego_view \
-  --clock-sync-evidence PATH \
   --max-source-age-ms 250 --max-new-message-gap-ms 500 \
   --minimum-new-fps 12 --minimum-new-frame-samples 120 \
   --frame-change-mad-threshold 2.0 \
   --minimum-changing-new-frame-ratio 0.5
 ```
 
-`--max-source-age-ms` is invalid unless `--clock-sync-evidence` is supplied. The script must validate the clock evidence and its SHA-256 before inspecting any age value; missing, older-than-600-second, host-mismatched, altered, or greater-than-50-ms-bound evidence is an immediate failure. It then reads the exact JSONL sidecar for the requested episode, verifies its schema and one-to-one video/frame-index coverage, and asserts strict source-timestamp advancement for new-message events.
+The validator must not accept an arbitrary clock-evidence path. It first reads the requested episode's sidecar, requires every non-null clock-evidence SHA-256 to be identical, and resolves exactly `<dataset-root>/meta/camera_clock_sync/<sidecar-sha256>.json`. It verifies the file's exact-byte SHA-256, camera host, NTP flags, and 50 ms conservative bound before inspecting any age value.
+
+For the 600-second freshness rule, define:
+
+```text
+evidence_age_at_collection_start =
+    first_sidecar_exporter_observation_wall_time - evidence.measured_at_utc
+required: 0 <= evidence_age_at_collection_start <= 600 seconds
+```
+
+Do not compare `measured_at_utc` with validator wall time. Thus immutable evidence remains valid when an episode is replayed hours or months later, while evidence that was already stale or future-dated when collection began is rejected. `--max-source-age-ms` is invalid if the selected episode has null evidence fields. After the evidence check, verify sidecar schema and one-to-one video/frame-index coverage and assert strict source-timestamp advancement for new-message events.
 
 Define progression only over saved video frames whose same-index sidecar entry has `is_new_message=true`:
 
@@ -749,6 +768,15 @@ required changing_new_frame_ratio >= 0.5
 Cached 50 Hz exporter frames are excluded from both numerator and denominator. The `2.0` MAD threshold is in 8-bit luma units and is exposed by `--frame-change-mad-threshold`; the ratio and minimum-sample arguments are validation-tool settings, not bridge freshness overrides. Reject `N < 120`, a missing/truncated sidecar, or an endlessly repeated valid image.
 
 - [ ] Add fixture tests for: corrupt/nonempty images, frozen repeated frames, advancing timestamps with frozen imagery, regressed timestamps, excessive gaps, correct RGB temporal color target, invalid/stale clock evidence, and a passing moving target. The key cadence fixture must contain 500 saved frames at 50 Hz, 150 `is_new_message=true` entries at 15 Hz, and movement on at least 75 of the 149 selected-frame comparisons; assert it passes even though fewer than 50% of all adjacent 50 Hz saved-frame pairs change. Keep fixtures small and generate them inside pytest temporary directories.
+
+- [ ] Add one append/replay lifecycle test spanning the exporter and validator. In one temporary dataset, append episode 0 using evidence bytes A measured at `T` with first exporter observation at `T+30s`; append episode 1 in a second exporter run using different evidence bytes B measured at `T+300s` with first observation at `T+330s`. Assert:
+
+  - both `meta/camera_clock_sync/<sha256(A)>.json` and `<sha256(B)>.json` exist with their original exact bytes;
+  - creating B does not change A's inode contents or digest;
+  - each episode sidecar references only its own digest;
+  - validation of both episodes succeeds with an injected validator wall clock of `T+3600s`, more than ten minutes after either evidence measurement;
+  - changing episode 0's first observation to `T+601s` fails as stale-at-collection even when validation occurs immediately;
+  - deleting, altering, or hash-renaming either immutable evidence object fails only the episode that references it.
 
 - [ ] Run focused tests and the existing exporter-related suite.
 
@@ -862,7 +890,7 @@ The installer must:
   - the PICO4U v1.1.1 selection;
   - manual foreground commands for troubleshooting;
   - worktree-local `.venv_data_collection` bootstrap and the rule to use its explicit interpreter for every Python verification command;
-  - same-NTP/chrony prerequisites, the 20-sample clock verifier, the 50 ms conservative offset maximum, evidence retention, and fail-fast behavior;
+  - same-NTP/chrony prerequisites, the 20-sample clock verifier, the 50 ms conservative offset maximum, content-addressed immutable evidence retention across appended episodes, startup fail-fast behavior, and replay-time evidence resolution;
   - the test-only bounded H.264 capture procedure and the fact that the systemd production binary cannot enable capture;
   - simultaneous episode collection and new-message-selected progression validation;
   - explicit warning that only `composed_camera` opens RealSense.
@@ -1135,7 +1163,6 @@ ssh unitree@192.168.123.164 \
   --dataset-root outputs/xr_bridge_realsense_progression \
   --episode-index 0 \
   --mount ego_view \
-  --clock-sync-evidence outputs/xr_bridge_realsense_progression/meta/camera_clock_sync.json \
   --max-source-age-ms 250 \
   --max-new-message-gap-ms 500 \
   --minimum-new-fps 12 \
@@ -1174,7 +1201,8 @@ git log --oneline --decorate -15
 - [ ] The test-only capture binary produces a current, bounded H.264 file from access units that completed PICO socket handoff; the production service binary exposes no capture flags.
 - [ ] PICO4U v1.1.1 displays correct, fresh SBS video for ten minutes.
 - [ ] No access unit completes local kernel handoff beyond 350 ms source age.
-- [ ] The concurrent episode has fresh matching clock evidence bounded to 50 ms, a corrected upper source age below 250 ms, at least 120 new-message frames, and a passing new-message-selected progression ratio across a bridge restart.
+- [ ] Every episode resolves its own immutable content-addressed clock evidence; evidence was at most 600 seconds old at that episode's first exporter observation, remains replayable later, and is bounded to 50 ms.
+- [ ] The concurrent episode has a corrected upper source age below 250 ms, at least 120 new-message frames, and a passing new-message-selected progression ratio across a bridge restart.
 - [ ] `composed_camera` remains the sole RealSense owner.
 - [ ] Installation is reproducible from the GR00T checkout and build manifest, with no external mutable source dependency.
 - [ ] Every implementation commit is focused, `git diff --check` is clean, and the unrelated user file remains untouched.
