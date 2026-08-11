@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import warnings
@@ -57,6 +58,10 @@ encoder:
       mode_id: 1
       required_observations: []
 """
+
+GOLDEN_DIR = Path("gear_sonic/tests/data/unitree_conversion")
+GOLDEN_ENCODER_CASE_SHA256 = "3696b203ab720431ae50c693a1c27e72105de76a2e4048bc38b8fc01a48d9509"
+GOLDEN_ENCODER_TOKEN_SHA256 = "d94d989f7d8d960653f76a78766b8a4ca8210f2b8e97010792d8189897b7ca2b"
 
 
 def _yaw(angle: float) -> np.ndarray:
@@ -654,3 +659,80 @@ def test_local_pinned_encoder_integration() -> None:
     token = encoder.encode(np.zeros((1, 1247), dtype=np.float32))
     assert token.shape == (1, 64)
     assert np.isfinite(token).all()
+
+
+@pytest.fixture(scope="module")
+def pinned_encoder() -> SonicEncoder:
+    override = os.environ.get("SONIC_PARITY_MODEL")
+    model_path = (
+        Path(override) if override is not None else Path("gear_sonic_deploy/policy/low_latency/model_encoder.onnx")
+    )
+    if not model_path.is_file():
+        pytest.skip("pinned low-latency encoder is not materialized")
+    ort = pytest.importorskip("onnxruntime")
+    lock = load_source_lock("gear_sonic/data/unitree_conversion/manifests/smoke_sources.yaml")
+    verified_model = verify_file(model_path, lock.encoder.size, lock.encoder.sha256)
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    session = ort.InferenceSession(
+        str(verified_model),
+        providers=["CPUExecutionProvider"],
+        sess_options=options,
+    )
+    return SonicEncoder.from_session(session)
+
+
+def test_golden_encoder_fixtures_are_immutable_numeric_arrays() -> None:
+    case_path = GOLDEN_DIR / "golden_encoder_case.npz"
+    token_path = GOLDEN_DIR / "golden_encoder_token.npy"
+    assert hashlib.sha256(case_path.read_bytes()).hexdigest() == GOLDEN_ENCODER_CASE_SHA256
+    assert hashlib.sha256(token_path.read_bytes()).hexdigest() == GOLDEN_ENCODER_TOKEN_SHA256
+
+    with np.load(case_path, allow_pickle=False) as case:
+        assert set(case.files) == {
+            "current_observed_root_wxyz",
+            "encoder_input",
+            "future_reference_root_wxyz",
+            "initial_observed_root_wxyz",
+            "initial_reference_root_wxyz",
+            "orientations",
+            "positions",
+            "velocities",
+        }
+        assert all(case[name].dtype != np.dtype(object) for name in case.files)
+    token = np.load(token_path, allow_pickle=False)
+    assert token.shape == (1, 64)
+    assert token.dtype == np.dtype(np.float32)
+
+
+def test_golden_encoder_case_matches_checked_token(pinned_encoder: SonicEncoder) -> None:
+    case = np.load(GOLDEN_DIR / "golden_encoder_case.npz")
+    orientations = build_encoder_orientation_window(
+        case["initial_observed_root_wxyz"],
+        case["current_observed_root_wxyz"],
+        case["initial_reference_root_wxyz"],
+        case["future_reference_root_wxyz"],
+    )
+    np.testing.assert_allclose(orientations, case["orientations"], atol=1e-12, rtol=0)
+    tensor = build_g1_encoder_input(case["positions"], case["velocities"], orientations)
+    np.testing.assert_array_equal(tensor, case["encoder_input"])
+    token = pinned_encoder.encode(tensor)
+    np.testing.assert_allclose(
+        token,
+        np.load(GOLDEN_DIR / "golden_encoder_token.npy"),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_large_semantic_perturbation_changes_token(pinned_encoder: SonicEncoder) -> None:
+    case = np.load(GOLDEN_DIR / "golden_encoder_case.npz")
+    baseline = pinned_encoder.encode(case["encoder_input"])
+    perturbed_positions = case["positions"].copy()
+    perturbed_positions[:, 11] += np.float32(0.5)
+    perturbed = build_g1_encoder_input(
+        perturbed_positions,
+        case["velocities"],
+        case["orientations"],
+    )
+    assert np.count_nonzero(pinned_encoder.encode(perturbed) != baseline) >= 1
