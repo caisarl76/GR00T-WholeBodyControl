@@ -78,14 +78,15 @@ RealSense image from `640x480` to `1080x810`, preserving its 4:3 aspect ratio,
 then duplicates it horizontally to produce the required `2160x810` frame.
 
 The stock profile targets a 60 FPS PICO camera. The RealSense publisher is 15
-FPS, so the bridge encodes each fresh source frame once at an effective 15 FPS.
-It does not synthesize four copies of every frame. The bridge uses an explicit
-default encoder bitrate of 4,000,000 bps, bounded by a CLI setting, because the
-upscaled 15 FPS source contains no additional detail that benefits from the
-profile's 20 MiB/s capture bitrate. Every accepted `OPEN_CAMERA` log states both
-the requested profile and the effective encoder FPS/bitrate. Width and height
-remain exactly `2160x810`, which is the dimension passed to the v1.1.1 native
-decoder.
+FPS, so the bridge uses a fixed 15 FPS encoder cadence and submits each selected
+fresh source frame at most once. Replaced or stale frames may be dropped under
+load; the bridge never synthesizes four copies of a frame to fill the 60 FPS
+request. The encoder bitrate is fixed at 4,000,000 bps because the upscaled 15
+FPS source contains no additional detail that benefits from the profile's 20
+Mib/s (`20,971,520` bps) capture bitrate. Every accepted `OPEN_CAMERA` log
+states both the requested profile and the fixed effective encoder FPS/bitrate.
+Width and height remain exactly `2160x810`, which is the dimension passed to
+the v1.1.1 native decoder.
 
 ## Architecture
 
@@ -210,9 +211,19 @@ is supported only on the trusted robot/headset LAN.
 ## End-to-End Freshness Invariant
 
 At no point may the bridge maintain an unbounded FIFO of decoded or encoded
-frames. A source frame older than 250 ms is never submitted to the encoder, and
-an encoded access unit older than 350 ms relative to its source timestamp is
-never sent.
+frames. Production freshness values are fixed, not runtime parameters:
+
+```text
+encoder cadence                 15 FPS
+maximum age at encoder input    250 ms
+maximum age at TCP send start   250 ms
+per-access-unit send deadline   100 ms
+maximum age at local handoff    350 ms
+```
+
+"Local handoff" means the complete four-byte prefix and access unit have been
+accepted by the pc2 kernel socket. Network transit and headset decode latency
+are outside this locally enforceable bound.
 
 The implementation enforces this across every stage:
 
@@ -232,11 +243,13 @@ The implementation enforces this across every stage:
    callback uses it to preserve the source timestamp through encoding.
 7. The appsink callback never writes to TCP. It replaces a one-element latest
    encoded-access-unit slot.
-8. A dedicated TCP sender uses `TCP_NODELAY`, a bounded socket send buffer,
-   nonblocking writes, and a 100 ms per-access-unit send deadline. A partial
-   packet that cannot complete before its deadline closes the video connection;
-   the bridge never continues after leaving a truncated length-framed packet in
-   the stream.
+8. Immediately before TCP send, the sender drops an access unit whose source
+   age exceeds 250 ms. It uses `TCP_NODELAY`, a bounded socket send buffer, and
+   nonblocking writes. Its absolute deadline is the earlier of 100 ms after
+   send start and the instant the source frame reaches 350 ms old. A partial
+   packet that cannot complete before that deadline closes the video
+   connection; the bridge never continues after leaving a truncated
+   length-framed packet in the stream.
 9. Connect to the headset has a two-second deadline. A connection or send
    failure tears down the current video stream but leaves command port `13579`
    available for the next Unity request.
@@ -285,13 +298,14 @@ the access units, and decoding the resulting `.h264` stream with FFmpeg.
 --allowed-headset-ip IPV4    required command peer and video destination
 --gr00t-zmq ENDPOINT         default tcp://127.0.0.1:5555
 --mount NAME                 default ego_view
---encoder-fps FPS            default 15; allowed range 1..15
---encoder-bitrate BPS        default 4000000; allowed range 1000000..8000000
---max-source-age-ms MS       default 250; allowed range 100..1000
---send-deadline-ms MS        default 100; allowed range 20..500
 --preview                    optional local preview with a bounded leaky branch
 --help                       print usage
 ```
+
+Encoder cadence, encoder bitrate, source-age limits, and send deadlines are
+fixed production constants in this v1.1.1/RealSense bridge. They have no CLI
+overrides. Changing one requires a new reviewed compatibility design rather
+than an unchecked service argument.
 
 Example:
 
@@ -363,7 +377,8 @@ The implementation never logs every frame.
   zero.
 - Force a partial TCP write past the deadline and verify the socket is closed
   rather than reused with corrupt framing.
-- Verify no transmitted access unit exceeds the configured 350 ms source age.
+- Verify complete local handoff never occurs after the fixed 350 ms source-age
+  ceiling.
 - Run a sustained slow-receiver test and verify the process has bounded memory
   and disconnects instead of accumulating latency.
 
@@ -417,8 +432,8 @@ cached image. While the bridge and episode recording run concurrently:
   fragmentation/coalescing, and other profiles are rejected.
 - XR output is `2160x810` SBS H.264 with correct color and decodes on the
   deployed v1.1.1 headset.
-- The bridge has no unbounded frame queue and never intentionally transmits an
-  access unit older than 350 ms.
+- The bridge has no unbounded frame queue and never completes local socket
+  handoff for an access unit older than 350 ms.
 - The data collector receives advancing, fresh camera timestamps while XR is
   active, and the recorded episode demonstrates temporal progression.
 - Restarting or failing the XR bridge does not interrupt GR00T collection.
