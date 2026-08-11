@@ -8,26 +8,84 @@ must not open the RealSense device or change the existing episode image path.
 
 Success requires both of the following at the same time:
 
-- the GR00T episode collector receives valid `observation.images.ego_view`
-  frames; and
-- XRoboToolkit displays the camera through its `PICO4U` video source.
+- the GR00T episode collector receives fresh
+  `observation.images.ego_view` frames; and
+- XRoboToolkit displays a fresh, correctly colored camera view through its
+  `PICO4U` video source.
 
-## Existing Contracts
+## Pinned Compatibility Baseline
+
+The deployed headset application is
+[`XRoboToolkit-PICO-1.1.1.apk`](https://github.com/XR-Robotics/XRoboToolkit-Unity-Client/releases/tag/v1.1.1),
+source commit `9f775b535d781618bd2bb7ef8d6c414c0531387c`.
+
+The bridge reimplements the required wire contracts in the GR00T repository.
+It does not build against or copy the upstream Orin sender. The behavior of
+[`XRoboToolkit-Orin-Video-Sender`](https://github.com/XR-Robotics/XRoboToolkit-Orin-Video-Sender)
+at commit `8bedc7bb225628235f97b6e51bfde5a2a3704031` is a protocol reference only.
+In particular, the bridge must not reuse that revision's `network_helper.hpp`,
+because it passes each individual `recv()` result to the command parser as if
+TCP preserved message boundaries.
+
+Supporting a different APK release is outside this design. A mismatched request
+is rejected and logged rather than silently mapped to another profile.
+
+## Existing GR00T Camera Contract
 
 The existing GR00T `composed_camera` process is the only RealSense owner. It
-publishes MessagePack payloads through ZMQ on `tcp://*:5555`. Each payload has
-an `images` map containing:
+publishes MessagePack payloads through ZMQ on `tcp://*:5555`. Each payload has:
 
-- `ego_view`: a `640x480` JPEG represented as either a base64 string or binary
-  bytes; and
-- `ego_view_depth`: depth data that the XR bridge ignores.
+- `timestamps["ego_view"]`: a wall-clock source timestamp generated on pc2;
+- `images["ego_view"]`: normally a base64 JPEG string for RealSense; and
+- optional `ego_view_depth` timestamp and image entries when depth is enabled.
 
-XRoboToolkit Unity connects to a command server on TCP port `13579`. An
-`OPEN_CAMERA` request for the `PICO4U` profile supplies camera type `VR`, output
-size `1280x480`, frame rate `15 FPS`, bitrate `1,000,000 bps`, and the headset
-IP and streaming port. Encoded video is returned to the headset on TCP port
-`12345`. Each H.264 buffer is preceded by a four-byte big-endian payload
-length.
+The configured RealSense source is `640x480`, RGB8, at 15 FPS. GR00T's legacy
+base64 path passes that RGB array directly to OpenCV JPEG encoding, whose input
+contract is BGR. The JPEG therefore carries red and blue in exchanged channel
+positions. A bridge that simply calls `cv::imdecode` and labels the result BGR
+would preserve the wrong display colors.
+
+Binary JPEG values have a different contract: they are raw on-device MJPEG
+bytes, such as those emitted by an OAK device. OpenCV decodes those bytes into
+normal BGR and no corrective channel exchange is required. The wire value type
+therefore determines the bridge's color conversion:
+
+| Wire value | Origin | After `cv::imdecode` | Before BGR GStreamer input |
+|---|---|---|---|
+| MessagePack string | Legacy RGB array encoded as BGR | red/blue exchanged | exchange red/blue once |
+| MessagePack binary | On-device standard JPEG | normal BGR | no channel exchange |
+
+The bridge ignores optional depth entries.
+
+## PICO4U v1.1.1 Contract
+
+The v1.1.1 `PICO4U` profile sends one `OPEN_CAMERA` request with these exact
+values:
+
+| Field | Required value |
+|---|---:|
+| camera | `VR` |
+| width | `2160` |
+| height | `810` |
+| fps | `60` |
+| bitrate | `20971520` |
+| enableMvHevc | `0` |
+| renderMode | `2` |
+| port | `12345` |
+
+The profile describes two 4:3 eye images side by side. The bridge resizes the
+RealSense image from `640x480` to `1080x810`, preserving its 4:3 aspect ratio,
+then duplicates it horizontally to produce the required `2160x810` frame.
+
+The stock profile targets a 60 FPS PICO camera. The RealSense publisher is 15
+FPS, so the bridge encodes each fresh source frame once at an effective 15 FPS.
+It does not synthesize four copies of every frame. The bridge uses an explicit
+default encoder bitrate of 4,000,000 bps, bounded by a CLI setting, because the
+upscaled 15 FPS source contains no additional detail that benefits from the
+profile's 20 MiB/s capture bitrate. Every accepted `OPEN_CAMERA` log states both
+the requested profile and the effective encoder FPS/bitrate. Width and height
+remain exactly `2160x810`, which is the dimension passed to the v1.1.1 native
+decoder.
 
 ## Architecture
 
@@ -39,153 +97,338 @@ GR00T composed_camera :5555
      | ZMQ PUB
      +--------------------> episode data collector
      |
-     +--------------------> OrinVideoSenderGR00T
-                               | TCP command server :13579
-                               | MessagePack/JPEG decode
-                               | mono-to-SBS conversion
-                               | Jetson H.264 encoding
+     +--------------------> gr00t_xr_video_bridge
+                               | bounded TCP command server :13579
+                               | newest-only JPEG decode and SBS conversion
+                               | bounded Jetson H.264 pipeline
+                               | deadline-bounded TCP sender
                                v
-                         PICO headset :12345
+                         allowed PICO headset :12345
 ```
 
-The bridge is an independent ZMQ subscriber. Its receive queue retains only
-the newest frame so XR backpressure cannot produce an increasingly stale
-display. This does not change the independent subscriber queue used by the
-episode collector.
+The bridge is an independent ZMQ subscriber. It cannot consume, acknowledge,
+or remove messages from the episode collector's independent subscription.
 
-## Components
+## Repository Ownership and Deliverables
 
-### GR00T XR sender
-
-Add `main_gr00t_zmq_tcp.cpp` to the XRoboToolkit Orin sender checkout. It reuses
-the upstream XR command deserialization, TCP server, TCP client, and encoded
-buffer framing. It does not include ZED headers, link `libsl_zed`, or access a
-`/dev/video*` device.
-
-The executable is named `OrinVideoSenderGR00T` and accepts:
+All maintained source and deployment artifacts live in
+`GR00T-WholeBodyControl`:
 
 ```text
---listen ADDRESS       XR command address; production value 0.0.0.0:13579
---gr00t-zmq ENDPOINT   GR00T publisher; default tcp://127.0.0.1:5555
---mount NAME           color-image mount; default ego_view
---preview              optional local preview
---help                 print usage
+gear_sonic/camera/xr_video_bridge/
+    main.cpp
+    xr_control_protocol.hpp/.cpp
+    gr00t_frame_decoder.hpp/.cpp
+    h264_pipeline.hpp/.cpp
+    bounded_tcp_sender.hpp/.cpp
+    latest_value_slot.hpp
+    Makefile
+    tests/
+install_scripts/install_xr_video_bridge.sh
+systemd/gr00t_xr_video_bridge.service.in
 ```
 
-### Independent build
+The installer builds
+`build/xr_video_bridge/gr00t_xr_video_bridge` from the current GR00T checkout.
+It installs build dependencies, verifies `nvv4l2h264enc`, and can generate a
+systemd unit with the actual repository path, Unix user, listen address, and
+allowed headset IPv4 address. No mutable external clone is used at build or
+runtime.
 
-Add `Makefile.gr00t` instead of changing the upstream ZED-selected Makefile.
-The GR00T build links GStreamer, GStreamer app, GLib, OpenCV, ZeroMQ,
-MessagePack, OpenSSL, CUDA, and pthread dependencies. It excludes all ZED SDK
-include paths and libraries.
+The installer uses these Ubuntu development packages:
 
-Build with:
+```text
+build-essential
+pkg-config
+libgstreamer1.0-dev
+libgstreamer-plugins-base1.0-dev
+libopencv-dev
+libzmq3-dev
+libmsgpack-dev
+libssl-dev
+```
+
+CUDA and the `nvv4l2h264enc` plugin come from the already installed JetPack
+image and are verified rather than reinstalled. The Makefile contains no ZED
+include path or `libsl_zed` linkage. The reproducibility boundary is the GR00T
+commit, the two pinned XR reference commits, the installed JetPack release, and
+the package versions reported by `dpkg-query`; the installer writes those
+versions to `build/xr_video_bridge/build-manifest.txt`.
+
+## Command TCP Protocol
+
+### Stream framing
+
+The control connection is a TCP byte stream. The bridge maintains a persistent
+byte accumulator per accepted client; one `recv()` may contain a partial frame,
+one frame, or several frames.
+
+Each outer frame is:
+
+```text
+uint32_be body_length
+body[body_length]
+```
+
+The parser waits for all four length bytes, validates `body_length` before
+allocating or accumulating its body, retains partial data, and extracts every
+complete frame before reading again. `body_length` must be between 8 and 65,536
+bytes. The total accumulator is bounded to 131,080 bytes; exceeding the bound
+closes the command connection.
+
+The body is:
+
+```text
+int32_le command_length
+command[command_length]          # UTF-8; ASCII commands in v1.1.1
+int32_le data_length
+data[data_length]
+```
+
+`command_length` is limited to 64 bytes and `data_length` to 4,096 bytes.
+Negative lengths, integer overflow, truncated fields, invalid UTF-8, and body
+bytes remaining after the declared data are protocol errors that close the
+client. The only supported commands for v1.1.1 are `OPEN_CAMERA` and
+`CLOSE_CAMERA`; an unknown command is rejected and logged.
+
+### Camera request payload
+
+`OPEN_CAMERA` data starts with `CA FE`, protocol version 1, then seven signed
+32-bit little-endian integers, followed by one-byte-length-prefixed UTF-8
+camera and IP strings. Parsing requires exact payload consumption.
+
+The bridge accepts only the complete v1.1.1 profile shown above. The request IP
+must equal both the TCP command peer and the required `--allowed-headset-ip`.
+The output target is forced to that peer on port `12345`; it is never an
+arbitrary request-controlled destination. `CLOSE_CAMERA` must have an empty
+payload.
+
+The production service listens on the pc2 LAN interface or `0.0.0.0:13579`, but
+the headset allowlist is mandatory. This is still an unencrypted protocol and
+is supported only on the trusted robot/headset LAN.
+
+## End-to-End Freshness Invariant
+
+At no point may the bridge maintain an unbounded FIFO of decoded or encoded
+frames. A source frame older than 250 ms is never submitted to the encoder, and
+an encoded access unit older than 350 ms relative to its source timestamp is
+never sent.
+
+The implementation enforces this across every stage:
+
+1. The ZMQ SUB socket uses `ZMQ_CONFLATE=1`, `ZMQ_RCVHWM=1`, and zero linger.
+2. MessagePack receive/decode publishes into a one-element latest-value slot.
+   A producer replaces an unconsumed value instead of waiting.
+3. Before resize/duplication and again before `appsrc`, the source wall-clock
+   timestamp is checked against the pc2 clock. Missing, non-finite,
+   non-monotonic, future-skewed, or older-than-250-ms timestamps are dropped.
+4. `appsrc` is live, nonblocking, limited to one queued buffer, and configured
+   to leak the oldest buffer downstream when supported by the installed
+   GStreamer version. Startup fails if equivalent bounded behavior cannot be
+   configured.
+5. The non-preview GStreamer path has no ordinary unbounded `queue`. `appsink`
+   is nonblocking, drops old samples, and retains at most one sample.
+6. GStreamer buffer PTS identifies the originating source frame. The appsink
+   callback uses it to preserve the source timestamp through encoding.
+7. The appsink callback never writes to TCP. It replaces a one-element latest
+   encoded-access-unit slot.
+8. A dedicated TCP sender uses `TCP_NODELAY`, a bounded socket send buffer,
+   nonblocking writes, and a 100 ms per-access-unit send deadline. A partial
+   packet that cannot complete before its deadline closes the video connection;
+   the bridge never continues after leaving a truncated length-framed packet in
+   the stream.
+9. Connect to the headset has a two-second deadline. A connection or send
+   failure tears down the current video stream but leaves command port `13579`
+   available for the next Unity request.
+
+This policy prefers a visible freeze or explicit reconnect over displaying a
+video stream that falls progressively behind real time.
+
+## H.264 Wire Contract
+
+GStreamer receives corrected BGR `2160x810` frames through `appsrc` at the
+effective 15 FPS cadence, converts them to NV12 in NVMM memory, and encodes them
+with `nvv4l2h264enc`. The encoder uses no B-frames, inserts SPS/PPS with IDR
+frames, and emits a periodic IDR at most every 15 source frames.
+
+`h264parse` uses `config-interval=-1`. After the parser, negotiated output caps
+are explicit:
+
+```text
+video/x-h264,stream-format=byte-stream,alignment=au
+```
+
+Thus every appsink sample is one Annex-B H.264 access unit. Each TCP video
+packet is:
+
+```text
+uint32_be access_unit_length
+annex_b_access_unit[access_unit_length]
+```
+
+The first transmitted access unit after each video connection must contain
+SPS, PPS, and an IDR frame. If the pipeline cannot negotiate byte-stream and
+access-unit alignment, or the installed encoder cannot disable incompatible
+codec behavior, `OPEN_CAMERA` fails visibly. A request with
+`enableMvHevc != 0` is rejected; the bridge never silently substitutes H.264
+for a requested codec.
+
+The v1.1.1 Android decoder is implemented in a closed vendor AAR, so headset
+integration remains the final compatibility authority. The Annex-B/AU contract
+is also validated independently by stripping TCP length prefixes, concatenating
+the access units, and decoding the resulting `.h264` stream with FFmpeg.
+
+## Runtime Interface
+
+```text
+--listen ADDRESS             required command address, for example 0.0.0.0:13579
+--allowed-headset-ip IPV4    required command peer and video destination
+--gr00t-zmq ENDPOINT         default tcp://127.0.0.1:5555
+--mount NAME                 default ego_view
+--encoder-fps FPS            default 15; allowed range 1..15
+--encoder-bitrate BPS        default 4000000; allowed range 1000000..8000000
+--max-source-age-ms MS       default 250; allowed range 100..1000
+--send-deadline-ms MS        default 100; allowed range 20..500
+--preview                    optional local preview with a bounded leaky branch
+--help                       print usage
+```
+
+Example:
 
 ```bash
-make -f Makefile.gr00t
+./build/xr_video_bridge/gr00t_xr_video_bridge \
+  --listen 0.0.0.0:13579 \
+  --allowed-headset-ip 192.168.123.45 \
+  --gr00t-zmq tcp://127.0.0.1:5555 \
+  --mount ego_view
 ```
 
-### Service
+## Lifecycle and Failure Handling
 
-After manual validation, add `gr00t_xr_video_bridge.service`. It starts after
-network availability and the composed-camera service, launches the bridge with
-the production arguments, and restarts on failure. It is a separate service so
-stopping or restarting XR streaming cannot stop camera capture or episode
-collection.
+1. The bridge starts its command listener without opening the RealSense or
+   starting an encoder.
+2. A validated `OPEN_CAMERA` connects to the allowed headset, creates a fresh
+   encoder, and begins consuming current GR00T frames.
+3. A second `OPEN_CAMERA` while streaming is rejected; the client must close or
+   disconnect first.
+4. `CLOSE_CAMERA`, command disconnect, video send failure, GStreamer error,
+   SIGINT, or SIGTERM releases the subscriber, pipeline, and video socket. The
+   RealSense and episode collector are unaffected.
+5. A missing ZMQ publisher leaves the command listener alive. During an open
+   session it reports the outage periodically without repeating stale frames,
+   and resumes from a fresh frame when the publisher returns.
 
-## Runtime Data Flow
-
-1. The bridge listens on `0.0.0.0:13579` without starting an encoder.
-2. Unity connects and sends `OPEN_CAMERA` using the `PICO4U` profile.
-3. The bridge validates the `VR` request and records its dimensions, FPS,
-   bitrate, target IP, and target port.
-4. The bridge connects a TCP video client to the headset target, normally port
-   `12345`.
-5. A ZMQ subscriber reads the newest MessagePack payload from port `5555`.
-6. The bridge selects `images["ego_view"]`, base64-decodes it when necessary,
-   and uses OpenCV to decode the JPEG into BGR pixels.
-7. The `640x480` image is duplicated horizontally to produce a `1280x480`
-   side-by-side image. Both eyes therefore see the same monocular camera view
-   without cropping or aspect distortion.
-8. GStreamer receives BGR frames through `appsrc`, converts them to NV12 NVMM
-   memory, and encodes them with `nvv4l2h264enc`. Encoder FPS and bitrate come
-   from the validated Unity request. SPS/PPS insertion and periodic IDR frames
-   allow the Unity decoder to recover after reconnects.
-9. Each encoded appsink buffer is prefixed with its four-byte big-endian size
-   and sent over TCP to the headset.
-10. `CLOSE_CAMERA` or a Unity disconnect stops the subscriber, encoder, and
-    video TCP client but leaves the command listener alive.
-
-## Validation and Bounds
-
-The bridge accepts the `PICO4U` contract: camera type `VR`, width `1280`, height
-`480`, and positive FPS and bitrate. It rejects invalid dimensions, ports,
-bitrates, or unsupported camera types without affecting the command server.
-Encoded output uses H.264 even if a malformed request asks for an unsupported
-codec.
-
-The implementation bounds command and frame lengths before allocating memory.
-It handles one active Unity command client and one active output stream. A
-second open request replaces no existing stream; Unity must close or disconnect
-the active stream first.
-
-## Failure Handling
-
-- A missing mount, malformed MessagePack payload, invalid base64 value, or JPEG
-  decode failure drops only that frame and increments a diagnostic counter.
-- A GR00T publisher outage leaves the command server alive. The ZMQ subscriber
-  continues waiting and resumes when frames return.
-- A headset connection or send failure stops the current XR stream and returns
-  to the command-listening state.
-- A GStreamer construction, state, or encode failure tears down the current
-  pipeline without affecting `composed_camera`.
-- `CLOSE_CAMERA`, command-client disconnect, SIGINT, and SIGTERM release all
-  GStreamer, ZMQ, and TCP resources deterministically.
-- The bridge prints periodic counters for received, decoded, dropped, encoded,
-  and transmitted frames without logging every frame.
+Malformed MessagePack, missing mounts, invalid base64, invalid JPEG, wrong
+dimensions, invalid timestamps, and color conversion failures drop one frame
+and increment a bounded-rate diagnostic counter. Periodic metrics include
+received, decoded, stale-dropped, decode-dropped, overwritten, encoded,
+network-dropped, and transmitted counts plus source-to-send age percentiles.
+The implementation never logs every frame.
 
 ## Testing
 
-### Automated tests
+### Command framing and protocol tests
 
-- Parse valid `OPEN_CAMERA` and `CLOSE_CAMERA` packets and reject malformed
-  lengths, magic bytes, versions, dimensions, and ports.
-- Verify H.264 payload length framing is four-byte big-endian.
-- Decode MessagePack payloads containing base64 JPEG and binary JPEG values.
-- Ignore `ego_view_depth` and reject missing or malformed `ego_view` values.
-- Convert a known `640x480` BGR image into `1280x480` and verify that both
-  output halves exactly match the input.
-- Verify bounded latest-frame behavior by submitting frames faster than the
-  consumer and confirming stale frames are discarded.
+- Construct canonical v1.1.1 `OPEN_CAMERA` and `CLOSE_CAMERA` fixtures.
+- Feed each outer frame at every possible single split boundary.
+- Feed complete frames one byte at a time.
+- Feed `OPEN_CAMERA || CLOSE_CAMERA` in one receive chunk.
+- Feed a partial frame followed by several concatenated frames.
+- Reject zero, negative-equivalent, oversized, overflowing, truncated, invalid
+  UTF-8, and trailing-byte cases before large allocation.
+- Verify exact v1.1.1 profile acceptance and one-field-at-a-time rejection.
+- Verify request IP, command peer, allowlisted IP, and port constraints.
+- Capture one real command from the deployed v1.1.1 APK and compare it with the
+  canonical fixture, including the outer four-byte length.
 
-Protocol and frame conversion logic must be isolated from sockets and
-GStreamer so these tests run without a RealSense, headset, or Jetson encoder.
+### JPEG color and SBS tests
 
-### Jetson integration test
+- Generate saturated red, green, and blue RGB patches.
+- Reproduce the RealSense legacy path by passing RGB directly to OpenCV JPEG
+  encoding, serialize it as base64, and verify the bridge's decoded BGR output
+  has the correct displayed channel dominance within JPEG tolerance.
+- Encode a standard BGR test pattern as binary MJPEG and verify that the binary
+  path does not perform the legacy corrective exchange.
+- Verify each corrected `640x480` input becomes `2160x810`, each half is
+  `1080x810`, the aspect ratio is preserved, and both halves match.
+- Decode a hardware-encoded color-bar stream and verify correct colors after
+  the complete JPEG-to-H.264 path.
 
-1. Start GR00T `composed_camera` on port `5555` and confirm `ego_view` is
-   `480x640x3` after JPEG decoding.
-2. Start `OrinVideoSenderGR00T` on port `13579`.
-3. Select `PICO4U` in XRoboToolkit and open Remote Vision.
-4. Confirm the bridge logs `VR`, `1280x480`, `15 FPS`, the headset IP, and port
-   `12345`.
-5. Confirm the headset renders a correctly proportioned image in both eyes.
-6. Confirm the sender approaches 15 FPS without unbounded queue growth.
+### Freshness and slow-receiver tests
+
+- Overproduce ZMQ frames and confirm only the latest unconsumed value survives.
+- Inject missing, non-monotonic, future, and stale source timestamps and verify
+  rejection.
+- Stall a fake video receiver and verify all internal queue sizes remain one or
+  zero.
+- Force a partial TCP write past the deadline and verify the socket is closed
+  rather than reused with corrupt framing.
+- Verify no transmitted access unit exceeds the configured 350 ms source age.
+- Run a sustained slow-receiver test and verify the process has bounded memory
+  and disconnects instead of accumulating latency.
+
+### H.264 tests
+
+- Assert negotiated caps are Annex-B byte-stream and access-unit aligned.
+- Inspect the first access unit for SPS, PPS, and IDR NAL units.
+- Verify every length prefix equals the complete following access-unit size.
+- Strip prefixes, concatenate access units, and decode the stream with FFmpeg.
+- Verify periodic IDR and SPS/PPS recovery after restarting a video connection.
+
+### Jetson and headset integration
+
+1. Confirm `nvv4l2h264enc` and all required bounded appsrc/appsink properties on
+   pc2 before building the service.
+2. Start GR00T `composed_camera` on `5555` and verify fresh `ego_view`
+   timestamps and `480x640x3` decoded frames.
+3. Start the bridge on `13579` with the actual PICO IPv4 allowlisted.
+4. Select `PICO4U` in XRoboToolkit v1.1.1 and confirm the logged request is
+   `VR`, `2160x810`, 60 FPS, 20,971,520 bps, render mode 2, and port `12345`.
+5. Confirm the bridge logs its effective 15 FPS / 4,000,000 bps adaptation.
+6. Confirm the headset renders a correctly proportioned, correctly colored
+   image in both eyes.
+7. Confirm source-to-send age remains bounded and the process does not build a
+   queue during a ten-minute session.
 
 ### Collection regression test
 
-1. Start XR display and record a short GR00T episode concurrently.
-2. Confirm the episode contains decodable, nonempty
-   `observation.images.ego_view` frames.
-3. Confirm logs contain no RealSense device-busy, disconnect, or second-owner
+The collection check must not pass merely because the exporter reuses its
+cached image. While the bridge and episode recording run concurrently:
+
+1. Instrument the actual `ComposedCameraClientSensor` used by the exporter and
+   record each newly received `timestamps["ego_view"]` value and client receive
+   time for at least ten seconds.
+2. Assert source timestamps are strictly increasing on new-message events,
+   source age is below 250 ms, no new-message gap exceeds 500 ms, and at least
+   12 new messages per second are observed for the configured 15 FPS source.
+3. Record a controlled moving RGB test target. Decode the saved episode and
+   verify the expected color ordering and temporal progression; a single
+   nonempty or endlessly repeated frame is a failure.
+4. Restart only the XR bridge while collection continues. Assert the exporter's
+   source timestamps continue advancing across the restart and the saved
+   episode retains temporal progression.
+5. Confirm logs contain no RealSense device-busy, disconnect, or second-owner
    errors.
-4. Restart the XR bridge while collection continues and verify new episode
-   frames remain available.
+
+## Acceptance Criteria
+
+- Only `composed_camera` opens the RealSense.
+- The v1.1.1 PICO4U request is parsed correctly under arbitrary TCP
+  fragmentation/coalescing, and other profiles are rejected.
+- XR output is `2160x810` SBS H.264 with correct color and decodes on the
+  deployed v1.1.1 headset.
+- The bridge has no unbounded frame queue and never intentionally transmits an
+  access unit older than 350 ms.
+- The data collector receives advancing, fresh camera timestamps while XR is
+  active, and the recorded episode demonstrates temporal progression.
+- Restarting or failing the XR bridge does not interrupt GR00T collection.
+- Installation and service generation require no unpinned external checkout.
 
 ## Non-Goals
 
-- Capturing the RealSense directly from the XR sender.
-- Streaming `ego_view_depth` to Unity.
+- Capturing the RealSense directly from the XR bridge.
+- Streaming depth to Unity.
 - Producing true stereo depth views from the monocular color stream.
-- Modifying the XRoboToolkit Unity client or its `PICO4U` profile.
-- Replacing the GR00T camera or episode data-collection protocols.
+- Modifying or rebuilding the v1.1.1 Unity APK.
+- Supporting other XRoboToolkit APK profiles or releases.
+- Authenticating or encrypting the trusted-LAN XR protocol.
