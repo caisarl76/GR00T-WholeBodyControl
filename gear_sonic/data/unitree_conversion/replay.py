@@ -7,16 +7,18 @@ tests remain usable in lightweight conversion environments.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
-import hmac
 import json
 import math
+import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import time
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -24,6 +26,10 @@ import numpy as np
 COMMAND_HZ = 50
 WARMUP_FRAMES = 2 * COMMAND_HZ
 HOLD_FRAMES = COMMAND_HZ
+
+
+class ProvenanceError(ValueError):
+    """Immutable merged dataset identity or byte authentication failed."""
 
 
 @dataclass
@@ -81,6 +87,15 @@ class SourceEpisodeRef:
     target_episode_index: int
     episode_length: int
     stage: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AuthenticatedDataset:
+    root: Path
+    artifact_sha256: Mapping[str, str]
+    dataset_checksums_sha256: str
+    source_manifest_sha256: str
+    conversion_identity: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -186,25 +201,20 @@ def _acceptance_failures(
     nonfinite_sample_count: int,
     controller_fault_count: int,
 ) -> tuple[str, ...]:
-    def exceeds(value: float, limit: float) -> bool:
-        return value > limit and not math.isclose(value, limit, rel_tol=0.0, abs_tol=1e-12)
-
     failures: list[str] = []
-    if (root_height_min < 0.45 and not math.isclose(root_height_min, 0.45, rel_tol=0.0, abs_tol=1e-12)) or exceeds(
-        root_height_max, 1.05
-    ):
+    if root_height_min < 0.45 or root_height_max > 1.05:
         failures.append("root_height")
-    if exceeds(root_roll_abs_max, 0.7):
+    if root_roll_abs_max > 0.7:
         failures.append("root_roll")
-    if exceeds(root_pitch_abs_max, 0.7):
+    if root_pitch_abs_max > 0.7:
         failures.append("root_pitch")
-    if exceeds(joint_limit_overshoot_max, 0.02):
+    if joint_limit_overshoot_max > 0.02:
         failures.append("joint_limit_overshoot")
-    if exceeds(joint_velocity_abs_max, 50.0):
+    if joint_velocity_abs_max > 50.0:
         failures.append("joint_velocity")
-    if exceeds(torque_ratio_max, 1.05):
+    if torque_ratio_max > 1.05:
         failures.append("torque_ratio")
-    if exceeds(contact_force_max, contact_limit_n):
+    if contact_force_max > contact_limit_n:
         failures.append("contact_force")
     if nonfinite_sample_count:
         failures.append("nonfinite")
@@ -475,41 +485,167 @@ def collector_from_mujoco_model(
     if mujoco_module is None:
         import mujoco as mujoco_module  # type: ignore[no-redef]
 
-    force_ranges = np.asarray(getattr(model, "actuator_forcerange"), dtype=np.float64)
     joint_ranges = np.asarray(getattr(model, "jnt_range"), dtype=np.float64)
-    if force_ranges.ndim != 2 or force_ranges.shape[1] != 2:
-        raise ValueError("loaded model actuator_forcerange must have shape (A, 2)")
+    joint_force_ranges = np.asarray(getattr(model, "jnt_actfrcrange"), dtype=np.float64)
+    joint_force_limited = np.asarray(getattr(model, "jnt_actfrclimited"))
     if joint_ranges.ndim != 2 or joint_ranges.shape[1] != 2:
         raise ValueError("loaded model jnt_range must have shape (J, 2)")
-    actuators = _validated_indices(actuator_ids, size=force_ranges.shape[0], name="actuator_ids")
+    if joint_force_ranges.shape != joint_ranges.shape:
+        raise ValueError("loaded model jnt_actfrcrange must have shape (J, 2)")
+    if joint_force_limited.shape != (joint_ranges.shape[0],):
+        raise ValueError("loaded model jnt_actfrclimited must have shape (J,)")
+    actuator_count = np.asarray(getattr(model, "actuator_forcerange")).shape[0]
+    actuators = _validated_indices(actuator_ids, size=actuator_count, name="actuator_ids")
     joints = _validated_indices(joint_ids, size=joint_ranges.shape[0], name="joint_ids")
     if actuators.size != joints.size:
         raise ValueError("actuator_ids and joint_ids must have the same length")
-    effort_limits = np.max(np.abs(force_ranges[actuators]), axis=1)
+    if not np.all(joint_force_limited[joints].astype(bool)):
+        raise ValueError("selected robot joints must have jnt_actfrclimited enabled")
+    effort_limits = np.max(np.abs(joint_force_ranges[joints]), axis=1)
     return ReplayMetricsCollector(
         sim_dt=getattr(getattr(model, "opt"), "timestep"),
         exclude_before_s=exclude_before_s,
         robot_mass_kg=mujoco_module.mj_getTotalmass(model),
         effort_limits=effort_limits,
         joint_limits=joint_ranges[joints],
-        effort_limit_source="mujoco.actuator_forcerange",
+        effort_limit_source="mujoco.jnt_actfrcrange",
     )
 
 
-def _manifest_checksum(root: Path, payload: bytes) -> None:
+def _hash_regular_file(path: Path) -> str:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ValueError(f"provenance artifact is missing: {path}") from error
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"provenance artifact must be a regular non-symlink file: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_relative_path(value: str) -> str:
+    candidate = Path(value)
+    if (
+        not value
+        or candidate.is_absolute()
+        or candidate.as_posix() != value
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    ):
+        raise ValueError("provenance checksum contains an unsafe artifact path")
+    return value
+
+
+def _authenticate_dataset(dataset_root: str | Path) -> AuthenticatedDataset:
+    """Verify the canonical merged checksum tree before any dataset reads."""
+
+    candidate = Path(dataset_root).absolute()
+    try:
+        root_metadata = candidate.lstat()
+    except OSError as error:
+        raise ValueError("provenance dataset root is missing") from error
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise ValueError("provenance dataset root must be a real directory")
+    root = candidate.resolve(strict=True)
     checksum_path = root / "dataset-checksums.sha256"
-    if checksum_path.is_symlink() or not checksum_path.is_file():
-        raise ValueError("provenance checksum file is missing or unsafe")
-    expected: list[str] = []
-    for line in checksum_path.read_text(encoding="utf-8").splitlines():
-        fields = line.split()
-        if len(fields) == 2 and fields[1].lstrip("*") == "source-manifest.json":
-            expected.append(fields[0].lower())
-    if len(expected) != 1 or len(expected[0]) != 64:
-        raise ValueError("provenance checksum for source-manifest.json is ambiguous")
-    actual = hashlib.sha256(payload).hexdigest()
-    if not hmac.compare_digest(expected[0], actual):
-        raise ValueError("provenance checksum mismatch for source-manifest.json")
+    checksum_digest = _hash_regular_file(checksum_path)
+    try:
+        checksum_bytes = checksum_path.read_bytes()
+        checksum_text = checksum_bytes.decode("ascii")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError("provenance dataset-checksums.sha256 must be readable ASCII") from error
+
+    actual_artifacts: list[str] = []
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for directory_name in directory_names:
+            directory = current_path / directory_name
+            metadata = directory.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("provenance dataset tree contains an unsafe directory")
+        for file_name in file_names:
+            artifact = current_path / file_name
+            metadata = artifact.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise ValueError("provenance dataset tree contains an unsafe artifact")
+            actual_artifacts.append(artifact.relative_to(root).as_posix())
+    actual_artifacts.sort()
+
+    entries: list[tuple[str, str]] = []
+    for line in checksum_text.splitlines(keepends=True):
+        if not line.endswith("\n") or len(line) < 67 or line[64:66] != "  ":
+            raise ValueError("provenance dataset-checksums.sha256 is malformed")
+        digest = line[:64].lower()
+        relative = _canonical_relative_path(line[66:-1])
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("provenance checksum digest is malformed")
+        entries.append((relative, digest))
+    expected_paths = tuple(path for path in actual_artifacts if path != "dataset-checksums.sha256")
+    if tuple(path for path, _ in entries) != expected_paths or len(set(expected_paths)) != len(entries):
+        raise ValueError("provenance checksum must list every dataset artifact exactly once in sorted order")
+    artifact_sha256 = {path: digest for path, digest in entries}
+    for relative, expected_digest in entries:
+        if _hash_regular_file(root / relative) != expected_digest:
+            raise ValueError(f"provenance checksum mismatch for {relative}")
+    canonical = "".join(f"{artifact_sha256[path]}  {path}\n" for path in expected_paths).encode("ascii")
+    if canonical != checksum_bytes:
+        raise ValueError("provenance checksum tree is not canonical")
+
+    manifest_relative = "source-manifest.json"
+    if manifest_relative not in artifact_sha256:
+        raise ValueError("provenance source-manifest.json is not authenticated")
+    manifest_path = root / manifest_relative
+    payload = guarded_authenticated_read(
+        manifest_path,
+        artifact_sha256[manifest_relative],
+        lambda path: path.read_bytes(),
+    )
+    try:
+        manifest = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("provenance source manifest is not valid JSON") from error
+    canonical_manifest = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if not isinstance(manifest, dict) or canonical_manifest != payload:
+        raise ValueError("provenance source manifest must be canonical JSON")
+    identity = manifest.get("conversion_identity", {})
+    if not isinstance(identity, dict):
+        raise ValueError("provenance conversion_identity must be an object")
+    return AuthenticatedDataset(
+        root=root,
+        artifact_sha256=MappingProxyType(artifact_sha256),
+        dataset_checksums_sha256=checksum_digest,
+        source_manifest_sha256=artifact_sha256[manifest_relative],
+        conversion_identity=dict(identity),
+    )
+
+
+def authenticate_dataset(dataset_root: str | Path) -> AuthenticatedDataset:
+    try:
+        return _authenticate_dataset(dataset_root)
+    except ProvenanceError:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise ProvenanceError(str(error)) from error
+
+
+def guarded_authenticated_read(
+    path: str | Path,
+    expected_sha256: str,
+    reader: Callable[[Path], Any],
+) -> Any:
+    """Read one authenticated artifact and reject before/after mutation."""
+
+    artifact = Path(path)
+    before = _hash_regular_file(artifact)
+    if before != expected_sha256:
+        raise ProvenanceError(f"provenance checksum mismatch before reading {artifact}")
+    result = reader(artifact)
+    after = _hash_regular_file(artifact)
+    if after != expected_sha256 or after != before:
+        raise ProvenanceError(f"provenance artifact mutated while reading {artifact}")
+    return result
 
 
 def _manifest_int_list(value: object, name: str, *, positive: bool = False) -> list[int]:
@@ -523,18 +659,25 @@ def _manifest_int_list(value: object, name: str, *, positive: bool = False) -> l
     return result
 
 
-def resolve_source_episode_ids(
+def _resolve_source_episode_ids(
     dataset_root: str | Path,
     source_episode_ids: Sequence[int],
+    *,
+    authenticated: AuthenticatedDataset | None = None,
 ) -> tuple[SourceEpisodeRef, ...]:
     """Resolve upstream IDs through immutable merge provenance, never local indices."""
 
-    root = Path(dataset_root)
+    verified = authenticate_dataset(dataset_root) if authenticated is None else authenticated
+    requested_root = Path(dataset_root).resolve(strict=True)
+    if verified.root != requested_root:
+        raise ValueError("authenticated dataset root does not match the requested replay root")
+    root = verified.root
     manifest_path = root / "source-manifest.json"
-    if root.is_symlink() or manifest_path.is_symlink() or not manifest_path.is_file():
-        raise ValueError("provenance source-manifest.json is missing or unsafe")
-    payload = manifest_path.read_bytes()
-    _manifest_checksum(root, payload)
+    payload = guarded_authenticated_read(
+        manifest_path,
+        verified.source_manifest_sha256,
+        lambda path: path.read_bytes(),
+    )
     try:
         manifest = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -575,6 +718,24 @@ def resolve_source_episode_ids(
     )
 
 
+def resolve_source_episode_ids(
+    dataset_root: str | Path,
+    source_episode_ids: Sequence[int],
+    *,
+    authenticated: AuthenticatedDataset | None = None,
+) -> tuple[SourceEpisodeRef, ...]:
+    try:
+        return _resolve_source_episode_ids(
+            dataset_root,
+            source_episode_ids,
+            authenticated=authenticated,
+        )
+    except ProvenanceError:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise ProvenanceError(str(error)) from error
+
+
 def build_replay_schedule(frames: Sequence[ReplayActionFrame]) -> tuple[ScheduledReplayAction, ...]:
     if not frames:
         raise ValueError("replay requires at least one action frame")
@@ -601,6 +762,7 @@ def run_replay_schedule(
     collector: ReplayMetricsCollector,
     publish: Callable[[ReplayActionFrame, str, int, float], None],
     step: Callable[[float], ReplaySample],
+    acknowledge: Callable[[ReplayActionFrame, str, int, float], None] | None = None,
     pace: Callable[[float], None] = time.sleep,
 ) -> ReplayReport:
     """Publish at 50 Hz and collect one sample after every simulator step."""
@@ -624,6 +786,8 @@ def run_replay_schedule(
                 raise ValueError("step returned a sample on a different replay timeline")
             collector.add(replay_sample)
             pace(collector.sim_dt)
+        if acknowledge is not None:
+            acknowledge(item.frame, item.phase, item.source_frame_index, item.time_s)
     return collector.finalize()
 
 
@@ -655,7 +819,7 @@ def wait_for_readiness(
 
 
 def stop_owned_process(process: object) -> None:
-    """Stop only the supplied owned process: SIGINT, wait, then terminate."""
+    """Stop only the supplied child: SIGINT, terminate, then kill with bounded waits."""
 
     if process.poll() is not None:
         return
@@ -664,20 +828,28 @@ def stop_owned_process(process: object) -> None:
         process.wait(timeout=5.0)
     except subprocess.TimeoutExpired:
         process.terminate()
-        process.wait(timeout=5.0)
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5.0)
 
 
 __all__ = [
+    "AuthenticatedDataset",
     "CohortReplayReport",
     "ReplayActionFrame",
     "ReplayMetricsCollector",
     "ReplayReport",
     "ReplaySample",
+    "ProvenanceError",
     "ScheduledReplayAction",
     "SourceEpisodeRef",
     "aggregate_replay_reports",
+    "authenticate_dataset",
     "build_replay_schedule",
     "collector_from_mujoco_model",
+    "guarded_authenticated_read",
     "max_mujoco_contact_force",
     "resolve_source_episode_ids",
     "run_replay_schedule",

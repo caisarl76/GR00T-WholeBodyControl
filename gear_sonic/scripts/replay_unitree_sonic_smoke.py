@@ -11,12 +11,12 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import random
-import socket
 import subprocess
 import sys
 import tempfile
@@ -29,18 +29,21 @@ if __package__ in {None, ""}:
 import numpy as np
 
 from gear_sonic.data.unitree_conversion.replay import (
+    AuthenticatedDataset,
+    ProvenanceError,
     ReplayActionFrame,
     ReplayMetricsCollector,
     ReplayReport,
     ReplaySample,
     SourceEpisodeRef,
     aggregate_replay_reports,
+    authenticate_dataset,
     collector_from_mujoco_model,
+    guarded_authenticated_read,
     max_mujoco_contact_force,
     resolve_source_episode_ids,
     run_replay_schedule,
     stop_owned_process,
-    wait_for_readiness,
 )
 
 REPLAY_COLUMNS = (
@@ -53,11 +56,120 @@ REPLAY_COLUMNS = (
 )
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DEPLOY_BINARY = REPOSITORY_ROOT / "gear_sonic_deploy/target/release/g1_deploy_onnx_ref"
-DEFAULT_POLICY_FILE = REPOSITORY_ROOT / "gear_sonic_deploy/policy/release/model_decoder.onnx"
+DEFAULT_POLICY_FILE = REPOSITORY_ROOT / "gear_sonic_deploy/policy/low_latency/model_decoder.onnx"
 DEFAULT_MOTION_DATA = REPOSITORY_ROOT / "gear_sonic_deploy/reference/example"
 DEFAULT_PLANNER_FILE = REPOSITORY_ROOT / "gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx"
 DEFAULT_OBSERVATION_CONFIG = REPOSITORY_ROOT / "gear_sonic_deploy/policy/low_latency/observation_config.yaml"
 DEFAULT_ENCODER_FILE = REPOSITORY_ROOT / "gear_sonic_deploy/policy/low_latency/model_encoder.onnx"
+DEX3_DATASET_DIRECTORY = "unitreerobotics--G1_Dex3_Pouring_Dataset"
+PINNED_SONIC_MODEL_REVISION = "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2"
+PINNED_ENCODER_URI = f"hf://models/nvidia/GEAR-SONIC@{PINNED_SONIC_MODEL_REVISION}/low_latency/model_encoder.onnx"
+PINNED_OBSERVATION_CONFIG_URI = (
+    f"hf://models/nvidia/GEAR-SONIC@{PINNED_SONIC_MODEL_REVISION}/low_latency/observation_config.yaml"
+)
+PINNED_ENCODER = (45933505, "60be43157f57d812f38bdbb740a5de5d5d070e8840d9edc16f02a91a6d06255b")
+PINNED_OBSERVATION_CONFIG = (
+    3258,
+    "582b9a273a3d69fbf49ae59b39295a3be2b4a295e195ef4cf674b5e2571c90ab",
+)
+UNITREE_BRIDGE_CHANNEL_ATTRIBUTES = (
+    "low_state_puber",
+    "odo_state_puber",
+    "torso_imu_puber",
+    "left_hand_state_puber",
+    "right_hand_state_puber",
+    "low_cmd_suber",
+    "left_hand_cmd_suber",
+    "right_hand_cmd_suber",
+    "wireless_controller_puber",
+)
+
+
+class TimelineError(ValueError):
+    """Target episode ordering or 50 Hz timeline is invalid."""
+
+
+class TargetValidationError(ValueError):
+    """Target action fields or schema cannot be replayed safely."""
+
+
+def classify_replay_error(error: BaseException) -> str:
+    if isinstance(error, ProvenanceError):
+        return "provenance_error"
+    if isinstance(error, TimelineError):
+        return "timeline_error"
+    if isinstance(error, TargetValidationError):
+        return "target_validation_error"
+    return "replay_acceptance_error"
+
+
+def artifact_identity(path: str | Path) -> dict[str, object]:
+    candidate = Path(path)
+    if candidate.is_symlink() or not candidate.is_file():
+        raise ProvenanceError(f"artifact must be a regular non-symlink file: {candidate}")
+    resolved = candidate.resolve(strict=True)
+    digest = hashlib.sha256()
+    with resolved.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return {
+        "path": str(resolved),
+        "size": resolved.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def verify_pinned_encoder_artifacts(
+    encoder: str | Path,
+    observation_config: str | Path,
+    *,
+    _expected: Mapping[str, tuple[int, str]] | None = None,
+) -> dict[str, dict[str, object]]:
+    expected = _expected or {
+        "encoder": PINNED_ENCODER,
+        "observation_config": PINNED_OBSERVATION_CONFIG,
+    }
+    result = {
+        "encoder": artifact_identity(encoder),
+        "observation_config": artifact_identity(observation_config),
+    }
+    for name, identity in result.items():
+        expected_size, expected_sha256 = expected[name]
+        if identity["size"] != expected_size or identity["sha256"] != expected_sha256:
+            raise ProvenanceError(f"pinned {name} size or SHA-256 mismatch")
+    return result
+
+
+def resolve_replay_dataset_root(path: str | Path) -> tuple[Path, Path]:
+    requested = Path(path).expanduser().resolve(strict=True)
+    if not requested.is_dir():
+        raise ProvenanceError("replay dataset root must be a directory")
+    markers = ("source-manifest.json", "dataset-checksums.sha256")
+    if all((requested / marker).is_file() for marker in markers):
+        return requested, requested.parent / f"{requested.name}-replay-report.json"
+    candidates = sorted(
+        candidate.resolve()
+        for candidate in requested.rglob(DEX3_DATASET_DIRECTORY)
+        if candidate.is_dir() and all((candidate / marker).is_file() for marker in markers)
+    )
+    if len(candidates) != 1:
+        raise ProvenanceError(
+            f"output root must contain exactly one unique {DEX3_DATASET_DIRECTORY} child; got {len(candidates)}"
+        )
+    return candidates[0], requested / "unitree-sonic-replay-report.json"
+
+
+def replay_protocol(sim_timestep_s: float) -> dict[str, object]:
+    if not math.isfinite(sim_timestep_s) or sim_timestep_s <= 0.0:
+        raise ValueError("sim_timestep_s must be finite and positive")
+    return {
+        "control_dt_s": 0.02,
+        "sim_timestep_s": sim_timestep_s,
+        "exclude_before_s": 1.0,
+        "final_hold_s": 1.0,
+        "seed": 0,
+        "warmup_s": 2.0,
+    }
 
 
 @dataclass(frozen=True)
@@ -89,9 +201,13 @@ class DeploymentConfig:
 class ReplayRuntime(Protocol):
     collector: ReplayMetricsCollector
 
-    def readiness_probe(self) -> bool: ...
-
-    def start_control(self) -> None: ...
+    def prime(
+        self,
+        frame: ReplayActionFrame,
+        *,
+        timeout_s: float,
+        pace: Callable[[float], None],
+    ) -> None: ...
 
     def publish(
         self,
@@ -102,6 +218,14 @@ class ReplayRuntime(Protocol):
     ) -> None: ...
 
     def step(self, time_s: float) -> ReplaySample: ...
+
+    def assert_action_ack(
+        self,
+        frame: ReplayActionFrame,
+        phase: str,
+        source_index: int,
+        time_s: float,
+    ) -> None: ...
 
     def stop_control(self) -> None: ...
 
@@ -169,6 +293,47 @@ def build_deployment_command(config: DeploymentConfig) -> list[str]:
     ]
 
 
+def build_execution_provenance(
+    config: DeploymentConfig,
+    dataset: AuthenticatedDataset,
+    *,
+    runtime_identities: Mapping[str, Mapping[str, object]],
+    _pinned_expected: Mapping[str, tuple[int, str]] | None = None,
+) -> dict[str, object]:
+    pinned = verify_pinned_encoder_artifacts(
+        config.encoder_file,
+        config.observation_config,
+        _expected=_pinned_expected,
+    )
+    expected_conversion_identity = {
+        "encoder_sha256": pinned["encoder"]["sha256"],
+        "encoder_config_sha256": pinned["observation_config"]["sha256"],
+    }
+    for name, expected_sha256 in expected_conversion_identity.items():
+        if dataset.conversion_identity.get(name) != expected_sha256:
+            raise ProvenanceError(
+                f"dataset conversion identity {name} does not match the pinned deployment artifact"
+            )
+    pinned["encoder"]["immutable_uri"] = PINNED_ENCODER_URI
+    pinned["observation_config"]["immutable_uri"] = PINNED_OBSERVATION_CONFIG_URI
+    return {
+        "command": build_deployment_command(config),
+        "artifacts": {
+            "binary": artifact_identity(config.binary),
+            "decoder": artifact_identity(config.policy_file),
+            "planner": artifact_identity(config.planner_file),
+            **pinned,
+        },
+        "dataset": {
+            "root": str(dataset.root),
+            "source_manifest_sha256": dataset.source_manifest_sha256,
+            "dataset_checksums_sha256": dataset.dataset_checksums_sha256,
+            "conversion_identity": dict(dataset.conversion_identity),
+        },
+        "runtime": {name: dict(identity) for name, identity in sorted(runtime_identities.items())},
+    }
+
+
 def frames_from_columns(
     columns: Mapping[str, Sequence[object]],
     *,
@@ -179,13 +344,13 @@ def frames_from_columns(
 
     missing = [name for name in REPLAY_COLUMNS if name not in columns]
     if missing:
-        raise ValueError(f"replay dataset columns are missing: {missing}")
+        raise TargetValidationError(f"replay dataset columns are missing: {missing}")
     if isinstance(target_episode_index, bool) or not isinstance(target_episode_index, int):
-        raise ValueError("target_episode_index must be an integer")
+        raise TargetValidationError("target_episode_index must be an integer")
     if isinstance(expected_length, bool) or not isinstance(expected_length, int) or expected_length <= 0:
-        raise ValueError("expected_length must be a positive integer")
+        raise TimelineError("expected_length must be a positive integer")
     if any(len(columns[name]) != expected_length for name in REPLAY_COLUMNS):
-        raise ValueError("replay columns do not match the immutable episode length")
+        raise TimelineError("replay columns do not match the immutable episode length")
 
     episode_indices = np.asarray(columns["episode_index"])
     frame_indices = np.asarray(columns["frame_index"])
@@ -193,30 +358,33 @@ def frames_from_columns(
     if episode_indices.dtype.kind not in "iu" or not np.array_equal(
         episode_indices, np.full(expected_length, target_episode_index, dtype=episode_indices.dtype)
     ):
-        raise ValueError("episode_index does not match the provenance-resolved target index")
+        raise TimelineError("episode_index does not match the provenance-resolved target index")
     if frame_indices.dtype.kind not in "iu" or not np.array_equal(
         frame_indices, np.arange(expected_length, dtype=frame_indices.dtype)
     ):
-        raise ValueError("frame_index must be the exact contiguous local timeline")
+        raise TimelineError("frame_index must be the exact contiguous local timeline")
     expected_timestamps = np.asarray(
         [np.float32(index / 50.0) for index in range(expected_length)], dtype=np.float32
     )
     try:
         actual_timestamps = timestamps.astype(np.float32)
     except (TypeError, ValueError) as error:
-        raise ValueError("timestamp must contain numeric 50 Hz values") from error
+        raise TimelineError("timestamp must contain numeric 50 Hz values") from error
     if not np.all(np.isfinite(actual_timestamps)) or not np.array_equal(actual_timestamps, expected_timestamps):
-        raise ValueError("timestamp must equal float32(frame_index / 50) exactly")
+        raise TimelineError("timestamp must equal float32(frame_index / 50) exactly")
 
     frames: list[ReplayActionFrame] = []
     for index in range(expected_length):
-        frames.append(
-            ReplayActionFrame(
-                motion_token=np.asarray(columns["action.motion_token"][index], dtype=np.float32),
-                left_hand=np.asarray(columns["teleop.left_hand_joints"][index], dtype=np.float32),
-                right_hand=np.asarray(columns["teleop.right_hand_joints"][index], dtype=np.float32),
+        try:
+            frames.append(
+                ReplayActionFrame(
+                    motion_token=np.asarray(columns["action.motion_token"][index], dtype=np.float32),
+                    left_hand=np.asarray(columns["teleop.left_hand_joints"][index], dtype=np.float32),
+                    right_hand=np.asarray(columns["teleop.right_hand_joints"][index], dtype=np.float32),
+                )
             )
-        )
+        except (TypeError, ValueError) as error:
+            raise TargetValidationError(f"target action frame {index} is invalid: {error}") from error
     return tuple(frames)
 
 
@@ -227,27 +395,43 @@ def _arrow_column_values(table: object, name: str) -> list[object]:
             column = column.combine_chunks()
         return column.to_pylist()
     except (AttributeError, KeyError) as error:
-        raise ValueError(f"replay Parquet is missing or cannot decode column {name}") from error
+        raise TargetValidationError(f"replay Parquet is missing or cannot decode column {name}") from error
 
 
-def load_episode_frames(dataset_root: Path, episode: SourceEpisodeRef) -> tuple[ReplayActionFrame, ...]:
+def load_episode_frames(
+    dataset_root: Path,
+    episode: SourceEpisodeRef,
+    *,
+    authenticated: AuthenticatedDataset | None = None,
+) -> tuple[ReplayActionFrame, ...]:
     """Load a provenance-resolved local episode. Heavy readers stay lazy."""
 
     import pyarrow.parquet as pq
 
     from gear_sonic.data.exporter import Gr00tDatasetMetadata
 
+    verified = authenticate_dataset(dataset_root) if authenticated is None else authenticated
     root = dataset_root.resolve(strict=True)
+    if verified.root != root:
+        raise ProvenanceError("authenticated dataset root does not match the requested replay root")
     metadata = Gr00tDatasetMetadata(repo_id="tmp/unitree_sonic_replay", root=root)
     relative = Path(metadata.get_data_file_path(episode.target_episode_index))
     parquet_path = (root / relative).resolve(strict=True)
     try:
         parquet_path.relative_to(root)
     except ValueError as error:
-        raise ValueError("resolved replay Parquet escapes the dataset root") from error
+        raise ProvenanceError("resolved replay Parquet escapes the dataset root") from error
     if parquet_path.is_symlink() or not parquet_path.is_file():
-        raise ValueError("resolved replay Parquet is missing or unsafe")
-    table = pq.read_table(parquet_path, columns=list(REPLAY_COLUMNS))
+        raise ProvenanceError("resolved replay Parquet is missing or unsafe")
+    relative_text = parquet_path.relative_to(root).as_posix()
+    expected_digest = verified.artifact_sha256.get(relative_text)
+    if expected_digest is None:
+        raise ProvenanceError("resolved replay Parquet is absent from the authenticated checksum tree")
+    table = guarded_authenticated_read(
+        parquet_path,
+        expected_digest,
+        lambda path: pq.read_table(path, columns=list(REPLAY_COLUMNS)),
+    )
     columns = {name: _arrow_column_values(table, name) for name in REPLAY_COLUMNS}
     return frames_from_columns(
         columns,
@@ -316,6 +500,142 @@ def send_repeated_command(
             sleep(interval_s)
 
 
+def validate_state_ack(
+    message: object,
+    frame: ReplayActionFrame,
+    *,
+    last_index: int,
+) -> int | None:
+    """Validate a fresh g1_debug echo of token, hands, and controller output."""
+
+    if not isinstance(message, Mapping):
+        raise RuntimeError("g1_debug acknowledgement must be a mapping")
+    required = {
+        "control_loop_type",
+        "index",
+        "token_state",
+        "last_left_hand_action",
+        "last_right_hand_action",
+        "last_action",
+    }
+    if not required.issubset(message):
+        raise RuntimeError("g1_debug acknowledgement is missing controller fields")
+    index = message["index"]
+    if isinstance(index, bool) or not isinstance(index, (int, np.integer)) or int(index) < 0:
+        raise RuntimeError("g1_debug acknowledgement index is invalid")
+    arrays: dict[str, np.ndarray] = {}
+    for name, shape in (
+        ("token_state", (64,)),
+        ("last_left_hand_action", (7,)),
+        ("last_right_hand_action", (7,)),
+        ("last_action", (29,)),
+    ):
+        value = np.asarray(message[name])
+        if value.shape != shape or not np.all(np.isfinite(value)):
+            raise RuntimeError(f"g1_debug acknowledgement {name} is invalid")
+        arrays[name] = value
+    if message["control_loop_type"] != "cpp" or int(index) <= last_index:
+        return None
+    if not (
+        np.array_equal(arrays["token_state"].astype(np.float32), frame.motion_token)
+        and np.array_equal(arrays["last_left_hand_action"].astype(np.float32), frame.left_hand)
+        and np.array_equal(arrays["last_right_hand_action"].astype(np.float32), frame.right_hand)
+    ):
+        return None
+    return int(index)
+
+
+def poll_until_acknowledged(
+    poll: Callable[[], bool],
+    *,
+    timeout_s: float,
+    poll_period_s: float = 0.0005,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Allow one bounded simulator-step window for asynchronous telemetry."""
+
+    if not math.isfinite(timeout_s) or timeout_s <= 0.0:
+        raise ValueError("acknowledgement timeout_s must be finite and positive")
+    if not math.isfinite(poll_period_s) or poll_period_s <= 0.0:
+        raise ValueError("acknowledgement poll_period_s must be finite and positive")
+    deadline = monotonic() + timeout_s
+    while True:
+        if poll():
+            return True
+        remaining = deadline - monotonic()
+        if remaining <= 0.0:
+            return False
+        sleep(min(poll_period_s, remaining))
+
+
+def prime_controller(
+    frame: ReplayActionFrame,
+    *,
+    process: object,
+    sim_dt: float,
+    timeout_s: float,
+    publish_action: Callable[[ReplayActionFrame], None],
+    publish_start: Callable[[], None],
+    step: Callable[[], None],
+    acknowledged: Callable[[ReplayActionFrame], bool],
+    monotonic: Callable[[], float] = time.monotonic,
+    pace: Callable[[float], None] = time.sleep,
+) -> int:
+    """Prime through the 3 s C++ INIT state until a real action echo arrives."""
+
+    if not math.isfinite(sim_dt) or sim_dt <= 0.0:
+        raise ValueError("priming sim_dt must be finite and positive")
+    if not math.isfinite(timeout_s) or timeout_s <= 3.0:
+        raise ValueError("priming timeout_s must be finite and greater than the 3 s INIT")
+    steps_per_control = round(0.02 / sim_dt)
+    if steps_per_control <= 0 or not math.isclose(steps_per_control * sim_dt, 0.02, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("priming sim_dt must divide the 20 ms control period")
+    minimum_steps = math.ceil(3.0 / sim_dt)
+    deadline = monotonic() + timeout_s
+    step_count = 0
+    while True:
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(f"owned deployment exited before acknowledgement with code {return_code}")
+        if step_count % steps_per_control == 0:
+            publish_action(frame)
+            publish_start()
+        step()
+        step_count += 1
+        pace(sim_dt)
+        has_ack = acknowledged(frame)
+        if step_count >= minimum_steps and has_ack:
+            return step_count
+        if monotonic() >= deadline:
+            raise TimeoutError(f"controller acknowledgement timed out after {timeout_s:g} seconds")
+
+
+def close_unitree_bridge_channels(bridge: object | None) -> None:
+    """Idempotently close every DDS channel owned by the simulator bridge."""
+
+    if bridge is None:
+        return
+    first_error: Exception | None = None
+    for attribute in UNITREE_BRIDGE_CHANNEL_ATTRIBUTES:
+        channel = getattr(bridge, attribute, None)
+        if channel is None:
+            continue
+        setattr(bridge, attribute, None)
+        try:
+            channel.Close()
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+
+
+def _require_floating_root(env: object) -> None:
+    if getattr(env, "use_floating_root_link", None) is not True:
+        raise ValueError("replay requires the loaded simulator model to have a floating root")
+
+
 def execute_owned_replay(
     frames: Sequence[ReplayActionFrame],
     *,
@@ -329,37 +649,62 @@ def execute_owned_replay(
 
     if not deployment_command or any(not isinstance(item, str) or not item for item in deployment_command):
         raise ValueError("deployment_command must be a non-empty string sequence")
+    if not frames:
+        raise ValueError("replay requires at least one action frame")
     process: object | None = None
     control_started = False
+    report: ReplayReport | None = None
+    primary_error: BaseException | None = None
     try:
         process = process_factory(list(deployment_command))
         attach = getattr(runtime, "attach_process", None)
         if callable(attach):
             attach(process)
-        wait_for_readiness(
-            process,
-            probe=runtime.readiness_probe,
-            timeout_s=readiness_timeout_s,
-        )
-        runtime.start_control()
         control_started = True
-        return run_replay_schedule(
+        prime_pace = DeadlinePacer() if pace is None else pace
+        runtime.prime(
+            frames[0],
+            timeout_s=readiness_timeout_s,
+            pace=prime_pace,
+        )
+        report = run_replay_schedule(
             frames,
             collector=runtime.collector,
             publish=runtime.publish,
             step=runtime.step,
+            acknowledge=runtime.assert_action_ack,
             pace=DeadlinePacer() if pace is None else pace,
         )
-    finally:
+    except BaseException as error:
+        primary_error = error
+
+    cleanup_errors: list[str] = []
+    if control_started:
         try:
-            if control_started:
-                runtime.stop_control()
-        finally:
-            try:
-                runtime.close()
-            finally:
-                if process is not None:
-                    stop_owned_process(process)
+            runtime.stop_control()
+        except BaseException as error:
+            cleanup_errors.append(f"cleanup stop_control failed: {type(error).__name__}: {error}")
+    if process is not None:
+        try:
+            stop_owned_process(process)
+        except BaseException as error:
+            cleanup_errors.append(f"cleanup owned process failed: {type(error).__name__}: {error}")
+    try:
+        runtime.close()
+    except BaseException as error:
+        cleanup_errors.append(f"cleanup runtime.close failed: {type(error).__name__}: {error}")
+
+    if primary_error is not None:
+        if cleanup_errors:
+            setattr(primary_error, "cleanup_errors", tuple(cleanup_errors))
+        raise primary_error
+    if cleanup_errors:
+        error = RuntimeError("; ".join(cleanup_errors))
+        setattr(error, "cleanup_errors", tuple(cleanup_errors))
+        raise error
+    if report is None:
+        raise RuntimeError("replay completed without a report")
+    return report
 
 
 @dataclass(frozen=True)
@@ -372,6 +717,8 @@ class RuntimeDependencies:
     config_factory: Callable[..., object]
     pack_action: Callable[..., bytes]
     build_command: Callable[..., bytes]
+    state_subscriber_factory: Callable[..., object] | None = None
+    wbc_config_path: Path | None = None
 
 
 def _load_runtime_dependencies() -> RuntimeDependencies:
@@ -379,6 +726,7 @@ def _load_runtime_dependencies() -> RuntimeDependencies:
     import zmq
 
     from gear_sonic.scripts.run_vla_inference import pack_latent_action_message
+    from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
     from gear_sonic.utils.mujoco_sim.base_sim import BaseSimulator
     from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_command_message
@@ -390,6 +738,8 @@ def _load_runtime_dependencies() -> RuntimeDependencies:
         config_factory=SimLoopConfig,
         pack_action=pack_latent_action_message,
         build_command=build_command_message,
+        state_subscriber_factory=ZMQStateSubscriber,
+        wbc_config_path=(REPOSITORY_ROOT / "gear_sonic/utils/mujoco_sim/wbc_configs/g1_29dof_sonic_model12.yaml"),
     )
 
 
@@ -408,6 +758,7 @@ class MujocoZmqRuntime:
         self._simulator: object | None = None
         self._context: object | None = None
         self._publisher: object | None = None
+        self._state_subscriber: object | None = None
         self._process: object | None = None
         self._closed = False
         dependencies = _dependencies or _load_runtime_dependencies()
@@ -416,6 +767,11 @@ class MujocoZmqRuntime:
         self._build_command = dependencies.build_command
         self._host = zmq_host
         self._state_port = state_port
+        self._expected_frame: ReplayActionFrame | None = None
+        self._expected_ack_received = False
+        self._last_state_index = -1
+        self._controller_acknowledged = False
+        self.runtime_identities: dict[str, dict[str, object]] = {}
         try:
             random.seed(0)
             np.random.seed(0)
@@ -430,6 +786,15 @@ class MujocoZmqRuntime:
             )
             wbc_config = config.load_wbc_yaml()
             wbc_config["ENV_NAME"] = "default"
+            wbc_config["ENABLE_ELASTIC_BAND"] = False
+            scene_value = wbc_config.get("ROBOT_SCENE")
+            if scene_value is not None:
+                scene_path = Path(scene_value)
+                if not scene_path.is_absolute():
+                    scene_path = REPOSITORY_ROOT / scene_path
+                self.runtime_identities["mujoco_scene"] = artifact_identity(scene_path)
+            if dependencies.wbc_config_path is not None:
+                self.runtime_identities["wbc_config"] = artifact_identity(dependencies.wbc_config_path)
             self._simulator = dependencies.simulator_factory(
                 wbc_config,
                 env_name="default",
@@ -439,6 +804,7 @@ class MujocoZmqRuntime:
             )
 
             env = self._simulator.sim_env
+            _require_floating_root(env)
             model = env.mj_model
             data = env.mj_data
             # MuJoCo qpos0 supplies the standing pelvis height. The loaded WBC
@@ -455,6 +821,7 @@ class MujocoZmqRuntime:
             data.ctrl[:] = 0.0
             data.time = 0.0
             self._mujoco.mj_forward(model, data)
+            self._initial_qpos = np.asarray(data.qpos, dtype=np.float64).copy()
 
             robot_joint_ids = np.concatenate(
                 (
@@ -476,6 +843,12 @@ class MujocoZmqRuntime:
                 mujoco_module=self._mujoco,
             )
 
+            if dependencies.state_subscriber_factory is not None:
+                self._state_subscriber = dependencies.state_subscriber_factory(
+                    host=zmq_host,
+                    port=state_port,
+                    topic="g1_debug",
+                )
             self._context = dependencies.zmq.Context()
             self._publisher = self._context.socket(dependencies.zmq.PUB)
             self._publisher.setsockopt(dependencies.zmq.LINGER, 0)
@@ -490,13 +863,6 @@ class MujocoZmqRuntime:
     def attach_process(self, process: object) -> None:
         self._process = process
 
-    def readiness_probe(self) -> bool:
-        try:
-            with socket.create_connection((self._host, self._state_port), timeout=0.1):
-                return True
-        except OSError:
-            return False
-
     def _send(self, payload: bytes) -> None:
         if self._process is not None:
             return_code = self._process.poll()
@@ -504,12 +870,67 @@ class MujocoZmqRuntime:
                 raise RuntimeError(f"owned deployment exited during replay with code {return_code}")
         self._publisher.send(payload)
 
-    def start_control(self) -> None:
-        send_repeated_command(
-            self._build_command(start=True, stop=False, planner=False),
-            send=self._send,
-            attempts=3,
-            interval_s=0.02,
+    def _send_start(self) -> None:
+        self._send(self._build_command(start=True, stop=False, planner=False))
+
+    def _poll_ack(self, frame: ReplayActionFrame) -> bool:
+        if self._state_subscriber is None:
+            raise RuntimeError("g1_debug state subscriber is unavailable")
+        bridge = getattr(self._simulator, "unitree_bridge", None)
+        if bridge is None or not all(
+            getattr(bridge, attribute, False) is True
+            for attribute in (
+                "low_cmd_received",
+                "left_hand_cmd_received",
+                "right_hand_cmd_received",
+            )
+        ):
+            return False
+        message = self._state_subscriber.get_msg(clear=True)
+        if message is None:
+            return False
+        acknowledged_index = validate_state_ack(
+            message,
+            frame,
+            last_index=self._last_state_index,
+        )
+        if acknowledged_index is None:
+            return False
+        self._last_state_index = acknowledged_index
+        self._controller_acknowledged = True
+        return True
+
+    def _step_unmeasured(self) -> None:
+        env = self._simulator.sim_env
+        if not self._controller_acknowledged:
+            data = env.mj_data
+            data.qpos[:] = self._initial_qpos
+            data.qvel[:] = 0.0
+            data.qacc[:] = 0.0
+            data.ctrl[:] = 0.0
+            data.time = 0.0
+            self._mujoco.mj_forward(env.mj_model, data)
+        env.sim_step()
+
+    def prime(
+        self,
+        frame: ReplayActionFrame,
+        *,
+        timeout_s: float,
+        pace: Callable[[float], None],
+    ) -> None:
+        if self._process is None:
+            raise RuntimeError("owned deployment process must be attached before priming")
+        prime_controller(
+            frame,
+            process=self._process,
+            sim_dt=self.collector.sim_dt,
+            timeout_s=timeout_s,
+            publish_action=lambda value: self.publish(value, "prime", 0, 0.0),
+            publish_start=self._send_start,
+            step=self._step_unmeasured,
+            acknowledged=self._poll_ack,
+            pace=pace,
         )
 
     def publish(
@@ -520,6 +941,8 @@ class MujocoZmqRuntime:
         time_s: float,
     ) -> None:
         del phase, time_s
+        self._expected_frame = frame
+        self._expected_ack_received = False
         self._send(
             self._pack(
                 motion_token=frame.motion_token,
@@ -532,6 +955,8 @@ class MujocoZmqRuntime:
     def step(self, time_s: float) -> ReplaySample:
         env = self._simulator.sim_env
         env.sim_step()
+        if self._expected_frame is not None and self._poll_ack(self._expected_frame):
+            self._expected_ack_received = True
         data = env.mj_data
         roll, pitch = quaternion_wxyz_to_roll_pitch(np.asarray(data.qpos[3:7]))
         warning_fault = any(int(warning.number) > 0 for warning in data.warning)
@@ -552,6 +977,22 @@ class MujocoZmqRuntime:
             controller_fault=warning_fault or process_fault or bool(getattr(env, "fall", False)),
         )
 
+    def assert_action_ack(
+        self,
+        frame: ReplayActionFrame,
+        phase: str,
+        source_index: int,
+        time_s: float,
+    ) -> None:
+        del phase, source_index, time_s
+        if self._expected_frame is frame and not self._expected_ack_received:
+            self._expected_ack_received = poll_until_acknowledged(
+                lambda: self._poll_ack(frame),
+                timeout_s=self.collector.sim_dt,
+            )
+        if self._expected_frame is not frame or not self._expected_ack_received:
+            raise RuntimeError("continuous g1_debug controller acknowledgement was missed")
+
     def stop_control(self) -> None:
         if self._process is None or self._process.poll() is None:
             self._publisher.send(self._build_command(start=False, stop=True, planner=False))
@@ -563,8 +1004,13 @@ class MujocoZmqRuntime:
         self._closed = True
         first_error: Exception | None = None
         for resource, operation in (
+            (self._state_subscriber, lambda value: value.close()),
             (self._publisher, lambda value: value.close(linger=0)),
             (self._context, lambda value: value.term()),
+            (
+                getattr(self._simulator, "unitree_bridge", None),
+                close_unitree_bridge_channels,
+            ),
             (self._simulator, lambda value: value.close()),
         ):
             if resource is None:
@@ -636,6 +1082,18 @@ def _existing_directory(path: str | Path, argument: str) -> Path:
     return value
 
 
+def _resolve_report_path(
+    requested: str | Path | None,
+    dataset_root: str | Path,
+    default: str | Path,
+) -> Path:
+    root = Path(dataset_root).resolve(strict=True)
+    destination = Path(default if requested is None else requested).expanduser().resolve()
+    if destination == root or root in destination.parents:
+        raise ProvenanceError("replay report must be written outside the authenticated dataset tree")
+    return destination
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True)
@@ -650,7 +1108,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--zmq-host", default="127.0.0.1")
     parser.add_argument("--action-port", type=int, default=5556)
     parser.add_argument("--state-port", type=int, default=5557)
-    parser.add_argument("--readiness-timeout-s", type=float, default=20.0)
+    parser.add_argument("--readiness-timeout-s", type=float, default=60.0)
     parser.add_argument("--output-report")
     parsed = parser.parse_args(argv)
     if not 1 <= len(parsed.source_episode_ids) <= 5:
@@ -659,8 +1117,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _run(args: argparse.Namespace) -> int:
-    dataset_root = _existing_directory(args.dataset_root, "--dataset-root")
-    episodes = resolve_source_episode_ids(dataset_root, args.source_episode_ids)
+    requested_root = _existing_directory(args.dataset_root, "--dataset-root")
+    dataset_root, default_output_report = resolve_replay_dataset_root(requested_root)
+    output_report = _resolve_report_path(args.output_report, dataset_root, default_output_report)
+    authenticated = authenticate_dataset(dataset_root)
+    episodes = resolve_source_episode_ids(
+        dataset_root,
+        args.source_episode_ids,
+        authenticated=authenticated,
+    )
     config = DeploymentConfig(
         binary=_existing_file(args.deploy_binary, "--deploy-binary"),
         network_interface=args.network_interface,
@@ -674,17 +1139,38 @@ def _run(args: argparse.Namespace) -> int:
         state_port=args.state_port,
     )
     command = build_deployment_command(config)
+    execution_provenance = dict(
+        build_execution_provenance(
+            config,
+            authenticated,
+            runtime_identities={},
+        )
+    )
     episode_reports: list[ReplayReport] = []
     serialized: list[dict[str, object]] = []
+    runtime_identities: dict[str, dict[str, object]] = {}
+    sim_timestep_s: float | None = None
     for episode in episodes:
+        runtime: object | None = None
         try:
-            frames = load_episode_frames(dataset_root, episode)
+            frames = load_episode_frames(dataset_root, episode, authenticated=authenticated)
             runtime = MujocoZmqRuntime(
                 network_interface=config.network_interface,
                 zmq_host=config.zmq_host,
                 action_port=config.action_port,
                 state_port=config.state_port,
             )
+            current_sim_timestep = float(runtime.collector.sim_dt)
+            if sim_timestep_s is None:
+                sim_timestep_s = current_sim_timestep
+            elif current_sim_timestep != sim_timestep_s:
+                raise RuntimeError("simulator timestep changed within the replay cohort")
+            current_identities = {
+                name: dict(identity) for name, identity in sorted(runtime.runtime_identities.items())
+            }
+            if runtime_identities and current_identities != runtime_identities:
+                raise ProvenanceError("MuJoCo scene or WBC configuration changed within the replay cohort")
+            runtime_identities = current_identities
             report = execute_owned_replay(
                 frames,
                 deployment_command=command,
@@ -701,21 +1187,41 @@ def _run(args: argparse.Namespace) -> int:
                 }
             )
         except Exception as error:
-            serialized.append(
-                {
-                    "source_episode_id": episode.source_episode_id,
-                    "target_episode_index": episode.target_episode_index,
-                    "status": "replay_acceptance_error",
-                    "error": f"{type(error).__name__}: {error}",
-                }
-            )
+            close_runtime = getattr(runtime, "close", None)
+            if callable(close_runtime):
+                try:
+                    close_runtime()
+                except Exception as cleanup_error:
+                    cleanup_errors = list(getattr(error, "cleanup_errors", ()))
+                    cleanup_errors.append(
+                        f"cleanup runtime.close failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                    setattr(error, "cleanup_errors", tuple(cleanup_errors))
+            failure: dict[str, object] = {
+                "source_episode_id": episode.source_episode_id,
+                "target_episode_index": episode.target_episode_index,
+                "status": classify_replay_error(error),
+                "error": f"{type(error).__name__}: {error}",
+            }
+            cleanup_errors = getattr(error, "cleanup_errors", ())
+            if cleanup_errors:
+                failure["cleanup_errors"] = list(cleanup_errors)
+            serialized.append(failure)
     cohort = aggregate_replay_reports(episode_reports) if episode_reports else None
     complete = len(episode_reports) == len(episodes)
     accepted = complete and cohort is not None and cohort.accepted
-    output_report = (
-        Path(args.output_report).expanduser().resolve()
-        if args.output_report is not None
-        else dataset_root / "unitree-sonic-replay-report.json"
+    execution_provenance["runtime"] = runtime_identities
+    protocol = (
+        replay_protocol(sim_timestep_s)
+        if sim_timestep_s is not None
+        else {
+            "control_dt_s": 0.02,
+            "sim_timestep_s": None,
+            "exclude_before_s": 1.0,
+            "final_hold_s": 1.0,
+            "seed": 0,
+            "warmup_s": 2.0,
+        }
     )
     write_json_report(
         output_report,
@@ -723,13 +1229,8 @@ def _run(args: argparse.Namespace) -> int:
             "accepted": accepted,
             "cohort": asdict(cohort) if cohort is not None else None,
             "episode_reports": serialized,
-            "protocol": {
-                "command_hz": 50,
-                "exclude_before_s": 1.0,
-                "final_hold_s": 1.0,
-                "seed": 0,
-                "warmup_s": 2.0,
-            },
+            "execution_provenance": execution_provenance,
+            "protocol": protocol,
             "source_episode_ids": [episode.source_episode_id for episode in episodes],
         },
     )
