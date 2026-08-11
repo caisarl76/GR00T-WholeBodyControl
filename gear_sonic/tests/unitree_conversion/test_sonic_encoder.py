@@ -705,7 +705,7 @@ def test_golden_encoder_fixtures_are_immutable_numeric_arrays() -> None:
     assert token.dtype == np.dtype(np.float32)
 
 
-def test_golden_encoder_case_matches_checked_token(pinned_encoder: SonicEncoder) -> None:
+def test_golden_encoder_case_rebuilds_orientation_and_input_without_model() -> None:
     case = np.load(GOLDEN_DIR / "golden_encoder_case.npz")
     orientations = build_encoder_orientation_window(
         case["initial_observed_root_wxyz"],
@@ -716,7 +716,11 @@ def test_golden_encoder_case_matches_checked_token(pinned_encoder: SonicEncoder)
     np.testing.assert_allclose(orientations, case["orientations"], atol=1e-12, rtol=0)
     tensor = build_g1_encoder_input(case["positions"], case["velocities"], orientations)
     np.testing.assert_array_equal(tensor, case["encoder_input"])
-    token = pinned_encoder.encode(tensor)
+
+
+def test_golden_encoder_case_matches_checked_token(pinned_encoder: SonicEncoder) -> None:
+    case = np.load(GOLDEN_DIR / "golden_encoder_case.npz")
+    token = pinned_encoder.encode(case["encoder_input"])
     np.testing.assert_allclose(
         token,
         np.load(GOLDEN_DIR / "golden_encoder_token.npy"),
