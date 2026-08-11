@@ -1,6 +1,6 @@
 # GR00T XRoboToolkit Video Bridge Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use `executing-plans` to execute this plan task by task. When a task is delegated within the same session, use `subagent-driven-development` for that task and preserve the review checkpoints below.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a reproducible pc2 service that subscribes to the existing GR00T RealSense ZMQ stream, serves the XRoboToolkit v1.1.1 command protocol, and sends fresh, correctly colored 2160x810 side-by-side H.264 to PICO4U without disrupting episode collection.
 
@@ -21,6 +21,7 @@
   - `/home/jihun/work/XRoboToolkit-Unity-Client` tag `v1.1.1` at `9f775b535d781618bd2bb7ef8d6c414c0531387c`.
 - Do not copy or link the upstream ZED sender. In particular, do not reuse its one-`recv()` command handling.
 - Run hardware-independent tests on the development PC. Run GStreamer encoder, service, camera, and headset gates on pc2 because the development PC does not provide the Jetson encoder plugin.
+- Create `.venv_data_collection` inside the implementation worktree and use only `./.venv_data_collection/bin/python` for Python tests, Ruff, exporter, clock verification, and episode validation. Bare `python`, a parent-checkout venv, and shell activation are not valid verification environments.
 - Follow test-driven development: add a focused failing test, observe the expected failure, make the smallest implementation, then rerun the focused and aggregate suites.
 - Commit after each task. Stage only the paths listed in that task.
 
@@ -101,6 +102,8 @@ gear_sonic/camera/xr_video_bridge/
   bounded_tcp_sender.cpp
   h264_pipeline.hpp
   h264_pipeline.cpp
+  bounded_test_capture.hpp
+  bounded_test_capture.cpp
   control_server.hpp
   control_server.cpp
   bridge_app.hpp
@@ -116,6 +119,7 @@ gear_sonic/camera/xr_video_bridge/
   tests/test_gr00t_subscriber.cpp
   tests/test_bounded_tcp_sender.cpp
   tests/test_h264_pipeline_contract.cpp
+  tests/test_bounded_test_capture.cpp
   tests/test_bridge_app.cpp
   tests/test_h264_pipeline_jetson.cpp
 ```
@@ -124,7 +128,9 @@ Add collection validation and deployment files:
 
 ```text
 gear_sonic/utils/data_collection/camera_freshness.py
+gear_sonic/scripts/verify_camera_clock_sync.py
 gear_sonic/scripts/validate_episode_camera_progression.py
+gear_sonic/tests/test_verify_camera_clock_sync.py
 gear_sonic/tests/test_composed_camera_client_freshness.py
 gear_sonic/tests/test_camera_freshness.py
 gear_sonic/tests/test_run_data_exporter_camera_freshness.py
@@ -170,6 +176,24 @@ git status --short
 ```
 
 Expected: clean feature worktree. Do not make an empty setup commit.
+
+- [ ] Bootstrap the worktree-local Python verification environment. The data-collection installer provides pinned project/runtime dependencies; add pinned test tools to that same interpreter.
+
+```bash
+cd /home/jihun/work/GR00T-WholeBodyControl-xr-video-bridge
+bash install_scripts/install_data_collection.sh
+uv pip install \
+  --python ./.venv_data_collection/bin/python \
+  pytest==9.0.3 ruff==0.15.20 \
+  opencv-python==4.11.0.86 av==17.0.1 \
+  pyzmq==27.1.0 msgpack==1.1.2
+./.venv_data_collection/bin/python -c \
+  'import av, cv2, importlib.metadata as m, lerobot, msgpack, numpy, pytest, zmq; assert "a445d9c9da6bea99a8972daa4fe1fdd053d711d2" in m.distribution("lerobot").read_text("direct_url.json"); print("python verification environment OK")'
+./.venv_data_collection/bin/python -m ruff --version
+./.venv_data_collection/bin/python -m pytest --version
+```
+
+Expected: the import probe confirms OpenCV, PyAV, the pinned LeRobot commit, MessagePack, NumPy, pytest, and pyzmq and prints `python verification environment OK`; Ruff reports `0.15.20`; pytest reports `9.0.3`. If dependency installation or the import probe fails, stop before Task 1; do not fall back to the parent checkout or Conda interpreter.
 
 ## Task 1: Establish the Native Test Harness and Newest-Only Slot
 
@@ -387,9 +411,10 @@ git commit -m "feat: subscribe to newest GR00T camera frame"
   - an absolute send deadline of `min(send_start + 100 ms, source_time + 350 ms)`;
   - socket closure after a partial packet misses its deadline;
   - no reuse of a stream after truncated framing;
+  - transmitted observer fires once after a complete handoff and never after a drop, error, or partial handoff;
   - a stalled receiver causing bounded disconnect, not queued access units.
 
-- [ ] Implement `BoundedTcpSender` with a worker consuming `LatestValueSlot<EncodedAccessUnit>`. It must re-check age immediately before the first byte, write prefix and access unit under one absolute deadline, and increment transmitted only after the kernel has accepted every byte.
+- [ ] Implement `BoundedTcpSender` with a worker consuming `LatestValueSlot<EncodedAccessUnit>`. It must re-check age immediately before the first byte, write prefix and access unit under one absolute deadline, and increment transmitted only after the kernel has accepted every byte. Accept an optional injected `std::function<void(const EncodedAccessUnit&)> on_transmitted` observer and invoke it only after that increment; production passes no observer, while Task 6's test-only capture binary uses it.
 
 Reject empty access units and units larger than `kMaxAccessUnitBytes` before constructing the prefix or entering the send loop.
 
@@ -419,7 +444,10 @@ git commit -m "feat: bound XR video socket latency"
 
 - Create: `gear_sonic/camera/xr_video_bridge/h264_pipeline.hpp`
 - Create: `gear_sonic/camera/xr_video_bridge/h264_pipeline.cpp`
+- Create: `gear_sonic/camera/xr_video_bridge/bounded_test_capture.hpp`
+- Create: `gear_sonic/camera/xr_video_bridge/bounded_test_capture.cpp`
 - Create: `gear_sonic/camera/xr_video_bridge/tests/test_h264_pipeline_contract.cpp`
+- Create: `gear_sonic/camera/xr_video_bridge/tests/test_bounded_test_capture.cpp`
 - Create: `gear_sonic/camera/xr_video_bridge/tests/test_h264_pipeline_jetson.cpp`
 - Modify: `gear_sonic/camera/xr_video_bridge/Makefile`
 
@@ -449,10 +477,23 @@ Restart the hardware test pipeline within one process and assert the first trans
 
 - [ ] Add the optional preview as a tee branch with an explicit one-buffer leaky queue. Verify preview-disabled is the service default and cannot backpressure encoding.
 
+- [ ] Add a bounded capture sink compiled only into `build/xr_video_bridge/gr00t_xr_video_bridge_capture`, never into the production service binary. After `BoundedTcpSender` completes local handoff of an access unit, the test binary passes that exact Annex-B payload to the sink. The sink writes raw payload bytes without TCP length prefixes, refuses an existing output path, and closes permanently at the first configured limit:
+
+```text
+hard maximum access units = 150
+hard maximum output bytes = 16,777,216
+test-only CLI = --capture-h264 PATH
+                --capture-max-access-units N  # 1..150
+                --capture-max-bytes N         # 1..16,777,216
+```
+
+The production `gr00t_xr_video_bridge` parser must reject these flags. Add tests proving byte-exact concatenation, no length prefixes, refusal to overwrite, both independent limits, close/flush behavior, and that failed or partial network handoffs are not captured.
+
 - [ ] Run the pure contract tests on the development PC.
 
 ```bash
 make -C gear_sonic/camera/xr_video_bridge test-h264-pipeline-contract
+make -C gear_sonic/camera/xr_video_bridge test-bounded-test-capture
 make -C gear_sonic/camera/xr_video_bridge native-tests
 ```
 
@@ -556,13 +597,14 @@ git commit -m "feat: serve XR video bridge sessions"
 
 ```text
 all                 build/xr_video_bridge/gr00t_xr_video_bridge
+capture-tool        build/xr_video_bridge/gr00t_xr_video_bridge_capture (test-only)
 native-tests        all hardware-independent unit/integration tests
 sanitize-tests      native tests under ASan and UBSan
 jetson-tests        encoder/plugin integration tests
 clean               only generated files under the bridge build directory
 ```
 
-Use `pkg-config` for `opencv4`, `libzmq`, `msgpack`, `gstreamer-1.0`, `gstreamer-app-1.0`, and `openssl` as actually needed. Keep include/link output visible in verbose mode. The Makefile must contain no `/usr/local/zed`, `sl/Camera.hpp`, `-lsl_zed`, CUDA include assumption, or dependency on either XR reference clone.
+Use `pkg-config` for `opencv4`, `libzmq`, `msgpack`, `gstreamer-1.0`, `gstreamer-app-1.0`, and `openssl` as actually needed. Keep include/link output visible in verbose mode. The production `all` target must not compile or link `bounded_test_capture.cpp`; only `capture-tool` and its focused tests may do so. The Makefile must contain no `/usr/local/zed`, `sl/Camera.hpp`, `-lsl_zed`, CUDA include assumption, or dependency on either XR reference clone.
 
 - [ ] Make dependency failures actionable by checking `pkg-config --exists` and naming the missing Ubuntu development package. Use dependency generation (`-MMD -MP`) so header changes rebuild affected objects.
 
@@ -580,7 +622,7 @@ Expected: `rg` returns no build/runtime coupling; an explanatory comment may nam
 - [ ] On pc2, build the production binary and verify dynamic linkage.
 
 ```bash
-make -C gear_sonic/camera/xr_video_bridge clean all jetson-tests
+make -C gear_sonic/camera/xr_video_bridge clean all capture-tool jetson-tests
 ldd build/xr_video_bridge/gr00t_xr_video_bridge
 ```
 
@@ -596,6 +638,8 @@ git commit -m "build: make XR bridge reproducible"
 **Files:**
 
 - Create: `gear_sonic/utils/data_collection/camera_freshness.py`
+- Create: `gear_sonic/scripts/verify_camera_clock_sync.py`
+- Create: `gear_sonic/tests/test_verify_camera_clock_sync.py`
 - Create: `gear_sonic/tests/test_composed_camera_client_freshness.py`
 - Create: `gear_sonic/tests/test_camera_freshness.py`
 - Create: `gear_sonic/tests/test_run_data_exporter_camera_freshness.py`
@@ -603,6 +647,47 @@ git commit -m "build: make XR bridge reproducible"
 - Create: `gear_sonic/tests/test_validate_episode_camera_progression.py`
 - Modify: `gear_sonic/scripts/run_data_exporter.py`
 - Modify: `gear_sonic/camera/composed_camera.py`
+
+- [ ] Add failing clock-evidence tests before computing workstation-side source age. Model one sample as local wall time before SSH, pc2 wall time returned by SSH, and local wall time after SSH. For each sample compute:
+
+```text
+round_trip_ms = local_after_ms - local_before_ms
+estimated_remote_minus_local_ms = remote_ms - (local_before_ms + local_after_ms) / 2
+uncertainty_ms = round_trip_ms / 2
+conservative_clock_offset_bound_ms = abs(estimated_remote_minus_local_ms) + uncertainty_ms
+```
+
+Use the lowest-round-trip sample from 20 attempts. Tests must accept a bound equal to 50 ms and reject a bound greater than 50 ms, unsynchronized `timedatectl` state on either host, fewer than 20 successful samples, camera-host mismatch, evidence older than 600 seconds, altered evidence hashes, and non-finite values.
+
+- [ ] Implement `verify_camera_clock_sync.py` using only the standard library. It must require local and remote `timedatectl show --property=NTPSynchronized --value` to return `yes`, collect exactly 20 successful SSH midpoint samples, enforce `conservative_clock_offset_bound_ms <= 50.0`, and atomically write JSON evidence with:
+
+```text
+schema_version=1
+camera_host
+ssh_target
+measured_at_utc
+sample_count=20
+best_round_trip_ms
+estimated_remote_minus_local_ms
+uncertainty_ms
+conservative_clock_offset_bound_ms
+maximum_allowed_clock_offset_ms=50.0
+local_ntp_synchronized=true
+remote_ntp_synchronized=true
+```
+
+CLI:
+
+```text
+./.venv_data_collection/bin/python gear_sonic/scripts/verify_camera_clock_sync.py \
+  --camera-host 192.168.123.164 \
+  --ssh-target unitree@192.168.123.164 \
+  --samples 20 \
+  --max-clock-offset-ms 50 \
+  --output /tmp/xr_bridge_camera_clock_sync.json
+```
+
+Exit nonzero and do not write evidence if any prerequisite fails. The implementation must invoke SSH with batch mode and a finite connection timeout so an unavailable pc2 fails rather than prompting or hanging.
 
 - [ ] Add failing Python tests for a `CameraFreshnessMonitor` that distinguishes a newly received source timestamp from a repeated cached message. Cover strictly increasing values, duplicate cached values, regressions, non-finite/future/stale values, gaps over 500 ms, a ten-second observation window below 12 new messages per second, and a valid 15 FPS window.
 
@@ -614,14 +699,15 @@ class CameraFreshnessEvent:
     source_timestamp: float
     received_monotonic: float
     is_new_message: bool
-    source_age_seconds: float
+    raw_source_age_seconds: float
+    corrected_source_age_upper_bound_seconds: float | None
 ```
 
 - [ ] Add `ComposedCameraClientSensor.read_with_status()` while preserving the existing `read()` return contract for every current caller. Factor both methods through one internal receive operation and return an immutable status containing `is_new_message` plus the exact client monotonic receive time. Add tests with a fake ZMQ receive method proving a network message is marked new, a cached fallback is not, and calling either public API performs at most one receive poll.
 
 - [ ] Implement the monitor with injected wall and monotonic clocks. Consume the explicit client read status. A cached message produces `is_new_message=False`; a network-received message with a duplicate or regressed source timestamp is a validation failure rather than being relabeled cached. Only network-received, strictly advancing timestamps update new-message cadence statistics.
 
-- [ ] Wire `read_with_status()` and the monitor at the actual exporter read boundary in `run_data_exporter.py`. Preserve the returned image message and collection timing. Record each new `timestamps["ego_view"]` with its exact client monotonic receive time, expose a compact end-of-episode summary, and rate-limit warnings for stale, duplicate, regressed, or gapped frames.
+- [ ] Wire `read_with_status()` and the monitor at the actual exporter read boundary in `run_data_exporter.py`. Preserve the returned image message and collection timing. Add `--camera-clock-sync-evidence PATH`; when supplied, validate the evidence before initializing collection, require its `camera_host` to equal `--camera-host`, require age no greater than 600 seconds and conservative offset bound no greater than 50 ms, then copy it to `<dataset-root>/meta/camera_clock_sync.json`. Refuse startup on missing, stale, mismatched, or out-of-bound evidence. Record each new `timestamps["ego_view"]` with its exact client monotonic receive time, expose a compact end-of-episode summary, and rate-limit warnings for stale, duplicate, regressed, or gapped frames.
 
 Do not change `ComposedCameraClientSensor` caching behavior as part of this feature; expose and correctly identify that existing behavior.
 
@@ -633,51 +719,72 @@ Add a focused exporter integration test with a fake image subscriber returning o
 <dataset-root>/meta/camera_freshness/episode_<six-digit-index>.jsonl
 ```
 
-Each line must contain schema version, episode index, episode frame index, mount, source wall timestamp, client receive monotonic time, exporter observation wall/monotonic times, computed source age, `is_new_message`, and current new-message gap. Flush on episode save/discard and process cleanup; reject an attempt to append a different episode to an open writer. Add temporary-directory tests proving line count and frame indices match exported-frame calls, including cached frames, and that one episode cannot overwrite another.
+Each line must contain schema version, episode index, episode frame index, mount, source wall timestamp, client receive monotonic time, exporter observation wall/monotonic times, raw cross-host source age, clock-corrected upper source-age bound, clock-evidence SHA-256, `is_new_message`, and current new-message gap. For remote cameras, compute the conservative upper age as `workstation_observation_time - pc2_source_timestamp + estimated_remote_minus_local + uncertainty`; the SHA-256 is the lowercase hexadecimal digest of the exact copied evidence-file bytes. Without evidence, write null corrected-age/hash fields and never describe raw wall-clock subtraction as authoritative age. Flush on episode save/discard and process cleanup; reject an attempt to append a different episode to an open writer. Add temporary-directory tests proving line count and frame indices match exported-frame calls, including cached frames, that one episode cannot overwrite another, and that the correction uses the signed estimated offset plus uncertainty.
 
 - [ ] Add a progression validator with a pure library entry point and CLI:
 
 ```text
-python gear_sonic/scripts/validate_episode_camera_progression.py \
+./.venv_data_collection/bin/python gear_sonic/scripts/validate_episode_camera_progression.py \
   --dataset-root PATH --episode-index N --mount ego_view \
+  --clock-sync-evidence PATH \
   --max-source-age-ms 250 --max-new-message-gap-ms 500 \
-  --minimum-new-fps 12 --minimum-changing-frame-ratio 0.5
+  --minimum-new-fps 12 --minimum-new-frame-samples 120 \
+  --frame-change-mad-threshold 2.0 \
+  --minimum-changing-new-frame-ratio 0.5
 ```
 
-The script must read the exact JSONL sidecar for the requested episode, verify its schema and one-to-one frame-index coverage, assert strict source-timestamp advancement for new-message events, and compute temporal progression from downscaled luma-frame mean absolute differences in the corresponding saved video. The threshold itself is a validation-tool argument, not a bridge freshness override. It must reject missing/truncated sidecars and an episode made from one repeated valid image.
+`--max-source-age-ms` is invalid unless `--clock-sync-evidence` is supplied. The script must validate the clock evidence and its SHA-256 before inspecting any age value; missing, older-than-600-second, host-mismatched, altered, or greater-than-50-ms-bound evidence is an immediate failure. It then reads the exact JSONL sidecar for the requested episode, verifies its schema and one-to-one video/frame-index coverage, and asserts strict source-timestamp advancement for new-message events.
 
-- [ ] Add fixture tests for: corrupt/nonempty images, frozen repeated frames, advancing timestamps with frozen imagery, regressed timestamps, excessive gaps, correct RGB temporal color target, and a passing moving target. Keep fixtures small and generate them inside pytest temporary directories.
+Define progression only over saved video frames whose same-index sidecar entry has `is_new_message=true`:
+
+```text
+selected frames N = video[sidecar[i].episode_frame_index] for each new-message entry
+minimum N = 120
+comparisons denominator = N - 1
+changed pair = mean(abs(gray64x48(N[i]) - gray64x48(N[i-1]))) >= 2.0
+changing_new_frame_ratio = changed_pair_count / (N - 1)
+required changing_new_frame_ratio >= 0.5
+```
+
+Cached 50 Hz exporter frames are excluded from both numerator and denominator. The `2.0` MAD threshold is in 8-bit luma units and is exposed by `--frame-change-mad-threshold`; the ratio and minimum-sample arguments are validation-tool settings, not bridge freshness overrides. Reject `N < 120`, a missing/truncated sidecar, or an endlessly repeated valid image.
+
+- [ ] Add fixture tests for: corrupt/nonempty images, frozen repeated frames, advancing timestamps with frozen imagery, regressed timestamps, excessive gaps, correct RGB temporal color target, invalid/stale clock evidence, and a passing moving target. The key cadence fixture must contain 500 saved frames at 50 Hz, 150 `is_new_message=true` entries at 15 Hz, and movement on at least 75 of the 149 selected-frame comparisons; assert it passes even though fewer than 50% of all adjacent 50 Hz saved-frame pairs change. Keep fixtures small and generate them inside pytest temporary directories.
 
 - [ ] Run focused tests and the existing exporter-related suite.
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -p no:cacheprovider \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./.venv_data_collection/bin/python -m pytest -q -p no:cacheprovider \
   gear_sonic/tests/test_composed_camera_client_freshness.py \
   gear_sonic/tests/test_camera_freshness.py \
   gear_sonic/tests/test_run_data_exporter_camera_freshness.py \
+  gear_sonic/tests/test_verify_camera_clock_sync.py \
   gear_sonic/tests/test_validate_episode_camera_progression.py
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -p no:cacheprovider \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./.venv_data_collection/bin/python -m pytest -q -p no:cacheprovider \
   gear_sonic/tests/test_run_camera_viewer.py
 ```
 
 - [ ] Run Python style checks on only the touched Python files.
 
 ```bash
-ruff check gear_sonic/utils/data_collection/camera_freshness.py \
+./.venv_data_collection/bin/python -m ruff check gear_sonic/utils/data_collection/camera_freshness.py \
+  gear_sonic/scripts/verify_camera_clock_sync.py \
   gear_sonic/scripts/validate_episode_camera_progression.py \
   gear_sonic/scripts/run_data_exporter.py \
   gear_sonic/camera/composed_camera.py \
   gear_sonic/tests/test_composed_camera_client_freshness.py \
   gear_sonic/tests/test_camera_freshness.py \
   gear_sonic/tests/test_run_data_exporter_camera_freshness.py \
+  gear_sonic/tests/test_verify_camera_clock_sync.py \
   gear_sonic/tests/test_validate_episode_camera_progression.py
-ruff format --check gear_sonic/utils/data_collection/camera_freshness.py \
+./.venv_data_collection/bin/python -m ruff format --check gear_sonic/utils/data_collection/camera_freshness.py \
+  gear_sonic/scripts/verify_camera_clock_sync.py \
   gear_sonic/scripts/validate_episode_camera_progression.py \
   gear_sonic/scripts/run_data_exporter.py \
   gear_sonic/camera/composed_camera.py \
   gear_sonic/tests/test_composed_camera_client_freshness.py \
   gear_sonic/tests/test_camera_freshness.py \
   gear_sonic/tests/test_run_data_exporter_camera_freshness.py \
+  gear_sonic/tests/test_verify_camera_clock_sync.py \
   gear_sonic/tests/test_validate_episode_camera_progression.py
 ```
 
@@ -685,12 +792,14 @@ ruff format --check gear_sonic/utils/data_collection/camera_freshness.py \
 
 ```bash
 git add gear_sonic/utils/data_collection/camera_freshness.py \
+  gear_sonic/scripts/verify_camera_clock_sync.py \
   gear_sonic/scripts/validate_episode_camera_progression.py \
   gear_sonic/scripts/run_data_exporter.py \
   gear_sonic/camera/composed_camera.py \
   gear_sonic/tests/test_composed_camera_client_freshness.py \
   gear_sonic/tests/test_camera_freshness.py \
   gear_sonic/tests/test_run_data_exporter_camera_freshness.py \
+  gear_sonic/tests/test_verify_camera_clock_sync.py \
   gear_sonic/tests/test_validate_episode_camera_progression.py
 git commit -m "test: detect stale episode camera frames"
 ```
@@ -752,7 +861,10 @@ The installer must:
   - firewall/LAN requirements for TCP 13579 and headset TCP 12345;
   - the PICO4U v1.1.1 selection;
   - manual foreground commands for troubleshooting;
-  - simultaneous episode collection and progression validation;
+  - worktree-local `.venv_data_collection` bootstrap and the rule to use its explicit interpreter for every Python verification command;
+  - same-NTP/chrony prerequisites, the 20-sample clock verifier, the 50 ms conservative offset maximum, evidence retention, and fail-fast behavior;
+  - the test-only bounded H.264 capture procedure and the fact that the systemd production binary cannot enable capture;
+  - simultaneous episode collection and new-message-selected progression validation;
   - explicit warning that only `composed_camera` opens RealSense.
 
 - [ ] Validate scripts and the rendered unit without installing anything on the development PC.
@@ -760,10 +872,10 @@ The installer must:
 ```bash
 bash -n install_scripts/install_camera_server.sh
 bash -n install_scripts/install_xr_video_bridge.sh
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -p no:cacheprovider \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./.venv_data_collection/bin/python -m pytest -q -p no:cacheprovider \
   gear_sonic/tests/test_install_xr_video_bridge.py
-ruff check gear_sonic/tests/test_install_xr_video_bridge.py
-ruff format --check gear_sonic/tests/test_install_xr_video_bridge.py
+./.venv_data_collection/bin/python -m ruff check gear_sonic/tests/test_install_xr_video_bridge.py
+./.venv_data_collection/bin/python -m ruff format --check gear_sonic/tests/test_install_xr_video_bridge.py
 install_scripts/install_xr_video_bridge.sh --dry-run \
   --allowed-headset-ip 192.0.2.10
 rg -n '@[A-Z0-9_]+@' systemd/gr00t_xr_video_bridge.service.in
@@ -797,31 +909,38 @@ make -C gear_sonic/camera/xr_video_bridge sanitize-tests
 - [ ] Run all touched Python tests and static checks.
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q -p no:cacheprovider \
+./.venv_data_collection/bin/python -c \
+  'import av, cv2, importlib.metadata as m, lerobot, msgpack, numpy, pytest, zmq; assert "a445d9c9da6bea99a8972daa4fe1fdd053d711d2" in m.distribution("lerobot").read_text("direct_url.json"); print("python verification environment OK")'
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./.venv_data_collection/bin/python -m pytest -q -p no:cacheprovider \
   gear_sonic/tests/test_composed_camera_client_freshness.py \
   gear_sonic/tests/test_camera_freshness.py \
   gear_sonic/tests/test_run_data_exporter_camera_freshness.py \
+  gear_sonic/tests/test_verify_camera_clock_sync.py \
   gear_sonic/tests/test_validate_episode_camera_progression.py \
   gear_sonic/tests/test_install_xr_video_bridge.py \
   gear_sonic/tests/test_run_camera_viewer.py
-ruff check gear_sonic/utils/data_collection/camera_freshness.py \
+./.venv_data_collection/bin/python -m ruff check gear_sonic/utils/data_collection/camera_freshness.py \
+  gear_sonic/scripts/verify_camera_clock_sync.py \
   gear_sonic/scripts/validate_episode_camera_progression.py \
   gear_sonic/scripts/run_data_exporter.py \
   gear_sonic/camera/composed_camera.py \
   gear_sonic/tests/test_composed_camera_client_freshness.py \
   gear_sonic/tests/test_camera_freshness.py \
   gear_sonic/tests/test_run_data_exporter_camera_freshness.py \
+  gear_sonic/tests/test_verify_camera_clock_sync.py \
   gear_sonic/tests/test_validate_episode_camera_progression.py
-ruff format --check gear_sonic/utils/data_collection/camera_freshness.py \
+./.venv_data_collection/bin/python -m ruff format --check gear_sonic/utils/data_collection/camera_freshness.py \
+  gear_sonic/scripts/verify_camera_clock_sync.py \
   gear_sonic/scripts/validate_episode_camera_progression.py \
   gear_sonic/scripts/run_data_exporter.py \
   gear_sonic/camera/composed_camera.py \
   gear_sonic/tests/test_composed_camera_client_freshness.py \
   gear_sonic/tests/test_camera_freshness.py \
   gear_sonic/tests/test_run_data_exporter_camera_freshness.py \
+  gear_sonic/tests/test_verify_camera_clock_sync.py \
   gear_sonic/tests/test_validate_episode_camera_progression.py
-ruff check gear_sonic/tests/test_install_xr_video_bridge.py
-ruff format --check gear_sonic/tests/test_install_xr_video_bridge.py
+./.venv_data_collection/bin/python -m ruff check gear_sonic/tests/test_install_xr_video_bridge.py
+./.venv_data_collection/bin/python -m ruff format --check gear_sonic/tests/test_install_xr_video_bridge.py
 bash -n install_scripts/install_camera_server.sh
 bash -n install_scripts/install_xr_video_bridge.sh
 ```
@@ -876,8 +995,8 @@ Expected interpreter: `/home/unitree/GR00T-WholeBodyControl/.venv_camera/bin/pyt
 sudo systemctl restart composed_camera_server.service
 sudo systemctl status --no-pager composed_camera_server.service
 journalctl -u composed_camera_server.service -n 100 --no-pager
-source .venv_camera/bin/activate
-python gear_sonic/scripts/run_camera_viewer.py --camera-host 127.0.0.1 --camera-port 5555
+./.venv_camera/bin/python gear_sonic/scripts/run_camera_viewer.py \
+  --camera-host 127.0.0.1 --camera-port 5555
 ```
 
 Close the viewer after confirming a fresh `480x640x3` `ego_view`. Verify with `lsof`/`pgrep` that no bridge process has opened a RealSense device.
@@ -887,7 +1006,8 @@ Close the viewer after confirming a fresh `480x640x3` `ego_view`. Verify with `l
 ```bash
 read -r -p "PICO4U IPv4 address: " XR_HEADSET_IP
 export XR_HEADSET_IP
-python3 -c 'import ipaddress, os; print(ipaddress.IPv4Address(os.environ["XR_HEADSET_IP"]))'
+./.venv_camera/bin/python -c \
+  'import ipaddress, os; print(ipaddress.IPv4Address(os.environ["XR_HEADSET_IP"]))'
 install_scripts/install_xr_video_bridge.sh \
   --allowed-headset-ip "$XR_HEADSET_IP" \
   --listen 0.0.0.0:13579 \
@@ -921,13 +1041,42 @@ build/xr_video_bridge/compare_xr_control_capture \
 
 Expected: byte-for-byte match. Keep the binary capture with the integration record, not in git.
 
-- [ ] Confirm the headset renders a correctly proportioned view in both eyes. Present a controlled red/green/blue target to confirm channel order. Save a bridge-side stripped H.264 sample and verify it independently:
+- [ ] Confirm the headset renders a correctly proportioned view in both eyes. Present a controlled red/green/blue target to confirm channel order.
+
+- [ ] Produce a bounded capture of access units that actually completed local handoff to the PICO. Stop the production unit temporarily and run the test-only capture binary built in Task 8; it uses the same bridge session but cannot be selected by systemd.
 
 ```bash
+XR_H264_CAPTURE="/tmp/gr00t_xr_video_bridge_capture.$$.h264"
+XR_CAPTURE_LOG="/tmp/gr00t_xr_video_bridge_capture.$$.log"
+test ! -e "$XR_H264_CAPTURE"
+sudo systemctl stop gr00t_xr_video_bridge.service
+restore_xr_bridge_service() { sudo systemctl start gr00t_xr_video_bridge.service; }
+trap restore_xr_bridge_service EXIT
+timeout --signal=INT --kill-after=5s 30s \
+  ./build/xr_video_bridge/gr00t_xr_video_bridge_capture \
+  --listen 0.0.0.0:13579 \
+  --allowed-headset-ip "$XR_HEADSET_IP" \
+  --gr00t-zmq tcp://127.0.0.1:5555 \
+  --mount ego_view \
+  --capture-h264 "$XR_H264_CAPTURE" \
+  --capture-max-access-units 150 \
+  --capture-max-bytes 16777216 \
+  >"$XR_CAPTURE_LOG" 2>&1 &
+XR_CAPTURE_PID=$!
+read -r -p "Reconnect PICO4U now; press Enter after live video appears: "
+wait "$XR_CAPTURE_PID"
+XR_CAPTURE_STATUS=$?
+test "$XR_CAPTURE_STATUS" -eq 0 || test "$XR_CAPTURE_STATUS" -eq 124
+rg 'capture_complete.*access_units=[1-9][0-9]*.*bytes=[1-9][0-9]*' "$XR_CAPTURE_LOG"
+test -s "$XR_H264_CAPTURE"
 ffprobe -v error -show_entries stream=codec_name,width,height,r_frame_rate \
-  -of default=nw=1 /tmp/gr00t_xr_video_bridge_capture.h264
-ffmpeg -v error -i /tmp/gr00t_xr_video_bridge_capture.h264 -frames:v 30 -f null -
+  -of default=nw=1 "$XR_H264_CAPTURE"
+ffmpeg -v error -i "$XR_H264_CAPTURE" -frames:v 30 -f null -
+sudo systemctl start gr00t_xr_video_bridge.service
+trap - EXIT
 ```
+
+Expected: the capture log identifies the current output path and reports no more than 150 access units and 16,777,216 bytes; ffprobe reports H.264, 2160x810, 15/1; FFmpeg exits zero. Because the sink observes only completed sends, the file cannot be produced from unsent pipeline output. Retain the unique capture and log with the integration record.
 
 - [ ] Run for ten minutes while periodically recording metrics. Acceptance requires bounded RSS, internal slot depths of zero or one, no completed local handoff over 350 ms source age, no progressive video lag, and no second-camera-owner errors.
 
@@ -939,37 +1088,60 @@ ffmpeg -v error -i /tmp/gr00t_xr_video_bridge_capture.h264 -frames:v 30 -f null 
 
 **Files:** no planned source changes; fixes require a failing regression test and a focused commit
 
+- [ ] On the workstation, verify both hosts report NTP synchronization and record a conservative cross-host offset bound immediately before collection. Key-based SSH to pc2 is a prerequisite because the verifier is deliberately noninteractive.
+
+```bash
+timedatectl show --property=NTPSynchronized --value
+ssh -o BatchMode=yes -o ConnectTimeout=5 unitree@192.168.123.164 \
+  timedatectl show --property=NTPSynchronized --value
+./.venv_data_collection/bin/python gear_sonic/scripts/verify_camera_clock_sync.py \
+  --camera-host 192.168.123.164 \
+  --ssh-target unitree@192.168.123.164 \
+  --samples 20 \
+  --max-clock-offset-ms 50 \
+  --output /tmp/xr_bridge_camera_clock_sync.json
+./.venv_data_collection/bin/python -m json.tool \
+  /tmp/xr_bridge_camera_clock_sync.json
+```
+
+Expected: both first commands print `yes`; the evidence reports `sample_count: 20` and `conservative_clock_offset_bound_ms <= 50.0`. Any nonzero command, unsynchronized host, missing evidence, or bound above 50 ms is a fail-fast stop: do not start the exporter or enforce the 250 ms source-age criterion. Synchronize both hosts to the same NTP/chrony source, rerun the measurement, and retain the successful JSON with the experiment record.
+
 - [ ] With `composed_camera` and the XR bridge active, start the normal teleop/deployment stack and exporter from the documented data-collection environments. Use an explicit dataset name so validation targets are unambiguous:
 
 ```bash
-source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_data_exporter.py \
+./.venv_data_collection/bin/python gear_sonic/scripts/run_data_exporter.py \
   --task-prompt "XR bridge RealSense progression test" \
   --dataset-name xr_bridge_realsense_progression \
   --camera-host 192.168.123.164 \
-  --camera-port 5555
+  --camera-port 5555 \
+  --camera-clock-sync-evidence /tmp/xr_bridge_camera_clock_sync.json
 ```
 
-Record at least ten seconds with a controlled moving RGB target while the headset is actively rendering.
+Record at least twelve seconds with a controlled moving RGB target while the headset is actively rendering, ensuring the sidecar contains at least 120 new-message events.
 
 - [ ] During the episode, restart only the XR bridge and continue recording across the restart.
 
 ```bash
-sudo systemctl restart gr00t_xr_video_bridge.service
-journalctl -u gr00t_xr_video_bridge.service -n 100 --no-pager
+ssh -tt unitree@192.168.123.164 \
+  'sudo systemctl restart gr00t_xr_video_bridge.service'
+ssh unitree@192.168.123.164 \
+  'journalctl -u gr00t_xr_video_bridge.service -n 100 --no-pager'
 ```
 
 - [ ] Validate the saved episode, substituting the actual episode index printed by the exporter:
 
 ```bash
-python gear_sonic/scripts/validate_episode_camera_progression.py \
+./.venv_data_collection/bin/python gear_sonic/scripts/validate_episode_camera_progression.py \
   --dataset-root outputs/xr_bridge_realsense_progression \
   --episode-index 0 \
   --mount ego_view \
+  --clock-sync-evidence outputs/xr_bridge_realsense_progression/meta/camera_clock_sync.json \
   --max-source-age-ms 250 \
   --max-new-message-gap-ms 500 \
   --minimum-new-fps 12 \
-  --minimum-changing-frame-ratio 0.5
+  --minimum-new-frame-samples 120 \
+  --frame-change-mad-threshold 2.0 \
+  --minimum-changing-new-frame-ratio 0.5
 ```
 
 If the exporter reports an episode index other than zero, pass that exact integer; do not scan for an arbitrary passing episode.
@@ -977,10 +1149,11 @@ If the exporter reports an episode index other than zero, pass that exact intege
 - [ ] Confirm all collection acceptance checks:
 
   - new-message source timestamps are strictly increasing;
-  - source age is below 250 ms;
+  - every new frame's clock-corrected upper source-age bound is below 250 ms, using matching evidence whose conservative clock offset is at most 50 ms;
   - no new-message gap exceeds 500 ms;
   - at least 12 new messages per second are observed;
-  - the RGB target has correct channel order and saved frames demonstrate temporal progression;
+  - at least 120 new-message-selected video frames exist, and at least 50% of their `N-1` adjacent comparisons exceed the 2.0-luma MAD threshold;
+  - the RGB target has correct channel order and those selected saved frames demonstrate temporal progression;
   - timestamps and imagery keep progressing across the bridge restart;
   - camera, exporter, and bridge logs contain no device-busy, disconnect, or second-owner errors.
 
@@ -998,9 +1171,10 @@ git log --oneline --decorate -15
 
 - [ ] All Task 11 local checks pass from a clean build.
 - [ ] pc2 builds without ZED and the hardware H.264 stream is Annex-B/AU with startup SPS/PPS/IDR.
+- [ ] The test-only capture binary produces a current, bounded H.264 file from access units that completed PICO socket handoff; the production service binary exposes no capture flags.
 - [ ] PICO4U v1.1.1 displays correct, fresh SBS video for ten minutes.
 - [ ] No access unit completes local kernel handoff beyond 350 ms source age.
-- [ ] The concurrent episode satisfies timestamp, cadence, age, color, and temporal-progression checks across a bridge restart.
+- [ ] The concurrent episode has fresh matching clock evidence bounded to 50 ms, a corrected upper source age below 250 ms, at least 120 new-message frames, and a passing new-message-selected progression ratio across a bridge restart.
 - [ ] `composed_camera` remains the sole RealSense owner.
 - [ ] Installation is reproducible from the GR00T checkout and build manifest, with no external mutable source dependency.
 - [ ] Every implementation commit is focused, `git diff --check` is clean, and the unrelated user file remains untouched.
