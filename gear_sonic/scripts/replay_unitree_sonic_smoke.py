@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 import hashlib
 import json
 import math
@@ -72,6 +72,7 @@ PINNED_OBSERVATION_CONFIG = (
     3258,
     "582b9a273a3d69fbf49ae59b39295a3be2b4a295e195ef4cf674b5e2571c90ab",
 )
+CONTROL_PERIOD_S = 1.0 / 50.0
 UNITREE_BRIDGE_CHANNEL_ATTRIBUTES = (
     "low_state_puber",
     "odo_state_puber",
@@ -163,7 +164,7 @@ def replay_protocol(sim_timestep_s: float) -> dict[str, object]:
     if not math.isfinite(sim_timestep_s) or sim_timestep_s <= 0.0:
         raise ValueError("sim_timestep_s must be finite and positive")
     return {
-        "control_dt_s": 0.02,
+        "control_dt_s": CONTROL_PERIOD_S,
         "sim_timestep_s": sim_timestep_s,
         "exclude_before_s": 1.0,
         "final_hold_s": 1.0,
@@ -566,7 +567,7 @@ def poll_until_acknowledged(
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> bool:
-    """Allow one bounded simulator-step window for asynchronous telemetry."""
+    """Poll asynchronous telemetry until the caller-provided deadline."""
 
     if not math.isfinite(timeout_s) or timeout_s <= 0.0:
         raise ValueError("acknowledgement timeout_s must be finite and positive")
@@ -601,8 +602,13 @@ def prime_controller(
         raise ValueError("priming sim_dt must be finite and positive")
     if not math.isfinite(timeout_s) or timeout_s <= 3.0:
         raise ValueError("priming timeout_s must be finite and greater than the 3 s INIT")
-    steps_per_control = round(0.02 / sim_dt)
-    if steps_per_control <= 0 or not math.isclose(steps_per_control * sim_dt, 0.02, rel_tol=0.0, abs_tol=1e-12):
+    steps_per_control = round(CONTROL_PERIOD_S / sim_dt)
+    if steps_per_control <= 0 or not math.isclose(
+        steps_per_control * sim_dt,
+        CONTROL_PERIOD_S,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
         raise ValueError("priming sim_dt must divide the 20 ms control period")
     minimum_steps = math.ceil(3.0 / sim_dt)
     deadline = monotonic() + timeout_s
@@ -1009,7 +1015,7 @@ class MujocoZmqRuntime:
         if self._expected_frame is frame and not self._expected_ack_received:
             self._expected_ack_received = poll_until_acknowledged(
                 lambda: self._poll_ack(frame),
-                timeout_s=self.collector.sim_dt,
+                timeout_s=CONTROL_PERIOD_S,
             )
         if self._expected_frame is not frame or not self._expected_ack_received:
             raise RuntimeError("continuous g1_debug controller acknowledgement was missed")
@@ -1236,7 +1242,7 @@ def _run(args: argparse.Namespace) -> int:
         replay_protocol(sim_timestep_s)
         if sim_timestep_s is not None
         else {
-            "control_dt_s": 0.02,
+            "control_dt_s": CONTROL_PERIOD_S,
             "sim_timestep_s": None,
             "exclude_before_s": 1.0,
             "final_hold_s": 1.0,
@@ -1258,9 +1264,164 @@ def _run(args: argparse.Namespace) -> int:
     return 0 if accepted else 1
 
 
+def _isolated_child_command(
+    args: argparse.Namespace,
+    source_episode_id: int,
+    output_report: Path,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--dataset-root",
+        str(args.dataset_root),
+        "--source-episode-ids",
+        str(source_episode_id),
+        "--deploy-binary",
+        str(args.deploy_binary),
+        "--network-interface",
+        str(args.network_interface),
+        "--policy-file",
+        str(args.policy_file),
+        "--motion-data-path",
+        str(args.motion_data_path),
+        "--planner-file",
+        str(args.planner_file),
+        "--observation-config",
+        str(args.observation_config),
+        "--encoder-file",
+        str(args.encoder_file),
+        "--zmq-host",
+        str(args.zmq_host),
+        "--action-port",
+        str(args.action_port),
+        "--state-port",
+        str(args.state_port),
+        "--readiness-timeout-s",
+        str(args.readiness_timeout_s),
+        "--output-report",
+        str(output_report),
+    ]
+
+
+def _deserialize_replay_report(value: object) -> ReplayReport:
+    if not isinstance(value, Mapping):
+        raise ProvenanceError("isolated child replay report payload is invalid")
+    expected_fields = {field.name for field in fields(ReplayReport)}
+    if set(value) != expected_fields:
+        raise ProvenanceError("isolated child replay report fields are invalid")
+    payload = dict(value)
+    for key, replacement in (("NaN", math.nan), ("Infinity", math.inf), ("-Infinity", -math.inf)):
+        for field_name, field_value in tuple(payload.items()):
+            if field_value == key:
+                payload[field_name] = replacement
+    gate_failures = payload.get("gate_failures")
+    if not isinstance(gate_failures, list) or not all(isinstance(item, str) for item in gate_failures):
+        raise ProvenanceError("isolated child replay gate failures are invalid")
+    payload["gate_failures"] = tuple(gate_failures)
+    try:
+        return ReplayReport(**payload)
+    except (TypeError, ValueError) as error:
+        raise ProvenanceError("isolated child replay report values are invalid") from error
+
+
+def run_isolated_cohort(
+    args: argparse.Namespace,
+    *,
+    _process_runner: Callable[..., object] = subprocess.run,
+) -> int:
+    """Replay plural cohorts with one fresh DDS/MuJoCo process per episode."""
+
+    if len(args.source_episode_ids) < 2:
+        raise ValueError("isolated cohort replay requires at least two episode IDs")
+    requested_root = _existing_directory(args.dataset_root, "--dataset-root")
+    dataset_root, default_output_report = resolve_replay_dataset_root(requested_root)
+    output_report = _resolve_report_path(args.output_report, dataset_root, default_output_report)
+    authenticated = authenticate_dataset(dataset_root)
+    episodes = resolve_source_episode_ids(
+        dataset_root,
+        args.source_episode_ids,
+        authenticated=authenticated,
+    )
+    output_report.parent.mkdir(parents=True, exist_ok=True)
+
+    serialized: list[dict[str, object]] = []
+    episode_reports: list[ReplayReport] = []
+    execution_provenance: Mapping[str, object] | None = None
+    child_protocol: Mapping[str, object] | None = None
+    child_acceptance: list[bool] = []
+    with tempfile.TemporaryDirectory(
+        prefix=".unitree-sonic-replay-",
+        dir=output_report.parent,
+    ) as temporary_directory:
+        temporary_root = Path(temporary_directory)
+        for position, episode in enumerate(episodes):
+            child_output = temporary_root / f"episode-{position:06d}.json"
+            completed = _process_runner(
+                _isolated_child_command(args, episode.source_episode_id, child_output),
+                check=False,
+            )
+            return_code = getattr(completed, "returncode", None)
+            if return_code not in (0, 1) or not child_output.is_file():
+                raise RuntimeError(
+                    f"isolated replay child {episode.source_episode_id} failed before producing a report"
+                )
+            try:
+                child = json.loads(child_output.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ProvenanceError("isolated replay child report is unreadable") from error
+            if not isinstance(child, Mapping):
+                raise ProvenanceError("isolated replay child report must be a mapping")
+            if child.get("source_episode_ids") != [episode.source_episode_id]:
+                raise ProvenanceError("isolated replay child reported the wrong source episode")
+            child_episodes = child.get("episode_reports")
+            if not isinstance(child_episodes, list) or len(child_episodes) != 1:
+                raise ProvenanceError("isolated replay child must report exactly one episode")
+            child_episode = child_episodes[0]
+            if not isinstance(child_episode, Mapping):
+                raise ProvenanceError("isolated replay child episode report must be a mapping")
+            if child_episode.get("source_episode_id") != episode.source_episode_id:
+                raise ProvenanceError("isolated replay child episode identity is inconsistent")
+            serialized.append(dict(child_episode))
+            if "report" in child_episode:
+                episode_reports.append(_deserialize_replay_report(child_episode["report"]))
+
+            current_provenance = child.get("execution_provenance")
+            current_protocol = child.get("protocol")
+            if not isinstance(current_provenance, Mapping) or not isinstance(current_protocol, Mapping):
+                raise ProvenanceError("isolated replay child omitted execution provenance or protocol")
+            if execution_provenance is None:
+                execution_provenance = dict(current_provenance)
+                child_protocol = dict(current_protocol)
+            elif current_provenance != execution_provenance or current_protocol != child_protocol:
+                raise ProvenanceError("isolated replay child provenance changed within the cohort")
+            child_acceptance.append(child.get("accepted") is True and return_code == 0)
+
+    cohort = aggregate_replay_reports(episode_reports) if episode_reports else None
+    accepted = (
+        len(episode_reports) == len(episodes) and all(child_acceptance) and cohort is not None and cohort.accepted
+    )
+    protocol = dict(child_protocol or {})
+    protocol["episode_process_isolation"] = True
+    write_json_report(
+        output_report,
+        {
+            "accepted": accepted,
+            "cohort": asdict(cohort) if cohort is not None else None,
+            "episode_reports": serialized,
+            "execution_provenance": dict(execution_provenance or {}),
+            "protocol": protocol,
+            "source_episode_ids": [episode.source_episode_id for episode in episodes],
+        },
+    )
+    return 0 if accepted else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
-        return _run(_parse_args(argv))
+        args = _parse_args(argv)
+        if len(args.source_episode_ids) > 1:
+            return run_isolated_cohort(args)
+        return _run(args)
     except (OSError, ValueError) as error:
         print(f"replay setup failed: {error}")
         return 2

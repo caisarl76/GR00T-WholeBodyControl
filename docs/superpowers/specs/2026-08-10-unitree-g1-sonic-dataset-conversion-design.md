@@ -162,6 +162,18 @@ The official Unitree source/controller motor IDs are side-specific:
 
 `teleop.left_hand_joints` and `teleop.right_hand_joints` preserve source indices because these are raw per-side DDS arrays. `observation.state` and `action.wbc` map by semantic name into RobotModel order. A one-hot test verifies all 14 paths. The conflicting symmetric local `DEX3_MOTOR_ORDER` tuple is not an authority for conversion.
 
+RobotModel determines the 43D field order, not a hand-coordinate conversion. This matches the deployed feedback path and `run_data_exporter.py`, which place measured/commanded Dex3 DDS values directly in the RobotModel-ordered hand slots. Consequently, the 29 body slots are checked against the exact combined-model URDF limits, while the 14 hand slots are checked in the pinned dataset's asymmetric DDS domains. The narrower supplemental shoulder-roll range is an operational safety posture constraint, not the representable deployed-feedback domain: the pinned Unitree trajectories legitimately cross it while remaining inside the URDF limits. The exact hand command-domain endpoints are the float32 values represented by the pinned dataset/controller convention:
+
+| DDS semantic | Left `[min, max]` radians | Right `[min, max]` radians |
+|---|---:|---:|
+| `thumb0` | `[-1.0471975803375244, 1.0471975803375244]` | same |
+| `thumb1` | `[-1.0471975803375244, 1.0471975803375244]` | same |
+| `thumb2` | `[0, 1.7453292608261108]` | `[-1.7453292608261108, 0]` |
+| `index0`, `middle0` | `[-1.832595705986023, 0.19198620319366455]` | `[-0.19198620319366455, 1.832595705986023]` |
+| `index1`, `middle1` | `[-2.094395160675049, 0]` | `[0, 2.094395160675049]` |
+
+`action.wbc` hand values must remain inside those command domains with only the numerical joint-limit tolerance. Measured `observation.state` hand values receive `0.01` radians of encoder tolerance. Values are never clipped or renormalized. This distinction is required because the local combined visualization URDF contains symmetric hand limits that contradict both valid right-hand DDS values and the runtime export representation.
+
 ## Inspire diagnostic-only gate
 
 The public WBT schema provides a 7D root followed by 29 generic joint columns, but does not authoritatively name those columns or define the controller-level semantics of `robot_q_desired`. Inspire's 6D hand action also has no approved calibration to the 7D Dex3 DDS target.
@@ -399,6 +411,8 @@ Small perturbations need not change the token because quantization can map them 
 ### Replay protocol
 
 All five Dex3 episodes are replayed. Inspire episodes are not replayed while gated.
+
+Each episode runs in a fresh OS process. The Unitree SDK channel factory is process-global and cannot be reliably reinitialized for multiple simulator lifetimes in one Python process; cohort orchestration therefore runs one authenticated single-episode child at a time, validates its report identity and immutable execution provenance, and deterministically merges the five child reports. A child must echo the exact current 64D token and both exact 7D measured-hand vectors with a monotonically increasing controller index. The acknowledgement deadline is one complete 50 Hz control period (`0.02 s`), which accommodates asynchronous telemetry without allowing the next command to be published first.
 
 For each episode:
 

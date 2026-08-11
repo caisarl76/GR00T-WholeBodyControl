@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import hashlib
 import json
 import math
@@ -936,6 +937,77 @@ def test_run_reports_resolved_dataset_provenance_protocol_and_failure_classes(
     assert not (dataset / "unitree-sonic-replay-report.json").exists()
 
 
+def test_plural_replay_isolates_each_episode_in_a_fresh_process(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "unitreerobotics--G1_Dex3_Pouring_Dataset"
+    dataset.mkdir()
+    _write_manifest(
+        dataset,
+        {
+            "source_episode_ids": [10, 11],
+            "episode_lengths": [2, 2],
+            "stages": [{"source_episode_id": 10}, {"source_episode_id": 11}],
+        },
+    )
+    accepted_collector = collector(mass=100.0)
+    accepted_collector.add(sample(time_s=1.0))
+    accepted_report = accepted_collector.finalize()
+    args = SimpleNamespace(
+        dataset_root=str(tmp_path),
+        source_episode_ids=[10, 11],
+        deploy_binary="deploy",
+        network_interface="lo",
+        policy_file="decoder",
+        motion_data_path="motions",
+        planner_file="planner",
+        observation_config="config",
+        encoder_file="encoder",
+        zmq_host="127.0.0.1",
+        action_port=5556,
+        state_port=5557,
+        readiness_timeout_s=3.1,
+        output_report=None,
+    )
+    commands: list[list[str]] = []
+
+    def run_child(command: list[str], *, check: bool) -> object:
+        assert check is False
+        commands.append(command)
+        source_id = int(command[command.index("--source-episode-ids") + 1])
+        output = Path(command[command.index("--output-report") + 1])
+        write_json_report(
+            output,
+            {
+                "accepted": True,
+                "cohort": asdict(aggregate_replay_reports([accepted_report])),
+                "episode_reports": [
+                    {
+                        "source_episode_id": source_id,
+                        "target_episode_index": source_id - 10,
+                        "status": "accepted",
+                        "report": asdict(accepted_report),
+                    }
+                ],
+                "execution_provenance": {"runtime": {"scene": "same"}},
+                "protocol": replay_protocol(0.005),
+                "source_episode_ids": [source_id],
+            },
+        )
+        return SimpleNamespace(returncode=0)
+
+    assert replay_cli.run_isolated_cohort(args, _process_runner=run_child) == 0
+
+    assert [command[command.index("--source-episode-ids") + 1] for command in commands] == ["10", "11"]
+    assert len({command[command.index("--output-report") + 1] for command in commands}) == 2
+    merged = json.loads((tmp_path / "unitree-sonic-replay-report.json").read_text())
+    assert merged["accepted"] is True
+    assert merged["source_episode_ids"] == [10, 11]
+    assert [item["source_episode_id"] for item in merged["episode_reports"]] == [10, 11]
+    assert merged["cohort"]["episode_count"] == 2
+    assert merged["protocol"]["episode_process_isolation"] is True
+
+
 def test_run_rejects_report_path_inside_authenticated_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1163,6 +1235,28 @@ def test_command_boundary_checks_ack_that_arrived_during_final_pace() -> None:
 
     assert polls == [frame]
     assert runtime._expected_ack_received is True
+
+
+def test_command_boundary_allows_one_50hz_period_for_async_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = action_frame(0.25)
+    runtime = object.__new__(MujocoZmqRuntime)
+    runtime._expected_frame = frame
+    runtime._expected_ack_received = False
+    runtime.collector = SimpleNamespace(sim_dt=0.005)
+    timeouts: list[float] = []
+
+    def poll_with_timeout(poll: object, *, timeout_s: float) -> bool:
+        del poll
+        timeouts.append(timeout_s)
+        return True
+
+    monkeypatch.setattr(replay_cli, "poll_until_acknowledged", poll_with_timeout)
+
+    runtime.assert_action_ack(frame, "trajectory", 7, 0.14)
+
+    assert timeouts == pytest.approx([0.02])
 
 
 def test_command_ack_wait_is_bounded_to_one_simulator_step() -> None:

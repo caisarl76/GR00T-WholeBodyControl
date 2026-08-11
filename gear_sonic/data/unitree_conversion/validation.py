@@ -71,6 +71,7 @@ TARGET_VIDEO_KEYS = frozenset(
 TARGET_VIDEO_SIZE = (640, 480)
 _QUATERNION_NORM_TOLERANCE = 1e-5
 _JOINT_LIMIT_TOLERANCE = 1e-9
+_DEX3_MEASUREMENT_TOLERANCE = 1e-2
 _EEF_POSITION_TOLERANCE = 1e-9
 _EEF_QUATERNION_TOLERANCE = 1e-8
 TARGET_JOINT_NAMES = (
@@ -117,6 +118,37 @@ TARGET_JOINT_NAMES = (
     "right_hand_thumb_0_joint",
     "right_hand_thumb_1_joint",
     "right_hand_thumb_2_joint",
+)
+# ``observation.state`` and ``action.wbc`` use RobotModel *ordering*, but the
+# hand slots retain the raw DDS motor coordinates used by deployment and the
+# existing data exporter.  They therefore cannot use the symmetric hand limits
+# from the visualization URDF.  These float32-exact command domains match the
+# pinned Unitree Dex3 dataset/controller convention.
+_DEX3_DDS_COMMAND_LIMITS: Mapping[str, tuple[float, float]] = MappingProxyType(
+    {
+        "left_hand_index_0_joint": (-1.832595705986023, 0.19198620319366455),
+        "left_hand_index_1_joint": (-2.094395160675049, 0.0),
+        "left_hand_middle_0_joint": (-1.832595705986023, 0.19198620319366455),
+        "left_hand_middle_1_joint": (-2.094395160675049, 0.0),
+        "left_hand_thumb_0_joint": (-1.0471975803375244, 1.0471975803375244),
+        "left_hand_thumb_1_joint": (-1.0471975803375244, 1.0471975803375244),
+        "left_hand_thumb_2_joint": (0.0, 1.7453292608261108),
+        "right_hand_index_0_joint": (-0.19198620319366455, 1.832595705986023),
+        "right_hand_index_1_joint": (0.0, 2.094395160675049),
+        "right_hand_middle_0_joint": (-0.19198620319366455, 1.832595705986023),
+        "right_hand_middle_1_joint": (0.0, 2.094395160675049),
+        "right_hand_thumb_0_joint": (-1.0471975803375244, 1.0471975803375244),
+        "right_hand_thumb_1_joint": (-1.0471975803375244, 1.0471975803375244),
+        "right_hand_thumb_2_joint": (-1.7453292608261108, 0.0),
+    }
+)
+_DEX3_DDS_INDICES = np.array(
+    [index for index, name in enumerate(TARGET_JOINT_NAMES) if name in _DEX3_DDS_COMMAND_LIMITS],
+    dtype=np.intp,
+)
+_BODY_JOINT_INDICES = np.array(
+    [index for index, name in enumerate(TARGET_JOINT_NAMES) if name not in _DEX3_DDS_COMMAND_LIMITS],
+    dtype=np.intp,
 )
 _EXACT_NEUTRAL_FIELDS: Mapping[str, np.ndarray] = MappingProxyType(
     {
@@ -167,16 +199,12 @@ def _target_kinematics() -> _TargetKinematics:
     supplemental = G1SupplementalInfo()
     if set(supplemental.joint_limits) != set(TARGET_JOINT_NAMES):
         raise RuntimeError("G1 supplemental limits do not match the exact 43-joint target model")
-    lower = np.array(
-        [supplemental.joint_limits[name][0] for name in TARGET_JOINT_NAMES],
-        dtype=np.float64,
-        order="C",
-    )
-    upper = np.array(
-        [supplemental.joint_limits[name][1] for name in TARGET_JOINT_NAMES],
-        dtype=np.float64,
-        order="C",
-    )
+    lower = np.array(model.lowerPositionLimit, dtype=np.float64, order="C", copy=True)
+    upper = np.array(model.upperPositionLimit, dtype=np.float64, order="C", copy=True)
+    for name, (lower_bound, upper_bound) in _DEX3_DDS_COMMAND_LIMITS.items():
+        index = TARGET_JOINT_NAMES.index(name)
+        lower[index] = lower_bound
+        upper[index] = upper_bound
     if lower.shape != (43,) or upper.shape != (43,) or not np.all(lower <= upper):
         raise RuntimeError("asset-free G1 URDF contains invalid target joint limits")
     lower.setflags(write=False)
@@ -191,7 +219,7 @@ def _target_kinematics() -> _TargetKinematics:
 
 
 def target_joint_limits() -> tuple[np.ndarray, np.ndarray]:
-    """Return detached supplemental-adjusted RobotModel limits in target order."""
+    """Return raw body-URDF and Dex3 DDS command limits in target field order."""
     kinematics = _target_kinematics()
     return kinematics.lower.copy(), kinematics.upper.copy()
 
@@ -322,10 +350,18 @@ def validate_target_rows(
         for key in ("observation.state", "action.wbc"):
             joint_values = row[key]
             assert isinstance(joint_values, np.ndarray)
-            if np.any(joint_values < kinematics.lower - _JOINT_LIMIT_TOLERANCE) or np.any(
-                joint_values > kinematics.upper + _JOINT_LIMIT_TOLERANCE
+            body_values = joint_values[_BODY_JOINT_INDICES]
+            if np.any(body_values < kinematics.lower[_BODY_JOINT_INDICES] - _JOINT_LIMIT_TOLERANCE) or np.any(
+                body_values > kinematics.upper[_BODY_JOINT_INDICES] + _JOINT_LIMIT_TOLERANCE
             ):
-                raise ValueError(f"row {index} {key} must remain within exact target joint limits")
+                raise ValueError(f"row {index} {key} must remain within exact target body joint limits")
+            hand_tolerance = _DEX3_MEASUREMENT_TOLERANCE if key == "observation.state" else _JOINT_LIMIT_TOLERANCE
+            hand_values = joint_values[_DEX3_DDS_INDICES]
+            if np.any(hand_values < kinematics.lower[_DEX3_DDS_INDICES] - hand_tolerance) or np.any(
+                hand_values > kinematics.upper[_DEX3_DDS_INDICES] + hand_tolerance
+            ):
+                qualifier = "measurement" if key == "observation.state" else "command"
+                raise ValueError(f"row {index} {key} must remain within exact Dex3 DDS {qualifier} limits")
         for key in (
             "observation.root_orientation",
             "observation.cpp_rotation_offset",

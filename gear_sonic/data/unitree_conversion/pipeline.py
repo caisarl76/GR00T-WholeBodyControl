@@ -391,7 +391,7 @@ def _resolve_source_task(tasks: Mapping[int, str], task_index: int) -> str:
     except KeyError as error:
         raise _EpisodePreflightError(
             "source_schema_error",
-            f"source task_index {task_index} is absent from meta/tasks.jsonl",
+            f"source task_index {task_index} is absent from the task catalog",
         ) from error
     return task
 
@@ -709,33 +709,76 @@ def _feature_video_size(feature: object, *, key: str) -> tuple[int, int]:
     if not isinstance(feature, Mapping) or feature.get("dtype") != "video":
         raise ValueError(f"source camera {key!r} must be a video feature")
     shape = feature.get("shape")
+    names = feature.get("names")
     if (
         not isinstance(shape, Sequence)
         or isinstance(shape, (str, bytes))
         or len(shape) != 3
         or any(type(value) is not int or value <= 0 for value in shape)
-        or shape[2] != 3
+        or not isinstance(names, Sequence)
+        or isinstance(names, (str, bytes))
+        or len(names) != 3
+        or any(not isinstance(value, str) for value in names)
     ):
-        raise ValueError(f"source camera {key!r} must declare positive HWC RGB shape")
-    return int(shape[1]), int(shape[0])
+        raise ValueError(f"source camera {key!r} must declare named positive RGB dimensions")
+    normalized_names = tuple("channels" if name == "channel" else name for name in names)
+    if set(normalized_names) != {"channels", "height", "width"}:
+        raise ValueError(f"source camera {key!r} must name channel, height, and width dimensions")
+    dimensions = dict(zip(normalized_names, shape, strict=True))
+    if dimensions["channels"] != 3:
+        raise ValueError(f"source camera {key!r} must declare exactly three RGB channels")
+    return int(dimensions["width"]), int(dimensions["height"])
 
 
 def _load_task_catalog(dataset_root: Path) -> Mapping[int, str]:
-    path = dataset_root / "meta" / "tasks.jsonl"
-    tasks: dict[int, str] = {}
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as error:
-        raise ValueError("source meta/tasks.jsonl must be readable UTF-8") from error
-    if not lines:
-        raise ValueError("source meta/tasks.jsonl must not be empty")
-    for line_number, line in enumerate(lines, start=1):
+    jsonl_path = dataset_root / "meta" / "tasks.jsonl"
+    parquet_path = dataset_root / "meta" / "tasks.parquet"
+    existing = tuple(path for path in (jsonl_path, parquet_path) if path.is_file())
+    if len(existing) != 1:
+        raise ValueError("source metadata must contain exactly one supported task catalog")
+
+    records: list[dict[str, object]] = []
+    if existing[0] == jsonl_path:
         try:
-            record = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"source tasks line {line_number} must be valid JSON") from error
-        if not isinstance(record, dict) or set(record) != {"task_index", "task"}:
-            raise ValueError("source task records must contain exactly task_index and task")
+            lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as error:
+            raise ValueError("source meta/tasks.jsonl must be readable UTF-8") from error
+        if not lines:
+            raise ValueError("source task catalog must not be empty")
+        for line_number, line in enumerate(lines, start=1):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"source tasks line {line_number} must be valid JSON") from error
+            if not isinstance(record, dict) or set(record) != {"task_index", "task"}:
+                raise ValueError("source task records must contain exactly task_index and task")
+            records.append(record)
+    else:
+        import pyarrow.parquet as pq
+
+        try:
+            table = pq.read_table(parquet_path)
+        except Exception as error:
+            raise ValueError("source meta/tasks.parquet must be readable") from error
+        column_names = set(table.column_names)
+        if column_names == {"task_index", "task"}:
+            task_column = "task"
+        elif column_names == {"task_index", "__index_level_0__"}:
+            task_column = "__index_level_0__"
+        else:
+            raise ValueError("source tasks.parquet has an unsupported exact schema")
+        records = [
+            {
+                "task_index": table["task_index"][row_index].as_py(),
+                "task": table[task_column][row_index].as_py(),
+            }
+            for row_index in range(table.num_rows)
+        ]
+        if not records:
+            raise ValueError("source task catalog must not be empty")
+
+    tasks: dict[int, str] = {}
+    for record in records:
         index = record["task_index"]
         text = record["task"]
         if type(index) is not int or index < 0 or not isinstance(text, str) or not text.strip():
@@ -748,7 +791,12 @@ def _load_task_catalog(dataset_root: Path) -> Mapping[int, str]:
     return MappingProxyType(dict(sorted(tasks.items())))
 
 
-def _selected_source_paths(dataset: object, episode_id: int) -> tuple[Path, ...]:
+def _selected_source_paths(
+    dataset: object,
+    episode_id: int,
+    *,
+    include_videos: bool = True,
+) -> tuple[Path, ...]:
     from gear_sonic.data.unitree_conversion.lerobot_v3_source import (
         _read_info,
         _selected_episode_row,
@@ -759,15 +807,22 @@ def _selected_source_paths(dataset: object, episode_id: int) -> tuple[Path, ...]
     info = _read_info(root)
     row = _selected_episode_row(root, episode_id=episode_id, video_keys=info.video_keys)
     relative = _selected_paths(row, info)
+    if not include_videos:
+        relative = relative[:1]
     paths = tuple((root / path).resolve(strict=True) for path in relative)
     if any(root.resolve() not in path.parents for path in paths):
         raise ValueError("selected source artifact escaped the pinned dataset root")
     return paths
 
 
-def _source_hashes(dataset: object, episode_id: int) -> Mapping[str, str]:
+def _source_hashes(
+    dataset: object,
+    episode_id: int,
+    *,
+    include_videos: bool = True,
+) -> Mapping[str, str]:
     root = Path(dataset.root).resolve()
-    selected = _selected_source_paths(dataset, episode_id)
+    selected = _selected_source_paths(dataset, episode_id, include_videos=include_videos)
     metadata_root = root / "meta"
     metadata = tuple(path for path in sorted(metadata_root.rglob("*")) if path.is_file())
     if not metadata:
@@ -846,7 +901,7 @@ def _validate_source_metadata(
                 episode_id,
                 cache_base=cache_base,
                 schema=schema,
-                download_videos=True,
+                download_videos=kind == "dex3",
             )
             phase = "identity"
             if dataset.revision != source.revision or dataset.meta.revision != source.revision:
@@ -872,7 +927,11 @@ def _validate_source_metadata(
 
             datasets[episode_id] = dataset
             phase = "hash"
-            source_hashes[episode_id] = _source_hashes(dataset, episode_id)
+            source_hashes[episode_id] = _source_hashes(
+                dataset,
+                episode_id,
+                include_videos=kind == "dex3",
+            )
         except Exception as error:
             if isinstance(error, _EpisodePreflightError):
                 failures[episode_id] = ClassifiedFailure(error.error_class, str(error))
@@ -904,7 +963,7 @@ def _preflight_repository(
     cache_dir: Path | None,
     kind: str,
 ) -> RepositoryPreflight:
-    del cache_dir, kind
+    del cache_dir
     from gear_sonic.data.unitree_conversion.video_timeline import (
         CameraStreamReport,
         EpisodeCameraReport,
@@ -916,6 +975,17 @@ def _preflight_repository(
     if not isinstance(metadata_value, _SourceMetadataContext):
         raise TypeError("source metadata validation must return _SourceMetadataContext")
     failures = dict(existing_failures)
+    if kind == "inspire":
+        return RepositoryPreflight(
+            context=_RepositoryPreflight(
+                metadata=metadata_value,
+                timelines=MappingProxyType({}),
+                camera_schema=None,
+            ),
+            episode_failures=failures,
+        )
+    if kind != "dex3":
+        raise ValueError(f"unsupported source kind: {kind!r}")
     timelines: dict[int, Mapping[str, object]] = {}
     reports: list[EpisodeCameraReport] = []
 
@@ -1399,7 +1469,7 @@ def _diagnose_inspire(
     dataset = preflight.datasets[episode_id]
     _validate_metadata(source, dataset.meta)
     expected_hashes = dict(preflight.source_hashes[episode_id])
-    if dict(_source_hashes(dataset, episode_id)) != expected_hashes:
+    if dict(_source_hashes(dataset, episode_id, include_videos=False)) != expected_hashes:
         raise _EpisodePreflightError(
             "provenance_error",
             "Inspire source files changed after preflight",
@@ -1458,7 +1528,7 @@ def _diagnose_inspire(
         primary_camera=source.primary_camera,
         camera_map=source.camera_map,
     )
-    if dict(_source_hashes(dataset, episode_id)) != expected_hashes:
+    if dict(_source_hashes(dataset, episode_id, include_videos=False)) != expected_hashes:
         raise _EpisodePreflightError(
             "provenance_error",
             "Inspire source files changed during diagnostics",

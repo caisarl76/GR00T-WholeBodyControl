@@ -327,7 +327,7 @@ def test_asset_free_target_kinematics_exposes_exact_43_joint_limits_and_fk() -> 
     assert np.linalg.norm(eef[10:14]) == pytest.approx(1.0)
 
 
-def test_target_limits_exactly_match_supplemental_adjusted_robot_model_order() -> None:
+def test_target_limits_use_robot_model_body_and_asymmetric_raw_dex3_domains() -> None:
     supplemental = G1SupplementalInfo()
     expected_lower = np.array(
         [supplemental.joint_limits[name][0] for name in staging_module.TARGET_JOINT_NAMES],
@@ -337,27 +337,86 @@ def test_target_limits_exactly_match_supplemental_adjusted_robot_model_order() -
         [supplemental.joint_limits[name][1] for name in staging_module.TARGET_JOINT_NAMES],
         dtype=np.float64,
     )
+    expected_lower[staging_module.TARGET_JOINT_NAMES.index("left_shoulder_roll_joint")] = -1.5882
+    expected_upper[staging_module.TARGET_JOINT_NAMES.index("right_shoulder_roll_joint")] = 1.5882
+    expected_hand_limits = {
+        "left_hand_index_0_joint": (-1.832595705986023, 0.19198620319366455),
+        "left_hand_index_1_joint": (-2.094395160675049, 0.0),
+        "left_hand_middle_0_joint": (-1.832595705986023, 0.19198620319366455),
+        "left_hand_middle_1_joint": (-2.094395160675049, 0.0),
+        "left_hand_thumb_0_joint": (-1.0471975803375244, 1.0471975803375244),
+        "left_hand_thumb_1_joint": (-1.0471975803375244, 1.0471975803375244),
+        "left_hand_thumb_2_joint": (0.0, 1.7453292608261108),
+        "right_hand_index_0_joint": (-0.19198620319366455, 1.832595705986023),
+        "right_hand_index_1_joint": (0.0, 2.094395160675049),
+        "right_hand_middle_0_joint": (-0.19198620319366455, 1.832595705986023),
+        "right_hand_middle_1_joint": (0.0, 2.094395160675049),
+        "right_hand_thumb_0_joint": (-1.0471975803375244, 1.0471975803375244),
+        "right_hand_thumb_1_joint": (-1.0471975803375244, 1.0471975803375244),
+        "right_hand_thumb_2_joint": (-1.7453292608261108, 0.0),
+    }
+    for name, (lower_bound, upper_bound) in expected_hand_limits.items():
+        index = staging_module.TARGET_JOINT_NAMES.index(name)
+        expected_lower[index] = lower_bound
+        expected_upper[index] = upper_bound
 
     lower, upper = target_joint_limits()
 
     assert np.array_equal(lower, expected_lower)
     assert np.array_equal(upper, expected_upper)
-    assert lower[16] == np.float64(0.19)
-    assert upper[30] == np.float64(-0.19)
+    assert lower[16] == np.float64(-1.5882)
+    assert upper[30] == np.float64(1.5882)
+
+
+def test_stage_accepts_asymmetric_raw_dex3_values_outside_symmetric_model_limits(
+    tmp_path: Path,
+) -> None:
+    rows = [_row(0, "task"), _row(1, "task")]
+    right_index_1 = staging_module.TARGET_JOINT_NAMES.index("right_hand_index_1_joint")
+    right_thumb_2 = staging_module.TARGET_JOINT_NAMES.index("right_hand_thumb_2_joint")
+    left_index_0 = staging_module.TARGET_JOINT_NAMES.index("left_hand_index_0_joint")
+    for row in rows:
+        row["observation.state"] = row["observation.state"].copy()
+        row["action.wbc"] = row["action.wbc"].copy()
+        row["observation.state"][right_index_1] = 2.085
+        row["observation.state"][right_thumb_2] = -1.56
+        row["observation.state"][left_index_0] = 0.19
+        row["action.wbc"][right_index_1] = np.float64(2.094395160675049)
+        row["action.wbc"][right_thumb_2] = -1.56
+        row["action.wbc"][left_index_0] = np.float64(0.19198620319366455)
+        row["observation.eef_state"] = regenerate_eef_state(row["observation.state"])
+
+    payload = StagePayload(rows=tuple(rows), videos=_payload(tmp_path).videos)
+
+    assert len(payload.rows) == 2
+
+
+def test_stage_allows_small_dex3_measurement_overshoot_but_not_commands(tmp_path: Path) -> None:
+    rows = [_row(0, "task"), _row(1, "task")]
+    left_thumb_1 = staging_module.TARGET_JOINT_NAMES.index("left_hand_thumb_1_joint")
+    rows[1]["observation.state"] = rows[1]["observation.state"].copy()
+    rows[1]["observation.state"][left_thumb_1] = 1.0506
+    rows[1]["observation.eef_state"] = regenerate_eef_state(rows[1]["observation.state"])
+    StagePayload(rows=tuple(rows), videos=_payload(tmp_path).videos)
+
+    rows[1]["action.wbc"] = rows[1]["action.wbc"].copy()
+    rows[1]["action.wbc"][left_thumb_1] = 1.0506
+    with pytest.raises(ValueError, match="action.wbc.*Dex3 DDS command limits"):
+        StagePayload(rows=tuple(rows), videos=_payload(tmp_path).videos)
 
 
 @pytest.mark.parametrize("field", ("observation.state", "action.wbc"))
-def test_stage_rejects_value_allowed_by_raw_urdf_but_not_effective_robot_model_limits(
-    tmp_path: Path, field: str
-) -> None:
+def test_stage_accepts_raw_urdf_shoulder_roll_values_used_by_deployed_feedback(tmp_path: Path, field: str) -> None:
     rows = [_row(0, "task"), _row(1, "task")]
     rows[1][field] = rows[1][field].copy()
     rows[1][field][16] = 0.0
+    rows[1][field][30] = 0.0
     if field == "observation.state":
         rows[1]["observation.eef_state"] = regenerate_eef_state(rows[1][field])
 
-    with pytest.raises(ValueError, match=f"{re.escape(field)}.*joint limits"):
-        StagePayload(rows=tuple(rows), videos=_payload(tmp_path).videos)
+    payload = StagePayload(rows=tuple(rows), videos=_payload(tmp_path).videos)
+
+    assert len(payload.rows) == 2
 
 
 @pytest.mark.parametrize("field", ("observation.state", "action.wbc"))

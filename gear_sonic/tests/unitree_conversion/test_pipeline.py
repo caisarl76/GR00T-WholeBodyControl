@@ -549,6 +549,146 @@ def test_inspire_smoke_never_constructs_encoder(smoke_lock, tmp_path: Path) -> N
     assert fake.encoder_constructions == 0
 
 
+def test_inspire_preflight_does_not_download_or_hash_unread_video_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+    smoke_lock,
+    tmp_path: Path,
+) -> None:
+    from gear_sonic.data.unitree_conversion import lerobot_v3_source, pipeline as pipeline_module
+
+    source = smoke_lock.inspire
+    calls: list[tuple[str, object]] = []
+    dataset = SimpleNamespace(
+        root=tmp_path,
+        revision=source.revision,
+        meta=SimpleNamespace(
+            revision=source.revision,
+            total_episodes=source.episode_count,
+            fps=30,
+        ),
+    )
+
+    def load(*args: object, **kwargs: object) -> object:
+        del args
+        calls.append(("download_videos", kwargs["download_videos"]))
+        return dataset
+
+    def source_hashes(*args: object, **kwargs: object) -> dict[str, str]:
+        del args
+        calls.append(("include_videos", kwargs["include_videos"]))
+        return {"data/chunk-000/file-000.parquet": "1" * 64}
+
+    monkeypatch.setattr(lerobot_v3_source, "load_pinned_v3_episode", load)
+    monkeypatch.setattr(pipeline_module, "_load_task_catalog", lambda root: {0: "pick up pillow"})
+    monkeypatch.setattr(pipeline_module, "_source_hashes", source_hashes)
+
+    result = pipeline_module._validate_source_metadata(
+        source,
+        (0,),
+        tmp_path,
+        "inspire",
+    )
+
+    assert result.episode_failures == {}
+    assert calls == [("download_videos", False), ("include_videos", False)]
+
+
+def test_source_task_catalog_reads_lerobot_v3_parquet_index_layout(tmp_path: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from gear_sonic.data.unitree_conversion import pipeline as pipeline_module
+
+    metadata = tmp_path / "meta"
+    metadata.mkdir()
+    pq.write_table(
+        pa.table(
+            {
+                "task_index": pa.array([0, 1], type=pa.int64()),
+                "__index_level_0__": pa.array(["pick up pillow", "place pillow"], type=pa.string()),
+            }
+        ),
+        metadata / "tasks.parquet",
+    )
+
+    assert pipeline_module._load_task_catalog(tmp_path) == {
+        0: "pick up pillow",
+        1: "place pillow",
+    }
+
+
+def test_source_video_size_uses_named_chw_dimensions_from_public_v3_metadata() -> None:
+    from gear_sonic.data.unitree_conversion import pipeline as pipeline_module
+
+    feature = {
+        "dtype": "video",
+        "shape": [3, 480, 640],
+        "names": ["channels", "height", "width"],
+    }
+
+    assert pipeline_module._feature_video_size(feature, key="camera") == (640, 480)
+
+
+def test_data_only_source_paths_do_not_resolve_absent_video_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from pathlib import PurePosixPath
+
+    from gear_sonic.data.unitree_conversion import lerobot_v3_source, pipeline as pipeline_module
+
+    data = tmp_path / "data/chunk-000/file-000.parquet"
+    data.parent.mkdir(parents=True)
+    data.write_bytes(b"selected data")
+    monkeypatch.setattr(
+        lerobot_v3_source,
+        "_read_info",
+        lambda root: SimpleNamespace(video_keys=("observation.images.cam_0",)),
+    )
+    monkeypatch.setattr(lerobot_v3_source, "_selected_episode_row", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        lerobot_v3_source,
+        "_selected_paths",
+        lambda row, info: (
+            PurePosixPath("data/chunk-000/file-000.parquet"),
+            PurePosixPath("videos/observation.images.cam_0/chunk-000/file-000.mp4"),
+        ),
+    )
+
+    assert pipeline_module._selected_source_paths(
+        SimpleNamespace(root=tmp_path),
+        0,
+        include_videos=False,
+    ) == (data.resolve(),)
+
+
+def test_inspire_repository_preflight_skips_camera_decode_for_diagnostic_only(
+    smoke_lock,
+) -> None:
+    from gear_sonic.data.unitree_conversion import pipeline as pipeline_module
+
+    source = smoke_lock.inspire
+    dataset = SimpleNamespace(video_segments={})
+    metadata = pipeline_module._SourceMetadataContext(
+        source=source,
+        datasets={0: dataset},
+        tasks={0: "pick up pillow"},
+        source_hashes={0: {"data/chunk-000/file-000.parquet": "1" * 64}},
+    )
+
+    result = pipeline_module._preflight_repository(
+        source,
+        (0,),
+        metadata,
+        None,
+        "inspire",
+    )
+
+    assert result.episode_failures == {}
+    assert result.context.timelines == {}
+    assert result.context.camera_schema is None
+
+
 def test_diagnostic_stage_is_immutable_and_provenance_bound(tmp_path: Path) -> None:
     identity = DiagnosticIdentity(
         source_repo_id="unitreerobotics/inspire",
