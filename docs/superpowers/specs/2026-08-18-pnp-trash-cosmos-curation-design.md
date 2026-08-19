@@ -193,6 +193,19 @@ tests freeze this behavior so the Next.js server never buffers parquet or
 video bodies. Only authenticated mutable curation calls use the same-origin
 Next.js token-injecting route.
 
+Hugging Face OAuth authentication is destination-aware. Replace the
+zero-argument `authHeaders()` helper with `authHeaders(destination)`, and pass
+the concrete URL from metadata, version, and `hyparquet` range fetches. It may
+return `Authorization: Bearer <HF token>` only when `new URL(destination)` has
+protocol `https:` and hostname exactly `huggingface.co`; relative, malformed,
+HTTP, loopback, and every other destination return `{}`. This comparison occurs
+after URL parsing, so hostname suffixes and user-info tricks do not match.
+`proxyHfUrl` uses the same shared destination predicate.
+Local assets and curation calls never receive the HF credential. The local
+read-only FastAPI asset route rejects any request carrying `Authorization`
+with `400` without logging the header value, making a regression fail closed.
+The separate curation bearer token remains server-side in the Next.js proxy.
+
 For every regular asset, a request without `Range` returns `200`, exact
 `Content-Length`, `Accept-Ranges: bytes`, a MIME type, and an ETag derived from
 that asset's SHA-256 entry in the immutable source manifest. A valid single
@@ -223,7 +236,9 @@ outputs/pnp_trash_curation/
 ├── contact_sheets/episode_<source-index>.png
 └── exports/<export-id>/
     ├── structural-report.json
+    ├── gr00t-stats-report.json
     ├── gr00t-loader-report.json
+    ├── final-consistency-report.json
     └── source-files.sha256
 ```
 
@@ -244,9 +259,10 @@ Cosmos artifacts use explicit JSON schemas rather than ad hoc dictionaries:
   body with the base64 payload replaced by `{ "redacted": "base64",
   "sha256": "...", "bytes": N }`.
 - `parsed.json` has `schema_version: 1`, `contract_version`, the schema-valid
-  `model_response` object, exactly six integer `snapped_transition_frames`, an
-  array of string `validation_warnings`, and `raw_response_sha256` pointing to
-  the response text that passed validation.
+  `model_response` object, exactly six integer-or-null
+  `snapped_transition_frames` corresponding to steps 2 through 7, an array of
+  string `validation_warnings`, and `raw_response_sha256` pointing to the
+  response text that passed validation.
 - `response.txt` is the exact UTF-8 bytes of the initial
   `choices[0].message.content` when one exists; `repair-response.txt` is the
   same for the repair call. HTTP envelope metadata is stored on the attempt
@@ -266,15 +282,15 @@ The core tables are:
 - `datasets`: alias, canonical source path, source SHA-256 manifest hash,
   prompt-template version/hash, and creation/update timestamps;
 - `episodes`: source index, length, review state, decision fields, six final
-  transition frames, monotonically increasing revision, approval revision,
-  reviewer, approval time, and update time;
+  nullable transition frames, monotonically increasing revision, approval
+  revision, reviewer, approval time, and update time;
 - `cosmos_jobs`: immutable configuration snapshot, lifecycle state, counts,
   cancel flag, owner, lease expiry, and timestamps;
 - `cosmos_attempts`: job, source episode, attempt number, lifecycle state,
   lease owner/expiry, request/response artifact references, error class, and
   timestamps;
 - `cosmos_proposals`: attempt, validated seven-segment response, six snapped
-  transition frames, warnings, and active/superseded status;
+  integer-or-null transition frames, warnings, and active/superseded status;
 - `artifacts`: relative path, media type, byte size, SHA-256, and creation
   time; and
 - `audit_events`: append-only actor, operation, episode/job/export identifier,
@@ -341,7 +357,7 @@ export. The snapshot hash is visible in provenance.
 Cosmos3-Nano is already hosted on H100 through the vLLM OpenAI-compatible
 `POST /v1/chat/completions` endpoint. Server lifecycle is external to this
 project. The worker follows
-[vLLM's documented pre-extracted-frame transport](https://github.com/vllm-project/vllm/blob/main/docs/features/multimodal_inputs.md#pre-extracted-frame-sequences-with-media_io_kwargs)
+[vLLM's documented pre-extracted-frame transport](https://docs.vllm.ai/en/latest/features/multimodal_inputs/#pre-extracted-frame-sequences-with-media_io_kwargs)
 so the workstation and H100 require no shared filesystem.
 
 ### Sampling and cross-host transport
@@ -464,8 +480,10 @@ Identify these phases exactly once and in this order:
 6 drop_object_into_black_trash_bin: release the object into the bin.
 7 stand_straight: return to and hold a standing-straight pose.
 Use visible evidence only. Do not infer a completed phase when it is absent or ambiguous.
-Set episode_complete true only when all seven phases complete successfully in order; otherwise list missing step numbers and explain uncertainty.
-Segments must cover the episode in order. Adjacent segment boundaries may differ by at most 0.5 seconds.
+For each phase set status to completed, partial, or not_observed. Use completed only when the described subtask succeeds. Use partial when the phase is attempted but does not successfully complete, including interrupted or failed attempts. Use not_observed when there is no visible evidence for an attempt.
+For completed or partial phases provide visible start/end times, confidence, and evidence. For not_observed phases set start_s, end_s, confidence, and evidence to null.
+Set missing_steps to exactly the step numbers whose status is not completed. Set episode_complete true if and only if missing_steps is empty.
+Only a complete episode must have segments covering the episode in order with adjacent boundaries differing by at most 0.5 seconds. In an incomplete episode, do not invent timing to fill gaps.
 You may first emit one <think>...</think> block. After it, emit exactly one JSON object matching this schema, with no Markdown fence or trailing prose:
 ```
 
@@ -480,19 +498,20 @@ string at `choices[0].message.content`. `choices[0].finish_reason` must be
 failure. The worker records the response `id`, `model`, `created`, `usage`, and
 finish reason when present, but only `message.content` enters the parser.
 
-The contract identifier is `pnp-trash-cosmos-v1`. The assistant may emit one
+The contract identifier is `pnp-trash-cosmos-v2`. The assistant may emit one
 leading `<think>...</think>` block. After removing
 that block, the remaining text must be exactly one JSON object with no fence or
 trailing prose:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "episode_complete": true,
   "segments": [
     {
       "step": 1,
       "phase": "approach_brown_table",
+      "status": "completed",
       "start_s": 0.0,
       "end_s": 8.6,
       "caption": "approach the brown table",
@@ -502,6 +521,7 @@ trailing prose:
     {
       "step": 2,
       "phase": "pick_up_object",
+      "status": "completed",
       "start_s": 8.6,
       "end_s": 15.1,
       "caption": "pick up the object",
@@ -511,6 +531,7 @@ trailing prose:
     {
       "step": 3,
       "phase": "turn_to_find_black_trash_bin",
+      "status": "completed",
       "start_s": 15.1,
       "end_s": 18.4,
       "caption": "turn to find the black trash bin",
@@ -520,6 +541,7 @@ trailing prose:
     {
       "step": 4,
       "phase": "approach_black_trash_bin",
+      "status": "completed",
       "start_s": 18.4,
       "end_s": 28.22,
       "caption": "approach the black trash bin",
@@ -529,6 +551,7 @@ trailing prose:
     {
       "step": 5,
       "phase": "lean_down_to_black_trash_bin",
+      "status": "completed",
       "start_s": 28.22,
       "end_s": 32.88,
       "caption": "lean down to the black trash bin",
@@ -538,6 +561,7 @@ trailing prose:
     {
       "step": 6,
       "phase": "drop_object_into_black_trash_bin",
+      "status": "completed",
       "start_s": 32.88,
       "end_s": 35.72,
       "caption": "drop the object into the black trash bin",
@@ -547,6 +571,7 @@ trailing prose:
     {
       "step": 7,
       "phase": "stand_straight",
+      "status": "completed",
       "start_s": 35.72,
       "end_s": 41.2,
       "caption": "go to a standing straight pose",
@@ -559,13 +584,34 @@ trailing prose:
 }
 ```
 
+An incomplete episode uses the same seven ordered slots without invented
+timing. For example, if leaning starts but the drop and recovery never occur:
+
+```json
+{
+  "schema_version": 2,
+  "episode_complete": false,
+  "segments": [
+    { "step": 1, "phase": "approach_brown_table", "status": "completed", "start_s": 0.0, "end_s": 8.6, "caption": "approach the brown table", "confidence": 0.93, "evidence": "the robot stops at the table" },
+    { "step": 2, "phase": "pick_up_object", "status": "completed", "start_s": 8.6, "end_s": 15.1, "caption": "pick up the object", "confidence": 0.91, "evidence": "the object is lifted" },
+    { "step": 3, "phase": "turn_to_find_black_trash_bin", "status": "completed", "start_s": 15.1, "end_s": 18.4, "caption": "turn to find the black trash bin", "confidence": 0.88, "evidence": "the bin becomes visible" },
+    { "step": 4, "phase": "approach_black_trash_bin", "status": "completed", "start_s": 18.4, "end_s": 28.2, "caption": "approach the black trash bin", "confidence": 0.94, "evidence": "the robot reaches the bin" },
+    { "step": 5, "phase": "lean_down_to_black_trash_bin", "status": "partial", "start_s": 28.2, "end_s": 31.0, "caption": "lean down to the black trash bin", "confidence": 0.62, "evidence": "the camera lowers but the motion is interrupted" },
+    { "step": 6, "phase": "drop_object_into_black_trash_bin", "status": "not_observed", "start_s": null, "end_s": null, "caption": "drop the object into the black trash bin", "confidence": null, "evidence": null },
+    { "step": 7, "phase": "stand_straight", "status": "not_observed", "start_s": null, "end_s": null, "caption": "go to a standing straight pose", "confidence": null, "evidence": null }
+  ],
+  "missing_steps": [5, 6, 7],
+  "uncertainties": ["the episode ends during the lean"]
+}
+```
+
 The parser validates the object against this JSON Schema 2020-12 definition;
 dynamic duration and adjacency constraints are applied immediately afterward:
 
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "pnp-trash-cosmos-v1",
+  "$id": "pnp-trash-cosmos-v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -576,7 +622,7 @@ dynamic duration and adjacency constraints are applied immediately afterward:
     "uncertainties"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "episode_complete": { "type": "boolean" },
     "segments": {
       "type": "array",
@@ -665,6 +711,7 @@ dynamic duration and adjacency constraints are applied immediately afterward:
     },
     "missing_steps": {
       "type": "array",
+      "maxItems": 7,
       "uniqueItems": true,
       "items": { "type": "integer", "minimum": 1, "maximum": 7 }
     },
@@ -681,6 +728,7 @@ dynamic duration and adjacency constraints are applied immediately afterward:
       "required": [
         "step",
         "phase",
+        "status",
         "start_s",
         "end_s",
         "caption",
@@ -690,12 +738,37 @@ dynamic duration and adjacency constraints are applied immediately afterward:
       "properties": {
         "step": { "type": "integer" },
         "phase": { "type": "string" },
-        "start_s": { "type": "number", "minimum": 0 },
-        "end_s": { "type": "number", "exclusiveMinimum": 0 },
+        "status": { "enum": ["completed", "partial", "not_observed"] },
+        "start_s": { "type": ["number", "null"] },
+        "end_s": { "type": ["number", "null"] },
         "caption": { "type": "string", "minLength": 1, "maxLength": 240 },
-        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-        "evidence": { "type": "string", "minLength": 1, "maxLength": 240 }
-      }
+        "confidence": { "type": ["number", "null"] },
+        "evidence": { "type": ["string", "null"] }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "not_observed" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "start_s": { "type": "null" },
+              "end_s": { "type": "null" },
+              "confidence": { "type": "null" },
+              "evidence": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "start_s": { "type": "number", "minimum": 0 },
+              "end_s": { "type": "number", "exclusiveMinimum": 0 },
+              "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+              "evidence": { "type": "string", "minLength": 1, "maxLength": 240 }
+            }
+          }
+        }
+      ]
     }
   }
 }
@@ -712,18 +785,29 @@ must equal the corresponding enum:
 6. `drop_object_into_black_trash_bin`
 7. `stand_straight`
 
-Times are finite seconds relative to the first video frame. They satisfy
-`0 <= start_s < end_s <= duration`, step 1 starts at 0 within 0.25 seconds,
-step 7 ends at duration within 0.5 seconds, and adjacent end/start values differ
-by at most 0.5 seconds. Confidence is finite in `[0,1]`; caption and evidence
-are nonempty UTF-8 strings of at most 240 characters. `missing_steps` contains
-unique integers 1 through 7; `uncertainties` contains at most 16 strings of at
-most 240 characters. `episode_complete=true` requires empty `missing_steps`.
+For a `completed` or `partial` slot, times are finite seconds relative to the
+first video frame and satisfy `0 <= start_s < end_s <= duration`; confidence is
+finite in `[0,1]`, and evidence is nonempty UTF-8 of at most 240 characters.
+For `not_observed`, all four conditional fields are JSON `null`. Caption is
+always a nonempty UTF-8 string of at most 240 characters.
 
-Only steps 2 through 7 `start_s` values become proposed transitions. Each is
-snapped to the nearest parquet timestamp with lower-frame tie breaking. Model
-end times, captions, confidence, and evidence remain audit/review aids and do
-not enter the training dataset.
+Let `M` be the ascending step numbers whose status is `partial` or
+`not_observed`. Dynamic validation requires `missing_steps == M` exactly and
+`episode_complete == (M is empty)` in both directions. An incomplete response
+must contain at least one uncertainty. Its non-null timed slots must remain in
+step order with strictly increasing starts, but they need not cover gaps. A
+complete response additionally requires step 1 to start at 0 within 0.25
+seconds, step 7 to end at duration within 0.5 seconds, and every adjacent
+end/start pair to differ by at most 0.5 seconds.
+
+Steps 2 through 7 with non-null `start_s` values are snapped to the nearest
+parquet timestamp with lower-frame tie breaking. The proposal stores six
+positions corresponding to steps 2 through 7, each an integer frame or `null`.
+Only a complete proposal has six integer transitions and may be applied as a
+complete draft; an incomplete proposal can populate its available fields or
+support `approved_reject`, but can never satisfy `approved_keep`. Model end
+times, captions, status, confidence, and evidence remain audit/review aids and
+do not enter the training dataset.
 
 A syntactically invalid or schema-invalid successful response receives one
 text-only repair request containing the invalid response and validation
@@ -734,7 +818,7 @@ three model calls: two bounded initial transport attempts and one repair.
 
 The repair request uses the same model, `temperature: 0`, `seed: 0`, and wire
 response rules, but contains no video or `media_io_kwargs`. Its sole user text
-is `Return only one corrected JSON object matching pnp-trash-cosmos-v1.\n`
+is `Return only one corrected JSON object matching pnp-trash-cosmos-v2.\n`
 followed by a canonical minified JSON object with
 `validation_errors: string[]` and `invalid_response: string`. The invalid
 response is capped at 64 KiB before building the request; a larger value skips
@@ -747,6 +831,46 @@ Batch state is `queued`, `running`, `cancel_requested`, `completed`,
 `queued`, `leased`, `requesting`, `succeeded`, `manual_only`, `retryable`, or
 `cancelled`.
 
+Execution uses one explicit, separate local CLI process; the FastAPI server
+never starts a background thread, task, or subprocess. `POST
+/api/curation/batches` only persists and returns a queued job plus its ID. The
+operator starts that job with exactly:
+
+```bash
+cd /home/jihun/work/lerobot-dataset-visualizer
+backend/.venv/bin/python backend/curation_worker.py \
+  --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
+  run --job-id <job-uuid>
+```
+
+The job snapshot already contains the dataset root, Cosmos base URL/model,
+sampling contract, and API-key environment-variable name; the CLI reads the
+secret value from that environment and accepts no secret argument. `run`
+requires a `queued` job, atomically moves it to `running`, acquires the
+job-level owner/lease, processes attempts until a terminal job state, and then
+exits. A second `run` never attaches to an existing job.
+
+After a process or workstation crash, resume the same persisted job with:
+
+```bash
+cd /home/jihun/work/lerobot-dataset-visualizer
+backend/.venv/bin/python backend/curation_worker.py \
+  --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
+  resume --job-id <job-uuid>
+```
+
+`resume` accepts only `running` or `cancel_requested` and acquires the expired
+job lease without creating new attempt rows. For `running`, it requeues expired
+attempt leases and continues. For `cancel_requested`, it makes no model calls,
+marks every remaining nonterminal attempt `cancelled`, and commits the job as
+`cancelled`. It refuses to run while either the job or an attempt has an
+unexpired lease, so it cannot overlap a live worker. `SIGINT`/`SIGTERM` stop
+claiming new work, finish or time-bound the current request, persist it, and
+exit with the job still resumable. Exit status is `0` for a terminal nonfailed
+job, `1` for job `failed`, `2` for arguments/configuration/state errors, `3`
+for a live-lease conflict, and `130` for a handled interrupt. Retry endpoints
+return a new child-job ID, which is launched with the same `run` command.
+
 - **Start:** `POST /api/curation/batches` validates endpoint/model capability,
   freezes the source fingerprint, prompt/sampling/limit configuration, and the
   ordered source-episode set, and creates attempts in one transaction. A
@@ -755,8 +879,9 @@ Batch state is `queued`, `running`, `cancel_requested`, `completed`,
   duplicate work.
 - **Claim and lock:** a worker uses `BEGIN IMMEDIATE` to claim the next queued
   or retryable attempt, assigns a UUID owner and 180-second lease, then commits
-  before doing media or network work. It heartbeats every 15 seconds. One
-  source episode can have only one nonsuperseded active attempt.
+  before doing media or network work. Every 15 seconds the same owner renews
+  both job and active-attempt leases. One source episode can have only one
+  nonsuperseded active attempt.
 - **Status:** `GET /api/curation/batches/{id}` returns immutable configuration,
   lifecycle state, counts by attempt result, active lease, current episode,
   timestamps, and the latest bounded error summaries. The UI polls this route.
@@ -768,16 +893,25 @@ Batch state is `queued`, `running`, `cancel_requested`, `completed`,
   change.
 - **Cancel:** cancellation sets `cancel_requested`. No new attempt is claimed;
   an in-flight request is allowed to reach its 120-second bound and persist its
-  result, after which the job becomes `cancelled`.
+  result, after which all remaining queued/retryable attempts become
+  `cancelled` and the job becomes `cancelled` in one transaction.
 - **Crash recovery:** at startup and before each claim, expired `leased` or
   `requesting` attempts become `retryable` with a crash-recovery audit event.
-  A `running` job with unfinished attempts returns to work when a worker starts
-  with `--resume`; otherwise its status remains visible and consistent.
+  A `running` job with unfinished attempts returns to work only through the
+  exact `resume` command above; otherwise its status remains visible and
+  consistent.
 - **Completion:** all terminal attempts yield `completed` when every episode
   targeted by that job has a valid proposal, or `completed_with_failures` when
   any target is `manual_only`. The status response also reports dataset-wide
   active-proposal coverage across parent and retry jobs. An unrecoverable
   database/configuration failure alone sets the job to `failed`.
+
+CLI integration tests run the exact entrypoint against a temporary workspace
+and fake Cosmos server. They prove that the API leaves a job queued without
+spawning work, `run` owns it to completion, a killed worker becomes resumable
+only after lease expiry, an unexpired lease returns status 3, cancellation
+stops further claims, and a retry child uses a distinct invocation and attempt
+rows.
 
 ## Deterministic Physical and Visual Cross-Checks
 
@@ -867,7 +1001,7 @@ need a schema-version increment:
   "cosmos": {
     "model": "<configured model id>",
     "endpoint_identity": "<non-secret configured label>",
-    "contract_version": "pnp-trash-cosmos-v1",
+    "contract_version": "pnp-trash-cosmos-v2",
     "sampling": { "target_fps": 2, "resize_max_long_edge": 640, "jpeg_quality": 85 },
     "limits": { "max_duration_s": 120, "max_frames": 240, "max_payload_bytes": 67108864 },
     "job_ids": ["<uuid>"],
@@ -920,10 +1054,14 @@ serialization.
 
 Raw Cosmos responses and reasoning stay in the curation workspace. They are
 referenced by hash but are not copied into the training dataset. Non-sensitive
-reports and contact sheets are copied as independent regular files into
-`meta/curation_artifacts/`. The output also contains
+structural, GR00T-stats, loader reports and selected contact sheets are copied
+as independent regular files into `meta/curation_artifacts/` before provenance
+is written. The final consistency report remains workspace-only because it
+validates provenance and the checksum. The output also contains
 `meta/curation_checksums.sha256`, covering every output file except the
-checksum file itself.
+checksum file itself. It uses the same lowercase digest, two-space separator,
+POSIX relative-path ordering, newline termination, and path rejection rules as
+`source-files.sha256`.
 
 ## Cleaned Dataset Construction and Publication
 
@@ -931,10 +1069,11 @@ Export is rejected unless all 92 source episodes are approved, at least one is
 `approved_keep`, every kept record validates at its approval revision, the
 final output does not exist, and no export for the dataset is active.
 
-Export lifecycle is `queued`, `building`, `structural_validated`,
-`gr00t_stats_validated`, `gr00t_loader_validated`, `published`, or `failed`.
-Only the corresponding successful validation step may advance the state. A
-partial unique SQLite index permits one active export per dataset.
+Export lifecycle is `queued`, `building`, `core_structural_validated`,
+`gr00t_stats_validated`, `gr00t_loader_validated`, `provenance_written`,
+`final_consistency_validated`, `publishing`, `published`, or `failed`. Only the
+corresponding successful step may advance the state. A partial unique SQLite
+index permits one active export per dataset.
 
 The exporter performs this fixed sequence:
 
@@ -956,18 +1095,60 @@ The exporter performs this fixed sequence:
    asset, including every video.
 7. Write consistent `info.json`, `episodes.jsonl`, `tasks.jsonl`, and
    `modality.json`; recompute `episodes_stats.jsonl` from rewritten parquet.
-8. Write provenance and audit artifacts.
-9. Run all structural and exact-preservation checks against staging.
-10. Run GR00T statistics generation inside staging.
-11. Run the real GR00T loader acceptance test against every staged episode.
-12. Write checksum and validation reports, fsync staged files and directories,
-    atomically publish with `os.replace(staging, final)`, and fsync the parent
-    directory.
+8. Run the core structural and exact-preservation checks against staging,
+   excluding provenance/checksum checks that cannot yet run. Persist
+   `structural-report.json` in the workspace and copy it into
+   `meta/curation_artifacts/`.
+9. Run GR00T statistics generation inside staging, persist command/output and
+   result as `gr00t-stats-report.json`, and copy the report into the artifact
+   directory.
+10. Run the real GR00T loader acceptance test against every staged episode,
+    persist `gr00t-loader-report.json`, and copy it into the artifact directory.
+11. Copy the selected contact sheets, then write
+    `meta/curation_provenance.json` only after every artifact it references
+    exists and its byte size and SHA-256 have been measured.
+12. Write `meta/curation_checksums.sha256` over every staged file except itself,
+    set regular files to mode `0444`, fsync and close every staged file, then
+    set directories bottom-up to `0555`, fsync and close them, and fsync the
+    staging parent. No later step may write staged bytes.
+13. Run the final read-only consistency gate: repeat structural and
+    exact-preservation checks after GR00T statistics, verify every provenance
+    artifact reference/hash, verify the checksum is complete and exact, verify
+    the approval/task/source hashes, and reject any unlisted or changed file.
+    Persist `final-consistency-report.json` only in the workspace and reference
+    it from the `exports` row, avoiding a checksum/provenance cycle.
+14. Commit export state `publishing`, publish with Linux
+    `renameat2(AT_FDCWD, staging, AT_FDCWD, final, RENAME_NOREPLACE)`, then
+    fsync the final parent directory and commit state `published`.
 
-There is no publish before GR00T validation. Structural, statistics, or loader
-failure leaves the uniquely named staging directory for diagnosis and leaves
-the absent or previous final path unchanged. An existing final output is never
-overwritten; replacement/removal is an explicit operation outside this tool.
+There is no publish before both validation gates and GR00T validation.
+Structural, statistics, loader, provenance, checksum, or consistency failure
+leaves the uniquely named staging directory for diagnosis and leaves the
+absent or previous final path unchanged.
+
+Publication is Linux-only and uses a small tested wrapper around libc
+`renameat2` with `AT_FDCWD=-100` and `RENAME_NOREPLACE=1`. There is no
+`os.replace`, plain `rename`, check-then-rename, or copy fallback. Lack of
+kernel/filesystem support is a fatal preflight error. If any file or directory
+appears at the final path before the syscall, `EEXIST` marks the export failed
+with `publish_destination_exists`; staging and the competing destination both
+remain untouched. Replacement/removal of an existing final output is an
+explicit operation outside this tool.
+
+On startup, a `publishing` export is reconciled without guessing: staging
+present/final absent returns to `final_consistency_validated`; staging
+absent/final present must pass the final read-only gate at the final path before
+advancing to `published`; both present or both absent is `failed` and requires
+operator inspection. This closes the crash window between the no-clobber
+rename, parent fsync, and SQLite commit.
+
+The publication race integration test pauses at a barrier immediately before
+`renameat2`. A second process creates the final path, first as an empty
+directory and in a second case as a directory containing a sentinel, then
+releases the barrier. Both cases must observe `EEXIST`, preserve the competing
+directory (and sentinel byte-for-byte), preserve the complete staging
+directory, and leave the export unpublished. A successful-path test verifies
+one atomic rename and an absent staging path afterward.
 
 Exact preservation is verified by comparing each untouched source/output Arrow
 column with `pyarrow.Array.equals`, checking schema field equality, and hashing
@@ -980,11 +1161,13 @@ source relative path and file proves the source dataset did not change.
 ### Automated tests
 
 Backend tests cover local-path containment, full/range/HEAD asset responses,
-v2.1 loading, SQLite concurrency and optimistic conflicts, review-state
-transitions, approval invalidation, Cosmos schema/limits/repair/resume/crash
-recovery, deterministic grip candidates, stable tasks, zero-kept rejection,
-exact column preservation, independent video copies, publication ordering, and
-source immutability.
+rejection of authorization on local assets, v2.1 loading, SQLite concurrency
+and optimistic conflicts, review-state transitions, approval invalidation,
+Cosmos complete/partial/not-observed schema cases, bidirectional completion
+rules, limits/repair/resume/crash recovery, deterministic grip candidates,
+stable tasks, zero-kept rejection, exact column preservation, independent
+video copies, publication ordering, final artifact consistency, no-clobber
+destination races, and source immutability.
 
 A dedicated v3.1 regression module loads the existing v3 fixture, exercises
 all existing atom read/write routes, exports `language_persistent`,
@@ -1001,7 +1184,10 @@ backend/.venv/bin/python -m pytest -q backend/tests
 The backend setup instructions and `backend/requirements.txt` must include
 `pytest`, so this command works after documented environment setup.
 
-Frontend tests cover metadata entry, timeline editing, one-frame adjustment,
+Frontend tests seed local storage with a sentinel HF token and assert that
+local metadata, version, parquet full/range, and video requests contain no
+`Authorization` header, while exact `https://huggingface.co` fetches still do.
+They also cover metadata entry, timeline editing, one-frame adjustment,
 conflict reload, state transitions, approval locking/reopening, batch status,
 save/resume, and approve-and-next navigation. The full visualizer gate is:
 
@@ -1013,11 +1199,12 @@ bun run format && bun run validate
 Both commands are mandatory. The Python suite's v3.1 regression module is the
 explicit compatibility gate for the existing annotation workflow.
 
-### Structural staging checks
+### Core structural staging gate
 
-Before GR00T statistics are generated, verify:
+Before GR00T statistics are generated, verify the dataset core:
 
-- all 92 source episodes are approved and at least one episode is kept;
+- all 92 immutable `export_episodes` snapshot rows are approved and at least
+  one episode is kept;
 - every kept episode has exactly seven nonempty ordered task runs;
 - step 1 begins at frame 0 and step 7 reaches the final frame;
 - all task indices resolve to exact frozen prompt strings;
@@ -1028,8 +1215,11 @@ Before GR00T statistics are generated, verify:
   episode;
 - untouched Arrow columns and video bytes pass exact-preservation checks;
 - every copied file is a regular file with no source hardlink or symlink;
-- provenance references resolve and artifact hashes match; and
 - the source full-file SHA-256 manifest remains unchanged.
+
+This gate does not require provenance, validation reports, or the final
+checksum. Its result is the immutable `structural-report.json` consumed by the
+later provenance step.
 
 ### GR00T staging acceptance
 
@@ -1055,8 +1245,29 @@ language changes through the seven expected prompts in order and matches the
 parquet `task_index` runs frame for frame. Record command, environment,
 per-episode result, and tracebacks in `gr00t-loader-report.json`.
 
+### Final provenance and checksum consistency gate
+
+After the structural, statistics, and loader reports exist, write provenance
+and the checksum exactly once, seal staging against further writes, and run a
+read-only final gate. It repeats every core structural/preservation check on
+the post-statistics bytes and verifies:
+
+- provenance references the exact approval snapshot, source manifest, prompt
+  templates, task mapping, copied contact sheets, and all three validation
+  reports;
+- every referenced path is output-relative, unique, present, and matches its
+  recorded media type, byte size, and SHA-256;
+- `meta/curation_checksums.sha256` contains exactly every other staged regular
+  file once, in UTF-8 path order, and every digest matches;
+- no unlisted file, symlink, hardlink to source, or post-checksum byte change
+  exists; and
+- the source manifest remains unchanged.
+
+The gate writes no staged bytes. Its workspace-only report and hash are stored
+in SQLite before the export advances to `final_consistency_validated`.
+
 The curation is complete only after the staging directory passes structural,
-statistics, and loader checks and is atomically published at
+statistics, loader, and final-consistency checks and is atomically published at
 `outputs/pnp_trash_cleaned`.
 
 ## Operational Sequence
@@ -1066,13 +1277,16 @@ statistics, and loader checks and is atomically published at
 2. Verify metadata, parquet charts, video seeking, and CORS/range behavior in
    the browser.
 3. Run Cosmos capability preflight and one-episode smoke annotation.
-4. Start the resumable Cosmos batch and monitor its persisted status until it
-   completes or completes with manual-only episodes.
+4. Create the resumable Cosmos batch through the API, launch its returned ID
+   with the exact `curation_worker.py run` command, and monitor persisted status
+   until it completes or completes with manual-only episodes.
 5. Review every episode in the visualizer, correcting transitions and entering
    object, hand, and direction metadata before approval.
 6. Inspect distribution, grip, and boundary-frame audit warnings.
 7. Freeze an approval snapshot and build the cleaned dataset in staging.
-8. Run structural preservation checks in staging.
+8. Run the core structural preservation gate in staging.
 9. Generate GR00T statistics and run the real loader against staging.
-10. Atomically publish the validated staging directory as
+10. Write provenance and checksums, then run the read-only final consistency
+    gate.
+11. Atomically publish with no-clobber `renameat2` as
     `outputs/pnp_trash_cleaned`.
