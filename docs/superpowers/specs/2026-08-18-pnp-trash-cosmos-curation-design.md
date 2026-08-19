@@ -1,7 +1,8 @@
 # PnP Trash Cosmos-Assisted Curation Design
 
 **Date:** 2026-08-18
-**Status:** Approved for implementation planning
+**Revised:** 2026-08-19
+**Status:** Revised after design review; awaiting final approval
 
 ## Objective
 
@@ -49,11 +50,8 @@ frames, 92 ego videos, and one whole-task prompt at 50 Hz.
 
 An episode is retained only when a curator confirms that all seven subtasks
 complete successfully in order, including the final standing-straight pose.
-Every source episode must end in one explicit state:
-
-- `keep`: complete, valid, and approved;
-- `reject`: excluded from the cleaned dataset, with an optional reason; or
-- `pending`: not yet reviewed and therefore blocks export.
+Every source episode must end as `approved_keep` or `approved_reject`.
+`pending` and `draft` are incomplete review states and block export.
 
 Short, corrupt, incomplete, or otherwise suspicious episodes may be
 pre-flagged, but only the curator decides whether to reject them.
@@ -106,16 +104,16 @@ snapping.
 The curation workspace contains:
 
 - current episode and dataset-wide review counts;
-- Cosmos proposal status and warnings;
+- Cosmos proposal and batch status;
 - keep/reject controls and rejection reason;
 - object free text with previously used values as suggestions;
 - pickup-hand and turn-direction selectors;
 - a seven-phase timeline with six selectable/draggable transitions;
 - controls to set the selected transition from current video time and adjust
   it by one frame;
-- grip-signal comparison for grasp and release;
-- validation errors; and
-- an `Approve & next episode` action.
+- deterministic grip-signal comparisons for grasp and release;
+- validation and stale-approval warnings; and
+- `Save draft`, `Approve & next episode`, and `Reopen` actions.
 
 The current uncommitted visualizer changes are user-owned. Implementation must
 inspect and patch around them, never discard or overwrite them.
@@ -128,221 +126,953 @@ behavior remain unchanged.
 
 The curation backend must:
 
-- read v2.1 `meta/info.json`, `meta/episodes.jsonl`, `meta/tasks.jsonl`,
-  per-episode parquet files, and videos;
+- register the local v2.1 dataset under a non-secret browser alias;
+- serve its metadata, parquet files, and videos through read-only asset routes;
 - expose episode review state, frame timestamps, grip diagnostics, and Cosmos
   proposals;
-- validate and atomically persist human decisions;
+- transactionally persist human decisions and batch state;
 - run or resume Cosmos batch pre-annotation; and
-- build and verify the cleaned v2.1 export.
+- build, validate, and atomically publish the cleaned v2.1 export.
 
-Local dataset identity and the curation workspace are explicit configuration,
-not inferred from URL path text. Runtime configuration includes:
+Runtime configuration is explicit:
 
-- source dataset path;
+- dataset alias `local/pnp_trash` mapped server-side to the source path;
 - curation workspace path;
-- output dataset path;
-- Cosmos base URL;
-- Cosmos model identifier;
-- API-key environment-variable name; and
-- request timeout and bounded retry settings.
+- final output dataset path;
+- Cosmos base URL and exact model identifier;
+- API-key environment-variable name;
+- request timeouts and retry limits; and
+- an allowlist containing only the visualizer browser origin.
 
-### Curation state
+Absolute source paths are never accepted from a browser request or embedded in
+a browser URL.
 
-All mutable state lives under `outputs/pnp_trash_curation/`. No annotation
-sidecar is written into `outputs/pnp_trash`.
+The backend and Next.js servers bind to loopback by default. Mutable curation
+routes require a bearer token supplied to both servers through environment
+configuration. Browser code calls a same-origin Next.js server route that
+injects the token; the credential is never exposed through a
+`NEXT_PUBLIC_*` variable or client bundle. The read-only asset route is
+restricted by the alias registry, path-containment checks, loopback binding,
+and the browser-origin allowlist.
 
-The authoritative manifest contains a schema version, a source fingerprint,
-the frozen prompt-template version, Cosmos run metadata, and one record per
-source episode. Each episode record stores:
+## Local Dataset Delivery to the Browser
 
-- source episode index and length;
-- review state and rejection reason;
-- object, pickup hand, and turn direction;
-- Cosmos transition proposal, confidence, evidence, warnings, and raw-artifact
-  reference;
-- final human-approved transition frames;
-- grip-signal candidates and comparison deltas;
-- reviewer and update timestamps; and
-- validation status.
+The frontend retains its current Hugging Face-shaped URL construction. For a
+default local run,
+`NEXT_PUBLIC_DATASET_URL=http://127.0.0.1:8000/api/local-datasets`, and the
+route `local/pnp_trash/episode_<N>?tab=annotations` supplies the dataset alias.
+The backend resolves requests of this form:
 
-Writes use a temporary file plus atomic replacement. The backend rejects a
-manifest whose source fingerprint or schema version does not match the loaded
-dataset. Saving one episode must not rewrite unrelated episode records.
+```text
+GET|HEAD /api/local-datasets/{org}/{dataset}/resolve/main/{asset_path}
+```
 
-## Cosmos3-Nano Pre-Annotation
+Only aliases registered at backend startup are valid. The resolver rejects
+non-`main` revisions, absolute paths, `..`, percent-decoded traversal,
+symlinks that escape the registered root, non-regular files, and files outside
+the root after `resolve()`.
 
-Cosmos3-Nano is already hosted on an H100 through an OpenAI-compatible vLLM
-endpoint. Server lifecycle is external to this project.
+The browser loads data as follows:
 
-### Request
+1. `meta/info.json`, `meta/episodes.jsonl`, and `meta/tasks.jsonl` are fetched
+   through the read-only asset route.
+2. The existing `hyparquet` client requests the episode parquet URL through
+   the same route and derives timestamps, chart series, and task data in the
+   browser. The route supports both a complete response and byte ranges, so
+   `hyparquet` may read the footer and selected ranges without downloading the
+   whole file.
+3. `<video>` receives the episode MP4 URL from the same route and performs
+   normal browser seek requests.
+4. Curation-only derived data, such as the grip trace and saved decisions,
+   comes from authenticated JSON curation endpoints rather than being inserted
+   into the source dataset.
 
-For each episode, the client sends the local ego-video path with 2 fps video
-sampling and a prompt containing:
+The existing URL helper proxies only authenticated `huggingface.co` URLs.
+Local asset URLs intentionally bypass that proxy and reach FastAPI directly;
+tests freeze this behavior so the Next.js server never buffers parquet or
+video bodies. Only authenticated mutable curation calls use the same-origin
+Next.js token-injecting route.
 
-- the seven ordered phase definitions;
-- the source duration;
-- the strict response schema;
-- the requirement to distinguish action starts from completion states; and
-- the instruction to report missing, failed, or ambiguous phases instead of
-  inventing boundaries.
+For every regular asset, a request without `Range` returns `200`, exact
+`Content-Length`, `Accept-Ranges: bytes`, a MIME type, and an ETag derived from
+that asset's SHA-256 entry in the immutable source manifest. A valid single
+range returns `206` with
+exact `Content-Range`, `Content-Length`, and the requested inclusive byte
+slice. Suffix and open-ended ranges are supported. Multiple or malformed
+ranges return `416` with `Content-Range: bytes */<size>`. `HEAD` returns the
+same headers without a body. Metadata uses `Cache-Control: no-store`; immutable
+parquet and video assets use private ETag revalidation. A matching
+`If-None-Match` on a non-range request returns `304`; a matching `If-Range`
+allows the requested `206`, while a nonmatching `If-Range` falls back to a full
+`200`. Asset bodies are never content-encoded. CORS allows only the configured
+local visualizer origin and exposes range and ETag headers.
 
-The model does not choose the final object name, hand, or turn direction; the
-curator supplies those values.
+## Concurrency-Safe Curation State
 
-### Response
+All mutable state lives under `outputs/pnp_trash_curation/`; the source dataset
+receives no annotations or lock files. The workspace layout is:
 
-The parsed response contains:
+```text
+outputs/pnp_trash_curation/
+├── curation.sqlite3
+├── artifacts/cosmos/<attempt-id>/
+│   ├── request.json
+│   ├── response.txt
+│   ├── parsed.json
+│   └── repair-response.txt       # only when a repair occurred
+├── contact_sheets/episode_<source-index>.png
+└── exports/<export-id>/
+    ├── structural-report.json
+    ├── gr00t-loader-report.json
+    └── source-files.sha256
+```
 
-- whether all seven phases appear complete and ordered;
-- six proposed transition times;
-- a confidence value and concise visible evidence for each transition; and
-- episode-level uncertainty or failure reasons.
+`source-files.sha256` is canonical UTF-8 text. For each source regular file,
+sorted by its POSIX relative-path UTF-8 bytes, it contains
+`<lowercase-sha256><two spaces><relative-path>\n`. Paths containing newline or
+carriage-return characters are rejected. The dataset fingerprint is the
+lowercase SHA-256 of those manifest bytes. It therefore covers metadata,
+parquet, videos, and any otherwise unknown source file.
 
-The client retains the resolved non-secret request configuration, latency,
-raw response, parsed response, repair response when applicable, and failure
-details. If the server returns model reasoning text, it remains in the
-access-controlled raw audit artifact but is never copied into training
-metadata or parquet data.
+Cosmos artifacts use explicit JSON schemas rather than ad hoc dictionaries:
 
-### Validation and repair
+- `request.json` has `schema_version: 1`, `contract_version`, UUID
+  `attempt_id`, integer `source_episode_index`, `source_video_sha256`,
+  `sampled_payload_sha256`, a `sampling` object containing original FPS/frame
+  count/duration, target FPS 2, selected frame indices and timestamps, decoder
+  name/version, RGB/resize rules, and JPEG settings, plus the exact request
+  body with the base64 payload replaced by `{ "redacted": "base64",
+  "sha256": "...", "bytes": N }`.
+- `parsed.json` has `schema_version: 1`, `contract_version`, the schema-valid
+  `model_response` object, exactly six integer `snapped_transition_frames`, an
+  array of string `validation_warnings`, and `raw_response_sha256` pointing to
+  the response text that passed validation.
+- `response.txt` is the exact UTF-8 bytes of the initial
+  `choices[0].message.content` when one exists; `repair-response.txt` is the
+  same for the repair call. HTTP envelope metadata is stored on the attempt
+  row, and transport failures store no fabricated response artifact.
+- Every row in `artifacts` identifies its owning attempt or export, artifact
+  kind, workspace-relative POSIX path, media type, nonnegative byte size,
+  lowercase SHA-256, and UTC creation timestamp. The database rejects
+  absolute paths and `..` components.
 
-The initial response must pass strict field, type, finite-number, duration,
-ordering, and phase-coverage checks. One structured repair request is allowed
-for malformed output. A timeout, transport error, second malformed response,
-or incomplete phase result marks the episode `manual_only`; it does not assign
-labels or remove the episode from the review denominator.
+SQLite is the authoritative state store. Connections enable WAL mode,
+`foreign_keys=ON`, `synchronous=FULL`, and a 5-second busy timeout. Every
+mutation uses a short `BEGIN IMMEDIATE` transaction. Schema migrations are
+versioned and transactional.
 
-Batch work checkpoints after every episode and resumes only unfinished or
-explicitly retried episodes. A one-episode smoke test must succeed before the
-full batch is allowed.
+The core tables are:
 
-## Physical and Visual Cross-Checks
+- `datasets`: alias, canonical source path, source SHA-256 manifest hash,
+  prompt-template version/hash, and creation/update timestamps;
+- `episodes`: source index, length, review state, decision fields, six final
+  transition frames, monotonically increasing revision, approval revision,
+  reviewer, approval time, and update time;
+- `cosmos_jobs`: immutable configuration snapshot, lifecycle state, counts,
+  cancel flag, owner, lease expiry, and timestamps;
+- `cosmos_attempts`: job, source episode, attempt number, lifecycle state,
+  lease owner/expiry, request/response artifact references, error class, and
+  timestamps;
+- `cosmos_proposals`: attempt, validated seven-segment response, six snapped
+  transition frames, warnings, and active/superseded status;
+- `artifacts`: relative path, media type, byte size, SHA-256, and creation
+  time; and
+- `audit_events`: append-only actor, operation, episode/job/export identifier,
+  prior revision, new revision, and timestamp;
+- `exports`: lifecycle state, immutable approval-snapshot SHA-256, staging and
+  final paths, validation artifact references, failure summary, and timestamps;
+  and
+- `export_episodes`: the immutable ordered approval rows copied into an export
+  transaction, including decision metadata and final boundaries.
 
-For the curator-selected hand, construct a grip-aperture proxy from its seven
-`observation.state` hand joints. Robust-scale each joint by its episode 5th and
-95th percentiles, use the median of the first 0.5 seconds as the open-hand
-baseline, compute RMS distance from that baseline, and smooth the result over
-0.2 seconds. The strongest sustained increase is the grasp candidate; the
-strongest sustained decrease after it is the release candidate. Compare those
-candidates with the starts of steps 2 and 6. A delta over 2.0 seconds produces
-an advisory warning. Missing, constant, or too-short signals produce an
-`unavailable` diagnostic. The UI never changes a boundary automatically.
+Episode update requests include `expected_revision`. A mismatch returns `409`
+and the current record; the UI must reload and ask the curator to reconcile.
+Model proposals and human labels are separate records, so a worker cannot
+overwrite curator data. Artifact files are written to a temporary path,
+fsynced, atomically renamed, hashed, and then referenced in the committing
+database transaction.
 
-The audit view reports across all 92 source episodes:
+The backend refuses to open a workspace when its source fingerprint differs
+from the registered dataset. It never silently migrates decisions to changed
+source bytes.
 
-- review-state counts;
-- Cosmos success, repair, failure, and `manual_only` counts;
-- transition-time and phase-duration distributions;
-- zero-length, order, coverage, and missing-metadata errors;
-- grip disagreement outliers; and
-- missing or unreadable data/video files.
+## Human Review State Machine
 
-For every episode with a Cosmos proposal or human approval, generate a contact
-sheet containing the six boundary frames, their timestamps, phase transition
-names, and proposal-versus-final deltas. These sheets are review aids and are
-not training data.
+Review state is one of `pending`, `draft`, `approved_keep`, or
+`approved_reject`. Cosmos attempt/proposal state is orthogonal.
 
-## Cleaned Dataset Export
+```text
+pending --Save draft/Apply proposal--> draft
+pending -----------------------------> approved_reject
+draft -------------------------------> approved_keep
+draft -------------------------------> approved_reject
+approved_keep --Reopen---------------> draft
+approved_reject --Reopen-------------> draft
+```
 
-Export is enabled only when every source episode is `keep` or `reject` and all
-kept records validate.
+- `approved_keep` requires a nonempty normalized object, valid hand and turn
+  enums, six strictly increasing in-range transition frames, seven nonempty
+  spans, current prompt-template hash, reviewer identity, and
+  `approval_revision == revision`.
+- `approved_reject` requires reviewer identity; its reason remains optional.
+- Approved records are immutable through normal edit endpoints. A curator must
+  invoke `Reopen`, which clears approval identity/time/revision, increments the
+  revision, and returns the record to `draft` before changing any decision
+  field.
+- Applying or editing a Cosmos proposal always creates or updates a draft; it
+  never approves an episode.
+- A newly completed Cosmos retry never changes human final boundaries and does
+  not invalidate an approval. The curator must explicitly reopen and apply it.
+- A prompt-template change transaction converts every `approved_keep` record
+  to `draft`, clears its approval fields, and records one audit event per
+  episode. Rejected approvals remain valid because no training prompt is
+  emitted for them.
+- A source-fingerprint change blocks the workspace completely rather than
+  invalidating records in place.
 
-The exporter performs these operations deterministically:
+Export creation copies all approved episode rows into `export_episodes` in one
+transaction and computes `approval_snapshot_sha256` over canonical JSON
+containing the source fingerprint, prompt hash, and ordered copied rows. Any
+episode mutation after that transaction does not affect the in-progress
+export. The snapshot hash is visible in provenance.
 
-1. Create a staging directory beside the configured final output.
-2. Deduplicate all generated prompt strings and assign stable task indices.
-3. Process kept source episodes in source-index order.
-4. Renumber output episodes contiguously from zero.
-5. Rewrite each parquet file with contiguous `episode_index`, `frame_index`,
-   global `index`, original `timestamp`, and per-frame `task_index`.
-6. Copy the unchanged episode videos into paths matching the new episode
-   indices.
+## Frozen Cosmos3-Nano Contract
+
+Cosmos3-Nano is already hosted on H100 through the vLLM OpenAI-compatible
+`POST /v1/chat/completions` endpoint. Server lifecycle is external to this
+project. The worker follows
+[vLLM's documented pre-extracted-frame transport](https://github.com/vllm-project/vllm/blob/main/docs/features/multimodal_inputs.md#pre-extracted-frame-sequences-with-media_io_kwargs)
+so the workstation and H100 require no shared filesystem.
+
+### Sampling and cross-host transport
+
+The local Python worker owns all sampling. Let `F` be the positive FPS in
+`info.json` and `N` the parquet row count. Alignment is proven only when
+`frame_index[i] == i`, every parquet timestamp `p[i]` is finite,
+`abs(p[i] - i/F) <= 1/(2F)`, the video stream rate agrees with `F` within
+`1e-6`, and a decoder or reliable container count confirms exactly `N` video
+frames. The canonical episode duration is `D=N/F` seconds.
+
+Using float64 arithmetic, the worker creates targets `t_k = 0.5*k` for every
+`t_k <= p[N-1]` and selects `argmin_i(abs(p[i]-t_k))`, breaking ties toward
+the smaller frame index and deduplicating repeated indices. The recorded
+sample timestamps are the selected `p[i]` values, not the idealized targets.
+It decodes those exact video frames, converts them to RGB, resizes without
+upscaling to a 640-pixel maximum long edge, and encodes deterministic JPEG at
+quality 85 with optimized/progressive encoding disabled.
+
+The sampled JPEGs are base64 encoded in index order, comma-concatenated, and
+sent as one `data:video/jpeg;base64,...` `video_url`. `extra_body` contains:
+
+```json
+{
+  "media_io_kwargs": {
+    "video": {
+      "fps": 50.0,
+      "frames_indices": [0, 25, 50],
+      "total_num_frames": 2060,
+      "duration": 41.2,
+      "do_sample_frames": false
+    }
+  }
+}
+```
+
+The actual values come from the source episode. `fps` is `F`, not 2;
+`duration` is `D`; and `frames_indices` preserves the 2 fps samples on the
+original timeline. The request artifact replaces the base64 field with its
+SHA-256 and records the source-video hash, exact indices, parquet timestamps,
+decoder version, resize rule, and JPEG parameters. This fully specifies the
+model input without storing another large copy of it.
+
+An episode is `manual_only` without a model call when `D > 120`, the sampled
+frame count exceeds 240, the comma-joined base64 ASCII payload after the URL
+prefix exceeds 67,108,864 bytes, or parquet/video frame alignment cannot be
+proven. These limits never reject the episode.
+
+### Request body and limits
+
+The request is deterministic:
+
+- `model`: required configured Cosmos3-Nano model identifier;
+- one user message containing the `video_url` followed by the frozen prompt;
+- `temperature: 0` and `seed: 0`;
+- `max_completion_tokens: 4096`;
+- one video per request and worker concurrency one;
+- 120-second HTTP timeout;
+- at most two initial transport attempts, retrying only connection failures,
+  `408`, `429`, and `5xx`, with one 1-second retry delay;
+- response body limit 2 MiB; and
+- prompt UTF-8 size limit 32 KiB.
+
+The HTTP request uses `Content-Type: application/json`,
+`Authorization: Bearer <value of the configured API-key environment
+variable>`, and `stream: false`. The JSON body is exactly the following shape;
+the OpenAI client's `extra_body.media_io_kwargs` is serialized as the top-level
+`media_io_kwargs` field:
+
+```json
+{
+  "model": "<configured-model-id>",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "video_url",
+          "video_url": {
+            "url": "data:video/jpeg;base64,<comma-concatenated-frame-payload>"
+          }
+        },
+        {
+          "type": "text",
+          "text": "<canonical-prompt>"
+        }
+      ]
+    }
+  ],
+  "temperature": 0,
+  "seed": 0,
+  "max_completion_tokens": 4096,
+  "stream": false,
+  "media_io_kwargs": {
+    "video": {
+      "fps": 50.0,
+      "frames_indices": [0, 25, 50],
+      "total_num_frames": 2060,
+      "duration": 41.2,
+      "do_sample_frames": false
+    }
+  }
+}
+```
+
+Angle-bracketed values above denote the episode/configuration substitutions,
+not literal wire values. The canonical prompt is constructed as the following
+exact UTF-8 prefix, followed by a newline and the minified JSON Schema in the
+next section using sorted keys and separators `(',', ':')`:
+
+```text
+You annotate one egocentric robot episode for temporal subtask supervision.
+Time 0.0 is the first supplied video frame. All start_s and end_s values are seconds on the original video timeline described by media_io_kwargs.
+Identify these phases exactly once and in this order:
+1 approach_brown_table: approach the brown table until locomotion stops at the table.
+2 pick_up_object: reach, grasp, and lift the object; include failed regrasp attempts in this phase.
+3 turn_to_find_black_trash_bin: turn until the black trash bin is found.
+4 approach_black_trash_bin: approach the bin while retaining the object.
+5 lean_down_to_black_trash_bin: lean down and position over the bin.
+6 drop_object_into_black_trash_bin: release the object into the bin.
+7 stand_straight: return to and hold a standing-straight pose.
+Use visible evidence only. Do not infer a completed phase when it is absent or ambiguous.
+Set episode_complete true only when all seven phases complete successfully in order; otherwise list missing step numbers and explain uncertainty.
+Segments must cover the episode in order. Adjacent segment boundaries may differ by at most 0.5 seconds.
+You may first emit one <think>...</think> block. After it, emit exactly one JSON object matching this schema, with no Markdown fence or trailing prose:
+```
+
+The model does not decide the final object name, hand, or turn direction.
+
+### Response schema
+
+An initial or repair call is accepted only for HTTP `200` whose JSON body is
+within the response limit, contains a nonempty `choices` array, and has a
+string at `choices[0].message.content`. `choices[0].finish_reason` must be
+`"stop"`; `"length"`, a missing field, or any other value is a schema
+failure. The worker records the response `id`, `model`, `created`, `usage`, and
+finish reason when present, but only `message.content` enters the parser.
+
+The contract identifier is `pnp-trash-cosmos-v1`. The assistant may emit one
+leading `<think>...</think>` block. After removing
+that block, the remaining text must be exactly one JSON object with no fence or
+trailing prose:
+
+```json
+{
+  "schema_version": 1,
+  "episode_complete": true,
+  "segments": [
+    {
+      "step": 1,
+      "phase": "approach_brown_table",
+      "start_s": 0.0,
+      "end_s": 8.6,
+      "caption": "approach the brown table",
+      "confidence": 0.93,
+      "evidence": "the robot stops in front of the table"
+    },
+    {
+      "step": 2,
+      "phase": "pick_up_object",
+      "start_s": 8.6,
+      "end_s": 15.1,
+      "caption": "pick up the object",
+      "confidence": 0.91,
+      "evidence": "the hand closes and raises the object"
+    },
+    {
+      "step": 3,
+      "phase": "turn_to_find_black_trash_bin",
+      "start_s": 15.1,
+      "end_s": 18.4,
+      "caption": "turn to find the black trash bin",
+      "confidence": 0.88,
+      "evidence": "the camera turns until the bin is visible"
+    },
+    {
+      "step": 4,
+      "phase": "approach_black_trash_bin",
+      "start_s": 18.4,
+      "end_s": 28.22,
+      "caption": "approach the black trash bin",
+      "confidence": 0.94,
+      "evidence": "the robot walks toward the bin while holding the object"
+    },
+    {
+      "step": 5,
+      "phase": "lean_down_to_black_trash_bin",
+      "start_s": 28.22,
+      "end_s": 32.88,
+      "caption": "lean down to the black trash bin",
+      "confidence": 0.9,
+      "evidence": "the camera lowers over the bin"
+    },
+    {
+      "step": 6,
+      "phase": "drop_object_into_black_trash_bin",
+      "start_s": 32.88,
+      "end_s": 35.72,
+      "caption": "drop the object into the black trash bin",
+      "confidence": 0.92,
+      "evidence": "the hand opens and the object enters the bin"
+    },
+    {
+      "step": 7,
+      "phase": "stand_straight",
+      "start_s": 35.72,
+      "end_s": 41.2,
+      "caption": "go to a standing straight pose",
+      "confidence": 0.95,
+      "evidence": "the camera rises and stabilizes upright"
+    }
+  ],
+  "missing_steps": [],
+  "uncertainties": []
+}
+```
+
+The parser validates the object against this JSON Schema 2020-12 definition;
+dynamic duration and adjacency constraints are applied immediately afterward:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pnp-trash-cosmos-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "episode_complete",
+    "segments",
+    "missing_steps",
+    "uncertainties"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "episode_complete": { "type": "boolean" },
+    "segments": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 1 },
+                "phase": { "const": "approach_brown_table" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 2 },
+                "phase": { "const": "pick_up_object" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 3 },
+                "phase": { "const": "turn_to_find_black_trash_bin" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 4 },
+                "phase": { "const": "approach_black_trash_bin" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 5 },
+                "phase": { "const": "lean_down_to_black_trash_bin" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 6 },
+                "phase": { "const": "drop_object_into_black_trash_bin" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 7 },
+                "phase": { "const": "stand_straight" }
+              }
+            }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "missing_steps": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 1, "maximum": 7 }
+    },
+    "uncertainties": {
+      "type": "array",
+      "maxItems": 16,
+      "items": { "type": "string", "minLength": 1, "maxLength": 240 }
+    }
+  },
+  "$defs": {
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "phase",
+        "start_s",
+        "end_s",
+        "caption",
+        "confidence",
+        "evidence"
+      ],
+      "properties": {
+        "step": { "type": "integer" },
+        "phase": { "type": "string" },
+        "start_s": { "type": "number", "minimum": 0 },
+        "end_s": { "type": "number", "exclusiveMinimum": 0 },
+        "caption": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "evidence": { "type": "string", "minLength": 1, "maxLength": 240 }
+      }
+    }
+  }
+}
+```
+
+`segments` must contain exactly steps 1 through 7 once and in order. `phase`
+must equal the corresponding enum:
+
+1. `approach_brown_table`
+2. `pick_up_object`
+3. `turn_to_find_black_trash_bin`
+4. `approach_black_trash_bin`
+5. `lean_down_to_black_trash_bin`
+6. `drop_object_into_black_trash_bin`
+7. `stand_straight`
+
+Times are finite seconds relative to the first video frame. They satisfy
+`0 <= start_s < end_s <= duration`, step 1 starts at 0 within 0.25 seconds,
+step 7 ends at duration within 0.5 seconds, and adjacent end/start values differ
+by at most 0.5 seconds. Confidence is finite in `[0,1]`; caption and evidence
+are nonempty UTF-8 strings of at most 240 characters. `missing_steps` contains
+unique integers 1 through 7; `uncertainties` contains at most 16 strings of at
+most 240 characters. `episode_complete=true` requires empty `missing_steps`.
+
+Only steps 2 through 7 `start_s` values become proposed transitions. Each is
+snapped to the nearest parquet timestamp with lower-frame tie breaking. Model
+end times, captions, confidence, and evidence remain audit/review aids and do
+not enter the training dataset.
+
+A syntactically invalid or schema-invalid successful response receives one
+text-only repair request containing the invalid response and validation
+errors, with `max_completion_tokens: 2048` and no transport retry. A semantic
+incomplete result is stored as such and is not repaired. Exhausted transport,
+parse, or schema failures become `manual_only`. Thus an episode makes at most
+three model calls: two bounded initial transport attempts and one repair.
+
+The repair request uses the same model, `temperature: 0`, `seed: 0`, and wire
+response rules, but contains no video or `media_io_kwargs`. Its sole user text
+is `Return only one corrected JSON object matching pnp-trash-cosmos-v1.\n`
+followed by a canonical minified JSON object with
+`validation_errors: string[]` and `invalid_response: string`. The invalid
+response is capped at 64 KiB before building the request; a larger value skips
+repair and becomes `manual_only`.
+
+## Resumable Cosmos Batch Lifecycle
+
+Batch state is `queued`, `running`, `cancel_requested`, `completed`,
+`completed_with_failures`, `cancelled`, or `failed`. Attempt state is
+`queued`, `leased`, `requesting`, `succeeded`, `manual_only`, `retryable`, or
+`cancelled`.
+
+- **Start:** `POST /api/curation/batches` validates endpoint/model capability,
+  freezes the source fingerprint, prompt/sampling/limit configuration, and the
+  ordered source-episode set, and creates attempts in one transaction. A
+  partial unique SQLite index permits only one active batch for the dataset.
+  The endpoint returns the existing active job with `409` rather than starting
+  duplicate work.
+- **Claim and lock:** a worker uses `BEGIN IMMEDIATE` to claim the next queued
+  or retryable attempt, assigns a UUID owner and 180-second lease, then commits
+  before doing media or network work. It heartbeats every 15 seconds. One
+  source episode can have only one nonsuperseded active attempt.
+- **Status:** `GET /api/curation/batches/{id}` returns immutable configuration,
+  lifecycle state, counts by attempt result, active lease, current episode,
+  timestamps, and the latest bounded error summaries. The UI polls this route.
+- **Retry:** `POST /api/curation/batches/{id}/retry` accepts explicit episode
+  indices or a failure-state filter and creates a child job with
+  `parent_job_id={id}` plus new immutable attempt rows. The completed parent
+  job, its attempts, and its artifacts never change. The latest valid proposal
+  is marked active and the prior proposal superseded. Human finals never
+  change.
+- **Cancel:** cancellation sets `cancel_requested`. No new attempt is claimed;
+  an in-flight request is allowed to reach its 120-second bound and persist its
+  result, after which the job becomes `cancelled`.
+- **Crash recovery:** at startup and before each claim, expired `leased` or
+  `requesting` attempts become `retryable` with a crash-recovery audit event.
+  A `running` job with unfinished attempts returns to work when a worker starts
+  with `--resume`; otherwise its status remains visible and consistent.
+- **Completion:** all terminal attempts yield `completed` when every episode
+  targeted by that job has a valid proposal, or `completed_with_failures` when
+  any target is `manual_only`. The status response also reports dataset-wide
+  active-proposal coverage across parent and retry jobs. An unrecoverable
+  database/configuration failure alone sets the job to `failed`.
+
+## Deterministic Physical and Visual Cross-Checks
+
+For the curator-selected hand, use these seven `observation.state` features in
+the listed order: `{side}_hand_index_0_joint`, `{side}_hand_index_1_joint`,
+`{side}_hand_middle_0_joint`, `{side}_hand_middle_1_joint`,
+`{side}_hand_thumb_0_joint`, `{side}_hand_thumb_1_joint`, and
+`{side}_hand_thumb_2_joint`. They are source vector positions `[22:29]` for
+left and `[36:43]` for right. A missing/misordered feature, a non-finite value,
+or fewer than 11 episode frames makes the diagnostic `unavailable`.
+
+For each joint `j`, let `q05_j` and `q95_j` be
+`numpy.percentile(values, [5, 95], method="linear")` over the episode. If
+fewer than four joints have `q95_j-q05_j > 1e-6`, the diagnostic is
+`unavailable`. Otherwise:
+
+1. clip each usable joint to `[q05_j,q95_j]` and scale it to `[0,1]`;
+2. define its baseline as NumPy's median over frames with timestamps in
+   `[0, min(0.5, duration))`;
+3. compute aperture proxy `a[i] = sqrt(mean_j((x[i,j]-baseline_j)^2))`;
+4. smooth with a centered 11-frame boxcar, using edge-value padding and
+   float64 arithmetic;
+5. compute `d[i] = a[i+5]-a[i-5]` for `5 <= i < N-5`;
+6. select grasp as the smallest index attaining `max(d)`;
+7. select release as the smallest eligible index strictly after grasp
+   attaining `min(d)`; if no such index exists, return `unavailable`; and
+8. convert both indices through the parquet timestamp column.
+
+If the selected release derivative is nonnegative or the grasp derivative is
+nonpositive, the diagnostic is `unavailable`. Otherwise, a difference greater
+than 2.0 seconds from the approved starts of steps 2 or 6 creates an advisory
+warning. This algorithm never changes a boundary or approval automatically.
+
+The audit view reports review-state counts, Cosmos lifecycle/results,
+transition-time and phase-duration distributions, zero-length/order/coverage
+errors, grip disagreements, and unreadable files. For every proposed or
+approved episode, it generates a contact sheet containing the six boundary
+frames, timestamps, transition names, and proposal-versus-final deltas.
+
+## Stable Tasks and Provenance
+
+At export, generate `(step_number, prompt)` pairs from all `approved_keep`
+records. Deduplicate by exact prompt string. For a string appearing more than
+once, its ordering step is the minimum step where it appears. Sort by ordering
+step and then by raw UTF-8 prompt bytes; enumerate from task index zero. This
+produces the same `tasks.jsonl` for every export of the same approval snapshot,
+independent of SQLite row order or worker completion order.
+
+`tasks.jsonl` contains one canonical compact-JSON line per task in that order,
+with exactly `{ "task": <prompt string>, "task_index": <integer> }`, followed
+by `\n`. Canonical JSON uses UTF-8, `ensure_ascii=false`, sorted keys, and
+separators `(',', ':')` everywhere a hash is computed.
+
+Each output episode's `tasks` metadata lists its seven expanded prompt strings
+in step order. Every parquet task index resolves to one `tasks.jsonl` row;
+there are no unreferenced task rows.
+
+The output contains `meta/curation_provenance.json` with this closed top-level
+schema; listed object and array-item fields are required and additional fields
+need a schema-version increment:
+
+```json
+{
+  "schema_version": 1,
+  "source": {
+    "dataset_alias": "local/pnp_trash",
+    "manifest_sha256": "<64 lowercase hex>",
+    "file_count": 189,
+    "original_tasks": [{ "task_index": 0, "task": "<original whole-task prompt>" }]
+  },
+  "approval": {
+    "snapshot_sha256": "<64 lowercase hex>",
+    "prompt_template_version": "pnp-trash-prompts-v1",
+    "prompt_template_sha256": "<64 lowercase hex>",
+    "templates": [{ "step": 1, "template": "approach the brown table" }]
+  },
+  "software": {
+    "exporter_version": "<version>",
+    "repositories": [{
+      "name": "lerobot-dataset-visualizer",
+      "commit": "<40 lowercase hex>",
+      "dirty": false,
+      "tracked_diff_sha256": null,
+      "untracked_files": []
+    }]
+  },
+  "cosmos": {
+    "model": "<configured model id>",
+    "endpoint_identity": "<non-secret configured label>",
+    "contract_version": "pnp-trash-cosmos-v1",
+    "sampling": { "target_fps": 2, "resize_max_long_edge": 640, "jpeg_quality": 85 },
+    "limits": { "max_duration_s": 120, "max_frames": 240, "max_payload_bytes": 67108864 },
+    "job_ids": ["<uuid>"],
+    "attempt_ids": ["<uuid>"],
+    "workspace_artifacts": [{ "artifact_id": "<uuid>", "sha256": "<64 lowercase hex>" }]
+  },
+  "export": {
+    "export_id": "<uuid>",
+    "created_at_utc": "<RFC 3339 UTC>",
+    "source_to_output": [{ "source_episode_index": 3, "output_episode_index": 0 }]
+  },
+  "episodes": {
+    "kept": [{
+      "source_episode_index": 3,
+      "output_episode_index": 0,
+      "object": "can",
+      "hand": "left",
+      "turn": "right",
+      "transition_frames": [400, 760, 910, 1400, 1660, 1810],
+      "reviewer": "<id>",
+      "revision": 4,
+      "approved_at": "<RFC 3339 UTC>"
+    }],
+    "rejected": [{
+      "source_episode_index": 4,
+      "reason": null,
+      "reviewer": "<id>",
+      "revision": 2,
+      "approved_at": "<RFC 3339 UTC>"
+    }]
+  },
+  "tasks": [{ "task_index": 0, "ordering_step": 1, "prompt": "approach the brown table" }],
+  "artifacts": [{
+    "kind": "structural_report",
+    "path": "meta/curation_artifacts/structural-report.json",
+    "bytes": 1234,
+    "sha256": "<64 lowercase hex>"
+  }]
+}
+```
+
+The example shows representative array entries; actual arrays contain all
+templates, contributing attempts, decisions, tasks, and copied artifacts.
+Repository entries also include the backend/exporter repository when it is
+distinct. Dirty entries require a tracked-diff hash and a sorted
+`untracked_files` array of `{path, bytes, sha256}`; clean entries require
+`null` and an empty array. All arrays with episode, task, file, job, or attempt
+identity are sorted numerically or by UUID/UTF-8 bytes as applicable before
+serialization.
+
+Raw Cosmos responses and reasoning stay in the curation workspace. They are
+referenced by hash but are not copied into the training dataset. Non-sensitive
+reports and contact sheets are copied as independent regular files into
+`meta/curation_artifacts/`. The output also contains
+`meta/curation_checksums.sha256`, covering every output file except the
+checksum file itself.
+
+## Cleaned Dataset Construction and Publication
+
+Export is rejected unless all 92 source episodes are approved, at least one is
+`approved_keep`, every kept record validates at its approval revision, the
+final output does not exist, and no export for the dataset is active.
+
+Export lifecycle is `queued`, `building`, `structural_validated`,
+`gr00t_stats_validated`, `gr00t_loader_validated`, `published`, or `failed`.
+Only the corresponding successful validation step may advance the state. A
+partial unique SQLite index permits one active export per dataset.
+
+The exporter performs this fixed sequence:
+
+1. In one transaction, validate approvals, copy them into immutable
+   `export_episodes`, and compute `approval_snapshot_sha256`.
+2. Compute the stable task map and source-to-output episode map.
+3. Create a unique staging directory on the same filesystem and in the same
+   parent directory as `outputs/pnp_trash_cleaned`.
+4. Process kept episodes in source-index order and renumber them contiguously.
+5. Rewrite parquet through PyArrow, replacing only `episode_index`,
+   `frame_index`, global `index`, and `task_index`. `timestamp` and every sensor,
+   state, action, teleoperation, and unknown column retain the same Arrow type,
+   null positions, list shape, row order, and element values as the source.
+   The four replaced columns also retain their source Arrow field types and
+   nullability while receiving the new deterministic values.
+6. Copy videos and other carried assets with independent regular files.
+   Hardlinks and symlinks to the immutable source are prohibited. Verify a
+   different `(st_dev, st_ino)` pair and identical SHA-256 for every copied
+   asset, including every video.
 7. Write consistent `info.json`, `episodes.jsonl`, `tasks.jsonl`, and
-   `modality.json`, and recompute `episodes_stats.jsonl` from each rewritten
-   parquet file.
-8. Preserve the original whole-task prompt and source-to-output episode map in
-   export provenance, not as a frame label.
-9. Verify the staging dataset completely.
-10. Publish the staging directory as `outputs/pnp_trash_cleaned` only after all
-    checks pass.
+   `modality.json`; recompute `episodes_stats.jsonl` from rewritten parquet.
+8. Write provenance and audit artifacts.
+9. Run all structural and exact-preservation checks against staging.
+10. Run GR00T statistics generation inside staging.
+11. Run the real GR00T loader acceptance test against every staged episode.
+12. Write checksum and validation reports, fsync staged files and directories,
+    atomically publish with `os.replace(staging, final)`, and fsync the parent
+    directory.
 
-An existing final output is never overwritten. The exporter refuses to
-proceed until the operator supplies a path that does not exist; replacement or
-removal of an older output remains an explicit operation outside the curation
-tool. A failed export leaves the source and previous final output unchanged.
+There is no publish before GR00T validation. Structural, statistics, or loader
+failure leaves the uniquely named staging directory for diagnosis and leaves
+the absent or previous final path unchanged. An existing final output is never
+overwritten; replacement/removal is an explicit operation outside this tool.
 
-Each output episode's `tasks` metadata lists its seven expanded prompts. The
-`tasks.jsonl` table contains every referenced task index exactly once and no
-unreferenced prompt rows.
+Exact preservation is verified by comparing each untouched source/output Arrow
+column with `pyarrow.Array.equals`, checking schema field equality, and hashing
+canonical Arrow IPC serialization of each untouched column before and after.
+Video hashes must match byte for byte. The pre/post SHA-256 manifest over every
+source relative path and file proves the source dataset did not change.
 
 ## Verification and Acceptance
 
 ### Automated tests
 
-Backend tests cover:
+Backend tests cover local-path containment, full/range/HEAD asset responses,
+v2.1 loading, SQLite concurrency and optimistic conflicts, review-state
+transitions, approval invalidation, Cosmos schema/limits/repair/resume/crash
+recovery, deterministic grip candidates, stable tasks, zero-kept rejection,
+exact column preservation, independent video copies, publication ordering, and
+source immutability.
 
-- v2.1 metadata and episode loading;
-- prompt normalization and expansion;
-- frame snapping and six-transition validation;
-- Cosmos parsing, repair, timeout, resume, and raw-artifact persistence;
-- atomic manifest updates and source-fingerprint mismatch handling;
-- keep/reject lifecycle and export gating;
-- deterministic task deduplication;
-- rejected-episode removal and contiguous reindexing;
-- parquet and metadata rewriting;
-- video copying and source immutability; and
-- recovery from a failed staging export.
+A dedicated v3.1 regression module loads the existing v3 fixture, exercises
+all existing atom read/write routes, exports `language_persistent`,
+`language_events`, and `tools`, and asserts that no `task_index` curation code
+changes those responses or output schemas.
 
-Frontend tests cover metadata entry, timeline editing, one-frame adjustment,
-validation messages, save/resume, keep/reject decisions, and approve-and-next
-navigation. All visualizer changes must pass its repository-mandated sequence:
+The executable Python backend gate is:
 
 ```bash
+cd /home/jihun/work/lerobot-dataset-visualizer
+backend/.venv/bin/python -m pytest -q backend/tests
+```
+
+The backend setup instructions and `backend/requirements.txt` must include
+`pytest`, so this command works after documented environment setup.
+
+Frontend tests cover metadata entry, timeline editing, one-frame adjustment,
+conflict reload, state transitions, approval locking/reopening, batch status,
+save/resume, and approve-and-next navigation. The full visualizer gate is:
+
+```bash
+cd /home/jihun/work/lerobot-dataset-visualizer
 bun run format && bun run validate
 ```
 
-### Dataset checks
+Both commands are mandatory. The Python suite's v3.1 regression module is the
+explicit compatibility gate for the existing annotation workflow.
 
-Before publication, the exporter verifies:
+### Structural staging checks
 
-- no pending source episodes;
+Before GR00T statistics are generated, verify:
+
+- all 92 source episodes are approved and at least one episode is kept;
 - every kept episode has exactly seven nonempty ordered task runs;
 - step 1 begins at frame 0 and step 7 reaches the final frame;
-- all task indices resolve to the expected exact strings;
+- all task indices resolve to exact frozen prompt strings;
 - parquet row counts, metadata lengths, and video frame counts agree;
 - episode, frame, and global indices are contiguous;
-- `info.json` totals and split ranges match the output;
-- every expected file exists and is readable; and
-- a pre/post SHA-256 manifest over every source file's relative path and bytes
-  proves that `outputs/pnp_trash` did not change.
+- `info.json` totals, task/video/chunk counts, and split ranges match output;
+- `episodes_stats.jsonl` contains exactly one recomputed row per output
+  episode;
+- untouched Arrow columns and video bytes pass exact-preservation checks;
+- every copied file is a regular file with no source hardlink or symlink;
+- provenance references resolve and artifact hashes match; and
+- the source full-file SHA-256 manifest remains unchanged.
 
-### GR00T acceptance
+### GR00T staging acceptance
 
-Generate the statistics required by the local Isaac-GR00T checkout, then load
-every kept episode through
+Run statistics against the staging path before publication:
+
+```bash
+cd /home/jihun/work/Isaac-GR00T
+test -n "$STAGING_PATH"
+.venv/bin/python gr00t/data/stats.py \
+  --dataset-path "$STAGING_PATH" \
+  --embodiment-tag UNITREE_G1_SONIC \
+  --modality-config-path gr00t/configs/data/embodiment_configs.py
+```
+
+The exporter sets `STAGING_PATH` to the canonical absolute staging directory
+when it invokes this command; the nonempty check makes a missing binding fail
+before the statistics process starts.
+
+Then load every staged episode through
 `/home/jihun/work/Isaac-GR00T/gr00t/data/dataset/lerobot_episode_loader.py`
-using the `UNITREE_G1_SONIC` modality configuration. For each episode, assert
-that the returned language values change through the seven expected prompts
-in order and match the parquet `task_index` runs frame for frame.
+using the same `UNITREE_G1_SONIC` modality configuration. Assert that returned
+language changes through the seven expected prompts in order and matches the
+parquet `task_index` runs frame for frame. Record command, environment,
+per-episode result, and tracebacks in `gr00t-loader-report.json`.
 
-The curation is complete only when:
-
-- every source episode has a human decision;
-- all kept episodes pass structural, video, prompt, and loader checks;
-- audit artifacts and the source-to-output map are present;
-- the original dataset fingerprint is unchanged; and
-- the cleaned dataset is available at `outputs/pnp_trash_cleaned`.
+The curation is complete only after the staging directory passes structural,
+statistics, and loader checks and is atomically published at
+`outputs/pnp_trash_cleaned`.
 
 ## Operational Sequence
 
-1. Configure and start the visualizer frontend and its FastAPI backend against
-   the local source, workspace, and output paths.
-2. Run Cosmos preflight and one-episode smoke annotation.
-3. Run the resumable Cosmos batch across all 92 episodes.
-4. Review every episode in the visualizer, correcting transitions and entering
+1. Register `local/pnp_trash`, configure the curation workspace/output, and
+   start the visualizer frontend plus FastAPI backend.
+2. Verify metadata, parquet charts, video seeking, and CORS/range behavior in
+   the browser.
+3. Run Cosmos capability preflight and one-episode smoke annotation.
+4. Start the resumable Cosmos batch and monitor its persisted status until it
+   completes or completes with manual-only episodes.
+5. Review every episode in the visualizer, correcting transitions and entering
    object, hand, and direction metadata before approval.
-5. Inspect distribution, grip, and boundary-frame audit warnings.
-6. Export to staging and run structural verification.
-7. Generate GR00T statistics and run the real-loader acceptance test.
-8. Publish the verified staging dataset as `outputs/pnp_trash_cleaned`.
+6. Inspect distribution, grip, and boundary-frame audit warnings.
+7. Freeze an approval snapshot and build the cleaned dataset in staging.
+8. Run structural preservation checks in staging.
+9. Generate GR00T statistics and run the real loader against staging.
+10. Atomically publish the validated staging directory as
+    `outputs/pnp_trash_cleaned`.
