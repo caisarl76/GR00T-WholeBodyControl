@@ -63,7 +63,69 @@ Unitree remote damping combinations are not an E-stop during low-level deploy.
 If the procedure is unknown, untrained, or unavailable, stop and do not run the
 real-robot sections. Loss of power makes the robot dead weight, so the
 harness/frame must support it.
+
+After **any** use of the lab-approved hardware stop, complete the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>` before remediation, restart, or
+restoring robot power.
 ```
+
+(independent-hardware-stop-process-cleanup)=
+## Independent Hardware-Stop Process Cleanup
+
+```{danger}
+An independent hardware stop prevents or removes actuation, but it does **not**
+prove that the deploy main loop or 500 Hz command writer exited. This cleanup
+rule applies after **every** use of
+`<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>`.
+
+Keep the independent stop secured and keep the robot physically unable to
+re-actuate or regain power. If PC2 remains available, send `Ctrl+C` to the
+foreground deploy process and require its terminal to return to the shell.
+Then, from a separate authorized PC2 terminal, run the fail-closed proof below.
+```
+
+**Separate authorized PC2 terminal after hardware stop — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  if DEPLOY_PROCESSES="$(pgrep -af 'target/release/g1_deploy_onnx_ref')"; then
+    printf 'ERROR: deploy process remains after hardware stop: %s\n' "$DEPLOY_PROCESSES" >&2
+    exit 1
+  else
+    PGREP_STATUS=$?
+    if [[ "$PGREP_STATUS" -ne 1 ]]; then
+      printf 'ERROR: deploy process query failed with status %s\n' "$PGREP_STATUS" >&2
+      exit "$PGREP_STATUS"
+    fi
+  fi
+
+  if ! DEPLOY_LISTENER="$(ss -H -ltnp 'sport = :5557')"; then
+    echo 'ERROR: could not query deploy listener state after hardware stop' >&2
+    exit 1
+  fi
+  if [[ -n "$DEPLOY_LISTENER" ]]; then
+    printf 'ERROR: port 5557 remains listening after hardware stop: %s\n' "$DEPLOY_LISTENER" >&2
+    exit 1
+  fi
+  echo 'PASS: deploy process absent and port 5557 released after hardware stop'
+)
+```
+
+Expected: `pgrep` finds no documented deploy process and returns exactly status
+1; any match or any other status fails closed. The exact `ss` filter returns an
+empty result. The final line must be exactly
+`PASS: deploy process absent and port 5557 released after hardware stop`, and
+the block must exit 0.
+
+If PC2 was powered down, it must remain down until the robot owner verifies
+that no deploy auto-start, process, or listener can become active on restart
+and authorizes a controlled PC2 boot while the robot remains physically unable
+to re-actuate. After that boot, run the same proof and require its `PASS`. Do
+not troubleshoot, remediate, restart any process, restore robot power, or
+release the physical stop until this cleanup `PASS` and the robot owner's
+confirmation are both complete.
 
 (safe-execution-order)=
 ## Safe Execution Order
@@ -132,22 +194,10 @@ export DATASET_NAME='<DATASET_NAME>'
 Expected: every assignment exits 0, prints no output, and defines the listed
 values in the current workstation terminal.
 
-Open an authorized shell on PC2 before running any PC2-labeled block. An
-authorized local PC2 console is acceptable; from the workstation, the standard
-handoff is SSH. Configuration exports are not forwarded, so run the documented
-PC2 configuration block separately in every new PC2 shell.
-
-**Workstation — any working directory; open a PC2 shell**
-
-```bash
-ssh "$PC2_USER@$PC2_IP"
-```
-
-Expected: SSH authenticates the authorized user and presents a PC2 shell. If
-authentication, host verification, or routing fails, stop setup and have the
-robot owner correct authorized access; do not bypass SSH verification. Every
-later **PC2** or **PC2 Terminal** label means either this authorized SSH shell or
-an authorized local PC2 console.
+Every PC2-labeled block on this page requires an authorized local PC2 console
+or an authorized SSH shell. Section 0 installs and verifies the SSH client
+before opening that shell; once connected, run the following exports in every
+new PC2 terminal.
 
 **PC2 — every new PC2 terminal, any working directory**
 
@@ -174,14 +224,56 @@ human checklist, never a command.
 
 ## 0. Clone the GR00T Repository
 
-On **both machines — any working directory**, install the prerequisites first:
+Install the workstation prerequisites before the first SSH handoff. `procps`
+provides the fail-closed `pgrep` cleanup proof, and `openssh-client` provides
+the verified `ssh` command.
+
+**Workstation — any working directory**
 
 ```bash
 set -euo pipefail
 sudo apt-get update
-sudo apt-get install -y git git-lfs iproute2 netcat-openbsd ripgrep
+sudo apt-get install -y git git-lfs iproute2 netcat-openbsd openssh-client procps ripgrep
 git lfs install
+command -v ssh
+command -v pgrep
 ```
+
+Expected: both package commands and `git lfs install` exit 0; `command -v`
+prints paths for both `ssh` and `pgrep` and exits 0.
+
+Open an authorized shell on PC2. An authorized local PC2 console is acceptable;
+from the workstation, use this standard handoff. Configuration exports are not
+forwarded, so run the documented PC2 configuration block separately in every
+new PC2 shell.
+
+**Workstation — any working directory; open a PC2 shell**
+
+```bash
+ssh "$PC2_USER@$PC2_IP"
+```
+
+Expected: SSH authenticates the authorized user and presents a PC2 shell. If
+authentication, host verification, or routing fails, stop setup and have the
+robot owner correct authorized access; do not bypass SSH verification. Every
+later **PC2** or **PC2 Terminal** label means either this authorized SSH shell or
+an authorized local PC2 console.
+
+Install the remaining prerequisites in that authorized PC2 shell before any
+PC2 clone or deployment command.
+
+**PC2 authorized shell — any working directory**
+
+```bash
+set -euo pipefail
+sudo apt-get update
+sudo apt-get install -y git git-lfs iproute2 netcat-openbsd procps ripgrep
+git lfs install
+command -v pgrep
+```
+
+Expected: both package commands and `git lfs install` exit 0;
+`command -v pgrep` prints its path and exits 0.
 
 **Workstation — parent directory of `$WORKSTATION_REPO_DIR`**
 
@@ -902,13 +994,17 @@ uppercase `O` in the focused PC2 deployment terminal immediately. Require, in
 order, `Stop`, `[DEBUG] Program exiting normally...`, and return to the shell.
 If any response is delayed, missing, or uncertain, immediately use
 `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>`; do not wait longer for software
-input.
+input. Keep the hardware stop secured and complete the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`. The hardware stop alone does not
+prove deploy exited and does not permit remediation.
 
 Do not troubleshoot, change configuration, retry a probe, or remediate any
 dependency, listener, route, firewall, service, artifact, or camera while the
-deployment remains actuated. Only after confirmed robot-process or independent
-hardware stop may remediation begin. Restart from the Safe Execution Order
-after every such stop.
+deployment remains actuated. Remediation may begin only after either the normal
+uppercase-`O` path returns to the shell or, when hardware stop was used, the
+cleanup rule produces its exact `PASS` with robot-owner confirmation. Restart
+from the Safe Execution Order after every such stop.
 
 This rule ends when the VR operator sends PICO engagement. During the
 five-second planner startup and the post-engagement `g1_debug` probe, retain the
@@ -1058,8 +1154,10 @@ The independent hardware-only fault-stop rule remains active until the exact
 ready marker appears. If it does not appear within five seconds, or if either
 error appears, immediately use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without
 waiting for uppercase `O` or PICO stop. Neither software input is an
-independent startup E-stop. Only after the ready marker appears with no error
-may the measured-state probe below be run or accepted.
+independent startup E-stop. After hardware stop, keep it secured and complete
+the {ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`. Only after the ready marker
+appears with no error may the measured-state probe below be run or accepted.
 ```
 
 ### Complete the Startup Gate with a Measured-State Probe
@@ -1111,9 +1209,11 @@ Expected: the final line is exactly
 `PASS: finite g1_debug body_q_measured received`, and the probe exits 0. Any
 nonzero exit, malformed shape, or non-finite value requires the safety operator
 to **immediately** use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without waiting
-for uppercase `O`. A PASS establishes that the sample contains exactly 29
-NumPy-convertible numeric, finite, double-equivalent measured-joint values. Do
-not continue on failure.
+for uppercase `O`, keep the stop secured, and complete the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`. A PASS establishes that the sample
+contains exactly 29 NumPy-convertible numeric, finite, double-equivalent
+measured-joint values. Do not continue on failure.
 
 ### Start Exporter and Viewer Only After the Probe Passes
 
@@ -1188,7 +1288,10 @@ only after confirmed robot shutdown may the supporting processes stop.
    `[DEBUG] Program exiting normally...`, and require the `just run` command to
    return to the shell. If these markers and terminal return do not occur
    promptly, or if the result is uncertain, use the independent hardware stop
-   or power-cut; the harness must carry the robot's dead weight.
+   or power-cut; the harness must carry the robot's dead weight. Keep the stop
+   secured and complete the {ref}`Independent hardware-stop process cleanup
+   <independent-hardware-stop-process-cleanup>` before continuing shutdown or
+   any remediation.
 3. Only after the exporter is idle, press `Ctrl+C` in Workstation Terminal 2.
    Never interrupt during `save_episode()`; wait for
    `Finished saving episode` or the zero-frame
@@ -1226,11 +1329,13 @@ Expected: the final line is exactly
 ```{danger}
 A robot or hardware fault during recording is not a normal shutdown. Use
 `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` immediately; do not delay the hardware
-stop to finalize data. If the manager and exporter remain responsive after the
-robot is safe, press **Left Grip + B**, wait for `Discarded episode`, and require
-idle. Never use **Left Grip + A** to normally save an episode whose robot stream
-was interrupted by a fault. If discard cannot be confirmed, stop the exporter
-and treat that episode as unusable.
+stop to finalize data. Keep the stop secured and complete the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`. If the manager and exporter remain
+responsive afterward, press **Left Grip + B**, wait for `Discarded episode`, and
+require idle. Never use **Left Grip + A** to normally save an episode whose robot
+stream was interrupted by a fault. If discard cannot be confirmed, stop the
+exporter and treat that episode as unusable.
 ```
 
 During normal shutdown, episode finalization is the only action before robot
@@ -1238,16 +1343,20 @@ process shutdown; the robot remains the first process stopped. Exporter
 cleanup, viewer, manager, or camera shutdown is never a substitute for
 confirmed robot shutdown. A fault during the five-second startup interval or
 any failed or bad state probe always bypasses the normal sequence and uses the
-independent hardware stop immediately.
+independent hardware stop immediately, followed by the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`.
 
 ### Troubleshooting
 
 Do not perform any troubleshooting in this table while deployment remains
 actuated. Before engagement, execute the universal pre-engagement stop rule and
 confirm shutdown first. During or after engagement, use the documented
-independent hardware fault-stop rule and confirm the robot is safe first. Only
-then perform the matching remediation and restart from the Safe Execution
-Order.
+independent hardware fault-stop rule, keep the stop secured, and complete the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`. Only after the cleanup `PASS` and
+robot-owner confirmation may you perform the matching remediation and restart
+from the Safe Execution Order.
 
 | Symptom | Required action |
 | --- | --- |
@@ -1256,6 +1365,6 @@ Order.
 | A cross-machine command uses `localhost` | If deployment has been actuated but PICO has not engaged, first execute the universal pre-engagement stop rule and confirm shutdown. Only then replace it with the configured PC2 or workstation IP. The workstation-local manager-to-exporter pose path is the sole use of `localhost:5556`. |
 | Port 5556, 5557, or the configured camera port is missing, unexpected, or blocked | If this is discovered after `ACTUATE` and before engagement, immediately execute the universal pre-engagement stop rule and confirm shutdown. Only then correct binding, routing, or firewall policy and restart the entire Safe Execution Order; never repeat the checks while actuated. |
 | `robot_config` schema or a value differs from the pinned contract | Immediately execute the universal pre-engagement stop rule and confirm shutdown. Only then check deploy arguments, artifacts, and revisions; restart the Safe Execution Order with the exact pinned configuration before rerunning the bounded probe. |
-| The planner-ready marker is absent, an initialization error appears, or `g1_debug` is absent, malformed, or non-finite after ready | Immediately use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without waiting for uppercase `O` or PICO stop. Inspect deploy startup and safety logs only after the robot is independently stopped; do not continue collection. |
+| The planner-ready marker is absent, an initialization error appears, or `g1_debug` is absent, malformed, or non-finite after ready | Immediately use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without waiting for uppercase `O` or PICO stop, keep it secured, and complete the Independent hardware-stop process cleanup. Inspect logs only after its `PASS` and robot-owner confirmation; do not continue collection. |
 | Camera discovery fails, frames time out, or foreground launch collides with systemd | Before actuation, stop setup and correct Section 4. After `ACTUATE` but before engagement, first execute the universal pre-engagement stop rule and confirm shutdown. Only then verify the device ID and listener or resolve the service collision; restart the Safe Execution Order before retrying. |
 | The two repository revisions differ | Stop. Check out the same explicit 40-character `$REPO_REVISION` on both machines, update submodules and LFS, and repeat the artifact and environment checks. |
