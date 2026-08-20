@@ -54,7 +54,19 @@ Before the real-robot procedure, the reader must have:
   XRoboToolkit PC service installation, headset networking, and the required
   tracker/controller calibration;
 - identified a safety operator and satisfied the repository's real-robot
-  preflight requirements.
+  preflight requirements;
+- obtained the lab-approved independent hardware E-stop or physical power-cut
+  procedure from the robot owner, rehearsed it with the robot supported, and
+  assigned a dedicated safety operator to keep that control continuously
+  available from before deploy launch until actuation has stopped.
+
+The independent stop must not depend on PC2, the deploy process, its input
+thread, ZMQ, the workstation, the network, or the Unitree wireless remote. The
+runbook must state that the remote's normal damping combinations are not an
+E-stop during low-level deploy. Loss of power makes the robot dead weight, so a
+protective harness/frame must already support it. If the lab cannot identify
+and drill such an independent stop, the reader must not run the real-robot
+sections.
 
 The onboarding page does not reteach simulation or PICO hardware setup, but it
 must present these as hard readiness gates rather than optional references.
@@ -75,11 +87,17 @@ tokens. The token table includes:
 - `<TASK_PROMPT>`
 - `<DATASET_NAME>`
 
+The separate non-shell safety-checklist field is
+`<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>`. The robot owner supplies the exact
+mechanism, location, and actions; a newcomer must not invent this procedure.
+
 Angle-bracket values are explicitly described as user-supplied configuration,
 not unfinished documentation. The page begins with copyable shell-variable
-blocks for each machine; readers replace the angle-bracket values once and the
-later commands use the named variables so the shell does not interpret angle
-brackets as redirection.
+blocks for each machine's network, path, camera, and dataset tokens; readers
+replace those angle-bracket values once and the later commands use the named
+variables so the shell does not interpret angle brackets as redirection. The
+hardware-stop field remains a human-readable checklist entry and is never
+executed by the shell.
 
 ## Runtime Topology
 
@@ -219,7 +237,18 @@ robot rather than the wrapper:
 2. Source `scripts/setup_env.sh`.
 3. Run `scripts/preflight.sh` manually and require every item to pass. The
    direct command must never be used to bypass preflight.
-4. Start the real-robot process without engaging the policy:
+4. Immediately before the launch command, place a prominent warning:
+
+   > **DANGER:** Pressing Enter starts an actuated initialization immediately;
+   > it drives all joints toward the default standing pose over three seconds
+   > with nonzero gains while publishing low-level commands at 500 Hz. PICO
+   > engagement starts policy `CONTROL`, but it is not the first robot motion.
+   > Before pressing Enter, the protective harness/frame, clear 3 m zone,
+   > spotter, and independent hardware E-stop or physical power-cut procedure
+   > must already be in position and ready.
+
+5. Launch the real-robot process. This begins the actuated initialization ramp
+   but does not yet engage policy `CONTROL`:
 
    ```sh
    just run g1_deploy_onnx_ref \
@@ -235,16 +264,16 @@ robot rather than the wrapper:
      --disable-dex3-hands
    ```
 
-5. Require startup logs to confirm `zmq_manager`, ZMQ output, the workstation
+6. Require startup logs to confirm `zmq_manager`, ZMQ output, the workstation
    host, and `[INFO] Dex3 hands disabled`.
-6. Require the exact PC2 log `Init Done`. The binary emits this only after
+7. Require the exact PC2 log `Init Done`. The binary emits this only after
    receiving valid LowState and transitioning from `INIT` to
    `WAIT_FOR_CONTROL`. Earlier LowState-unavailable messages may occur while the
    robot initializes; do not continue unless they stop and `Init Done` appears.
    Do not continue if a CRC or safety error appears.
-7. Do not send the PICO start command until the Section 5 bidirectional network
+8. Do not send the PICO start command until the Section 5 bidirectional network
    and pre-engagement `robot_config` checks pass.
-8. Confirm that PC2 listens on TCP port 5557 after the deploy process starts.
+9. Confirm that PC2 listens on TCP port 5557 after the deploy process starts.
 
 The guide does not recommend disabling CRC, VR_3PT safety filters, preflight
 checks, or other safety mechanisms. The direct invocation is intentionally
@@ -319,12 +348,24 @@ Before policy engagement, require exact directional and configuration checks:
 4. From the workstation, `nc -zvw 3 <PC2_IP> 5557` must succeed.
 5. From the workstation, `nc -zvw 3 <PC2_IP> <CAMERA_PORT>` must succeed.
 6. Run `poll_robot_config_zmq(<PC2_IP>, 5557, timeout_sec=10)` from
-   `.venv_data_collection`. Require a decoded mapping containing the expected
-   decoder, encoder, observation-config, planner, and reference-motion paths,
-   plus `control_frequency`, `planner_frequency`, and `is_using_encoder`.
-   Compare those values with the direct deployment command, print a single
-   `PASS` line, and exit zero. A timeout, decode error, missing key, or mismatch
-   exits nonzero.
+   `.venv_data_collection`. Require this exact decoded subset:
+
+   ```text
+   model_path = "policy/release/model_decoder.onnx"
+   reference_motion_path = "reference/example/"
+   planner_path = "planner/target_vel/V2/planner_sonic.onnx"
+   obs_config_path = "policy/release/observation_config.yaml"
+   encoder_file = "policy/release/model_encoder.onnx"
+   control_frequency = 50
+   planner_frequency = 10
+   is_using_encoder = true
+   ```
+
+   The five paths must match the direct invocation. The frequencies and encoder
+   state are runtime expectations derived from the deployed binary, not command
+   arguments. Print a single `PASS` line and exit zero only when all eight
+   values match. A timeout, decode error, missing key, or mismatch exits
+   nonzero.
 7. In parallel, require the PC2 deploy log to contain `Init Done`, with no
    continuing LowState-unavailable messages and no CRC or safety error.
    Together with the `robot_config` probe, this confirms that the correct
@@ -336,8 +377,15 @@ does not publish measured state until it enters `CONTROL`.
 After all pre-engagement checks pass, the VR operator assumes the documented
 calibration pose and presses PICO `A+B+X+Y` to send the ZMQ start command and
 enter planner mode. `]` is not an engagement key in `zmq_manager`. The safety
-operator keeps the deploy terminal focused and uses `O` as the primary software
-stop.
+operator keeps the deploy terminal focused for the normal software stop `O`
+and continuously holds the independent hardware E-stop or physical power-cut
+control.
+
+The runbook must warn that after the PICO start message sets
+`operator_state.start`, the ZMQ manager input thread may block for up to five
+seconds waiting for planner initialization. During that interval, keyboard `O`
+and a later PICO stop message are not guaranteed to be processed immediately.
+Neither software path qualifies as the independent startup E-stop.
 
 Immediately after start—and before entering VR_3PT, starting the exporter, or
 recording—run a second bounded probe from `.venv_data_collection` using the
@@ -345,7 +393,9 @@ existing `ZMQStateSubscriber`. Within 10 seconds it must receive `g1_debug`,
 find a finite `body_q_measured` vector with at least 29 values, print a single
 `PASS` line, and exit zero. Timeout, decode failure, missing fields, wrong shape,
 or non-finite values exits nonzero. On failure, the safety operator immediately
-presses `O`; do not proceed with teleoperation or data collection.
+uses the independent hardware E-stop or physical power cut; do not wait for
+keyboard `O`, and do not proceed with teleoperation or data collection. The
+protective harness/frame must catch the robot when motor power is removed.
 
 Do not require a manager startup feedback log: the manager polls that socket
 only during later freeze/recalibration/VR-entry transitions. The independent
@@ -368,8 +418,11 @@ Add a compact troubleshooting table for the highest-probability failures:
 - Camera not detected or frame timeouts.
 - PICO manager and deploy using incompatible ZMQ host or port values.
 
-Shutdown guidance prioritizes robot safety: stop or emergency-stop robot control
-using the documented deploy controls. Before interrupting the exporter, either
+Shutdown guidance prioritizes robot safety. For normal shutdown, stop robot
+control using the documented deploy controls and confirm actuation has stopped.
+For a fault or any uncertain software-stop response, use the independent
+hardware E-stop or physical power cut; do not rely on the Unitree remote. Before
+interrupting the exporter, either
 save the active episode with `Left Grip + A` and wait for `Finished saving
 episode`/idle confirmation, or discard it with `Left Grip + B` and wait for
 `Discarded episode`. An interrupt with buffered frames marks that episode as
@@ -398,15 +451,24 @@ Before considering the page complete:
 8. Confirm the direct deployment command includes `zmq_manager`, ZMQ output,
    the workstation host, and `--disable-dex3-hands`, with a manual preflight
    immediately before it.
-9. Confirm the runbook contains both directional port checks, the bounded
+9. Confirm an actuated-initialization danger warning appears immediately before
+   launch and requires the harness/frame, clear zone, spotter, and independent
+   hardware stop to be ready before Enter is pressed.
+10. Confirm the runbook contains both directional port checks, the bounded
    pre-engagement `robot_config` probe, and the `Init Done`/no-error PC2 log
    gate before PICO engagement.
-10. Confirm the camera section contains a dependency/import/device gate for
+11. Confirm the config probe checks the five named path keys plus
+    `control_frequency == 50`, `planner_frequency == 10`, and
+    `is_using_encoder == true`.
+12. Confirm the camera section contains a dependency/import/device gate for
     each permitted camera type.
-11. Confirm the bounded `g1_debug` content probe occurs immediately after start
-    and before VR_3PT, exporter startup, or recording, with `O` as the required
-    failure response.
-12. Review the page for a safe startup order, PICO-based engagement,
+13. Confirm the bounded `g1_debug` content probe occurs immediately after start
+    and before VR_3PT, exporter startup, or recording, with the independent
+    hardware stop—not keyboard `O`—as the required failure response.
+14. Confirm the guide explains the ZMQ manager's potentially blocking startup
+    interval and never represents keyboard or PICO input as an independent
+    E-stop during that interval.
+15. Review the page for a safe startup order, PICO-based engagement,
     episode-aware shutdown, and an explicit process shutdown path.
 
 Hardware execution is outside documentation verification: do not start the real
