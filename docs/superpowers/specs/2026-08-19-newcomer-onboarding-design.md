@@ -237,9 +237,14 @@ robot rather than the wrapper:
 
 5. Require startup logs to confirm `zmq_manager`, ZMQ output, the workstation
    host, and `[INFO] Dex3 hands disabled`.
-6. Do not send the PICO start command until the Section 5 bidirectional network
-   and content checks pass.
-7. Confirm that PC2 listens on TCP port 5557 after the deploy process starts.
+6. Require the exact PC2 log `Init Done`. The binary emits this only after
+   receiving valid LowState and transitioning from `INIT` to
+   `WAIT_FOR_CONTROL`. Earlier LowState-unavailable messages may occur while the
+   robot initializes; do not continue unless they stop and `Init Done` appears.
+   Do not continue if a CRC or safety error appears.
+7. Do not send the PICO start command until the Section 5 bidirectional network
+   and pre-engagement `robot_config` checks pass.
+8. Confirm that PC2 listens on TCP port 5557 after the deploy process starts.
 
 The guide does not recommend disabling CRC, VR_3PT safety filters, preflight
 checks, or other safety mechanisms. The direct invocation is intentionally
@@ -290,7 +295,9 @@ supported.
 
 ### 5. Run Workstation Processes
 
-Use three labeled terminals, all launched from `<WORKSTATION_REPO_DIR>`:
+Use three labeled terminals, all launched from `<WORKSTATION_REPO_DIR>`. Start
+the PICO manager first; start the exporter and viewer only after the post-start
+`g1_debug` check passes:
 
 1. `.venv_teleop`: run `pico_manager_thread_server.py` in manager/controller
    mode on local port 5556 and explicitly subscribe to measured state with
@@ -304,31 +311,51 @@ Use three labeled terminals, all launched from `<WORKSTATION_REPO_DIR>`:
 Document the exporter recording controls already implemented by the manager:
 start or save with `Left Grip + A`, and discard with `Left Grip + B`.
 
-Before policy engagement, require exact directional checks:
+Before policy engagement, require exact directional and configuration checks:
 
 1. On the workstation, `ss` must show the PICO manager listening on `*:5556`.
 2. From PC2, a bounded `nc -zvw 3 <WORKSTATION_IP> 5556` check must succeed.
 3. On PC2, `ss` must show the deploy feedback publisher listening on `*:5557`.
 4. From the workstation, `nc -zvw 3 <PC2_IP> 5557` must succeed.
 5. From the workstation, `nc -zvw 3 <PC2_IP> <CAMERA_PORT>` must succeed.
-6. Run a bounded Python content probe from `.venv_data_collection` using the
-   existing `ZMQStateSubscriber`. Within 10 seconds it must receive the
-   `g1_debug` topic, find a finite `body_q_measured` vector with at least 29
-   values, print a single `PASS` line, and exit zero. Timeout, decode failure,
-   missing fields, the wrong shape, or non-finite values must exit nonzero.
+6. Run `poll_robot_config_zmq(<PC2_IP>, 5557, timeout_sec=10)` from
+   `.venv_data_collection`. Require a decoded mapping containing the expected
+   decoder, encoder, observation-config, planner, and reference-motion paths,
+   plus `control_frequency`, `planner_frequency`, and `is_using_encoder`.
+   Compare those values with the direct deployment command, print a single
+   `PASS` line, and exit zero. A timeout, decode error, missing key, or mismatch
+   exits nonzero.
+7. In parallel, require the PC2 deploy log to contain `Init Done`, with no
+   continuing LowState-unavailable messages and no CRC or safety error.
+   Together with the `robot_config` probe, this confirms that the correct
+   process is in `WAIT_FOR_CONTROL` before start.
 
-Do not require a manager startup feedback log: the manager does not poll that
-socket until later freeze/recalibration/VR-entry transitions. The independent
-content probe validates the same `<PC2_IP>:5557` endpoint before engagement;
-the manager command must still use
+The pre-engagement probe must not subscribe to `g1_debug`: the current runtime
+does not publish measured state until it enters `CONTROL`.
+
+After all pre-engagement checks pass, the VR operator assumes the documented
+calibration pose and presses PICO `A+B+X+Y` to send the ZMQ start command and
+enter planner mode. `]` is not an engagement key in `zmq_manager`. The safety
+operator keeps the deploy terminal focused and uses `O` as the primary software
+stop.
+
+Immediately after start—and before entering VR_3PT, starting the exporter, or
+recording—run a second bounded probe from `.venv_data_collection` using the
+existing `ZMQStateSubscriber`. Within 10 seconds it must receive `g1_debug`,
+find a finite `body_q_measured` vector with at least 29 values, print a single
+`PASS` line, and exit zero. Timeout, decode failure, missing fields, wrong shape,
+or non-finite values exits nonzero. On failure, the safety operator immediately
+presses `O`; do not proceed with teleoperation or data collection.
+
+Do not require a manager startup feedback log: the manager polls that socket
+only during later freeze/recalibration/VR-entry transitions. The independent
+post-start content probe validates the same `<PC2_IP>:5557` endpoint; the
+manager command must still use
 `--zmq_feedback_host <PC2_IP> --zmq_feedback_port 5557`.
 
-Only after these outcomes, the VR operator assumes the documented calibration
-pose and presses PICO `A+B+X+Y` to send the ZMQ start command and enter planner
-mode. `]` is not an engagement key in `zmq_manager`. The safety operator keeps
-the deploy terminal focused and uses `O` as the primary software stop. The
-runbook must name the expected success text or exit code for every check and
-must not suggest engagement when any check fails.
+The runbook must name the expected success text or exit code for every check and
+must not suggest PICO engagement when a pre-engagement check fails or continued
+operation when the post-start check fails.
 
 ## Failure Handling and Safe Shutdown
 
@@ -371,11 +398,15 @@ Before considering the page complete:
 8. Confirm the direct deployment command includes `zmq_manager`, ZMQ output,
    the workstation host, and `--disable-dex3-hands`, with a manual preflight
    immediately before it.
-9. Confirm the runbook contains both directional port checks and the bounded
-   `g1_debug` content probe before PICO engagement.
+9. Confirm the runbook contains both directional port checks, the bounded
+   pre-engagement `robot_config` probe, and the `Init Done`/no-error PC2 log
+   gate before PICO engagement.
 10. Confirm the camera section contains a dependency/import/device gate for
     each permitted camera type.
-11. Review the page for a safe startup order, PICO-based engagement,
+11. Confirm the bounded `g1_debug` content probe occurs immediately after start
+    and before VR_3PT, exporter startup, or recording, with `O` as the required
+    failure response.
+12. Review the page for a safe startup order, PICO-based engagement,
     episode-aware shutdown, and an explicit process shutdown path.
 
 Hardware execution is outside documentation verification: do not start the real
