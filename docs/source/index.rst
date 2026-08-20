@@ -81,6 +81,7 @@ Documentation
    getting_started/download_models
    getting_started/quickstart
    getting_started/vr_teleop_setup
+   getting_started/newcomer_onboarding
 
 .. toctree::
    :maxdepth: 2

@@ -35,9 +35,12 @@ feedback, state, and camera endpoints must use the configured machine IPs.
 
 ## Before You Begin
 
-This is a hard reader contract for the real-robot sections. Repository cloning
-and non-actuating setup or reading may proceed before every gate below is
-complete, but do not launch or actuate the real robot until they all pass.
+This section is the hard prerequisite contract for the real-robot sections.
+Repository cloning and non-actuating setup or reading may proceed before these
+prerequisites are complete, but do not launch or actuate the real robot until
+every prerequisite in this section passes. Later sections introduce staged
+gates at the documented point; each gate must pass before the next action it
+protects, and none may be skipped.
 Complete the [MuJoCo Quick Start](quickstart.md) with the intended input
 sequence, drill the stop paths in simulation from [Real Robot Teleoperation
 Safety](../user_guide/real_robot_safety.md), and complete [VR Teleop
@@ -101,6 +104,9 @@ export TASK_PROMPT='<TASK_PROMPT>'
 export DATASET_NAME='<DATASET_NAME>'
 ```
 
+Expected: every assignment exits 0, prints no output, and defines the listed
+values in the current workstation terminal.
+
 **PC2 — every new PC2 terminal, any working directory**
 
 ```bash
@@ -115,6 +121,10 @@ export EGO_CAMERA_DEVICE_ID='<EGO_CAMERA_DEVICE_ID>'
 export CAMERA_PORT='<CAMERA_PORT>'
 readonly GEAR_SONIC_HF_REV='9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2'
 ```
+
+Expected: every assignment exits 0, prints no output, and defines the listed
+values in the current PC2 terminal. The pinned Hugging Face revision is also
+defined as read-only in that terminal.
 
 The quotes make the placeholders safe to paste without accidental shell
 redirection, but you must replace them before use. The hardware-stop value is a
@@ -220,8 +230,9 @@ Expected: both installers exit 0, both Python version commands report Python
 
 When prompted to install the systemd service, answer `n`. This prevents this
 installer run from creating or starting the service so foreground mode can be
-used later, but it does not prove that a service left by an older installation
-is inactive. Section 4 checks that condition before foreground launch.
+used later, but it does not prove that no service unit was installed by an
+older installation. Before foreground launch, Section 4 requires the exact
+`LoadState=not-found` result, not merely an inactive unit.
 
 Expected: the installer exits 0, the version command reports Python 3.10, the
 import command prints `PASS: camera imports`, and the help command exits 0.
@@ -548,7 +559,7 @@ requires that no camera service unit is installed.
       exit 1
       ;;
     *)
-      echo "ERROR: installed camera service (LoadState=$CAMERA_SERVICE_LOAD_STATE) is an alternate launch path; use it or have the robot owner remove it before foreground mode" >&2
+      echo "ERROR: installed camera service (LoadState=$CAMERA_SERVICE_LOAD_STATE) is an alternate launch path; stop and have the robot owner remove the unit before continuing with foreground mode" >&2
       exit 1
       ;;
   esac
@@ -558,10 +569,11 @@ requires that no camera service unit is installed.
 
 Expected: `PASS: camera service LoadState=not-found; no unit is installed` and
 exit 0. A query failure, empty state, or any installed unit state is a hard
-stop. If a unit is installed, use the systemd launch branch instead or have the
-robot owner remove it before continuing with foreground mode. This foreground
-branch never treats an installed inactive, failed, masked, or transitional unit
-as safe; the repository unit uses `Restart=on-failure`.
+stop. Systemd mode is outside this runbook; stop and have the robot owner remove
+the installed alternate unit before continuing with foreground mode. Do not
+improvise or mix the two launch methods. This foreground branch never treats an
+installed inactive, failed, masked, or transitional unit as safe; the
+repository unit uses `Restart=on-failure`.
 
 Before camera-specific discovery, reject every unsupported configured type.
 Run this command directly so its failure cannot be masked by a later command.
@@ -692,7 +704,7 @@ the configured ID is empty instead of passing an empty CLI argument.
       exit 1
       ;;
     *)
-      echo "ERROR: installed camera service (LoadState=$CAMERA_SERVICE_LOAD_STATE) is an alternate launch path; use it or have the robot owner remove it before foreground mode" >&2
+      echo "ERROR: installed camera service (LoadState=$CAMERA_SERVICE_LOAD_STATE) is an alternate launch path; stop and have the robot owner remove the unit before continuing with foreground mode" >&2
       exit 1
       ;;
   esac
