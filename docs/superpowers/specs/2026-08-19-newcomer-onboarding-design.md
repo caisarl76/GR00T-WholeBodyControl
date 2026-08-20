@@ -26,6 +26,12 @@ Add the user-facing guide at:
 docs/source/getting_started/newcomer_onboarding.md
 ```
 
+Add the pinned deployment-artifact checksum manifest at:
+
+```text
+docs/source/getting_started/gear_sonic_deployment_9c0ff22.sha256
+```
+
 Add it to the **Getting Started** toctree in `docs/source/index.rst`. Keep the
 existing installation, VR setup, deployment, and data-collection pages as the
 detailed references; the new page is the single ordered runbook for the lab's
@@ -134,17 +140,66 @@ the package-install command before using either diagnostic.
 Provide lightweight import or `--help` checks after installation. Warn that the
 install scripts recreate their target virtual environments, so readers should
 not rerun them casually when an environment contains local packages.
+During the PC2 camera-environment installation, answer `n` to the optional
+systemd prompt; Section 4 uses this existing environment and does not rerun the
+destructive installer.
 
-On PC2, use the already-created camera environment to install
-`huggingface_hub`, then run the repository downloader from the repository root:
+Before the native C++ build, require the PC2 platform gates from the deployment
+installation guide:
+
+- Run `uname -m` and identify PC2 as either x86_64 or Jetson/aarch64.
+- Jetson/aarch64 requires JetPack 6 and TensorRT 10.7. Require L4T `R36.x`
+  from `/etc/nv_tegra_release`; when the `nvidia-jetpack` metapackage is
+  installed, `dpkg-query` must report a 6.x version.
+- x86_64 requires TensorRT 10.13.
+- Set `TensorRT_ROOT`, require it to be a directory, and run
+  `$TensorRT_ROOT/bin/trtexec --version`. The printed major/minor version must
+  exactly match the platform requirement; do not continue on a mismatch.
+- Run `gear_sonic_deploy/scripts/install_deps.sh`, source
+  `gear_sonic_deploy/scripts/setup_env.sh`, and require the setup output to say
+  that the TensorRT environment is configured.
+- Run `just build` from `gear_sonic_deploy` and require
+  `target/release/g1_deploy_onnx_ref` to be executable.
+
+The exact TensorRT version is a safety gate because the repository warns that a
+different version can produce incorrect planner inference.
+
+On PC2, use the already-created camera environment to install the Hugging Face
+CLI:
 
 ```sh
 uv pip install --python .venv_camera/bin/python huggingface_hub
-.venv_camera/bin/python download_from_hf.py
 ```
 
-Git LFS does not provide the ignored deployment ONNX files. Before building or
-launching, require exact successful `test -s` checks for:
+Do not use `download_from_hf.py` for this runbook because it currently resolves
+the mutable `main` branch and has no revision option. Download the four files
+with `.venv_camera/bin/hf download`, pinned to Hugging Face revision
+`9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2`. Download the policy files into
+`gear_sonic_deploy/policy/release/` and the planner into
+`gear_sonic_deploy/planner/target_vel/V2/`.
+
+The tracked checksum manifest contains these SHA-256 values:
+
+```text
+013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3  gear_sonic_deploy/policy/release/model_encoder.onnx
+c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed  gear_sonic_deploy/policy/release/model_decoder.onnx
+466d05947c78af6c76388adfb86e3a2a77b2a1d921a64883ed3d085ebf58de1b  gear_sonic_deploy/policy/release/observation_config.yaml
+39b553e197f62f077975ba38512bc04781a3fc37c2af7c6756e04629f760edea  gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx
+```
+
+These values were verified on 2026-08-20 against the official
+`nvidia/GEAR-SONIC` repository at the pinned revision
+(`https://huggingface.co/nvidia/GEAR-SONIC/tree/9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2`)
+and against the local deployment artifacts. Run `sha256sum --check` on the
+tracked manifest and require all four lines to report `OK`. The checksum check
+supersedes the weaker non-empty-file check, although the runbook may retain
+`test -s` as an early diagnostic.
+
+Git LFS does not provide the ignored deployment ONNX files. Before launching,
+also require a non-empty `gear_sonic_deploy/reference/example/` motion-data
+directory.
+
+The deployment files are:
 
 ```text
 gear_sonic_deploy/policy/release/model_encoder.onnx
@@ -153,39 +208,43 @@ gear_sonic_deploy/policy/release/observation_config.yaml
 gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx
 ```
 
-The expected outcome is exit status zero for every check and a non-empty
-`gear_sonic_deploy/reference/example/` motion-data directory.
-
 ### 2. Deploy GEAR-SONIC on PC2
 
-Use the repository-supported deployment wrapper with explicit cross-machine
-input settings:
+The documented PC2 robot has no Dex3 or Inspire hands, while the deployment
+binary enables Dex3 by default. Because `deploy.sh` cannot forward
+`--disable-dex3-hands`, use a direct, fully expanded invocation for this lab
+robot rather than the wrapper:
 
 1. SSH to PC2 and enter `gear_sonic_deploy`.
-2. Source `scripts/setup_env.sh` and build with `just build` during one-time
-   setup.
-3. Start the real-robot process without engaging the policy:
+2. Source `scripts/setup_env.sh`.
+3. Run `scripts/preflight.sh` manually and require every item to pass. The
+   direct command must never be used to bypass preflight.
+4. Start the real-robot process without engaging the policy:
 
    ```sh
-   bash deploy.sh \
+   just run g1_deploy_onnx_ref \
+     <ROBOT_NETWORK_INTERFACE> \
+     policy/release/model_decoder.onnx \
+     reference/example/ \
+     --obs-config policy/release/observation_config.yaml \
+     --encoder-file policy/release/model_encoder.onnx \
+     --planner-file planner/target_vel/V2/planner_sonic.onnx \
      --input-type zmq_manager \
      --output-type zmq \
      --zmq-host <WORKSTATION_IP> \
-     <ROBOT_NETWORK_INTERFACE>
+     --disable-dex3-hands
    ```
 
-4. Confirm that the printed configuration says `Input Type: zmq_manager`,
-   `Output Type: zmq`, and `ZMQ Host: <WORKSTATION_IP>`.
-5. Complete the deploy preflight, but do not press the policy-engagement key
-   until the Section 5 bidirectional network checks pass.
-6. Confirm that PC2 listens on TCP port 5557 after the deploy process starts.
+5. Require startup logs to confirm `zmq_manager`, ZMQ output, the workstation
+   host, and `[INFO] Dex3 hands disabled`.
+6. Do not send the PICO start command until the Section 5 bidirectional network
+   and content checks pass.
+7. Confirm that PC2 listens on TCP port 5557 after the deploy process starts.
 
 The guide does not recommend disabling CRC, VR_3PT safety filters, preflight
-checks, or other safety mechanisms. Do not promise arbitrary binary flags such
-as `--disable-dex3-hands` through `deploy.sh`: the current wrapper accepts only
-its documented options and treats unknown flags as interface values. Robot-
-specific binary flags require a separately validated direct invocation or a
-future wrapper change and are outside this docs-only task.
+checks, or other safety mechanisms. The direct invocation is intentionally
+specific to the documented no-Dex3 lab robot; a robot with hands needs a
+separately approved command.
 
 ### 3. Set Up PICO Teleoperation
 
@@ -196,15 +255,24 @@ mandatory PICO setup prerequisite and links the full existing setup guide.
 
 ### 4. Run the Camera Server on PC2
 
-Define two mutually exclusive camera startup branches. The reader chooses one
-while running `install_scripts/install_camera_server.sh`:
+Keep the first version to a foreground camera process so the installer cannot
+start a service before type-specific dependencies are ready. The Section 1
+installer run already created `.venv_camera` with systemd declined. Do not rerun
+that installer here. Confirm `composed_camera_server.service` is inactive before
+opening the camera in the foreground.
 
-- **Foreground:** answer `n` to the systemd prompt, confirm the service is not
-  active, then run `python -m gear_sonic.camera.composed_camera` with
-  `<EGO_CAMERA_TYPE>`, optional `<EGO_CAMERA_DEVICE_ID>`, and `<CAMERA_PORT>`.
-- **systemd:** answer `y`, supply the camera configuration and port to the
-  installer, then use the generated service only. Do not also run the foreground
-  command.
+Constrain `<EGO_CAMERA_TYPE>` to the configurations required by this workflow:
+
+- `oak` or `oak_mono`: `depthai` is installed by the camera extra; require a
+  successful import and device enumeration.
+- `realsense`: install `pyrealsense2` into `.venv_camera`, require a successful
+  import, enumerate the serials with `rs.context().query_devices()`, and confirm
+  `<EGO_CAMERA_DEVICE_ID>` appears before startup.
+
+Only after the type-specific check, run
+`python -m gear_sonic.camera.composed_camera` with `<EGO_CAMERA_TYPE>`, optional
+`<EGO_CAMERA_DEVICE_ID>`, and `<CAMERA_PORT>`. Persistent systemd deployment and
+other camera types are outside this first version.
 
 For an empty device-ID value, omit the entire device-ID option rather than
 passing an empty shell argument.
@@ -243,14 +311,24 @@ Before policy engagement, require exact directional checks:
 3. On PC2, `ss` must show the deploy feedback publisher listening on `*:5557`.
 4. From the workstation, `nc -zvw 3 <PC2_IP> 5557` must succeed.
 5. From the workstation, `nc -zvw 3 <PC2_IP> <CAMERA_PORT>` must succeed.
-6. The manager must report received robot feedback rather than operating only
-   from unset/frozen measured targets.
+6. Run a bounded Python content probe from `.venv_data_collection` using the
+   existing `ZMQStateSubscriber`. Within 10 seconds it must receive the
+   `g1_debug` topic, find a finite `body_q_measured` vector with at least 29
+   values, print a single `PASS` line, and exit zero. Timeout, decode failure,
+   missing fields, the wrong shape, or non-finite values must exit nonzero.
 
-Only after these outcomes, the safety operator may press `]` in the deploy
-terminal to engage the policy. The runbook must name the expected success text
-or exit code for each command and must not suggest policy engagement when any
-check fails. It must keep the deploy terminal focused and remind the safety
-operator that `O` is the primary software stop.
+Do not require a manager startup feedback log: the manager does not poll that
+socket until later freeze/recalibration/VR-entry transitions. The independent
+content probe validates the same `<PC2_IP>:5557` endpoint before engagement;
+the manager command must still use
+`--zmq_feedback_host <PC2_IP> --zmq_feedback_port 5557`.
+
+Only after these outcomes, the VR operator assumes the documented calibration
+pose and presses PICO `A+B+X+Y` to send the ZMQ start command and enter planner
+mode. `]` is not an engagement key in `zmq_manager`. The safety operator keeps
+the deploy terminal focused and uses `O` as the primary software stop. The
+runbook must name the expected success text or exit code for every check and
+must not suggest engagement when any check fails.
 
 ## Failure Handling and Safe Shutdown
 
@@ -269,8 +347,9 @@ save the active episode with `Left Grip + A` and wait for `Finished saving
 episode`/idle confirmation, or discard it with `Left Grip + B` and wait for
 `Discarded episode`. An interrupt with buffered frames marks that episode as
 discarded. After the exporter is idle, stop camera viewing, PICO management, and
-the foreground camera server as appropriate. A systemd camera service is
-managed with `systemctl` rather than killed as an arbitrary process.
+the foreground camera server as appropriate. If a pre-existing systemd camera
+service is discovered, do not start a competing foreground process; stop and
+resolve which configuration is authoritative before continuing.
 
 ## Verification
 
@@ -287,11 +366,17 @@ Before considering the page complete:
    table.
 5. Confirm every command block names its machine and working directory.
 6. Compare CLI flags against the current scripts or their `--help` output.
-7. Confirm the exact deployment model files with non-empty-file checks.
-8. Confirm the runbook contains both directional port checks before policy
-   engagement.
-9. Review the page for a safe startup order, episode-aware shutdown, and an
-   explicit process shutdown path.
+7. Run `sha256sum --check` against the tracked artifact manifest and require
+   all four pinned artifacts to pass.
+8. Confirm the direct deployment command includes `zmq_manager`, ZMQ output,
+   the workstation host, and `--disable-dex3-hands`, with a manual preflight
+   immediately before it.
+9. Confirm the runbook contains both directional port checks and the bounded
+   `g1_debug` content probe before PICO engagement.
+10. Confirm the camera section contains a dependency/import/device gate for
+    each permitted camera type.
+11. Review the page for a safe startup order, PICO-based engagement,
+    episode-aware shutdown, and an explicit process shutdown path.
 
 Hardware execution is outside documentation verification: do not start the real
 robot, PICO hardware, or camera merely to validate a docs-only change.
@@ -300,5 +385,6 @@ robot, PICO hardware, or camera merely to validate a docs-only change.
 
 This version does not cover PICO hardware installation or calibration, SONIC
 training, checkpoint export, simulation, VLA fine-tuning, robot network
-provisioning, or camera-driver development. It links to existing detailed pages
-where useful without reproducing them.
+provisioning, persistent camera services, unsupported camera drivers, or robots
+with Dex3/Inspire hands. It links to existing detailed pages where useful
+without reproducing them.
