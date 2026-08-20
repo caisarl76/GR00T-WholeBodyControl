@@ -65,6 +65,29 @@ real-robot sections. Loss of power makes the robot dead weight, so the
 harness/frame must support it.
 ```
 
+(safe-execution-order)=
+## Safe Execution Order
+
+```{important}
+The numbered sections group related topics; **do not execute them strictly from
+Section 0 through Section 5**. Use this safety order:
+
+1. Complete Sections 0 and 1 on the named machines.
+2. Go to Section 4. Complete its camera dependencies, foreground-service
+   exclusion, device discovery, and server startup; require live frames to be
+   publishing, require the exact pre-actuation camera-probe `PASS`, and leave
+   the camera server running.
+3. Go to the manager-only start at the beginning of Section 5. Start the PICO
+   manager/listener, verify its port-5556 listener, and leave it running. Do not
+   start the exporter or viewer.
+4. Return to Section 2. Pass every preflight gate, type `ACTUATE`, and require
+   the documented startup evidence.
+5. Resume Section 5 at **Verify Both Network Directions Before Engagement**.
+   Complete the network and configuration gates, PICO engagement, measured-state
+   probe, exporter startup, and viewer startup in that order.
+
+```
+
 ## Configuration
 
 Replace every angle-bracket value below with the lab's configuration. These are
@@ -350,11 +373,12 @@ normally unset; `set -u` restores it immediately afterward.
 The direct CMake configure mirrors the current `.justfile` recipe flags but
 replaces `just build` because that recipe reuses `build/`; its cache could
 resolve stale or default TensorRT paths. `mktemp` instead creates a unique fresh
-binary directory under the ignored `build/` directory. It does not delete or
-overwrite an existing build, so the isolated directory remains available for
-inspection or later cleanup. The root test rejects `/`: `TensorRT_ROOT` must
-name a specific TensorRT installation so the quoted containment check is
-unambiguous.
+binary directory under the ignored `build/` directory. Only the CMake
+cache/object directory is isolated and retained for inspection or later
+cleanup: the build still writes and replaces the shared
+`target/release/g1_deploy_onnx_ref` executable. The root test rejects `/`:
+`TensorRT_ROOT` must name a specific TensorRT installation so the quoted
+containment check is unambiguous.
 
 Expected: every top-level command in the subshell exits 0. An `x86_64` PC2 must
 use TensorRT 10.13. An `aarch64` PC2 must use L4T R36.x, JetPack 6 when the
@@ -463,6 +487,18 @@ nonempty real joint CSV whose first record begins with the field `joint_0`.
 
 ## 2. Deploy GEAR-SONIC on PC2
 
+This section has a hard precondition from the {ref}`Safe Execution Order
+<safe-execution-order>`: Section 4's camera server must already be running and
+the bounded content probe must have printed exactly
+`PASS: live camera frames received before actuation`. The manager-only start at
+the beginning of Section 5 must also be listening on workstation port 5556. If
+either gate has not passed, do not type `ACTUATE`.
+
+After typing `ACTUATE`, do not install camera packages, discover devices,
+change services, or perform camera remediation while deployment remains
+actuated. If camera readiness is lost, stop the robot using the documented
+normal or fault path before doing any camera work.
+
 This lab runbook is only for the physically confirmed configuration without
 Dex3 or Inspire hands. The operator and robot owner must physically inspect the
 robot together and verbally confirm that no hands are attached before
@@ -534,6 +570,12 @@ running and focused for the safety operator; do not reuse it for other work.
 
 ## 3. Set Up PICO Teleoperation
 ## 4. Run the Camera Server on PC2
+
+Complete every step in this section before Section 2 and before typing
+`ACTUATE`, as required by the {ref}`Safe Execution Order
+<safe-execution-order>`.
+Do not perform installation, discovery, service changes, or camera remediation
+while the deployment process remains actuated.
 
 Section 1 created `.venv_camera`; do not rerun the destructive camera
 installer. Open a new PC2 terminal, load the PC2 configuration variables, and
@@ -723,11 +765,54 @@ backend initializes, the server binds the configured port, frames are
 published, and no repeated timeout or reconnect messages appear. Keep this
 foreground terminal running.
 
+From the workstation, require camera content—not only TCP reachability—before
+continuing to the manager-only start in Section 5.
+
+**Workstation new terminal — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_data_collection/bin/python - "$PC2_IP" "$CAMERA_PORT" <<'PY'
+import sys
+import time
+
+from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+
+PC2_IP = sys.argv[1]
+CAMERA_PORT = int(sys.argv[2])
+client = ComposedCameraClientSensor(server_ip=PC2_IP, port=CAMERA_PORT)
+deadline = time.monotonic() + 10.0
+try:
+    while time.monotonic() < deadline:
+        sample = client.read(blocking=False)
+        if sample is not None and sample.get("images"):
+            print("PASS: live camera frames received before actuation")
+            break
+        time.sleep(0.02)
+    else:
+        raise SystemExit("FAIL: no live camera frames within 10 seconds")
+finally:
+    client.close()
+PY
+)
+```
+
+Expected: the final line is exactly
+`PASS: live camera frames received before actuation`, and the probe exits 0.
+The `finally` block closes the client on both PASS and failure. Leave the PC2
+camera server running and continue to the manager-only start in Section 5. Do
+not proceed toward `ACTUATE` without this PASS.
+
 ## 5. Run Workstation Processes
 
-Start only the PICO manager first. Do not start the exporter or viewer yet;
-their startup is gated on the directional network checks and the pre- and
-post-engagement probes below.
+This first manager-only phase occurs before Section 2 and before typing
+`ACTUATE`, as required by the {ref}`Safe Execution Order
+<safe-execution-order>`.
+Start only the PICO manager, verify its listener, and then return to Section 2.
+Do not start the exporter or viewer yet; their startup is gated on the later
+directional network checks and the pre- and post-engagement probes.
 
 **Workstation Terminal 1 — `$WORKSTATION_REPO_DIR`**
 
@@ -747,6 +832,25 @@ Expected: the process enters interactive manager mode, listens on workstation
 port 5556, and connects its feedback input to PC2 port 5557. Keep this
 foreground process running in Workstation Terminal 1. **Do not start the
 exporter or viewer yet.**
+
+Verify the manager listener before returning to Section 2.
+
+**Workstation Terminal 2 — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  MANAGER_LISTENER="$(ss -H -ltnp 'sport = :5556')"
+  test -n "$MANAGER_LISTENER"
+  printf '%s\n' "$MANAGER_LISTENER"
+)
+```
+
+Expected: the exact socket filter returns a nonempty port-5556 listener, with
+the manager process shown when `ss -p` permissions expose it. If the address or
+visible process contradicts Workstation Terminal 1, stop. Otherwise, leave the
+manager running, return to Section 2, and complete deployment through `Init
+Done`. Then resume here at the next heading.
 
 ### Verify Both Network Directions Before Engagement
 
@@ -997,37 +1101,76 @@ The recording controls are exact:
   `discarded_episode_indices` and returns the exporter to idle. It does not
   delete the episode.
 
-### Normal Shutdown: Stop the Robot First
+### Normal Shutdown: Finalize, Then Stop the Robot Process First
 
-Normal shutdown must follow this exact order. A fault during the five-second
-startup interval or any failed or bad state probe always bypasses this normal
-sequence and uses the independent hardware stop immediately.
+Normal shutdown must follow this exact order. While robot state, camera, and
+manager streams are still healthy, first finish the active episode and require
+the exporter to become idle. The robot is then the first **process** stopped;
+only after confirmed robot shutdown may the supporting processes stop.
 
-1. Press uppercase `O` in the focused PC2 deployment terminal. Require it to
+1. If an episode is active, press **Left Grip + A**. For a nonempty episode,
+   wait for `Finished saving episode`; for a zero-frame episode, wait for
+   `Skipping save: no frames collected`. Either outcome returns the exporter to
+   idle. Alternatively, press **Left Grip + B** and wait for `Discarded episode`,
+   which saves the episode to disk marked in `discarded_episode_indices` and
+   returns the exporter to idle. Do not begin process shutdown without the
+   applicable confirmation and idle state.
+2. Press uppercase `O` in the focused PC2 deployment terminal. Require it to
    print `Stop` after the damping-only LowCommandWriter, then
    `[DEBUG] Program exiting normally...`, and require the `just run` command to
    return to the shell. If these markers and terminal return do not occur
    promptly, or if the result is uncertain, use the independent hardware stop
    or power-cut; the harness must carry the robot's dead weight.
-2. If an episode is active, press **Left Grip + A** and wait for
-   `Finished saving episode` (the code transitions to idle in the same loop),
-   **or** press **Left Grip + B** and wait for `Discarded episode` (which saves
-   it to disk marked in `discarded_episode_indices` and returns the exporter to
-   idle; it does not delete the episode). Do not proceed without the chosen
-   confirmation.
 3. Only after the exporter is idle, press `Ctrl+C` in Workstation Terminal 2.
    Never interrupt during `save_episode()`; wait for
-   `Finished saving episode` and idle. `Ctrl+C` attempts to mark a still-intact
-   unsaved buffer discarded only when its size is greater than zero. It cannot
-   guarantee recovery or marking if interruption occurs inside
-   `save_episode()` after the buffer has already been consumed or popped.
+   `Finished saving episode` or the zero-frame
+   `Skipping save: no frames collected` outcome and idle. `Ctrl+C` attempts to
+   mark a still-intact unsaved buffer discarded only when its size is greater
+   than zero. It cannot guarantee recovery or marking if interruption occurs
+   inside `save_episode()` after the buffer has already been consumed or popped.
 4. Press lowercase `q` in the focused viewer window.
 5. Press `Ctrl+C` in Workstation Terminal 1 to stop the manager.
 6. Press `Ctrl+C` in the PC2 foreground camera terminal to stop the camera
-   server.
+   server. Require the exact lines `Stopping composed camera server...` and
+   `Composed camera server stopped.`, followed by return to the shell. Then run
+   the port-release check below.
 
-The robot always stops first. Neither exporter cleanup nor viewer, manager, or
-camera shutdown is a substitute for confirmed robot shutdown.
+**PC2 camera terminal after it returns — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  if ! CAMERA_LISTENER="$(ss -H -ltn "sport = :$CAMERA_PORT")"; then
+    echo 'ERROR: could not query camera listener state' >&2
+    exit 1
+  fi
+  if [[ -n "$CAMERA_LISTENER" ]]; then
+    printf 'ERROR: camera port is still listening after shutdown: %s\n' "$CAMERA_LISTENER" >&2
+    exit 1
+  fi
+  echo 'PASS: camera port released after shutdown'
+)
+```
+
+Expected: the final line is exactly
+`PASS: camera port released after shutdown`, and the check exits 0.
+
+```{danger}
+A robot or hardware fault during recording is not a normal shutdown. Use
+`<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` immediately; do not delay the hardware
+stop to finalize data. If the manager and exporter remain responsive after the
+robot is safe, press **Left Grip + B**, wait for `Discarded episode`, and require
+idle. Never use **Left Grip + A** to normally save an episode whose robot stream
+was interrupted by a fault. If discard cannot be confirmed, stop the exporter
+and treat that episode as unusable.
+```
+
+During normal shutdown, episode finalization is the only action before robot
+process shutdown; the robot remains the first process stopped. Exporter
+cleanup, viewer, manager, or camera shutdown is never a substitute for
+confirmed robot shutdown. A fault during the five-second startup interval or
+any failed or bad state probe always bypasses the normal sequence and uses the
+independent hardware stop immediately.
 
 ### Troubleshooting
 
