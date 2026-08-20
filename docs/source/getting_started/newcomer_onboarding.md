@@ -449,3 +449,264 @@ Expected: `command -v rg` succeeds, all file checks exit 0, all four hashes
 report `OK`, no unresolved Git LFS pointer exists under `reference/example`, and
 only `rg` status 1 (no matches) is accepted. The final check finds at least one
 nonempty real joint CSV whose first record begins with the field `joint_0`.
+
+## 2. Deploy GEAR-SONIC on PC2
+
+This lab runbook is only for the physically confirmed configuration without
+Dex3 or Inspire hands. The operator and robot owner must physically inspect the
+robot together and verbally confirm that no hands are attached before
+continuing. If the hardware differs or either person is uncertain, stop. The
+`deploy.sh` wrapper cannot forward `--disable-dex3-hands`, so this configuration
+uses the validated direct `just run` invocation below.
+
+Use one focused deployment terminal so setup, preflight, and launch share the
+same current environment. Nounset is disabled only while sourcing the upstream
+`setup_env.sh`, which reads normally unset variables, and is restored
+immediately afterward. The preflight is interactive: confirm every prompt and
+require `Real-robot preflight confirmed.` before launch. After preflight, the
+operator must type exactly `ACTUATE` at the distinct actuation prompt. Any other
+input or EOF aborts before launch, and any failed command stops the entire
+block.
+
+Before running it, fill in `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` with the
+exact lab procedure and verbally confirm the completed procedure with the robot
+owner.
+
+**PC2 focused deployment terminal — `$PC2_REPO_DIR/gear_sonic_deploy`**
+
+```{danger}
+After preflight, typing `ACTUATE` and pressing Enter starts an actuated initialization immediately. The deploy process drives all joints toward the default standing pose over three seconds with nonzero gains while low-level commands are published at 500 Hz. PICO engagement starts policy CONTROL, but it is not the first robot motion. Before typing `ACTUATE` and pressing Enter, the protective harness/frame, clear 3 m zone, spotter, and independent hardware E-stop or physical power-cut procedure must already be ready.
+```
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR/gear_sonic_deploy"
+  set +u
+  source scripts/setup_env.sh
+  set -u
+  bash scripts/preflight.sh
+  IFS= read -r -p 'Type ACTUATE to begin the three-second initialization ramp: ' ACTUATION_CONFIRMATION
+  test "$ACTUATION_CONFIRMATION" = ACTUATE
+  just run g1_deploy_onnx_ref \
+    "$ROBOT_NETWORK_INTERFACE" \
+    policy/release/model_decoder.onnx \
+    reference/example/ \
+    --obs-config policy/release/observation_config.yaml \
+    --encoder-file policy/release/model_encoder.onnx \
+    --planner-file planner/target_vel/V2/planner_sonic.onnx \
+    --input-type zmq_manager \
+    --output-type zmq \
+    --zmq-host "$WORKSTATION_IP" \
+    --disable-dex3-hands
+)
+```
+
+Expected sequence: preflight prints `Real-robot preflight confirmed.`, the
+operator types exactly `ACTUATE` at the confirmation prompt, and only then does
+deployment produce the startup evidence below. Any other input or EOF aborts
+the block before `just run`.
+
+Expected startup evidence:
+
+- Input type is `zmq_manager`.
+- Output is ZMQ and port 5557 binds successfully.
+- The configured workstation host is displayed.
+- `[INFO] Dex3 hands disabled` is printed.
+- Transient LowState-unavailable messages stop.
+- `Init Done` proves the process reached WAIT_FOR_CONTROL.
+- No CRC or safety error is reported.
+
+Policy CONTROL waits for the later PICO start, but the three-second
+initialization has already actuated the robot. Keep this deployment terminal
+running and focused for the safety operator; do not reuse it for other work.
+
+## 3. Set Up PICO Teleoperation
+## 4. Run the Camera Server on PC2
+
+Section 1 created `.venv_camera`; do not rerun the destructive camera
+installer. Open a new PC2 terminal, load the PC2 configuration variables, and
+work from `$PC2_REPO_DIR`.
+
+First, establish mutual exclusion with the systemd launch path. Foreground mode
+requires that no camera service unit is installed.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  if ! CAMERA_SERVICE_LOAD_STATE="$(systemctl show --property=LoadState --value composed_camera_server.service 2>/dev/null)"; then
+    echo 'ERROR: could not query camera service LoadState' >&2
+    exit 1
+  fi
+  case "$CAMERA_SERVICE_LOAD_STATE" in
+    not-found) ;;
+    '')
+      echo 'ERROR: camera service LoadState is empty; cannot prove foreground exclusivity' >&2
+      exit 1
+      ;;
+    *)
+      echo "ERROR: installed camera service (LoadState=$CAMERA_SERVICE_LOAD_STATE) is an alternate launch path; use it or have the robot owner remove it before foreground mode" >&2
+      exit 1
+      ;;
+  esac
+  echo 'PASS: camera service LoadState=not-found; no unit is installed'
+)
+```
+
+Expected: `PASS: camera service LoadState=not-found; no unit is installed` and
+exit 0. A query failure, empty state, or any installed unit state is a hard
+stop. If a unit is installed, use the systemd launch branch instead or have the
+robot owner remove it before continuing with foreground mode. This foreground
+branch never treats an installed inactive, failed, masked, or transitional unit
+as safe; the repository unit uses `Restart=on-failure`.
+
+Before camera-specific discovery, reject every unsupported configured type.
+Run this command directly so its failure cannot be masked by a later command.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+case "$EGO_CAMERA_TYPE" in
+  oak|oak_mono|realsense) ;;
+  *) echo "Unsupported EGO_CAMERA_TYPE: $EGO_CAMERA_TYPE" >&2; exit 1 ;;
+esac
+```
+
+Expected: exit 0 only for `oak`, `oak_mono`, or `realsense`. Any other value
+prints the unsupported type and exits 1; stop there.
+
+Run only the discovery branch matching the configured camera type. For `oak`
+or `oak_mono`, use the existing DepthAI dependency. The probe requires
+`DeviceInfo.getDeviceId()` and validates exactly the identifier API that the
+runtime OAK driver consumes. An SDK lacking that API is incompatible and must
+not pass discovery.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  .venv_camera/bin/python - "$EGO_CAMERA_DEVICE_ID" <<'PY'
+import sys
+import depthai as dai
+
+expected = sys.argv[1]
+devices = dai.Device.getAllAvailableDevices()
+ids = []
+for device in devices:
+    runtime_getter = getattr(device, "getDeviceId", None)
+    if not callable(runtime_getter):
+        raise SystemExit("FAIL: installed DepthAI lacks DeviceInfo.getDeviceId required by runtime")
+    ids.append(runtime_getter())
+print("Detected OAK IDs:", ids)
+if not ids:
+    raise SystemExit("FAIL: no OAK camera detected")
+if expected and expected not in ids:
+    raise SystemExit(f"FAIL: configured OAK ID {expected!r} not found")
+print("PASS: OAK camera detected")
+PY
+)
+```
+
+Expected: the detected OAK IDs are printed, followed by
+`PASS: OAK camera detected`, and the probe exits 0. An empty configured device
+ID is allowed when the selected backend does not need one.
+
+For `realsense`, install its separate driver into the existing camera
+environment first. This is a new terminal, so make the user-local `uv`
+locations discoverable explicitly.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  command -v uv
+  uv pip install --python .venv_camera/bin/python pyrealsense2
+)
+```
+
+Expected: `command -v uv` prints its executable path, the `pyrealsense2`
+installation exits 0, and no new virtual environment is created. Then probe
+the configured serial in the same PC2 repo context; RealSense requires an
+explicit nonempty serial.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  .venv_camera/bin/python - "$EGO_CAMERA_DEVICE_ID" <<'PY'
+import sys
+import pyrealsense2 as rs
+
+expected = sys.argv[1]
+if not expected:
+    raise SystemExit("FAIL: set EGO_CAMERA_DEVICE_ID to a RealSense serial")
+serials = [
+    device.get_info(rs.camera_info.serial_number)
+    for device in rs.context().query_devices()
+]
+print("Detected RealSense serials:", serials)
+if expected not in serials:
+    raise SystemExit(f"FAIL: configured RealSense serial {expected!r} not found")
+print("PASS: RealSense camera detected")
+PY
+)
+```
+
+Expected: the detected serial list is printed, followed by
+`PASS: RealSense camera detected`, and the probe exits 0. A missing or
+unmatched configured serial is a hard stop.
+
+After the matching discovery probe passes, start the foreground camera server
+in that same new PC2 terminal. The Bash array omits the device-ID option when
+the configured ID is empty instead of passing an empty CLI argument.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  CAMERA_DEVICE_ARGS=()
+  if [[ -n "$EGO_CAMERA_DEVICE_ID" ]]; then
+    CAMERA_DEVICE_ARGS=(--ego-view-device-id "$EGO_CAMERA_DEVICE_ID")
+  fi
+
+  if ! CAMERA_SERVICE_LOAD_STATE="$(systemctl show --property=LoadState --value composed_camera_server.service 2>/dev/null)"; then
+    echo 'ERROR: could not query camera service LoadState' >&2
+    exit 1
+  fi
+  case "$CAMERA_SERVICE_LOAD_STATE" in
+    not-found) ;;
+    '')
+      echo 'ERROR: camera service LoadState is empty; cannot prove foreground exclusivity' >&2
+      exit 1
+      ;;
+    *)
+      echo "ERROR: installed camera service (LoadState=$CAMERA_SERVICE_LOAD_STATE) is an alternate launch path; use it or have the robot owner remove it before foreground mode" >&2
+      exit 1
+      ;;
+  esac
+  echo 'PASS: camera service LoadState=not-found; no unit is installed'
+
+  .venv_camera/bin/python -m gear_sonic.camera.composed_camera \
+    --ego-view-camera "$EGO_CAMERA_TYPE" \
+    "${CAMERA_DEVICE_ARGS[@]}" \
+    --port "$CAMERA_PORT"
+)
+```
+
+Expected: the repeated fail-closed classifier prints its second `PASS`
+immediately before starting the foreground Python process, the configured
+backend initializes, the server binds the configured port, frames are
+published, and no repeated timeout or reconnect messages appear. Keep this
+foreground terminal running.
