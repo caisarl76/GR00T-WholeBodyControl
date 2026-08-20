@@ -78,13 +78,15 @@ Section 0 through Section 5**. Use this safety order:
    publishing, require the exact pre-actuation camera-probe `PASS`, and leave
    the camera server running.
 3. Go to the manager-only start at the beginning of Section 5. Start the PICO
-   manager/listener, verify its port-5556 listener, and leave it running. Do not
-   start the exporter or viewer.
+   manager/listener, verify its port-5556 listener, require exactly
+   `PASS: PC2 can reach manager port 5556 before actuation`, and leave it
+   running. Do not start the exporter or viewer.
 4. Return to Section 2. Pass every preflight gate, type `ACTUATE`, and require
    the documented startup evidence.
-5. Resume Section 5 at **Verify Both Network Directions Before Engagement**.
-   Complete the network and configuration gates, PICO engagement, measured-state
-   probe, exporter startup, and viewer startup in that order.
+5. Resume Section 5 at the **Universal pre-engagement stop rule** immediately
+   before **Verify Both Network Directions Before Engagement**. Read the rule,
+   then complete the network and configuration gates, PICO engagement,
+   measured-state probe, exporter startup, and viewer startup in that order.
 
 ```
 
@@ -129,6 +131,23 @@ export DATASET_NAME='<DATASET_NAME>'
 
 Expected: every assignment exits 0, prints no output, and defines the listed
 values in the current workstation terminal.
+
+Open an authorized shell on PC2 before running any PC2-labeled block. An
+authorized local PC2 console is acceptable; from the workstation, the standard
+handoff is SSH. Configuration exports are not forwarded, so run the documented
+PC2 configuration block separately in every new PC2 shell.
+
+**Workstation — any working directory; open a PC2 shell**
+
+```bash
+ssh "$PC2_USER@$PC2_IP"
+```
+
+Expected: SSH authenticates the authorized user and presents a PC2 shell. If
+authentication, host verification, or routing fails, stop setup and have the
+robot owner correct authorized access; do not bypass SSH verification. Every
+later **PC2** or **PC2 Terminal** label means either this authorized SSH shell or
+an authorized local PC2 console.
 
 **PC2 — every new PC2 terminal, any working directory**
 
@@ -491,8 +510,10 @@ This section has a hard precondition from the {ref}`Safe Execution Order
 <safe-execution-order>`: Section 4's camera server must already be running and
 the bounded content probe must have printed exactly
 `PASS: live camera frames received before actuation`. The manager-only start at
-the beginning of Section 5 must also be listening on workstation port 5556. If
-either gate has not passed, do not type `ACTUATE`.
+the beginning of Section 5 must also be listening on workstation port 5556,
+and its PC2-side reachability gate must have printed exactly
+`PASS: PC2 can reach manager port 5556 before actuation`. If any gate has not
+passed, do not type `ACTUATE`.
 
 After typing `ACTUATE`, do not install camera packages, discover devices,
 change services, or perform camera remediation while deployment remains
@@ -563,6 +584,11 @@ Expected startup evidence:
 - Transient LowState-unavailable messages stop.
 - `Init Done` proves the process reached WAIT_FOR_CONTROL.
 - No CRC or safety error is reported.
+
+Any missing, delayed, or contradictory startup evidence after `ACTUATE` is a
+pre-engagement gate failure. Execute the {ref}`universal pre-engagement stop
+rule <pre-engagement-stop-rule>` immediately; do not inspect, retry, or
+remediate while deployment remains actuated.
 
 Policy CONTROL waits for the later PICO start, but the three-second
 initialization has already actuated the robot. Keep this deployment terminal
@@ -848,9 +874,47 @@ Verify the manager listener before returning to Section 2.
 
 Expected: the exact socket filter returns a nonempty port-5556 listener, with
 the manager process shown when `ss -p` permissions expose it. If the address or
-visible process contradicts Workstation Terminal 1, stop. Otherwise, leave the
-manager running, return to Section 2, and complete deployment through `Init
-Done`. Then resume here at the next heading.
+visible process contradicts Workstation Terminal 1, correct it now, before
+actuation. Otherwise, leave the manager running and verify the connection from
+PC2.
+
+**PC2 pre-actuation terminal — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  nc -zvw 3 "$WORKSTATION_IP" 5556
+  echo 'PASS: PC2 can reach manager port 5556 before actuation'
+)
+```
+
+Expected: `nc` reports success and the final line is exactly
+`PASS: PC2 can reach manager port 5556 before actuation`. This gate must pass
+before `ACTUATE`. Leave the manager running, return to Section 2, and complete
+deployment through `Init Done`. Then resume here at the next rule and heading.
+
+(pre-engagement-stop-rule)=
+```{danger}
+**Universal pre-engagement stop rule:** from immediately after `ACTUATE` until
+PICO engagement, **any** failed or contradictory network check, listener check,
+startup log, or `robot_config` check requires the safety operator to press
+uppercase `O` in the focused PC2 deployment terminal immediately. Require, in
+order, `Stop`, `[DEBUG] Program exiting normally...`, and return to the shell.
+If any response is delayed, missing, or uncertain, immediately use
+`<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>`; do not wait longer for software
+input.
+
+Do not troubleshoot, change configuration, retry a probe, or remediate any
+dependency, listener, route, firewall, service, artifact, or camera while the
+deployment remains actuated. Only after confirmed robot-process or independent
+hardware stop may remediation begin. Restart from the Safe Execution Order
+after every such stop.
+
+This rule ends when the VR operator sends PICO engagement. During the
+five-second planner startup and the post-engagement `g1_debug` probe, retain the
+documented immediate independent-hardware-stop rule; do **not** substitute
+uppercase `O` there.
+```
 
 ### Verify Both Network Directions Before Engagement
 
@@ -876,9 +940,10 @@ Expected: the exact socket filter returns a nonempty listener on port 5556,
 with output showing the expected wildcard address and the manager process when
 `ss -p` permissions expose it. The filter alone proves that something listens
 on the exact port, not its identity. If its address or visible process
-contradicts Workstation Terminal 1, stop. Both `nc` commands must report success
-and exit 0; they check the workstation-to-PC2 paths for deployment state and
-camera traffic.
+contradicts Workstation Terminal 1, or if either `nc` command fails, execute the
+universal pre-engagement stop rule immediately. Do not remediate while
+actuated. Both `nc` commands must report success and exit 0; they check the
+workstation-to-PC2 paths for deployment state and camera traffic.
 
 **PC2 Terminal 2 — any working directory**
 
@@ -900,11 +965,12 @@ show deployment on port 5557 using the expected wildcard address and the
 camera server on its configured port using a non-loopback address; expected
 process names should also appear when `ss -p` permissions expose them. The
 filters alone prove only that something listens on each exact port, not the
-listener identities. Stop if an address or visible process contradicts the
-focused deployment or camera terminal. `nc` must reach the workstation manager
-on port 5556 and exit 0. The later content probes supply protocol-level
-evidence; stop on any failure here because all three cross-machine paths must
-work in the documented directions.
+listener identities. If an address or visible process contradicts the focused
+deployment or camera terminal, or if any command fails, execute the universal
+pre-engagement stop rule immediately. Do not remediate while actuated. `nc`
+must reach the workstation manager on port 5556 and exit 0. The later content
+probes supply protocol-level evidence; all three cross-machine paths must work
+in the documented directions.
 
 ### Probe the Pinned Configuration Before Engagement
 
@@ -957,7 +1023,9 @@ Expected: the final line is exactly
 `PASS: robot_config matches the pinned deployment`, and the probe exits 0. At
 the same time, the focused PC2 deployment terminal must show `Init Done`, must
 not continue reporting LowState-unavailable messages, and must show no CRC or
-safety error. Stop if any of these checks fail.
+safety error. If the probe, schema, value, startup-log, or safety-log check
+fails, execute the universal pre-engagement stop rule immediately. Do not
+inspect or remediate the cause while actuated.
 
 The manager's FeedbackReader is already subscribed to `g1_debug`, but
 deployment publishes no payload on that topic while it is in INIT or
@@ -1174,13 +1242,20 @@ independent hardware stop immediately.
 
 ### Troubleshooting
 
+Do not perform any troubleshooting in this table while deployment remains
+actuated. Before engagement, execute the universal pre-engagement stop rule and
+confirm shutdown first. During or after engagement, use the documented
+independent hardware fault-stop rule and confirm the robot is safe first. Only
+then perform the matching remediation and restart from the Safe Execution
+Order.
+
 | Symptom | Required action |
 | --- | --- |
 | An ONNX or other deployment artifact is a Git LFS pointer or is missing | Stop. Restore the pinned Hugging Face revision and verify the documented SHA-256 hashes from Section 1; do not substitute an unpinned artifact. |
 | Imports or CLI options are missing | Confirm the command uses `.venv_teleop` for the manager, `.venv_data_collection` for exporter/viewer/probes, and `.venv_camera` for the PC2 camera server. Rerun the matching focused Section 1 checks. |
-| A cross-machine command uses `localhost` | Replace it with the configured PC2 or workstation IP. Only the workstation-local manager-to-exporter pose path uses `localhost:5556`. |
-| Port 5556, 5557, or the configured camera port is missing, unexpected, or blocked | Stop before engagement. Repeat both exact-filter directional `ss`/`nc` blocks, compare visible listener address/process with the launched terminals, correct binding, routing, or firewall policy, and require every command to exit 0. |
-| `robot_config` schema or a value differs from the pinned contract | Stop before engagement. Check deploy arguments, artifacts, and revisions on both machines; restart with the exact pinned configuration and rerun the bounded ten-field probe. |
+| A cross-machine command uses `localhost` | If deployment has been actuated but PICO has not engaged, first execute the universal pre-engagement stop rule and confirm shutdown. Only then replace it with the configured PC2 or workstation IP. The workstation-local manager-to-exporter pose path is the sole use of `localhost:5556`. |
+| Port 5556, 5557, or the configured camera port is missing, unexpected, or blocked | If this is discovered after `ACTUATE` and before engagement, immediately execute the universal pre-engagement stop rule and confirm shutdown. Only then correct binding, routing, or firewall policy and restart the entire Safe Execution Order; never repeat the checks while actuated. |
+| `robot_config` schema or a value differs from the pinned contract | Immediately execute the universal pre-engagement stop rule and confirm shutdown. Only then check deploy arguments, artifacts, and revisions; restart the Safe Execution Order with the exact pinned configuration before rerunning the bounded probe. |
 | The planner-ready marker is absent, an initialization error appears, or `g1_debug` is absent, malformed, or non-finite after ready | Immediately use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without waiting for uppercase `O` or PICO stop. Inspect deploy startup and safety logs only after the robot is independently stopped; do not continue collection. |
-| Camera discovery fails, frames time out, or foreground launch collides with systemd | Stop collection. Re-run the matching Section 4 camera probe, verify device ID and non-loopback listener, and resolve the installed service versus foreground launch path before retrying. |
+| Camera discovery fails, frames time out, or foreground launch collides with systemd | Before actuation, stop setup and correct Section 4. After `ACTUATE` but before engagement, first execute the universal pre-engagement stop rule and confirm shutdown. Only then verify the device ID and listener or resolve the service collision; restart the Safe Execution Order before retrying. |
 | The two repository revisions differ | Stop. Check out the same explicit 40-character `$REPO_REVISION` on both machines, update submodules and LFS, and repeat the artifact and environment checks. |

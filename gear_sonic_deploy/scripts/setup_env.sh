@@ -284,7 +284,7 @@ if [ -z "$CUDAToolkit_ROOT" ] && [ -d "/usr/lib/aarch64-linux-gnu/nvidia/" ]; th
 elif [ -n "$CUDAToolkit_ROOT" ]; then
     echo "✅ Using CUDA libraries from toolkit (prioritized over system runtime libs)"
 else
-    cuda_so_path=$(find /usr -name libcuda.so.1 2>/dev/null | head -n1)
+    cuda_so_path=$(find /usr -name libcuda.so.1 -print -quit 2>/dev/null)
     if [ -n "$cuda_so_path" ]; then
         export LD_PRELOAD="$cuda_so_path"
         echo "✅ CUDA runtime library found at $cuda_so_path"
