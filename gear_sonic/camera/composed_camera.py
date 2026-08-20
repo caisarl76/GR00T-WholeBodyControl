@@ -510,6 +510,18 @@ class ComposedCameraSensor(Sensor, SensorServer):
             return None
 
 
+def run_composed_camera_server(config: ComposedCameraConfig) -> None:
+    composed_camera = ComposedCameraSensor(config)
+    print("Running composed camera server...")
+    try:
+        composed_camera.run_server()
+    except KeyboardInterrupt:
+        print("Stopping composed camera server...")
+    finally:
+        composed_camera.close()
+        print("Composed camera server stopped.")
+
+
 class ComposedCameraClientSensor(Sensor, SensorClient):
     """ZMQ client that deserializes merged camera frames from the server."""
 
@@ -689,9 +701,7 @@ if __name__ == "__main__":
     config = tyro.cli(ComposedCameraConfig)
 
     if config.run_as_server:
-        composed_camera = ComposedCameraSensor(config)
-        print("Running composed camera server...")
-        composed_camera.run_server()
+        run_composed_camera_server(config)
     else:
         composed_client = ComposedCameraClientSensor(server_ip="localhost", port=config.port)
         try:
