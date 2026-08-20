@@ -710,3 +710,322 @@ immediately before starting the foreground Python process, the configured
 backend initializes, the server binds the configured port, frames are
 published, and no repeated timeout or reconnect messages appear. Keep this
 foreground terminal running.
+
+## 5. Run Workstation Processes
+
+Start only the PICO manager first. Do not start the exporter or viewer yet;
+their startup is gated on the directional network checks and the pre- and
+post-engagement probes below.
+
+**Workstation Terminal 1 — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_teleop/bin/python gear_sonic/scripts/pico_manager_thread_server.py \
+    --manager \
+    --port 5556 \
+    --zmq_feedback_host "$PC2_IP" \
+    --zmq_feedback_port 5557
+)
+```
+
+Expected: the process enters interactive manager mode, listens on workstation
+port 5556, and connects its feedback input to PC2 port 5557. Keep this
+foreground process running in Workstation Terminal 1. **Do not start the
+exporter or viewer yet.**
+
+### Verify Both Network Directions Before Engagement
+
+These commands prove TCP reachability only. They do not prove that a peer is
+publishing valid robot state, planner commands, or camera content. Run each
+block directly so that `set -e` stops at the first failed check and a later
+success cannot mask it.
+
+**Workstation Terminal 2 — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  MANAGER_LISTENER="$(ss -H -ltnp 'sport = :5556')"
+  test -n "$MANAGER_LISTENER"
+  printf '%s\n' "$MANAGER_LISTENER"
+  nc -zvw 3 "$PC2_IP" 5557
+  nc -zvw 3 "$PC2_IP" "$CAMERA_PORT"
+)
+```
+
+Expected: the exact socket filter returns a nonempty listener on port 5556,
+with output showing the expected wildcard address and the manager process when
+`ss -p` permissions expose it. The filter alone proves that something listens
+on the exact port, not its identity. If its address or visible process
+contradicts Workstation Terminal 1, stop. Both `nc` commands must report success
+and exit 0; they check the workstation-to-PC2 paths for deployment state and
+camera traffic.
+
+**PC2 Terminal 2 — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  DEPLOY_LISTENER="$(ss -H -ltnp 'sport = :5557')"
+  CAMERA_LISTENER="$(ss -H -ltnp "sport = :$CAMERA_PORT")"
+  test -n "$DEPLOY_LISTENER"
+  test -n "$CAMERA_LISTENER"
+  printf '%s\n' "$DEPLOY_LISTENER"
+  printf '%s\n' "$CAMERA_LISTENER"
+  nc -zvw 3 "$WORKSTATION_IP" 5556
+)
+```
+
+Expected: both exact socket filters return nonempty results. Their output must
+show deployment on port 5557 using the expected wildcard address and the
+camera server on its configured port using a non-loopback address; expected
+process names should also appear when `ss -p` permissions expose them. The
+filters alone prove only that something listens on each exact port, not the
+listener identities. Stop if an address or visible process contradicts the
+focused deployment or camera terminal. `nc` must reach the workstation manager
+on port 5556 and exit 0. The later content probes supply protocol-level
+evidence; stop on any failure here because all three cross-machine paths must
+work in the documented directions.
+
+### Probe the Pinned Configuration Before Engagement
+
+Before engaging the robot, request one bounded `robot_config` response. This
+checks the current exact ten-field schema and every advertised value against
+the pinned configuration; it does not engage CONTROL.
+
+**Workstation Terminal 2 — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_data_collection/bin/python - "$PC2_IP" <<'PY'
+import sys
+
+from gear_sonic.utils.data_collection.zmq_state_subscriber import poll_robot_config_zmq
+
+host = sys.argv[1]
+expected = {
+    "model_path": "policy/release/model_decoder.onnx",
+    "reference_motion_path": "reference/example/",
+    "planner_path": "planner/target_vel/V2/planner_sonic.onnx",
+    "obs_config_path": "policy/release/observation_config.yaml",
+    "encoder_file": "policy/release/model_encoder.onnx",
+    "control_frequency": 50,
+    "planner_frequency": 10,
+    "is_using_encoder": True,
+    "policy_fp16": False,
+    "planner_fp16": False,
+}
+config = poll_robot_config_zmq(host, 5557, timeout_sec=10)
+missing = sorted(set(expected) - set(config))
+unexpected = sorted(set(config) - set(expected))
+if missing or unexpected:
+    raise SystemExit(f"FAIL: robot_config schema mismatch: missing={missing}, unexpected={unexpected}")
+mismatches = {
+    key: {"expected": value, "actual": config.get(key)}
+    for key, value in expected.items()
+    if config.get(key) != value
+}
+if mismatches:
+    raise SystemExit(f"FAIL: robot_config mismatch: {mismatches}")
+print("PASS: robot_config matches the pinned deployment")
+PY
+)
+```
+
+Expected: the final line is exactly
+`PASS: robot_config matches the pinned deployment`, and the probe exits 0. At
+the same time, the focused PC2 deployment terminal must show `Init Done`, must
+not continue reporting LowState-unavailable messages, and must show no CRC or
+safety error. Stop if any of these checks fail.
+
+The manager's FeedbackReader is already subscribed to `g1_debug`, but
+deployment publishes no payload on that topic while it is in INIT or
+WAIT_FOR_CONTROL. Do **not** run a standalone `g1_debug` probe or treat absence
+as a failure until CONTROL has entered the startup-ready state below.
+
+### Engage Planner Mode
+
+The VR operator assumes the `CALIB_FULL` pose documented in the VR teleoperation
+setup, then presses the PICO `A+B+X+Y` combination to enter planner mode. The
+keyboard `]` key is **not** the engagement key for the `zmq_manager` input mode
+used by this runbook. Begin the startup gate immediately when the combination
+is pressed.
+
+```{danger}
+After PICO start sets `operator_state.start`, the ZMQ manager input thread may
+block for up to five seconds while it waits for planner initialization. During
+that interval, keyboard uppercase `O` and a later PICO stop are not guaranteed
+to take effect immediately.
+
+The safety operator must watch the focused PC2 deployment terminal while
+continuously holding the independent hardware E-stop or power-cut described by
+`<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>`. Within five seconds of PICO start,
+that terminal must print exactly
+`[ZMQManager] motion name is planner_motion`, with neither
+`Planner initialization timeout` nor
+`Planner failed to initialize. Stopping control.`
+
+The independent hardware-only fault-stop rule remains active until the exact
+ready marker appears. If it does not appear within five seconds, or if either
+error appears, immediately use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without
+waiting for uppercase `O` or PICO stop. Neither software input is an
+independent startup E-stop. Only after the ready marker appears with no error
+may the measured-state probe below be run or accepted.
+```
+
+### Complete the Startup Gate with a Measured-State Probe
+
+As soon as the startup-ready marker appears with no initialization error, run
+this bounded `g1_debug` probe. Both the ready marker and this probe's PASS are
+required **before** starting VR_3PT, the exporter, the viewer, or recording.
+
+**Workstation Terminal 2 — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_data_collection/bin/python - "$PC2_IP" <<'PY'
+import sys
+import time
+
+import numpy as np
+
+from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
+
+subscriber = ZMQStateSubscriber(host=sys.argv[1], port=5557)
+deadline = time.monotonic() + 10.0
+try:
+    while time.monotonic() < deadline:
+        message = subscriber.get_msg()
+        if message is None:
+            time.sleep(0.02)
+            continue
+        if "body_q_measured" not in message:
+            raise SystemExit("FAIL: g1_debug is missing body_q_measured")
+        measured = np.asarray(message["body_q_measured"])
+        if measured.shape != (29,):
+            raise SystemExit(f"FAIL: body_q_measured shape is {measured.shape}")
+        if not np.isfinite(measured).all():
+            raise SystemExit("FAIL: body_q_measured contains non-finite values")
+        print("PASS: finite g1_debug body_q_measured received")
+        break
+    else:
+        raise SystemExit("FAIL: no g1_debug message within 10 seconds")
+finally:
+    subscriber.close()
+PY
+)
+```
+
+Expected: the final line is exactly
+`PASS: finite g1_debug body_q_measured received`, and the probe exits 0. Any
+nonzero exit, malformed shape, or non-finite value requires the safety operator
+to **immediately** use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without waiting
+for uppercase `O`. A PASS establishes that the sample contains exactly 29
+NumPy-convertible numeric, finite, double-equivalent measured-joint values. Do
+not continue on failure.
+
+### Start Exporter and Viewer Only After the Probe Passes
+
+Only after the focused PC2 terminal prints the exact startup-ready marker with
+no initialization error **and** the post-start `g1_debug` probe prints its
+`PASS` line may you start the exporter.
+
+**Workstation Terminal 2 — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_data_collection/bin/python gear_sonic/scripts/run_data_exporter.py \
+    --dataset-name "$DATASET_NAME" \
+    --task-prompt "$TASK_PROMPT" \
+    --camera-host "$PC2_IP" \
+    --camera-port "$CAMERA_PORT" \
+    --sonic-zmq-host localhost \
+    --sonic-zmq-port 5556 \
+    --state-zmq-host "$PC2_IP" \
+    --state-zmq-port 5557 \
+    --robot-config-timeout 10
+)
+```
+
+Expected: the exporter receives the pinned robot configuration and state from
+PC2, manager pose data from workstation-local port 5556, and camera frames
+from PC2 without a timeout. Keep it running.
+
+Then start the viewer in a third workstation terminal.
+
+**Workstation Terminal 3 — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_data_collection/bin/python gear_sonic/scripts/run_camera_viewer.py \
+    --camera-host "$PC2_IP" \
+    --camera-port "$CAMERA_PORT"
+)
+```
+
+Expected: the configured streams appear and live frames continue updating.
+Keep the viewer running.
+
+The recording controls are exact:
+
+- **Left Grip + A** starts an episode; pressing **Left Grip + A** again saves
+  it.
+- **Left Grip + B** saves the active episode to disk marked discarded in
+  `discarded_episode_indices` and returns the exporter to idle. It does not
+  delete the episode.
+
+### Normal Shutdown: Stop the Robot First
+
+Normal shutdown must follow this exact order. A fault during the five-second
+startup interval or any failed or bad state probe always bypasses this normal
+sequence and uses the independent hardware stop immediately.
+
+1. Press uppercase `O` in the focused PC2 deployment terminal. Require it to
+   print `Stop` after the damping-only LowCommandWriter, then
+   `[DEBUG] Program exiting normally...`, and require the `just run` command to
+   return to the shell. If these markers and terminal return do not occur
+   promptly, or if the result is uncertain, use the independent hardware stop
+   or power-cut; the harness must carry the robot's dead weight.
+2. If an episode is active, press **Left Grip + A** and wait for
+   `Finished saving episode` (the code transitions to idle in the same loop),
+   **or** press **Left Grip + B** and wait for `Discarded episode` (which saves
+   it to disk marked in `discarded_episode_indices` and returns the exporter to
+   idle; it does not delete the episode). Do not proceed without the chosen
+   confirmation.
+3. Only after the exporter is idle, press `Ctrl+C` in Workstation Terminal 2.
+   Never interrupt during `save_episode()`; wait for
+   `Finished saving episode` and idle. `Ctrl+C` attempts to mark a still-intact
+   unsaved buffer discarded only when its size is greater than zero. It cannot
+   guarantee recovery or marking if interruption occurs inside
+   `save_episode()` after the buffer has already been consumed or popped.
+4. Press lowercase `q` in the focused viewer window.
+5. Press `Ctrl+C` in Workstation Terminal 1 to stop the manager.
+6. Press `Ctrl+C` in the PC2 foreground camera terminal to stop the camera
+   server.
+
+The robot always stops first. Neither exporter cleanup nor viewer, manager, or
+camera shutdown is a substitute for confirmed robot shutdown.
+
+### Troubleshooting
+
+| Symptom | Required action |
+| --- | --- |
+| An ONNX or other deployment artifact is a Git LFS pointer or is missing | Stop. Restore the pinned Hugging Face revision and verify the documented SHA-256 hashes from Section 1; do not substitute an unpinned artifact. |
+| Imports or CLI options are missing | Confirm the command uses `.venv_teleop` for the manager, `.venv_data_collection` for exporter/viewer/probes, and `.venv_camera` for the PC2 camera server. Rerun the matching focused Section 1 checks. |
+| A cross-machine command uses `localhost` | Replace it with the configured PC2 or workstation IP. Only the workstation-local manager-to-exporter pose path uses `localhost:5556`. |
+| Port 5556, 5557, or the configured camera port is missing, unexpected, or blocked | Stop before engagement. Repeat both exact-filter directional `ss`/`nc` blocks, compare visible listener address/process with the launched terminals, correct binding, routing, or firewall policy, and require every command to exit 0. |
+| `robot_config` schema or a value differs from the pinned contract | Stop before engagement. Check deploy arguments, artifacts, and revisions on both machines; restart with the exact pinned configuration and rerun the bounded ten-field probe. |
+| The planner-ready marker is absent, an initialization error appears, or `g1_debug` is absent, malformed, or non-finite after ready | Immediately use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without waiting for uppercase `O` or PICO stop. Inspect deploy startup and safety logs only after the robot is independently stopped; do not continue collection. |
+| Camera discovery fails, frames time out, or foreground launch collides with systemd | Stop collection. Re-run the matching Section 4 camera probe, verify device ID and non-loopback listener, and resolve the installed service versus foreground launch path before retrying. |
+| The two repository revisions differ | Stop. Check out the same explicit 40-character `$REPO_REVISION` on both machines, update submodules and LFS, and repeat the artifact and environment checks. |
