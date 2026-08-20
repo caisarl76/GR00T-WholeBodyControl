@@ -1,7 +1,7 @@
 # PnP Trash Cosmos-Assisted Curation Design
 
 **Date:** 2026-08-18
-**Revised:** 2026-08-19
+**Revised:** 2026-08-20
 **Status:** Revised after design review; awaiting final approval
 
 ## Objective
@@ -233,7 +233,8 @@ outputs/pnp_trash_curation/
 │   ├── response.txt
 │   ├── parsed.json
 │   └── repair-response.txt       # only when a repair occurred
-├── contact_sheets/episode_<source-index>.png
+├── contact_sheets/proposals/proposal_<proposal-id>.png
+├── contact_sheets/finals/episode_<source-index>_revision_<revision>.png
 └── exports/<export-id>/
     ├── structural-report.json
     ├── gr00t-stats-report.json
@@ -891,10 +892,21 @@ return a new child-job ID, which is launched with the same `run` command.
   job, its attempts, and its artifacts never change. The latest valid proposal
   is marked active and the prior proposal superseded. Human finals never
   change.
-- **Cancel:** cancellation sets `cancel_requested`. No new attempt is claimed;
-  an in-flight request is allowed to reach its 120-second bound and persist its
-  result, after which all remaining queued/retryable attempts become
-  `cancelled` and the job becomes `cancelled` in one transaction.
+- **Cancel:** `POST /api/curation/batches/{id}/cancel` has no request body and
+  is idempotent for cancellable states. An unknown ID returns
+  `404 {"error":"batch_not_found","job_id":"<uuid>"}`. For `queued`, one
+  transaction marks every attempt and the job `cancelled`, and returns
+  `200 {"job_id":"<uuid>","state":"cancelled","changed":true}`. For
+  `running`, it sets `cancel_requested`, records one audit event, and returns
+  `202 {"job_id":"<uuid>","state":"cancel_requested","changed":true}`; a
+  repeated request in `cancel_requested` returns the same `202` representation
+  with `changed:false` and creates no new audit event. No new attempt is then
+  claimed; an in-flight request may reach its 120-second bound and persist its
+  result, after which all remaining queued/retryable attempts and the job
+  become `cancelled` in one transaction. A request for `cancelled` returns
+  `200 {"job_id":"<uuid>","state":"cancelled","changed":false}`. Requests
+  for `completed`, `completed_with_failures`, or `failed` return
+  `409 {"error":"batch_terminal","job_id":"<uuid>","state":"<unchanged>"}`.
 - **Crash recovery:** at startup and before each claim, expired `leased` or
   `requesting` attempts become `retryable` with a crash-recovery audit event.
   A `running` job with unfinished attempts returns to work only through the
@@ -910,8 +922,9 @@ CLI integration tests run the exact entrypoint against a temporary workspace
 and fake Cosmos server. They prove that the API leaves a job queued without
 spawning work, `run` owns it to completion, a killed worker becomes resumable
 only after lease expiry, an unexpired lease returns status 3, cancellation
-stops further claims, and a retry child uses a distinct invocation and attempt
-rows.
+stops further claims, queued/running/repeated/terminal cancel calls return the
+specified statuses without duplicate audit events, and a retry child uses a
+distinct invocation and attempt rows.
 
 ## Deterministic Physical and Visual Cross-Checks
 
@@ -947,9 +960,21 @@ warning. This algorithm never changes a boundary or approval automatically.
 
 The audit view reports review-state counts, Cosmos lifecycle/results,
 transition-time and phase-duration distributions, zero-length/order/coverage
-errors, grip disagreements, and unreadable files. For every proposed or
-approved episode, it generates a contact sheet containing the six boundary
-frames, timestamps, transition names, and proposal-versus-final deltas.
+errors, grip disagreements, and unreadable files.
+
+A proposal contact sheet always contains six fixed cells corresponding to the
+starts of steps 2 through 7. An integer proposal transition renders its decoded
+frame, parquet timestamp, transition name, and proposal status. A `null`
+transition renders a deterministic `NOT OBSERVED` placeholder with the
+transition name and model status; it decodes no frame and displays no timestamp
+or delta. This preserves the six-cell layout without fabricating visual
+evidence. An `approved_keep` additionally produces a final-boundary sheet from
+its six non-null human transitions. Each final cell contains the final frame
+and timestamp; it shows proposal-versus-final delta only when the corresponding
+proposal transition is an integer, otherwise `proposal: NOT OBSERVED` and no
+delta. `approved_reject` has no final-boundary sheet. Artifact names include
+the immutable proposal ID or approval revision so regeneration cannot
+overwrite prior evidence.
 
 ## Stable Tasks and Provenance
 
@@ -1119,7 +1144,9 @@ The exporter performs this fixed sequence:
     it from the `exports` row, avoiding a checksum/provenance cycle.
 14. Commit export state `publishing`, publish with Linux
     `renameat2(AT_FDCWD, staging, AT_FDCWD, final, RENAME_NOREPLACE)`, then
-    fsync the final parent directory and commit state `published`.
+    fsync the final parent directory and commit state `published`. A parent
+    fsync failure leaves state `publishing` with
+    `publish_parent_fsync_failed`; it never commits `published`.
 
 There is no publish before both validation gates and GR00T validation.
 Structural, statistics, loader, provenance, checksum, or consistency failure
@@ -1137,8 +1164,11 @@ explicit operation outside this tool.
 
 On startup, a `publishing` export is reconciled without guessing: staging
 present/final absent returns to `final_consistency_validated`; staging
-absent/final present must pass the final read-only gate at the final path before
-advancing to `published`; both present or both absent is `failed` and requires
+absent/final present must pass the final read-only gate at the final path, then
+successfully fsync the canonical final parent directory, and only then commit
+SQLite state `published`. If that fsync fails, state remains `publishing` with
+`publish_parent_fsync_failed` and reconciliation may retry it; it must never
+report `published`. Both paths present or both absent is `failed` and requires
 operator inspection. This closes the crash window between the no-clobber
 rename, parent fsync, and SQLite commit.
 
@@ -1149,6 +1179,13 @@ releases the barrier. Both cases must observe `EEXIST`, preserve the competing
 directory (and sentinel byte-for-byte), preserve the complete staging
 directory, and leave the export unpublished. A successful-path test verifies
 one atomic rename and an absent staging path afterward.
+
+A separate crash test terminates the exporter immediately after successful
+`renameat2` and before parent fsync. On restart it must observe staging absent
+and final present, pass the final gate at the final path, call parent fsync, and
+only afterward commit `published`. With an injected parent-fsync failure it
+must remain `publishing`, surface `publish_parent_fsync_failed`, and succeed on
+a later reconciliation only after fsync succeeds.
 
 Exact preservation is verified by comparing each untouched source/output Arrow
 column with `pyarrow.Array.equals`, checking schema field equality, and hashing
@@ -1164,10 +1201,11 @@ Backend tests cover local-path containment, full/range/HEAD asset responses,
 rejection of authorization on local assets, v2.1 loading, SQLite concurrency
 and optimistic conflicts, review-state transitions, approval invalidation,
 Cosmos complete/partial/not-observed schema cases, bidirectional completion
-rules, limits/repair/resume/crash recovery, deterministic grip candidates,
+rules, limits/repair/resume/crash recovery, cancellation endpoint idempotency,
+nullable-proposal contact-sheet placeholders, deterministic grip candidates,
 stable tasks, zero-kept rejection, exact column preservation, independent
 video copies, publication ordering, final artifact consistency, no-clobber
-destination races, and source immutability.
+destination races, post-rename parent-fsync recovery, and source immutability.
 
 A dedicated v3.1 regression module loads the existing v3 fixture, exercises
 all existing atom read/write routes, exports `language_persistent`,
