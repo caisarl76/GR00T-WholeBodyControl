@@ -165,6 +165,7 @@ intentional configuration tokens, not unfinished documentation.
 | `<WORKSTATION_IP>` | Workstation address reachable from PC2 for PICO-manager planner commands. |
 | `<WORKSTATION_REPO_DIR>` | Absolute checkout path on the workstation. |
 | `<ROBOT_NETWORK_INTERFACE>` | PC2 network interface connected to the robot. |
+| `<REPOSITORY_URL>` | Git repository that contains `<REPO_REVISION>`; for this draft use the fork URL supplied by the handover. |
 | `<REPO_REVISION>` | The same explicit 40-character Git commit to check out on both machines. |
 | `<TENSORRT_ROOT>` | PC2 TensorRT installation root used by the C++ deployment build. |
 | `<EGO_CAMERA_TYPE>` | Camera backend: only `oak`, `oak_mono`, or `realsense`. |
@@ -185,6 +186,7 @@ export PC2_USER='<PC2_USER>'
 export PC2_REPO_DIR='<PC2_REPO_DIR>'
 export WORKSTATION_IP='<WORKSTATION_IP>'
 export WORKSTATION_REPO_DIR='<WORKSTATION_REPO_DIR>'
+export REPOSITORY_URL='<REPOSITORY_URL>'
 export REPO_REVISION='<REPO_REVISION>'
 export CAMERA_PORT='<CAMERA_PORT>'
 export TASK_PROMPT='<TASK_PROMPT>'
@@ -205,6 +207,7 @@ new PC2 terminal.
 export PC2_IP='<PC2_IP>'
 export PC2_REPO_DIR='<PC2_REPO_DIR>'
 export WORKSTATION_IP='<WORKSTATION_IP>'
+export REPOSITORY_URL='<REPOSITORY_URL>'
 export REPO_REVISION='<REPO_REVISION>'
 export ROBOT_NETWORK_INTERFACE='<ROBOT_NETWORK_INTERFACE>'
 export TensorRT_ROOT='<TENSORRT_ROOT>'
@@ -279,8 +282,9 @@ Expected: both package commands and `git lfs install` exit 0;
 
 ```bash
 set -euo pipefail
-git clone https://github.com/NVlabs/GR00T-WholeBodyControl.git "$WORKSTATION_REPO_DIR"
+git clone "$REPOSITORY_URL" "$WORKSTATION_REPO_DIR"
 cd "$WORKSTATION_REPO_DIR"
+test "$(git remote get-url origin)" = "$REPOSITORY_URL"
 git fetch origin "$REPO_REVISION"
 git checkout --detach "$REPO_REVISION"
 test "$(git rev-parse HEAD)" = "$REPO_REVISION"
@@ -293,8 +297,9 @@ git rev-parse HEAD
 
 ```bash
 set -euo pipefail
-git clone https://github.com/NVlabs/GR00T-WholeBodyControl.git "$PC2_REPO_DIR"
+git clone "$REPOSITORY_URL" "$PC2_REPO_DIR"
 cd "$PC2_REPO_DIR"
+test "$(git remote get-url origin)" = "$REPOSITORY_URL"
 git fetch origin "$REPO_REVISION"
 git checkout --detach "$REPO_REVISION"
 test "$(git rev-parse HEAD)" = "$REPO_REVISION"
@@ -303,12 +308,16 @@ git lfs pull
 git rev-parse HEAD
 ```
 
-The package and clone commands must exit 0. Each checkout explicitly fails
-unless `git rev-parse HEAD` exactly equals `$REPO_REVISION`; the final
+The package and clone commands must exit 0. The handover supplies the repository
+URL for this draft and a fail-closed remote-head resolver; use its result as the
+lab-provided `<REPO_REVISION>`. Each clone explicitly fails if `origin` differs
+from `$REPOSITORY_URL`, and each checkout explicitly fails unless
+`git rev-parse HEAD` exactly equals `$REPO_REVISION`. The final
 `git rev-parse HEAD` visibly prints the resulting 40-character commit. Both
-final outputs must be the same 40-character commit; stop on a mismatch because
-the Python and C++ components share a ZMQ wire format. `git lfs pull` does not
-download ignored deployment ONNX files; Section 1 handles those files.
+final outputs must be the same 40-character commit; stop on a repository or
+revision mismatch because the Python and C++ components share a ZMQ wire
+format. `git lfs pull` does not download ignored deployment ONNX files; Section
+1 handles those files.
 
 ## 1. Install the Required Environments
 
