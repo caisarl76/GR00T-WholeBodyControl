@@ -73,8 +73,11 @@ rather than calling the current branch tip the implementation tip:
   change is separate from the original implementation-tip claim.
 - The **future handover document commit** is created after the
   publication-contract correction and the approved implementation plan. The
-  completed handover and PR body record it separately from `4db4795`,
-  `e2b923d`, `8cd095d`, and the publication-contract correction.
+  handover records only stable commits that precede it; it cannot record its
+  own future hash. After that source commit is created and transplanted, the PR
+  body records the source-handover SHA and its different published SHA
+  separately from `4db4795`, `e2b923d`, `8cd095d`, and the
+  publication-contract correction.
 
 No hardware was started while producing or validating any of these commits.
 
@@ -162,8 +165,10 @@ token is a verification failure.
 
 ## Reproducible Verification Contract
 
-Unless a command says otherwise, its working directory is the root of a
-checkout containing the handover commit. All commands are non-actuating.
+Unless a command says otherwise, its working directory is the source-worktree
+root containing the complete handover content. Run the contract once before
+creating the handover commit, then rerun it from the committed source and
+publication worktrees as specified below. All commands are non-actuating.
 
 ### Pinned Verification Environment
 
@@ -181,10 +186,12 @@ test "$(.venv_teleop/bin/python -m pytest --version)" = 'pytest 9.0.3'
 test "$(.venv_teleop/bin/ruff --version)" = 'ruff 0.15.20'
 ```
 
-Expected: exit 0 and both exact version comparisons pass. Record the installer
-and pinned-tool result at the future handover document commit. Every later
-Python command uses an executable under `.venv_teleop/bin`; bare `python`,
-`pytest`, and `ruff` are not accepted.
+Expected: exit 0 and both exact version comparisons pass. Record the
+pre-commit installer and pinned-tool result in the handover, then record the
+post-commit rerun in the PR body. Every later test, byte-compilation, or Ruff
+command uses an executable under `.venv_teleop/bin`; bare `pytest` and `ruff`
+are not accepted. The documentation-structure validators intentionally use
+system `python3` because they require only the standard library.
 
 ### PICO, Camera Shutdown, and Viewer Regressions
 
@@ -201,9 +208,10 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 ```
 
 Expected: exit 0 and `14 passed`. A pre-design-review run against the source
-tree containing `4db4795` and `e2b923d` reported `14 passed in 1.84s`; rerun
-and record the result at the future handover document commit and again on the
-publication transplant.
+tree containing `4db4795` and `e2b923d` reported `14 passed in 1.84s`; record a
+fresh pre-commit result in the handover. Rerun after the source handover commit
+and after the publication transplant, and record both SHA/result pairs in the
+PR body.
 
 ### Python Static Checks
 
@@ -229,9 +237,10 @@ PYTHONDONTWRITEBYTECODE=1 .venv_teleop/bin/python -m py_compile \
 Expected: exit 0 and two `All checks passed!` lines from Ruff. The manager-only
 invocation excludes its pre-existing whole-file import-order finding; the
 `4db4795` patch does not touch that import block. It does not exclude any other
-Ruff rule. Rerun and record all three results at the future handover document
-commit and on the publication transplant; the historical `e2b923d` result
-covered only the two camera files.
+Ruff rule. Record fresh pre-commit results in the handover, then rerun after
+the source handover commit and on the publication transplant and record both
+SHA/result pairs in the PR body. The historical `e2b923d` result covered only
+the two camera files.
 
 ### Deployment Environment Syntax and Behavior
 
@@ -404,8 +413,9 @@ exactly the 15 allowlisted placeholders, Section 3 has zero body bytes, no
 declared private-data or high-confidence credential pattern matches, and the
 exact `PASS` line prints. The full-address patterns intentionally avoid false
 positives from TensorRT versions such as 10.13 and 10.7. Record this result only
-at the future handover document commit and on the transplanted publication
-tip. Historical `e2b923d` evidence covered the then-current runbook alone with
+as a pre-commit handover result; rerun it against the source handover commit and
+the transplanted publication tip and record both SHA/result pairs in the PR
+body. Historical `e2b923d` evidence covered the then-current runbook alone with
 its 14-token allowlist; it cannot attest to documents or the repository token
 created afterward.
 
@@ -448,8 +458,9 @@ print("PASS: newcomer onboarding is in the Getting Started toctree exactly once"
 PY
 ```
 
-Expected: exit 0 and the exact `PASS` line. Record the result at the future
-handover document commit and on the transplanted publication tip.
+Expected: exit 0 and the exact `PASS` line. Record a fresh pre-commit result in
+the handover, then record post-commit source and publication SHA/result pairs
+in the PR body.
 
 ### Genuinely Forced Sphinx Rebuild
 
@@ -485,10 +496,12 @@ git diff --check 1e851175f883dc41299e60dc89f4949eac3ff04d..HEAD
 git status --short
 ```
 
-Expected on the source branch at the final handover commit: both commands exit
-0 and `git status` prints nothing. On the transplanted publication branch,
-replace the diff base with
-`af76fae68930b4a9276af768015fc81fbcedc344`. Record both results in the PR.
+Expected before the source handover commit: both commands exit 0 except that
+`git status --short` lists only the intentionally staged handover files. After
+the source commit, rerun and require both commands to exit 0 with no status
+output. On the transplanted publication branch, replace the diff base with
+`af76fae68930b4a9276af768015fc81fbcedc344`. Record the post-commit source and
+publication SHA/result pairs in the PR body.
 
 ## Publication Strategy
 
@@ -531,29 +544,57 @@ publication-contract correction must update the runbook as follows:
 4. State that, for this draft publication, the teammate must set
    `<REPOSITORY_URL>` to
    `https://github.com/caisarl76/GR00T-WholeBodyControl.git` and
-   `<REPO_REVISION>` to the final 40-character published head. Neither machine
-   may continue with the upstream NVlabs origin unless that exact revision is
-   first mirrored there and the handover is revised and revalidated.
+   resolve `<REPO_REVISION>` from remote head
+   `refs/heads/docs/newcomer-onboarding` with the command below. The resulting
+   40-character value is lab-supplied configuration, not a SHA embedded in the
+   handover. Neither machine may continue with the upstream NVlabs origin
+   unless that exact revision is first mirrored there and the handover is
+   revised and revalidated.
 
-After push and before opening the draft PR, prove the advertised remote head is
-reachable from the configured repository:
+The handover records the repository URL, published base, remote-head name, and
+this resolution command, but no future source-handover or published SHA:
 
 ```bash
 set -euo pipefail
 REPOSITORY_URL='https://github.com/caisarl76/GR00T-WholeBodyControl.git'
+REMOTE_HEAD='refs/heads/docs/newcomer-onboarding'
+REPO_REVISION="$(git ls-remote --exit-code --heads \
+  "$REPOSITORY_URL" "$REMOTE_HEAD" | awk 'NR == 1 {print $1}')"
+test "${#REPO_REVISION}" -eq 40
+case "$REPO_REVISION" in
+  *[!0-9a-f]*) exit 1 ;;
+esac
+printf 'PASS: set <REPO_REVISION> to %s from %s\n' \
+  "$REPO_REVISION" "$REMOTE_HEAD"
+```
+
+Expected after publication: exit 0 and a `PASS` line containing one lowercase
+40-character commit. The lab copies that value into `<REPO_REVISION>` on both
+machines. Before publication, the absent head makes this command fail closed.
+
+After push and before opening the draft PR, prove the advertised remote head is
+reachable from the configured repository and capture both hashes for the PR
+body:
+
+```bash
+set -euo pipefail
+REPOSITORY_URL='https://github.com/caisarl76/GR00T-WholeBodyControl.git'
+SOURCE_HANDOVER_REVISION="$(git rev-parse docs/newcomer-onboarding)"
 PUBLISHED_REVISION="$(git rev-parse publish/newcomer-onboarding)"
-REMOTE_REVISION="$(git ls-remote --heads "$REPOSITORY_URL" \
+REMOTE_REVISION="$(git ls-remote --exit-code --heads "$REPOSITORY_URL" \
   refs/heads/docs/newcomer-onboarding | awk 'NR == 1 {print $1}')"
 test -n "$REMOTE_REVISION"
 test "$REMOTE_REVISION" = "$PUBLISHED_REVISION"
+test "${#SOURCE_HANDOVER_REVISION}" -eq 40
 test "${#PUBLISHED_REVISION}" -eq 40
-printf 'PASS: published revision %s is reachable from %s\n' \
-  "$PUBLISHED_REVISION" "$REPOSITORY_URL"
+printf 'PASS: source handover %s; published revision %s is reachable from %s\n' \
+  "$SOURCE_HANDOVER_REVISION" "$PUBLISHED_REVISION" "$REPOSITORY_URL"
 ```
 
 Expected: exit 0 and one `PASS` line containing the same 40-character commit
-recorded in the handover and PR body. A missing branch, empty result, query
-failure, or mismatch blocks the PR.
+resolved by the handover's command. A missing branch, empty result, query
+failure, or mismatch blocks the PR. Record the source-handover and published
+SHAs in the PR body only; do not amend either handover commit to insert them.
 
 ### Chosen Strategy: Transplant Only Onboarding History
 
@@ -584,8 +625,9 @@ Getting Started toctree. Do not transplant the unrelated source-branch entry.
 
 Because cherry-picking changes commit identifiers, the handover records the
 source milestones above, while the PR body records a source-to-published commit
-map. The published tree must match the source branch for every onboarding-owned
-file before push.
+map. Only the post-push PR body records the final source-handover and published
+tip SHAs. The published tree must match the source branch for every
+onboarding-owned file before push.
 
 Publish exactly:
 
@@ -636,11 +678,14 @@ The written handover is accepted when:
 
 - it contains the authority hierarchy, supersession table, complete deviation
   ledger including all four PICO files, role-based ownership, lab placeholder
-  allowlist, source milestone identities, reachable clone contract, and exact
-  publication target;
+  allowlist, stable pre-handover milestone identities, reachable clone
+  contract, remote-head resolution command, and exact publication target, but
+  does not claim its own source or future published SHA;
 - every repository path and recorded commit exists;
-- every command in the reproducible verification contract is rerun at the
-  future handover commit and its actual result is recorded;
+- every command in the reproducible verification contract has its fresh
+  pre-commit result recorded in the handover, then is rerun against the source
+  handover commit and publication tip with those SHA/result pairs recorded in
+  the PR body;
 - no unfinished-marker token, concrete home path, private IPv4 address,
   declared credential pattern, or secret assignment appears;
 - no real robot, PICO, deploy binary, camera server, manager, exporter, or
@@ -648,4 +693,6 @@ The written handover is accepted when:
 - the publication transplant is tree-equivalent for onboarding-owned files,
   passes verification, pushes without force, proves its 40-character head is
   reachable from the runbook's configured repository, and produces one draft
-  PR against the exact fork base above.
+  PR against the exact fork base above; and
+- the post-push PR body, rather than either handover commit, records the final
+  source-handover SHA, published SHA, and source-to-published commit map.
