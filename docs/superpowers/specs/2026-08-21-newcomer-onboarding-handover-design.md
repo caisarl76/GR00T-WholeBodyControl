@@ -5,9 +5,11 @@ Date: 2026-08-21
 ## Purpose
 
 Create a concise repository-local handover for the teammate who will review,
-adopt, and maintain the new PC2/workstation newcomer-onboarding workflow. The
-handover complements the user-facing runbook; it does not duplicate the
-runbook's runnable commands.
+adopt, and maintain the PC2/workstation newcomer-onboarding workflow. The
+handover explains what actually shipped, calls out every departure from the
+documentation-only implementation plan, and gives reproducible verification
+and publication instructions. It links to the user-facing runbook instead of
+copying that runbook's commands.
 
 ## Destination and Audience
 
@@ -17,77 +19,464 @@ Write the handover at:
 docs/superpowers/progress/2026-08-21-newcomer-onboarding-handover.md
 ```
 
-The audience is a teammate familiar with the repository who needs enough
-context to review the change, fill in lab-owned configuration, execute the
-documented verification, and help a newcomer use the runbook safely.
+The audience is a repository teammate who must review the implementation,
+supply lab-owned configuration, help a newcomer execute the final runbook, and
+own follow-up in the relevant documentation, camera-runtime, or deployment
+environment area.
 
-## Sources of Truth
+## Authority and Supersession
 
-The handover links to, rather than restates:
+The documents have this authority order:
 
-- `docs/source/getting_started/newcomer_onboarding.md` for the operational
-  procedure;
-- `docs/source/getting_started/gear_sonic_deployment_9c0ff22.sha256` for pinned
-  deployment-artifact integrity;
-- `docs/superpowers/specs/2026-08-19-newcomer-onboarding-design.md` for the
-  approved design rationale;
-- `docs/superpowers/plans/2026-08-20-newcomer-onboarding.md` for the
-  implementation plan.
+1. `docs/source/getting_started/newcomer_onboarding.md` is the sole operational
+   source of truth for real execution.
+2. `docs/source/getting_started/gear_sonic_deployment_9c0ff22.sha256` is the
+   source of truth for the four pinned deployment-artifact digests.
+3. `docs/superpowers/specs/2026-08-19-newcomer-onboarding-design.md` records the
+   approved design rationale but does not override the final runbook.
+4. `docs/superpowers/plans/2026-08-20-newcomer-onboarding.md` is historical
+   implementation intent. It is not an operational source of truth and is
+   superseded wherever it conflicts with the final runbook or the deviation
+   ledger below.
 
-## Required Content
+The handover must mark these old-plan instructions as superseded explicitly:
 
-The handover contains these compact sections:
+| Topic | Superseded plan instruction | Governing final behavior |
+| --- | --- | --- |
+| `ACTUATE` readiness | The numbered implementation sequence places deployment before camera and manager setup. | Complete Sections 0 and 1, complete Section 4 through the live-frame content `PASS`, start and probe the Section 5 manager from PC2, and only then return to Section 2 and type `ACTUATE`. |
+| Episode close | The old normal shutdown stops deployment before saving or discarding an active episode. | While all streams are healthy, finish or discard the active episode and require exporter idle; the robot deployment is then the first **process** stopped. |
+| Deployment stop | The old plan treats an independent hardware stop as sufficient robot shutdown. | After any hardware stop, keep the stop secured, terminate deploy, and prove both the documented process and TCP port 5557 are absent before remediation, restart, or robot-power restoration. |
+| Remediation order | The old plan uses generic stop-and-resolve language after a failed gate. | A post-`ACTUATE`, pre-engagement failure requires confirmed uppercase-`O` shutdown or the full independent-stop cleanup. Planner-start or measured-state failure uses the independent hardware stop and the same process-cleanup proof. Troubleshooting begins only afterward. |
 
-1. **Outcome and scope** — what the branch adds and which machine runs each
-   component.
-2. **Canonical documents** — direct repository-relative links to the sources
-   of truth.
-3. **Safety-critical decisions** — camera and manager readiness before
-   `ACTUATE`, the independent hardware-stop prerequisite, confirmed deployment
-   shutdown before remediation, and episode finalization/discard behavior.
-4. **Lab-owned inputs** — the placeholders, robot-owner stop procedure,
-   physical no-hands confirmation, network access, and camera identity that
-   cannot be supplied by the repository.
-5. **Verification evidence** — the focused tests, command-fence parsing,
-   checksum validation, privacy scan, and forced Sphinx build used for this
-   branch.
-6. **Teammate onboarding checklist** — review the runbook, supply lab values,
-   rehearse simulation and stop paths, validate both machines at the same
-   revision, and perform a supervised first run.
-7. **Branch and publishing context** — feature branch, base branch, final
-   implementation commit, and draft-PR intent.
+## Implementation Identity
 
-## Constraints
+The handover distinguishes three milestones rather than calling the current
+branch tip the implementation tip:
 
-- Do not include private IP addresses, usernames, credentials, secrets, or
-  machine-specific repository paths.
-- Do not copy the full operational command sequence into the handover; avoid a
-  second source of truth that can drift.
-- Do not claim that hardware execution occurred. The implementation and review
-  used source inspection, static checks, local tests, artifact verification,
-  and documentation builds only.
-- Keep the PICO setup section in the user-facing runbook blank as requested;
-  the handover may point to the existing VR setup prerequisite but must not
-  introduce a competing PICO procedure.
-- Distinguish repository-verified facts from lab-owner decisions and external
-  prerequisites.
+- `e2b923d1e986bb9019fa21295c1b16c81226e4dd` is the source branch's final
+  onboarding **implementation tip**. It includes the final safety sequencing,
+  runtime cleanup, tests, and environment hardening.
+- `8cd095d5b4fc9f8a47930ea7b494bf5687d8d09c` is the initial **handover-design
+  commit**. It is documentation about the later handover and is not part of the
+  implementation-tip claim. Subsequent review-fix commits to this design must
+  be identified as design-only history.
+- The **future handover commit** is created only after this revised written
+  design is approved. The completed handover and PR body must record that
+  commit separately from `e2b923d` and `8cd095d`.
 
-## Verification and Acceptance
+No hardware was started while producing or validating any of these commits.
 
-The handover is accepted when:
+## Deviation Ledger
 
-- every referenced repository path exists;
-- the stated branch, base, and final commit match Git;
-- no unfinished-marker tokens remain;
-- the privacy scan finds no concrete home path or private IPv4 address;
-- `git diff --check` passes;
-- the existing onboarding tests and forced Sphinx build remain green; and
-- a teammate can identify the canonical runbook, required lab inputs, safety
-  gates, and first-run checklist without reading the implementation history.
+The old plan says the implementation changes documentation only. The final
+implementation deliberately exceeds that scope. The handover includes the
+following ledger without hiding the runtime files in a generic summary.
 
-## Publishing
+There is no repository `CODEOWNERS` file. Until reviewers assign named owners,
+`caisarl76` owns branch follow-through and review resolution; domain acceptance
+belongs to the role-based maintainers below.
 
-Commit the handover on `docs/newcomer-onboarding`, push that branch to the
-configured fork, and open one draft pull request against the branch's actual
-upstream base. The PR summary links the handover and user-facing runbook and
-reports verification without claiming real-hardware execution.
+| Unplanned file | Source commits | Behavioral effect | Rationale | Test evidence at `e2b923d` | Maintainer ownership |
+| --- | --- | --- | --- | --- | --- |
+| `gear_sonic/camera/composed_camera.py` | `29d680f9d0efa369cc7b3164a8118ab01884b781`, `a3547641cf688ff08afc3f003bdee57169b40beb` | Foreground server shutdown now closes camera workers and ZMQ resources on steady-loop interruption, construction interruption, bind failure, or other startup failure; cleanup is idempotent and unexpected errors still propagate. | The documented foreground `Ctrl+C` shutdown was not runnable because non-daemon camera workers could survive, including failures during construction. | Six focused shutdown tests pass; the shutdown tests plus the existing viewer regression report `7 passed`. | GEAR-SONIC camera/runtime maintainers; `caisarl76` owns the PR until acceptance. |
+| `gear_sonic/tests/test_composed_camera_server_shutdown.py` | `29d680f9d0efa369cc7b3164a8118ab01884b781`, `a3547641cf688ff08afc3f003bdee57169b40beb` | Adds regression coverage only; it does not change production behavior. It covers runtime and construction interrupts, bind failure, partial thread/context cleanup, idempotence, exact log order, and unexpected-error propagation. | The runtime change needs executable evidence for both the steady-state and partial-construction paths. | `6 passed` in the focused file; `7 passed` with `gear_sonic/tests/test_run_camera_viewer.py`. | GEAR-SONIC camera test maintainers; camera/runtime reviewers approve alongside production code. |
+| `gear_sonic_deploy/scripts/setup_env.sh` | `b1a4f62deff3aaf8e7bc36c4c4cf995828c0c6fc` | Replaces `find /usr ... \| head -n1` with `find /usr ... -print -quit`, preserving first-match behavior without a `pipefail`/SIGPIPE false abort. | The final runbook sources this script under `errexit` and `pipefail`; a successful runtime-only CUDA discovery must not be reported as setup failure. | `bash -n` exits 0, the retired pipeline is absent, and the exact `-print -quit` command is present. | GEAR-SONIC deployment-environment maintainers; `caisarl76` owns the PR until acceptance. |
+
+The final runbook is a planned file, but its safety sequencing differs from the
+old plan. Commits `868bbdf`, `b1a4f62`, and `e2b923d` implement the supersession
+table above. The current handover design and the future handover are
+post-implementation documentation requested by the user; they do not alter
+runtime behavior.
+
+## Required Handover Content
+
+The handover contains these sections:
+
+1. **Outcome and machine topology** — PC2 owns GEAR-SONIC deploy and camera;
+   the workstation owns the PICO manager, exporter, and viewer.
+2. **Authority and superseded instructions** — the final runbook governs the
+   four safety-critical lifecycle topics listed above.
+3. **Deviation ledger** — each unplanned file, commit, behavior, rationale,
+   test result, and maintainer role.
+4. **Lab-owned inputs** — the intentional placeholders, robot-owner hardware
+   stop procedure, no-hands confirmation, network access, and camera identity.
+5. **Reproducible verification** — the exact commands and recorded results in
+   the next section.
+6. **Teammate onboarding checklist** — document review, lab-value population,
+   simulation and stop-path rehearsal, same-revision checks on both machines,
+   and a supervised first real run.
+7. **Publication context** — source milestones, live fork state, transplant
+   strategy, target repository/base/head, and PR limitations.
+
+The handover must not duplicate the full operational command sequence or add a
+PICO procedure. Section 3 of the user-facing runbook remains empty.
+
+## Lab Placeholder Allowlist
+
+The following 14 placeholders are intentional and are the complete allowlist:
+
+```text
+<PC2_IP>
+<PC2_USER>
+<PC2_REPO_DIR>
+<WORKSTATION_IP>
+<WORKSTATION_REPO_DIR>
+<ROBOT_NETWORK_INTERFACE>
+<REPO_REVISION>
+<TENSORRT_ROOT>
+<EGO_CAMERA_TYPE>
+<EGO_CAMERA_DEVICE_ID>
+<CAMERA_PORT>
+<TASK_PROMPT>
+<DATASET_NAME>
+<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>
+```
+
+The handover says these must be supplied by the lab and must never be replaced
+with real values in the committed documentation. Any other angle-bracket token
+is a verification failure.
+
+## Reproducible Verification Contract
+
+Unless a command says otherwise, its working directory is the root of a
+checkout containing the handover commit. All commands are non-actuating.
+
+### Camera Shutdown and Viewer Regression
+
+Prerequisite: `.venv_teleop` was created with
+`install_scripts/install_pico.sh` and contains the test dependencies.
+
+```bash
+set -euo pipefail
+PYTHONPATH="$PWD" \
+PYTHONDONTWRITEBYTECODE=1 \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+.venv_teleop/bin/python -m pytest -q -p no:cacheprovider \
+  gear_sonic/tests/test_composed_camera_server_shutdown.py \
+  gear_sonic/tests/test_run_camera_viewer.py
+```
+
+Expected: exit 0 and `7 passed`. Recorded at implementation tip `e2b923d`:
+`7 passed in 0.15s`.
+
+### Python Static Checks
+
+```bash
+set -euo pipefail
+PYTHONDONTWRITEBYTECODE=1 .venv_teleop/bin/python -m py_compile \
+  gear_sonic/camera/composed_camera.py \
+  gear_sonic/tests/test_composed_camera_server_shutdown.py
+ruff check --no-cache \
+  gear_sonic/camera/composed_camera.py \
+  gear_sonic/tests/test_composed_camera_server_shutdown.py
+```
+
+Expected: exit 0 and `All checks passed!` from Ruff. Recorded at `e2b923d`:
+both commands exited 0.
+
+### Deployment Environment Syntax and Behavior
+
+```bash
+set -euo pipefail
+bash -n gear_sonic_deploy/scripts/setup_env.sh
+test "$(rg -nF 'cuda_so_path=$(find /usr -name libcuda.so.1 -print -quit 2>/dev/null)' \
+  gear_sonic_deploy/scripts/setup_env.sh | wc -l)" -eq 1
+if rg -nF 'find /usr -name libcuda.so.1 2>/dev/null | head -n1' \
+  gear_sonic_deploy/scripts/setup_env.sh; then
+  exit 1
+else
+  test "$?" -eq 1
+fi
+```
+
+Expected: exit 0, exactly one safe lookup, and no retired pipeline. Recorded at
+`e2b923d`: all three gates passed.
+
+### Runbook Command-Fence Validation
+
+```bash
+set -euo pipefail
+python3 - <<'PY'
+from pathlib import Path
+import ast
+import re
+import subprocess
+
+source = Path("docs/source/getting_started/newcomer_onboarding.md").read_text()
+bash_blocks = re.findall(r"```bash\n(.*?)\n```", source, re.S)
+python_bodies = re.findall(r"<<'PY'\n(.*?)\nPY", source, re.S)
+failures = []
+for number, block in enumerate(bash_blocks, start=1):
+    result = subprocess.run(["bash", "-n"], input=block, text=True, capture_output=True)
+    if result.returncode:
+        failures.append((number, result.stderr))
+for body in python_bodies:
+    ast.parse(body)
+assert not failures, failures
+assert len(bash_blocks) == 32, len(bash_blocks)
+assert len(python_bodies) == 5, len(python_bodies)
+print("PASS: 32 Bash fences and 5 Python heredocs")
+PY
+```
+
+Expected and recorded at `e2b923d`: exit 0 and the exact `PASS` line.
+
+### Manifest Structure: Always Runnable
+
+This validates the tracked manifest without requiring downloaded ONNX files.
+
+```bash
+set -euo pipefail
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+path = Path("docs/source/getting_started/gear_sonic_deployment_9c0ff22.sha256")
+lines = path.read_text().splitlines()
+expected_paths = [
+    "gear_sonic_deploy/policy/release/model_encoder.onnx",
+    "gear_sonic_deploy/policy/release/model_decoder.onnx",
+    "gear_sonic_deploy/policy/release/observation_config.yaml",
+    "gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx",
+]
+assert len(lines) == 4, len(lines)
+actual_paths = []
+for line in lines:
+    match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+    assert match, line
+    actual_paths.append(match.group(2))
+assert actual_paths == expected_paths, actual_paths
+print("PASS: checksum manifest structure")
+PY
+```
+
+Expected and recorded at `e2b923d`: exit 0 and
+`PASS: checksum manifest structure`.
+
+### Artifact Checksum Verification: Downloads Required
+
+This separate gate is runnable only after the runbook's pinned Hugging Face
+downloads and Git LFS population have created all four files.
+
+```bash
+set -euo pipefail
+LC_ALL=C sha256sum --check \
+  docs/source/getting_started/gear_sonic_deployment_9c0ff22.sha256
+```
+
+Expected: exit 0 and four `OK` results. Recorded against the downloaded local
+artifacts while reviewing `e2b923d`: all four files matched. Missing artifacts
+make this command fail and do not invalidate the always-runnable manifest
+structure check.
+
+### Placeholder, Blank-Section, and Privacy Validation
+
+```bash
+set -euo pipefail
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+paths = [
+    Path("docs/source/getting_started/newcomer_onboarding.md"),
+    Path("docs/superpowers/specs/2026-08-21-newcomer-onboarding-handover-design.md"),
+    Path("docs/superpowers/progress/2026-08-21-newcomer-onboarding-handover.md"),
+]
+documents = {path: path.read_text() for path in paths}
+source = documents[paths[0]]
+expected = {
+    "<PC2_IP>",
+    "<PC2_USER>",
+    "<PC2_REPO_DIR>",
+    "<WORKSTATION_IP>",
+    "<WORKSTATION_REPO_DIR>",
+    "<ROBOT_NETWORK_INTERFACE>",
+    "<REPO_REVISION>",
+    "<TENSORRT_ROOT>",
+    "<EGO_CAMERA_TYPE>",
+    "<EGO_CAMERA_DEVICE_ID>",
+    "<CAMERA_PORT>",
+    "<TASK_PROMPT>",
+    "<DATASET_NAME>",
+    "<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>",
+}
+found = set(re.findall(r"<[A-Z][A-Z0-9_]*>", source))
+assert found == expected, {"missing": sorted(expected - found), "extra": sorted(found - expected)}
+all_found = set().union(
+    *(set(re.findall(r"<[A-Z][A-Z0-9_]*>", text)) for text in documents.values())
+)
+assert all_found == expected, {
+    "missing": sorted(expected - all_found),
+    "extra": sorted(all_found - expected),
+}
+headings = re.findall(r"^## ([0-5])\. .+$", source, re.M)
+assert headings == list("012345"), headings
+section_3 = re.search(
+    r"^## 3\. Set Up PICO Teleoperation\n(.*?)^## 4\. ", source, re.M | re.S
+).group(1)
+assert section_3 == "", repr(section_3)
+private_patterns = [
+    r"/" + "home" + r"/",
+    r"(?<![0-9.])192\.168(?:\.[0-9]{1,3}){2}(?![0-9.])",
+    r"(?<![0-9.])10(?:\.[0-9]{1,3}){3}(?![0-9.])",
+    r"(?<![0-9.])172\.(?:1[6-9]|2[0-9]|3[01])(?:\.[0-9]{1,3}){2}(?![0-9.])",
+]
+for path, text in documents.items():
+    for pattern in private_patterns:
+        assert not re.search(pattern, text), (path, pattern)
+    for marker in ("TO" + "DO", "T" + "BD", "FIX" + "ME"):
+        assert marker not in text, (path, marker)
+print("PASS: placeholders, blank Section 3, and privacy")
+PY
+```
+
+Expected and recorded at `e2b923d`: exit 0, exactly 14 allowlisted
+placeholders, zero Section 3 body bytes, and the exact `PASS` line. The
+full-address patterns intentionally avoid false positives from TensorRT
+versions such as 10.13 and 10.7.
+
+### Genuinely Forced Sphinx Rebuild
+
+Prerequisite: `.venv_docs` exists and was populated with
+`docs/requirements.txt`.
+
+```bash
+set -euo pipefail
+BUILD_LOG="$(mktemp)"
+trap 'rm -f "$BUILD_LOG"' EXIT
+make -C docs \
+  SPHINXBUILD=../.venv_docs/bin/sphinx-build \
+  SPHINXOPTS='-E -a' \
+  html 2>&1 | tee "$BUILD_LOG"
+test -s docs/build/html/getting_started/newcomer_onboarding.html
+if rg -n 'newcomer_onboarding.*WARNING|WARNING.*newcomer_onboarding' "$BUILD_LOG"; then
+  exit 1
+else
+  test "$?" -eq 1
+fi
+```
+
+`-E -a` discards the cached Sphinx environment and rebuilds every source.
+Expected: exit 0, nonempty rendered onboarding HTML, and no warning naming the
+onboarding page. Recorded at `e2b923d`: build exit 0 with 10 unrelated existing
+or offline-inventory warnings and no onboarding-page warning.
+
+### Git Whitespace and Scope
+
+```bash
+set -euo pipefail
+git diff --check 1e851175f883dc41299e60dc89f4949eac3ff04d..HEAD
+git status --short
+```
+
+Expected on the source branch at the final handover commit: both commands exit
+0 and `git status` prints nothing. On the transplanted publication branch,
+replace the diff base with
+`af76fae68930b4a9276af768015fc81fbcedc344`. Record both results in the PR.
+
+## Publication Strategy
+
+### Verified Live State
+
+Read-only verification on 2026-08-21 established:
+
+- repository: `caisarl76/GR00T-WholeBodyControl`;
+- published base: `vr3pt-cleanup-minimal-official` at
+  `af76fae68930b4a9276af768015fc81fbcedc344`;
+- source implementation baseline:
+  `1e851175f883dc41299e60dc89f4949eac3ff04d`, 40 commits ahead of the
+  published base;
+- source implementation tip: `e2b923d`, 51 commits ahead of the published
+  base;
+- initial handover-design tip: `8cd095d`, 52 commits ahead of the published
+  base; and
+- no published `docs/newcomer-onboarding` branch.
+
+The upstream `NVlabs/GR00T-WholeBodyControl` repository has no
+`vr3pt-cleanup-minimal-official` branch, so this workflow does not create an
+upstream PR with a nonexistent base.
+
+### Chosen Strategy: Transplant Only Onboarding History
+
+Do **not** push the source branch directly and do **not** update the fork base
+with the 40 unrelated commits. Create an isolated publication branch from
+`af76fae` and cherry-pick only onboarding-specific history:
+
+1. The six onboarding design/plan commits already present before the source
+   implementation baseline:
+   `ab1aae5`, `c57782f`, `680e9f0`, `026d477`, `7023033`, and `1e85117`.
+2. The eleven implementation commits in their existing order: `b2a2860`,
+   `bf91b1e`, `3620afc`, `99a3cee`, `59e3c21`, `da5d21c`, `29d680f`,
+   `868bbdf`, `a354764`, `b1a4f62`, and `e2b923d`.
+3. The handover-design history beginning with `8cd095d`, its reviewed revision
+   commits, the future implementation plan at
+   `docs/superpowers/plans/2026-08-21-newcomer-onboarding-handover.md`, and the
+   future handover document commit.
+
+The source branch inherits an unrelated pre-baseline `docs/source/index.rst`
+toctree edit. If the onboarding toctree cherry-pick reports an index-context
+conflict, resolve only by adding one
+`getting_started/newcomer_onboarding` entry to the published base's existing
+Getting Started toctree. Do not transplant the unrelated source-branch entry.
+
+Because cherry-picking changes commit identifiers, the handover records the
+source milestones above, while the PR body records a source-to-published commit
+map. The published tree must match the source branch for every onboarding-owned
+file before push.
+
+Publish exactly:
+
+- repository: `caisarl76/GR00T-WholeBodyControl`;
+- base: `vr3pt-cleanup-minimal-official` at `af76fae`;
+- remote head: `docs/newcomer-onboarding`;
+- PR state: draft;
+- PR count: one.
+
+Use local publication branch `publish/newcomer-onboarding` and push it as
+`publish/newcomer-onboarding:docs/newcomer-onboarding`. Since the remote head
+is absent, no force push is permitted or needed. If live base/head state
+changes, stop and revise this strategy instead of overwriting remote history.
+
+Before push, compare the onboarding-owned trees from the repository root:
+
+```bash
+set -euo pipefail
+git diff --exit-code \
+  docs/newcomer-onboarding \
+  publish/newcomer-onboarding \
+  -- \
+  docs/source/getting_started/newcomer_onboarding.md \
+  docs/source/getting_started/gear_sonic_deployment_9c0ff22.sha256 \
+  docs/superpowers/specs/2026-08-19-newcomer-onboarding-design.md \
+  docs/superpowers/plans/2026-08-20-newcomer-onboarding.md \
+  docs/superpowers/specs/2026-08-21-newcomer-onboarding-handover-design.md \
+  docs/superpowers/plans/2026-08-21-newcomer-onboarding-handover.md \
+  docs/superpowers/progress/2026-08-21-newcomer-onboarding-handover.md \
+  gear_sonic/camera/composed_camera.py \
+  gear_sonic/tests/test_composed_camera_server_shutdown.py \
+  gear_sonic_deploy/scripts/setup_env.sh
+test "$(git show publish/newcomer-onboarding:docs/source/index.rst | \
+  rg -c 'getting_started/newcomer_onboarding')" -eq 1
+```
+
+Expected: both commands exit 0. `docs/source/index.rst` is checked semantically
+rather than by whole-file equality because the source branch inherits
+unrelated pre-baseline toctree history that must not be transplanted.
+
+## Acceptance
+
+The written handover is accepted when:
+
+- it contains the authority hierarchy, supersession table, complete deviation
+  ledger, role-based ownership, lab placeholder allowlist, source milestone
+  identities, and exact publication target;
+- every repository path and recorded commit exists;
+- every command in the reproducible verification contract is rerun at the
+  future handover commit and its actual result is recorded;
+- no unfinished-marker token, concrete home path, private IPv4 address,
+  credential, or secret appears;
+- no real robot, PICO, deploy binary, camera server, manager, exporter, or
+  viewer is started during handover verification; and
+- the publication transplant is tree-equivalent for onboarding-owned files,
+  passes verification, pushes without force, and produces one draft PR against
+  the exact fork base above.
