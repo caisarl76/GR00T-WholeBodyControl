@@ -16,6 +16,14 @@ R_HEADSET_TO_WORLD = np.array(
 )
 
 
+def pico_joysticks_to_nav_inputs(left_joystick, right_joystick):
+    """Map PICO joystick axes to [forward, strafe, yaw] nav inputs."""
+    fwd_bwd_input = left_joystick[1]
+    strafe_input = -left_joystick[0]
+    yaw_input = right_joystick[0]
+    return fwd_bwd_input, strafe_input, yaw_input
+
+
 class PicoStreamer(BaseStreamer):
     def __init__(self):
         self.xr_client = XrClient()
@@ -115,9 +123,10 @@ class PicoStreamer(BaseStreamer):
         MAX_LINEAR_VEL = 0.5  # m/s
         MAX_ANGULAR_VEL = 1.0  # rad/s
 
-        fwd_bwd_input = pico_data["left_joystick"][1]
-        strafe_input = -pico_data["left_joystick"][0]
-        yaw_input = -pico_data["right_joystick"][0]
+        fwd_bwd_input, strafe_input, yaw_input = pico_joysticks_to_nav_inputs(
+            pico_data["left_joystick"],
+            pico_data["right_joystick"],
+        )
 
         lin_vel_x = self._apply_dead_zone(fwd_bwd_input, DEAD_ZONE) * MAX_LINEAR_VEL
         lin_vel_y = self._apply_dead_zone(strafe_input, DEAD_ZONE) * MAX_LINEAR_VEL

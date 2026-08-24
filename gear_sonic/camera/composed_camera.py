@@ -121,11 +121,22 @@ class ComposedCameraSensor(Sensor, SensorServer):
         self.error_events: dict[str, threading.Event] = {}
         self.error_messages: dict[str, str] = {}
         self._observation_spaces: dict[str, Any] = {}
+        self.context = None
+        self.socket = None
+        self._closed = False
+
+        try:
+            self._initialize()
+        except BaseException:
+            self.close()
+            raise
+
+    def _initialize(self):
 
         camera_configs = self._get_camera_configs()
 
         for _idx, (mount_position, camera_config) in enumerate(camera_configs.items()):
-            camera_queue = queue.Queue(maxsize=config.queue_size)
+            camera_queue = queue.Queue(maxsize=self.config.queue_size)
             shutdown_event = threading.Event()
             error_event = threading.Event()
 
@@ -144,8 +155,8 @@ class ComposedCameraSensor(Sensor, SensorServer):
                     error_event,
                 ),
             )
-            thread.start()
             self.camera_threads[mount_position] = thread
+            thread.start()
 
             # Stagger init to avoid USB bandwidth contention
             init_timeout = 15.0
@@ -159,10 +170,10 @@ class ComposedCameraSensor(Sensor, SensorServer):
             else:
                 print(f"[{mount_position}] Camera init timeout, proceeding anyway...")
 
-        if config.run_as_server:
+        if self.config.run_as_server:
             print("Waiting for all cameras to be ready before starting server...")
             self._wait_for_all_cameras_ready(timeout=60.0)
-            self.start_server(config.port)
+            self.start_server(self.config.port)
 
     def _get_camera_configs(self) -> dict[str, dict]:
         camera_configs = {}
@@ -444,18 +455,32 @@ class ComposedCameraSensor(Sensor, SensorServer):
         return latest
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
+
         for shutdown_event in self.shutdown_events.values():
             shutdown_event.set()
         for thread in self.camera_threads.values():
-            thread.join(timeout=5.0)
+            if thread.is_alive():
+                thread.join(timeout=5.0)
         for camera_queue in self.camera_queues.values():
             try:
                 while True:
                     camera_queue.get_nowait()
             except queue.Empty:
                 pass
-        if self.config.run_as_server:
-            self.stop_server()
+
+        socket = self.socket
+        context = self.context
+        self.socket = None
+        self.context = None
+        try:
+            if socket is not None:
+                socket.close()
+        finally:
+            if context is not None:
+                context.term()
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError("Use serialize_message() for ComposedCameraSensor")
@@ -508,6 +533,20 @@ class ComposedCameraSensor(Sensor, SensorServer):
             return gym.spaces.Dict(self._observation_spaces)
         except ImportError:
             return None
+
+
+def run_composed_camera_server(config: ComposedCameraConfig) -> None:
+    print("Running composed camera server...")
+    composed_camera = None
+    try:
+        composed_camera = ComposedCameraSensor(config)
+        composed_camera.run_server()
+    except KeyboardInterrupt:
+        print("Stopping composed camera server...")
+    finally:
+        if composed_camera is not None:
+            composed_camera.close()
+        print("Composed camera server stopped.")
 
 
 class ComposedCameraClientSensor(Sensor, SensorClient):
@@ -689,9 +728,7 @@ if __name__ == "__main__":
     config = tyro.cli(ComposedCameraConfig)
 
     if config.run_as_server:
-        composed_camera = ComposedCameraSensor(config)
-        print("Running composed camera server...")
-        composed_camera.run_server()
+        run_composed_camera_server(config)
     else:
         composed_client = ComposedCameraClientSensor(server_ip="localhost", port=config.port)
         try:

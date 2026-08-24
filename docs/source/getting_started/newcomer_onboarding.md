@@ -1,0 +1,1379 @@
+# Newcomer Onboarding: PC2 + Workstation Data Collection
+
+This command-first page uses the lab topology in which **PC2** runs the C++
+GEAR-SONIC deployment and camera server, while the laptop/workstation runs the
+PICO manager, data exporter, and camera viewer. It overrides conflicting
+placement of both C++ deployment and the camera server in the existing [Data
+Collection](../tutorials/data_collection.md) tutorial. That tutorial remains
+authoritative only where it does not conflict with this PC2/workstation
+topology.
+
+## Runtime Topology
+
+```text
+Laptop/workstation                              PC2
+------------------                              ---
+PICO manager          -- planner commands -->   GEAR-SONIC deploy
+<WORKSTATION_IP>:5556                           state publisher :5557
+
+PICO manager          <-- measured state -----  GEAR-SONIC deploy
+feedback=<PC2_IP>:5557
+
+PICO manager          -- pose stream ------->   Data exporter
+localhost:5556 (workstation-local)
+
+Data exporter         <-- robot state -------   GEAR-SONIC deploy
+                      <-- camera frames ------   camera server :<CAMERA_PORT>
+
+Camera viewer         <-- camera frames ------   camera server :<CAMERA_PORT>
+```
+
+`localhost:5556` is the workstation-local PICO-manager-to-exporter pose stream:
+the exporter subscribes to the manager. `localhost` is correct only for this
+manager-to-exporter traffic on the workstation. Cross-machine manager,
+feedback, state, and camera endpoints must use the configured machine IPs.
+
+## Before You Begin
+
+This section is the hard prerequisite contract for the real-robot sections.
+Repository cloning and non-actuating setup or reading may proceed before these
+prerequisites are complete, but do not launch or actuate the real robot until
+every prerequisite in this section passes. Later sections introduce staged
+gates at the documented point; each gate must pass before the next action it
+protects, and none may be skipped.
+Complete the [MuJoCo Quick Start](quickstart.md) with the intended input
+sequence, drill the stop paths in simulation from [Real Robot Teleoperation
+Safety](../user_guide/real_robot_safety.md), and complete [VR Teleop
+Setup](vr_teleop_setup.md), including XRoboToolkit, networking, and calibration.
+
+You must also have authorized G1 access; a clear 3 m zone; a protective
+harness/frame; and named assignments for the robot owner, VR operator, spotter,
+and safety operator.
+
+```{danger}
+The robot owner must supply `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` with the
+exact mechanism, location, and actions. This independent hardware-stop or
+physical power-cut procedure must not depend on PC2, the deploy process or
+input thread, ZMQ, the workstation, the network, or the Unitree wireless
+remote. Rehearse it with the robot supported, and assign a dedicated safety
+operator to keep it continuously available from before launch until actuation
+stops.
+
+Unitree remote damping combinations are not an E-stop during low-level deploy.
+If the procedure is unknown, untrained, or unavailable, stop and do not run the
+real-robot sections. Loss of power makes the robot dead weight, so the
+harness/frame must support it.
+
+After **any** use of the lab-approved hardware stop, complete the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>` before remediation, restart, or
+restoring robot power.
+```
+
+(independent-hardware-stop-process-cleanup)=
+## Independent Hardware-Stop Process Cleanup
+
+```{danger}
+An independent hardware stop prevents or removes actuation, but it does **not**
+prove that the deploy main loop or 500 Hz command writer exited. This cleanup
+rule applies after **every** use of
+`<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>`.
+
+Keep the independent stop secured and keep the robot physically unable to
+re-actuate or regain power. If PC2 remains available, send `Ctrl+C` to the
+foreground deploy process and require its terminal to return to the shell.
+Then, from a separate authorized PC2 terminal, run the fail-closed proof below.
+```
+
+**Separate authorized PC2 terminal after hardware stop — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  if DEPLOY_PROCESSES="$(pgrep -af 'target/release/g1_deploy_onnx_ref')"; then
+    printf 'ERROR: deploy process remains after hardware stop: %s\n' "$DEPLOY_PROCESSES" >&2
+    exit 1
+  else
+    PGREP_STATUS=$?
+    if [[ "$PGREP_STATUS" -ne 1 ]]; then
+      printf 'ERROR: deploy process query failed with status %s\n' "$PGREP_STATUS" >&2
+      exit "$PGREP_STATUS"
+    fi
+  fi
+
+  if ! DEPLOY_LISTENER="$(ss -H -ltnp 'sport = :5557')"; then
+    echo 'ERROR: could not query deploy listener state after hardware stop' >&2
+    exit 1
+  fi
+  if [[ -n "$DEPLOY_LISTENER" ]]; then
+    printf 'ERROR: port 5557 remains listening after hardware stop: %s\n' "$DEPLOY_LISTENER" >&2
+    exit 1
+  fi
+  echo 'PASS: deploy process absent and port 5557 released after hardware stop'
+)
+```
+
+Expected: `pgrep` finds no documented deploy process and returns exactly status
+1; any match or any other status fails closed. The exact `ss` filter returns an
+empty result. The final line must be exactly
+`PASS: deploy process absent and port 5557 released after hardware stop`, and
+the block must exit 0.
+
+If PC2 was powered down, it must remain down until the robot owner verifies
+that no deploy auto-start, process, or listener can become active on restart
+and authorizes a controlled PC2 boot while the robot remains physically unable
+to re-actuate. After that boot, run the same proof and require its `PASS`. Do
+not troubleshoot, remediate, restart any process, restore robot power, or
+release the physical stop until this cleanup `PASS` and the robot owner's
+confirmation are both complete.
+
+(safe-execution-order)=
+## Safe Execution Order
+
+```{important}
+The numbered sections group related topics; **do not execute them strictly from
+Section 0 through Section 5**. Use this safety order:
+
+1. Complete Sections 0 and 1 on the named machines.
+2. Go to Section 4. Complete its camera dependencies, foreground-service
+   exclusion, device discovery, and server startup; require live frames to be
+   publishing, require the exact pre-actuation camera-probe `PASS`, and leave
+   the camera server running.
+3. Go to the manager-only start at the beginning of Section 5. Start the PICO
+   manager/listener, verify its port-5556 listener, require exactly
+   `PASS: PC2 can reach manager port 5556 before actuation`, and leave it
+   running. Do not start the exporter or viewer.
+4. Return to Section 2. Pass every preflight gate, type `ACTUATE`, and require
+   the documented startup evidence.
+5. Resume Section 5 at the **Universal pre-engagement stop rule** immediately
+   before **Verify Both Network Directions Before Engagement**. Read the rule,
+   then complete the network and configuration gates, PICO engagement,
+   measured-state probe, exporter startup, and viewer startup in that order.
+
+```
+
+## Configuration
+
+Replace every angle-bracket value below with the lab's configuration. These are
+intentional configuration tokens, not unfinished documentation.
+
+| Shell token | Description |
+| --- | --- |
+| `<PC2_IP>` | PC2's reachable IP address for deployment state and camera traffic. |
+| `<PC2_USER>` | SSH user authorized to access PC2. |
+| `<PC2_REPO_DIR>` | Absolute checkout path on PC2. |
+| `<WORKSTATION_IP>` | Workstation address reachable from PC2 for PICO-manager planner commands. |
+| `<WORKSTATION_REPO_DIR>` | Absolute checkout path on the workstation. |
+| `<ROBOT_NETWORK_INTERFACE>` | PC2 network interface connected to the robot. |
+| `<REPOSITORY_URL>` | Git repository that contains `<REPO_REVISION>`; for this draft use the fork URL supplied by the handover. |
+| `<REPO_REVISION>` | The same explicit 40-character Git commit to check out on both machines. |
+| `<TENSORRT_ROOT>` | PC2 TensorRT installation root used by the C++ deployment build. |
+| `<EGO_CAMERA_TYPE>` | Camera backend: only `oak`, `oak_mono`, or `realsense`. |
+| `<EGO_CAMERA_DEVICE_ID>` | Camera device identifier; use `''` when the selected backend does not need one. |
+| `<CAMERA_PORT>` | TCP port exposed by the PC2 camera server. |
+| `<TASK_PROMPT>` | Task prompt recorded with the collected data. |
+| `<DATASET_NAME>` | Destination dataset name for the data exporter. |
+
+`<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` is a non-shell human checklist: the
+robot owner supplies the exact mechanism, location, and actions. Never execute
+it as a shell command.
+
+**Workstation — every new workstation terminal, any working directory**
+
+```bash
+export PC2_IP='<PC2_IP>'
+export PC2_USER='<PC2_USER>'
+export PC2_REPO_DIR='<PC2_REPO_DIR>'
+export WORKSTATION_IP='<WORKSTATION_IP>'
+export WORKSTATION_REPO_DIR='<WORKSTATION_REPO_DIR>'
+export REPOSITORY_URL='<REPOSITORY_URL>'
+export REPO_REVISION='<REPO_REVISION>'
+export CAMERA_PORT='<CAMERA_PORT>'
+export TASK_PROMPT='<TASK_PROMPT>'
+export DATASET_NAME='<DATASET_NAME>'
+```
+
+Expected: every assignment exits 0, prints no output, and defines the listed
+values in the current workstation terminal.
+
+Every PC2-labeled block on this page requires an authorized local PC2 console
+or an authorized SSH shell. Section 0 installs and verifies the SSH client
+before opening that shell; once connected, run the following exports in every
+new PC2 terminal.
+
+**PC2 — every new PC2 terminal, any working directory**
+
+```bash
+export PC2_IP='<PC2_IP>'
+export PC2_REPO_DIR='<PC2_REPO_DIR>'
+export WORKSTATION_IP='<WORKSTATION_IP>'
+export REPOSITORY_URL='<REPOSITORY_URL>'
+export REPO_REVISION='<REPO_REVISION>'
+export ROBOT_NETWORK_INTERFACE='<ROBOT_NETWORK_INTERFACE>'
+export TensorRT_ROOT='<TENSORRT_ROOT>'
+export EGO_CAMERA_TYPE='<EGO_CAMERA_TYPE>'
+export EGO_CAMERA_DEVICE_ID='<EGO_CAMERA_DEVICE_ID>'
+export CAMERA_PORT='<CAMERA_PORT>'
+readonly GEAR_SONIC_HF_REV='9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2'
+```
+
+Expected: every assignment exits 0, prints no output, and defines the listed
+values in the current PC2 terminal. The pinned Hugging Face revision is also
+defined as read-only in that terminal.
+
+The quotes make the placeholders safe to paste without accidental shell
+redirection, but you must replace them before use. The hardware-stop value is a
+human checklist, never a command.
+
+## 0. Clone the GR00T Repository
+
+Install the workstation prerequisites before the first SSH handoff. `procps`
+provides the fail-closed `pgrep` cleanup proof, and `openssh-client` provides
+the verified `ssh` command.
+
+**Workstation — any working directory**
+
+```bash
+set -euo pipefail
+sudo apt-get update
+sudo apt-get install -y git git-lfs iproute2 netcat-openbsd openssh-client procps ripgrep
+git lfs install
+command -v ssh
+command -v pgrep
+```
+
+Expected: both package commands and `git lfs install` exit 0; `command -v`
+prints paths for both `ssh` and `pgrep` and exits 0.
+
+Open an authorized shell on PC2. An authorized local PC2 console is acceptable;
+from the workstation, use this standard handoff. Configuration exports are not
+forwarded, so run the documented PC2 configuration block separately in every
+new PC2 shell.
+
+**Workstation — any working directory; open a PC2 shell**
+
+```bash
+ssh "$PC2_USER@$PC2_IP"
+```
+
+Expected: SSH authenticates the authorized user and presents a PC2 shell. If
+authentication, host verification, or routing fails, stop setup and have the
+robot owner correct authorized access; do not bypass SSH verification. Every
+later **PC2** or **PC2 Terminal** label means either this authorized SSH shell or
+an authorized local PC2 console.
+
+Install the remaining prerequisites in that authorized PC2 shell before any
+PC2 clone or deployment command.
+
+**PC2 authorized shell — any working directory**
+
+```bash
+set -euo pipefail
+sudo apt-get update
+sudo apt-get install -y git git-lfs iproute2 netcat-openbsd procps ripgrep
+git lfs install
+command -v pgrep
+```
+
+Expected: both package commands and `git lfs install` exit 0;
+`command -v pgrep` prints its path and exits 0.
+
+**Workstation — parent directory of `$WORKSTATION_REPO_DIR`**
+
+```bash
+set -euo pipefail
+git clone "$REPOSITORY_URL" "$WORKSTATION_REPO_DIR"
+cd "$WORKSTATION_REPO_DIR"
+test "$(git remote get-url origin)" = "$REPOSITORY_URL"
+git fetch origin "$REPO_REVISION"
+git checkout --detach "$REPO_REVISION"
+test "$(git rev-parse HEAD)" = "$REPO_REVISION"
+git submodule update --init --recursive
+git lfs pull
+git rev-parse HEAD
+```
+
+**PC2 — parent directory of `$PC2_REPO_DIR`**
+
+```bash
+set -euo pipefail
+git clone "$REPOSITORY_URL" "$PC2_REPO_DIR"
+cd "$PC2_REPO_DIR"
+test "$(git remote get-url origin)" = "$REPOSITORY_URL"
+git fetch origin "$REPO_REVISION"
+git checkout --detach "$REPO_REVISION"
+test "$(git rev-parse HEAD)" = "$REPO_REVISION"
+git submodule update --init --recursive
+git lfs pull
+git rev-parse HEAD
+```
+
+The package and clone commands must exit 0. The handover supplies the repository
+URL for this draft and a fail-closed remote-head resolver; use its result as the
+lab-provided `<REPO_REVISION>`. Each clone explicitly fails if `origin` differs
+from `$REPOSITORY_URL`, and each checkout explicitly fails unless
+`git rev-parse HEAD` exactly equals `$REPO_REVISION`. The final
+`git rev-parse HEAD` visibly prints the resulting 40-character commit. Both
+final outputs must be the same 40-character commit; stop on a repository or
+revision mismatch because the Python and C++ components share a ZMQ wire
+format. `git lfs pull` does not download ignored deployment ONNX files; Section
+1 handles those files.
+
+## 1. Install the Required Environments
+
+The environment installers are destructive with respect to their target virtual
+environments: `install_scripts/install_pico.sh` deletes and recreates
+`.venv_teleop`, `install_scripts/install_data_collection.sh` deletes and
+recreates `.venv_data_collection`, and
+`install_scripts/install_camera_server.sh` deletes and recreates
+`.venv_camera`. Do not rerun them casually when locally installed packages or
+other changes inside those environments matter.
+
+This workflow does not use unqualified `python check_environment.py`. Its
+default all-mode includes unrelated training, Isaac Lab, CUDA, and TensorRT
+checks. Use the focused checks below instead.
+
+**Workstation — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  bash install_scripts/install_pico.sh
+  bash install_scripts/install_data_collection.sh
+
+  .venv_teleop/bin/python --version
+  .venv_teleop/bin/python -c 'import msgpack, numpy, zmq; print("PASS: teleop imports")'
+  .venv_teleop/bin/python gear_sonic/scripts/pico_manager_thread_server.py --help
+
+  .venv_data_collection/bin/python --version
+  .venv_data_collection/bin/python -c 'import cv2, lerobot, msgpack_numpy, zmq; print("PASS: data imports")'
+  .venv_data_collection/bin/python gear_sonic/scripts/run_data_exporter.py --help
+  .venv_data_collection/bin/python gear_sonic/scripts/run_camera_viewer.py --help
+)
+```
+
+Expected: both installers exit 0, both Python version commands report Python
+3.10, both import commands print their `PASS` line, and every help command exits
+0.
+
+**PC2 — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  bash install_scripts/install_camera_server.sh
+
+  .venv_camera/bin/python --version
+  .venv_camera/bin/python -c 'import depthai, msgpack_numpy, zmq; print("PASS: camera imports")'
+  .venv_camera/bin/python -m gear_sonic.camera.composed_camera --help
+)
+```
+
+When prompted to install the systemd service, answer `n`. This prevents this
+installer run from creating or starting the service so foreground mode can be
+used later, but it does not prove that no service unit was installed by an
+older installation. Before foreground launch, Section 4 requires the exact
+`LoadState=not-found` result, not merely an inactive unit.
+
+Expected: the installer exits 0, the version command reports Python 3.10, the
+import command prints `PASS: camera imports`, and the help command exits 0.
+These checks validate the common camera environment only; they do not establish
+that a RealSense camera is ready. The camera-type-specific checks come in
+Section 4.
+
+### PC2 Native Dependencies, Platform Gate, and Build
+
+`scripts/install_deps.sh` may use `sudo` and install system packages, including
+JetPack or CUDA packages where appropriate. It therefore runs before the
+platform and TensorRT gate, which must pass before the build.
+
+Sourcing `scripts/setup_env.sh` also has host effects. On a bare Jetson it may
+run `sudo jetson_clocks`, create DLA symlinks under
+`/usr/lib/aarch64-linux-gnu/nvidia`, and append the DLA library path to
+`~/.bashrc`. Obtain operator and administrator authorization for these package,
+privilege, performance-mode, system-library, and shell-profile changes before
+running the block. Stop here if that authorization is not granted.
+
+**PC2 — `$PC2_REPO_DIR/gear_sonic_deploy`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR/gear_sonic_deploy"
+  bash scripts/install_deps.sh
+
+  ARCH="$(uname -m)"
+  printf 'PC2 architecture: %s\n' "$ARCH"
+  test -d "$TensorRT_ROOT"
+  test -x "$TensorRT_ROOT/bin/trtexec"
+  TRT_VERSION="$("$TensorRT_ROOT/bin/trtexec" --version 2>&1)"
+  printf '%s\n' "$TRT_VERSION"
+
+  case "$ARCH" in
+    x86_64)
+      printf '%s\n' "$TRT_VERSION" | grep -Eq 'TensorRT.*10\.13([. ]|$)'
+      ;;
+    aarch64)
+      grep -q 'R36' /etc/nv_tegra_release
+      if dpkg-query -W -f='${Version}\n' nvidia-jetpack 2>/dev/null; then
+        dpkg-query -W -f='${Version}\n' nvidia-jetpack | grep -Eq '^6([.+~-]|$)'
+      fi
+      printf '%s\n' "$TRT_VERSION" | grep -Eq 'TensorRT.*10\.7([. ]|$)'
+      ;;
+    *)
+      printf 'Unsupported PC2 architecture: %s\n' "$ARCH" >&2
+      exit 1
+      ;;
+  esac
+
+  VALIDATED_TENSORRT_ROOT="$TensorRT_ROOT"
+  set +u
+  source scripts/setup_env.sh
+  set -u
+  test "$TensorRT_ROOT" = "$VALIDATED_TENSORRT_ROOT"
+
+  CANONICAL_TENSORRT_ROOT="$(realpath -e "$TensorRT_ROOT")"
+  test "$CANONICAL_TENSORRT_ROOT" != /
+  mkdir -p build
+  BUILD_DIR="$(mktemp -d "$PWD/build/onboarding.XXXXXX")"
+  printf 'Fresh build directory: %s\n' "$BUILD_DIR"
+  cmake -S . -B "$BUILD_DIR" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DBUILD_ROS2=OFF \
+    -DBUILD_DEPLOY_TESTS=OFF \
+    -DTensorRT_ROOT="$CANONICAL_TENSORRT_ROOT"
+
+  mapfile -t TRT_INCLUDE_PATHS < <(
+    sed -n 's/^TensorRT_INCLUDE_DIR:[^=]*=//p' "$BUILD_DIR/CMakeCache.txt"
+  )
+  mapfile -t TRT_LIBRARY_PATHS < <(
+    sed -nE 's/^TensorRT_[A-Za-z0-9_]+_LIBRARY:[^=]*=(.*)$/\1/p' "$BUILD_DIR/CMakeCache.txt"
+  )
+  test "${#TRT_INCLUDE_PATHS[@]}" -eq 1
+  TRT_INCLUDE_DIR="${TRT_INCLUDE_PATHS[0]}"
+  test -n "$TRT_INCLUDE_DIR"
+  test "${#TRT_LIBRARY_PATHS[@]}" -eq 4
+
+  for TRT_PATH in "$TRT_INCLUDE_DIR" "${TRT_LIBRARY_PATHS[@]}"; do
+    CANONICAL_TRT_PATH="$(realpath -e "$TRT_PATH")"
+    case "$CANONICAL_TRT_PATH" in
+      "$CANONICAL_TENSORRT_ROOT"/*) ;;
+      *)
+        printf 'TensorRT cache path escaped validated root: %s\n' \
+          "$CANONICAL_TRT_PATH" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  TRT_VERSION_HEADER="$TRT_INCLUDE_DIR/NvInferVersion.h"
+  grep -Eq '^[[:space:]]*#[[:space:]]*define[[:space:]]+NV_TENSORRT_MAJOR[[:space:]]+10([[:space:]]|$)' \
+    "$TRT_VERSION_HEADER"
+  case "$ARCH" in
+    x86_64) TRT_EXPECTED_MINOR=13 ;;
+    aarch64) TRT_EXPECTED_MINOR=7 ;;
+  esac
+  grep -Eq "^[[:space:]]*#[[:space:]]*define[[:space:]]+NV_TENSORRT_MINOR[[:space:]]+${TRT_EXPECTED_MINOR}([[:space:]]|$)" \
+    "$TRT_VERSION_HEADER"
+
+  cmake --build "$BUILD_DIR" -j"$(nproc)"
+  test -x target/release/g1_deploy_onnx_ref
+)
+```
+
+This is one fail-fast subshell: a failed dependency installation or gate cannot
+be hidden by a later successful command, and the build must consume the same
+TensorRT root that passed validation. Nounset is deliberately disabled only
+while sourcing the upstream `setup_env.sh` because it reads variables that are
+normally unset; `set -u` restores it immediately afterward.
+
+The direct CMake configure mirrors the current `.justfile` recipe flags but
+replaces `just build` because that recipe reuses `build/`; its cache could
+resolve stale or default TensorRT paths. `mktemp` instead creates a unique fresh
+binary directory under the ignored `build/` directory. Only the CMake
+cache/object directory is isolated and retained for inspection or later
+cleanup: the build still writes and replaces the shared
+`target/release/g1_deploy_onnx_ref` executable. The root test rejects `/`:
+`TensorRT_ROOT` must name a specific TensorRT installation so the quoted
+containment check is unambiguous.
+
+Expected: every top-level command in the subshell exits 0. An `x86_64` PC2 must
+use TensorRT 10.13. An `aarch64` PC2 must use L4T R36.x, JetPack 6 when the
+`nvidia-jetpack` metapackage is installed, and TensorRT 10.7. Environment setup
+prints `TensorRT environment configured`, and the validated root comparison
+exits 0. The fresh CMake cache must contain exactly one include path and four
+component-library paths, all resolving canonically beneath the validated root;
+the cached header must report TensorRT major 10 and platform-specific minor 13
+or 7. Only then does the build run; it and the executable check must exit 0.
+
+```{danger}
+This gate is a hard stop. A platform or TensorRT mismatch can produce unsafe
+planner inference. Do not bypass, weaken, or ignore a failed check; correct the
+PC2 platform and TensorRT installation before continuing to the native build.
+```
+
+### Immutable Deployment Artifacts
+
+Install the Hugging Face CLI into the existing camera environment rather than
+creating another environment.
+
+**PC2 — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  command -v uv
+  uv pip install --python .venv_camera/bin/python huggingface_hub
+  test -x .venv_camera/bin/hf
+)
+```
+
+The camera installer may place `uv` in one of these user-local directories, but
+changes made to its child-shell `PATH` do not propagate to this terminal.
+Expected: `command -v uv` succeeds, installation exits 0, and the executable
+check confirms `.venv_camera/bin/hf`.
+
+Use the pinned shell constant from the PC2 configuration for every download.
+
+**PC2 — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  .venv_camera/bin/hf download nvidia/GEAR-SONIC model_encoder.onnx \
+    --revision "$GEAR_SONIC_HF_REV" \
+    --local-dir gear_sonic_deploy/policy/release
+  .venv_camera/bin/hf download nvidia/GEAR-SONIC model_decoder.onnx \
+    --revision "$GEAR_SONIC_HF_REV" \
+    --local-dir gear_sonic_deploy/policy/release
+  .venv_camera/bin/hf download nvidia/GEAR-SONIC observation_config.yaml \
+    --revision "$GEAR_SONIC_HF_REV" \
+    --local-dir gear_sonic_deploy/policy/release
+  .venv_camera/bin/hf download nvidia/GEAR-SONIC planner_sonic.onnx \
+    --revision "$GEAR_SONIC_HF_REV" \
+    --local-dir gear_sonic_deploy/planner/target_vel/V2
+)
+```
+
+Expected: all four downloads exit 0 and populate the named paths. Do not use
+`python download_from_hf.py`: it resolves the mutable `main` branch and accepts
+no Hugging Face Hub revision.
+
+The repository already tracks `gear_sonic_deploy/reference/example` through Git
+LFS. Its contents are pinned by `$REPO_REVISION` and populated by the successful
+Section 0 `git lfs pull`; do not replace them with a mutable download or runtime
+conversion. Later deployment uses `gear_sonic_deploy/reference/example/`
+directly.
+
+### Artifact Integrity Checks
+
+**PC2 — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  command -v rg
+  test -s gear_sonic_deploy/policy/release/model_encoder.onnx
+  test -s gear_sonic_deploy/policy/release/model_decoder.onnx
+  test -s gear_sonic_deploy/policy/release/observation_config.yaml
+  test -s gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx
+  sha256sum --check docs/source/getting_started/gear_sonic_deployment_9c0ff22.sha256
+  if rg -l '^version https://git-lfs.github.com/spec/v1$' gear_sonic_deploy/reference/example; then
+    printf 'Unresolved Git LFS pointers found under reference/example\n' >&2
+    exit 1
+  else
+    RG_STATUS=$?
+    if [ "$RG_STATUS" -ne 1 ]; then
+      printf 'Reference-tree scan failed with status %s\n' "$RG_STATUS" >&2
+      exit "$RG_STATUS"
+    fi
+  fi
+  find gear_sonic_deploy/reference/example -type f -name joint_pos.csv -size +0c \
+    -exec awk -F, 'NR == 1 { exit !($1 == "joint_0") }' {} \; -print -quit | grep -q .
+)
+```
+
+Expected: `command -v rg` succeeds, all file checks exit 0, all four hashes
+report `OK`, no unresolved Git LFS pointer exists under `reference/example`, and
+only `rg` status 1 (no matches) is accepted. The final check finds at least one
+nonempty real joint CSV whose first record begins with the field `joint_0`.
+
+## 2. Deploy GEAR-SONIC on PC2
+
+This section has a hard precondition from the {ref}`Safe Execution Order
+<safe-execution-order>`: Section 4's camera server must already be running and
+the bounded content probe must have printed exactly
+`PASS: live camera frames received before actuation`. The manager-only start at
+the beginning of Section 5 must also be listening on workstation port 5556,
+and its PC2-side reachability gate must have printed exactly
+`PASS: PC2 can reach manager port 5556 before actuation`. If any gate has not
+passed, do not type `ACTUATE`.
+
+After typing `ACTUATE`, do not install camera packages, discover devices,
+change services, or perform camera remediation while deployment remains
+actuated. If camera readiness is lost, stop the robot using the documented
+normal or fault path before doing any camera work.
+
+This lab runbook is only for the physically confirmed configuration without
+Dex3 or Inspire hands. The operator and robot owner must physically inspect the
+robot together and verbally confirm that no hands are attached before
+continuing. If the hardware differs or either person is uncertain, stop. The
+`deploy.sh` wrapper cannot forward `--disable-dex3-hands`, so this configuration
+uses the validated direct `just run` invocation below.
+
+Use one focused deployment terminal so setup, preflight, and launch share the
+same current environment. Nounset is disabled only while sourcing the upstream
+`setup_env.sh`, which reads normally unset variables, and is restored
+immediately afterward. The preflight is interactive: confirm every prompt and
+require `Real-robot preflight confirmed.` before launch. After preflight, the
+operator must type exactly `ACTUATE` at the distinct actuation prompt. Any other
+input or EOF aborts before launch, and any failed command stops the entire
+block.
+
+Before running it, fill in `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` with the
+exact lab procedure and verbally confirm the completed procedure with the robot
+owner.
+
+**PC2 focused deployment terminal — `$PC2_REPO_DIR/gear_sonic_deploy`**
+
+```{danger}
+After preflight, typing `ACTUATE` and pressing Enter starts an actuated initialization immediately. The deploy process drives all joints toward the default standing pose over three seconds with nonzero gains while low-level commands are published at 500 Hz. PICO engagement starts policy CONTROL, but it is not the first robot motion. Before typing `ACTUATE` and pressing Enter, the protective harness/frame, clear 3 m zone, spotter, and independent hardware E-stop or physical power-cut procedure must already be ready.
+```
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR/gear_sonic_deploy"
+  set +u
+  source scripts/setup_env.sh
+  set -u
+  bash scripts/preflight.sh
+  IFS= read -r -p 'Type ACTUATE to begin the three-second initialization ramp: ' ACTUATION_CONFIRMATION
+  test "$ACTUATION_CONFIRMATION" = ACTUATE
+  just run g1_deploy_onnx_ref \
+    "$ROBOT_NETWORK_INTERFACE" \
+    policy/release/model_decoder.onnx \
+    reference/example/ \
+    --obs-config policy/release/observation_config.yaml \
+    --encoder-file policy/release/model_encoder.onnx \
+    --planner-file planner/target_vel/V2/planner_sonic.onnx \
+    --input-type zmq_manager \
+    --output-type zmq \
+    --zmq-host "$WORKSTATION_IP" \
+    --disable-dex3-hands
+)
+```
+
+Expected sequence: preflight prints `Real-robot preflight confirmed.`, the
+operator types exactly `ACTUATE` at the confirmation prompt, and only then does
+deployment produce the startup evidence below. Any other input or EOF aborts
+the block before `just run`.
+
+Expected startup evidence:
+
+- Input type is `zmq_manager`.
+- Output is ZMQ and port 5557 binds successfully.
+- The configured workstation host is displayed.
+- `[INFO] Dex3 hands disabled` is printed.
+- Transient LowState-unavailable messages stop.
+- `Init Done` proves the process reached WAIT_FOR_CONTROL.
+- No CRC or safety error is reported.
+
+Any missing, delayed, or contradictory startup evidence after `ACTUATE` is a
+pre-engagement gate failure. Execute the {ref}`universal pre-engagement stop
+rule <pre-engagement-stop-rule>` immediately; do not inspect, retry, or
+remediate while deployment remains actuated.
+
+Policy CONTROL waits for the later PICO start, but the three-second
+initialization has already actuated the robot. Keep this deployment terminal
+running and focused for the safety operator; do not reuse it for other work.
+
+## 3. Set Up PICO Teleoperation
+## 4. Run the Camera Server on PC2
+
+Complete every step in this section before Section 2 and before typing
+`ACTUATE`, as required by the {ref}`Safe Execution Order
+<safe-execution-order>`.
+Do not perform installation, discovery, service changes, or camera remediation
+while the deployment process remains actuated.
+
+Section 1 created `.venv_camera`; do not rerun the destructive camera
+installer. Open a new PC2 terminal, load the PC2 configuration variables, and
+work from `$PC2_REPO_DIR`.
+
+First, establish mutual exclusion with the systemd launch path. Foreground mode
+requires that no camera service unit is installed.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  if ! CAMERA_SERVICE_LOAD_STATE="$(systemctl show --property=LoadState --value composed_camera_server.service 2>/dev/null)"; then
+    echo 'ERROR: could not query camera service LoadState' >&2
+    exit 1
+  fi
+  case "$CAMERA_SERVICE_LOAD_STATE" in
+    not-found) ;;
+    '')
+      echo 'ERROR: camera service LoadState is empty; cannot prove foreground exclusivity' >&2
+      exit 1
+      ;;
+    *)
+      echo "ERROR: installed camera service (LoadState=$CAMERA_SERVICE_LOAD_STATE) is an alternate launch path; stop and have the robot owner remove the unit before continuing with foreground mode" >&2
+      exit 1
+      ;;
+  esac
+  echo 'PASS: camera service LoadState=not-found; no unit is installed'
+)
+```
+
+Expected: `PASS: camera service LoadState=not-found; no unit is installed` and
+exit 0. A query failure, empty state, or any installed unit state is a hard
+stop. Systemd mode is outside this runbook; stop and have the robot owner remove
+the installed alternate unit before continuing with foreground mode. Do not
+improvise or mix the two launch methods. This foreground branch never treats an
+installed inactive, failed, masked, or transitional unit as safe; the
+repository unit uses `Restart=on-failure`.
+
+Before camera-specific discovery, reject every unsupported configured type.
+Run this command directly so its failure cannot be masked by a later command.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+case "$EGO_CAMERA_TYPE" in
+  oak|oak_mono|realsense) ;;
+  *) echo "Unsupported EGO_CAMERA_TYPE: $EGO_CAMERA_TYPE" >&2; exit 1 ;;
+esac
+```
+
+Expected: exit 0 only for `oak`, `oak_mono`, or `realsense`. Any other value
+prints the unsupported type and exits 1; stop there.
+
+Run only the discovery branch matching the configured camera type. For `oak`
+or `oak_mono`, use the existing DepthAI dependency. The probe requires
+`DeviceInfo.getDeviceId()` and validates exactly the identifier API that the
+runtime OAK driver consumes. An SDK lacking that API is incompatible and must
+not pass discovery.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  .venv_camera/bin/python - "$EGO_CAMERA_DEVICE_ID" <<'PY'
+import sys
+import depthai as dai
+
+expected = sys.argv[1]
+devices = dai.Device.getAllAvailableDevices()
+ids = []
+for device in devices:
+    runtime_getter = getattr(device, "getDeviceId", None)
+    if not callable(runtime_getter):
+        raise SystemExit("FAIL: installed DepthAI lacks DeviceInfo.getDeviceId required by runtime")
+    ids.append(runtime_getter())
+print("Detected OAK IDs:", ids)
+if not ids:
+    raise SystemExit("FAIL: no OAK camera detected")
+if expected and expected not in ids:
+    raise SystemExit(f"FAIL: configured OAK ID {expected!r} not found")
+print("PASS: OAK camera detected")
+PY
+)
+```
+
+Expected: the detected OAK IDs are printed, followed by
+`PASS: OAK camera detected`, and the probe exits 0. An empty configured device
+ID is allowed when the selected backend does not need one.
+
+For `realsense`, install its separate driver into the existing camera
+environment first. This is a new terminal, so make the user-local `uv`
+locations discoverable explicitly.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+  command -v uv
+  uv pip install --python .venv_camera/bin/python pyrealsense2
+)
+```
+
+Expected: `command -v uv` prints its executable path, the `pyrealsense2`
+installation exits 0, and no new virtual environment is created. Then probe
+the configured serial in the same PC2 repo context; RealSense requires an
+explicit nonempty serial.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  .venv_camera/bin/python - "$EGO_CAMERA_DEVICE_ID" <<'PY'
+import sys
+import pyrealsense2 as rs
+
+expected = sys.argv[1]
+if not expected:
+    raise SystemExit("FAIL: set EGO_CAMERA_DEVICE_ID to a RealSense serial")
+serials = [
+    device.get_info(rs.camera_info.serial_number)
+    for device in rs.context().query_devices()
+]
+print("Detected RealSense serials:", serials)
+if expected not in serials:
+    raise SystemExit(f"FAIL: configured RealSense serial {expected!r} not found")
+print("PASS: RealSense camera detected")
+PY
+)
+```
+
+Expected: the detected serial list is printed, followed by
+`PASS: RealSense camera detected`, and the probe exits 0. A missing or
+unmatched configured serial is a hard stop.
+
+After the matching discovery probe passes, start the foreground camera server
+in that same new PC2 terminal. The Bash array omits the device-ID option when
+the configured ID is empty instead of passing an empty CLI argument.
+
+**PC2 new camera terminal — `$PC2_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$PC2_REPO_DIR"
+  CAMERA_DEVICE_ARGS=()
+  if [[ -n "$EGO_CAMERA_DEVICE_ID" ]]; then
+    CAMERA_DEVICE_ARGS=(--ego-view-device-id "$EGO_CAMERA_DEVICE_ID")
+  fi
+
+  if ! CAMERA_SERVICE_LOAD_STATE="$(systemctl show --property=LoadState --value composed_camera_server.service 2>/dev/null)"; then
+    echo 'ERROR: could not query camera service LoadState' >&2
+    exit 1
+  fi
+  case "$CAMERA_SERVICE_LOAD_STATE" in
+    not-found) ;;
+    '')
+      echo 'ERROR: camera service LoadState is empty; cannot prove foreground exclusivity' >&2
+      exit 1
+      ;;
+    *)
+      echo "ERROR: installed camera service (LoadState=$CAMERA_SERVICE_LOAD_STATE) is an alternate launch path; stop and have the robot owner remove the unit before continuing with foreground mode" >&2
+      exit 1
+      ;;
+  esac
+  echo 'PASS: camera service LoadState=not-found; no unit is installed'
+
+  .venv_camera/bin/python -m gear_sonic.camera.composed_camera \
+    --ego-view-camera "$EGO_CAMERA_TYPE" \
+    "${CAMERA_DEVICE_ARGS[@]}" \
+    --port "$CAMERA_PORT"
+)
+```
+
+Expected: the repeated fail-closed classifier prints its second `PASS`
+immediately before starting the foreground Python process, the configured
+backend initializes, the server binds the configured port, frames are
+published, and no repeated timeout or reconnect messages appear. Keep this
+foreground terminal running.
+
+From the workstation, require camera content—not only TCP reachability—before
+continuing to the manager-only start in Section 5.
+
+**Workstation new terminal — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_data_collection/bin/python - "$PC2_IP" "$CAMERA_PORT" <<'PY'
+import sys
+import time
+
+from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+
+PC2_IP = sys.argv[1]
+CAMERA_PORT = int(sys.argv[2])
+client = ComposedCameraClientSensor(server_ip=PC2_IP, port=CAMERA_PORT)
+deadline = time.monotonic() + 10.0
+try:
+    while time.monotonic() < deadline:
+        sample = client.read(blocking=False)
+        if sample is not None and sample.get("images"):
+            print("PASS: live camera frames received before actuation")
+            break
+        time.sleep(0.02)
+    else:
+        raise SystemExit("FAIL: no live camera frames within 10 seconds")
+finally:
+    client.close()
+PY
+)
+```
+
+Expected: the final line is exactly
+`PASS: live camera frames received before actuation`, and the probe exits 0.
+The `finally` block closes the client on both PASS and failure. Leave the PC2
+camera server running and continue to the manager-only start in Section 5. Do
+not proceed toward `ACTUATE` without this PASS.
+
+## 5. Run Workstation Processes
+
+This first manager-only phase occurs before Section 2 and before typing
+`ACTUATE`, as required by the {ref}`Safe Execution Order
+<safe-execution-order>`.
+Start only the PICO manager, verify its listener, and then return to Section 2.
+Do not start the exporter or viewer yet; their startup is gated on the later
+directional network checks and the pre- and post-engagement probes.
+
+**Workstation Terminal 1 — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_teleop/bin/python gear_sonic/scripts/pico_manager_thread_server.py \
+    --manager \
+    --port 5556 \
+    --zmq_feedback_host "$PC2_IP" \
+    --zmq_feedback_port 5557
+)
+```
+
+Expected: the process enters interactive manager mode, listens on workstation
+port 5556, and connects its feedback input to PC2 port 5557. Keep this
+foreground process running in Workstation Terminal 1. **Do not start the
+exporter or viewer yet.**
+
+Verify the manager listener before returning to Section 2.
+
+**Workstation Terminal 2 — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  MANAGER_LISTENER="$(ss -H -ltnp 'sport = :5556')"
+  test -n "$MANAGER_LISTENER"
+  printf '%s\n' "$MANAGER_LISTENER"
+)
+```
+
+Expected: the exact socket filter returns a nonempty port-5556 listener, with
+the manager process shown when `ss -p` permissions expose it. If the address or
+visible process contradicts Workstation Terminal 1, correct it now, before
+actuation. Otherwise, leave the manager running and verify the connection from
+PC2.
+
+**PC2 pre-actuation terminal — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  nc -zvw 3 "$WORKSTATION_IP" 5556
+  echo 'PASS: PC2 can reach manager port 5556 before actuation'
+)
+```
+
+Expected: `nc` reports success and the final line is exactly
+`PASS: PC2 can reach manager port 5556 before actuation`. This gate must pass
+before `ACTUATE`. Leave the manager running, return to Section 2, and complete
+deployment through `Init Done`. Then resume here at the next rule and heading.
+
+(pre-engagement-stop-rule)=
+```{danger}
+**Universal pre-engagement stop rule:** from immediately after `ACTUATE` until
+PICO engagement, **any** failed or contradictory network check, listener check,
+startup log, or `robot_config` check requires the safety operator to press
+uppercase `O` in the focused PC2 deployment terminal immediately. Require, in
+order, `Stop`, `[DEBUG] Program exiting normally...`, and return to the shell.
+If any response is delayed, missing, or uncertain, immediately use
+`<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>`; do not wait longer for software
+input. Keep the hardware stop secured and complete the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`. The hardware stop alone does not
+prove deploy exited and does not permit remediation.
+
+Do not troubleshoot, change configuration, retry a probe, or remediate any
+dependency, listener, route, firewall, service, artifact, or camera while the
+deployment remains actuated. Remediation may begin only after either the normal
+uppercase-`O` path returns to the shell or, when hardware stop was used, the
+cleanup rule produces its exact `PASS` with robot-owner confirmation. Restart
+from the Safe Execution Order after every such stop.
+
+This rule ends when the VR operator sends PICO engagement. During the
+five-second planner startup and the post-engagement `g1_debug` probe, retain the
+documented immediate independent-hardware-stop rule; do **not** substitute
+uppercase `O` there.
+```
+
+### Verify Both Network Directions Before Engagement
+
+These commands prove TCP reachability only. They do not prove that a peer is
+publishing valid robot state, planner commands, or camera content. Run each
+block directly so that `set -e` stops at the first failed check and a later
+success cannot mask it.
+
+**Workstation Terminal 2 — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  MANAGER_LISTENER="$(ss -H -ltnp 'sport = :5556')"
+  test -n "$MANAGER_LISTENER"
+  printf '%s\n' "$MANAGER_LISTENER"
+  nc -zvw 3 "$PC2_IP" 5557
+  nc -zvw 3 "$PC2_IP" "$CAMERA_PORT"
+)
+```
+
+Expected: the exact socket filter returns a nonempty listener on port 5556,
+with output showing the expected wildcard address and the manager process when
+`ss -p` permissions expose it. The filter alone proves that something listens
+on the exact port, not its identity. If its address or visible process
+contradicts Workstation Terminal 1, or if either `nc` command fails, execute the
+universal pre-engagement stop rule immediately. Do not remediate while
+actuated. Both `nc` commands must report success and exit 0; they check the
+workstation-to-PC2 paths for deployment state and camera traffic.
+
+**PC2 Terminal 2 — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  DEPLOY_LISTENER="$(ss -H -ltnp 'sport = :5557')"
+  CAMERA_LISTENER="$(ss -H -ltnp "sport = :$CAMERA_PORT")"
+  test -n "$DEPLOY_LISTENER"
+  test -n "$CAMERA_LISTENER"
+  printf '%s\n' "$DEPLOY_LISTENER"
+  printf '%s\n' "$CAMERA_LISTENER"
+  nc -zvw 3 "$WORKSTATION_IP" 5556
+)
+```
+
+Expected: both exact socket filters return nonempty results. Their output must
+show deployment on port 5557 using the expected wildcard address and the
+camera server on its configured port using a non-loopback address; expected
+process names should also appear when `ss -p` permissions expose them. The
+filters alone prove only that something listens on each exact port, not the
+listener identities. If an address or visible process contradicts the focused
+deployment or camera terminal, or if any command fails, execute the universal
+pre-engagement stop rule immediately. Do not remediate while actuated. `nc`
+must reach the workstation manager on port 5556 and exit 0. The later content
+probes supply protocol-level evidence; all three cross-machine paths must work
+in the documented directions.
+
+### Probe the Pinned Configuration Before Engagement
+
+Before engaging the robot, request one bounded `robot_config` response. This
+checks the current exact ten-field schema and every advertised value against
+the pinned configuration; it does not engage CONTROL.
+
+**Workstation Terminal 2 — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_data_collection/bin/python - "$PC2_IP" <<'PY'
+import sys
+
+from gear_sonic.utils.data_collection.zmq_state_subscriber import poll_robot_config_zmq
+
+host = sys.argv[1]
+expected = {
+    "model_path": "policy/release/model_decoder.onnx",
+    "reference_motion_path": "reference/example/",
+    "planner_path": "planner/target_vel/V2/planner_sonic.onnx",
+    "obs_config_path": "policy/release/observation_config.yaml",
+    "encoder_file": "policy/release/model_encoder.onnx",
+    "control_frequency": 50,
+    "planner_frequency": 10,
+    "is_using_encoder": True,
+    "policy_fp16": False,
+    "planner_fp16": False,
+}
+config = poll_robot_config_zmq(host, 5557, timeout_sec=10)
+missing = sorted(set(expected) - set(config))
+unexpected = sorted(set(config) - set(expected))
+if missing or unexpected:
+    raise SystemExit(f"FAIL: robot_config schema mismatch: missing={missing}, unexpected={unexpected}")
+mismatches = {
+    key: {"expected": value, "actual": config.get(key)}
+    for key, value in expected.items()
+    if config.get(key) != value
+}
+if mismatches:
+    raise SystemExit(f"FAIL: robot_config mismatch: {mismatches}")
+print("PASS: robot_config matches the pinned deployment")
+PY
+)
+```
+
+Expected: the final line is exactly
+`PASS: robot_config matches the pinned deployment`, and the probe exits 0. At
+the same time, the focused PC2 deployment terminal must show `Init Done`, must
+not continue reporting LowState-unavailable messages, and must show no CRC or
+safety error. If the probe, schema, value, startup-log, or safety-log check
+fails, execute the universal pre-engagement stop rule immediately. Do not
+inspect or remediate the cause while actuated.
+
+The manager's FeedbackReader is already subscribed to `g1_debug`, but
+deployment publishes no payload on that topic while it is in INIT or
+WAIT_FOR_CONTROL. Do **not** run a standalone `g1_debug` probe or treat absence
+as a failure until CONTROL has entered the startup-ready state below.
+
+### Engage Planner Mode
+
+The VR operator assumes the `CALIB_FULL` pose documented in the VR teleoperation
+setup, then presses the PICO `A+B+X+Y` combination to enter planner mode. The
+keyboard `]` key is **not** the engagement key for the `zmq_manager` input mode
+used by this runbook. Begin the startup gate immediately when the combination
+is pressed.
+
+```{danger}
+After PICO start sets `operator_state.start`, the ZMQ manager input thread may
+block for up to five seconds while it waits for planner initialization. During
+that interval, keyboard uppercase `O` and a later PICO stop are not guaranteed
+to take effect immediately.
+
+The safety operator must watch the focused PC2 deployment terminal while
+continuously holding the independent hardware E-stop or power-cut described by
+`<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>`. Within five seconds of PICO start,
+that terminal must print exactly
+`[ZMQManager] motion name is planner_motion`, with neither
+`Planner initialization timeout` nor
+`Planner failed to initialize. Stopping control.`
+
+The independent hardware-only fault-stop rule remains active until the exact
+ready marker appears. If it does not appear within five seconds, or if either
+error appears, immediately use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without
+waiting for uppercase `O` or PICO stop. Neither software input is an
+independent startup E-stop. After hardware stop, keep it secured and complete
+the {ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`. Only after the ready marker
+appears with no error may the measured-state probe below be run or accepted.
+```
+
+### Complete the Startup Gate with a Measured-State Probe
+
+As soon as the startup-ready marker appears with no initialization error, run
+this bounded `g1_debug` probe. Both the ready marker and this probe's PASS are
+required **before** starting VR_3PT, the exporter, the viewer, or recording.
+
+**Workstation Terminal 2 — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_data_collection/bin/python - "$PC2_IP" <<'PY'
+import sys
+import time
+
+import numpy as np
+
+from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
+
+subscriber = ZMQStateSubscriber(host=sys.argv[1], port=5557)
+deadline = time.monotonic() + 10.0
+try:
+    while time.monotonic() < deadline:
+        message = subscriber.get_msg()
+        if message is None:
+            time.sleep(0.02)
+            continue
+        if "body_q_measured" not in message:
+            raise SystemExit("FAIL: g1_debug is missing body_q_measured")
+        measured = np.asarray(message["body_q_measured"])
+        if measured.shape != (29,):
+            raise SystemExit(f"FAIL: body_q_measured shape is {measured.shape}")
+        if not np.isfinite(measured).all():
+            raise SystemExit("FAIL: body_q_measured contains non-finite values")
+        print("PASS: finite g1_debug body_q_measured received")
+        break
+    else:
+        raise SystemExit("FAIL: no g1_debug message within 10 seconds")
+finally:
+    subscriber.close()
+PY
+)
+```
+
+Expected: the final line is exactly
+`PASS: finite g1_debug body_q_measured received`, and the probe exits 0. Any
+nonzero exit, malformed shape, or non-finite value requires the safety operator
+to **immediately** use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without waiting
+for uppercase `O`, keep the stop secured, and complete the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`. A PASS establishes that the sample
+contains exactly 29 NumPy-convertible numeric, finite, double-equivalent
+measured-joint values. Do not continue on failure.
+
+### Start Exporter and Viewer Only After the Probe Passes
+
+Only after the focused PC2 terminal prints the exact startup-ready marker with
+no initialization error **and** the post-start `g1_debug` probe prints its
+`PASS` line may you start the exporter.
+
+**Workstation Terminal 2 — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_data_collection/bin/python gear_sonic/scripts/run_data_exporter.py \
+    --dataset-name "$DATASET_NAME" \
+    --task-prompt "$TASK_PROMPT" \
+    --camera-host "$PC2_IP" \
+    --camera-port "$CAMERA_PORT" \
+    --sonic-zmq-host localhost \
+    --sonic-zmq-port 5556 \
+    --state-zmq-host "$PC2_IP" \
+    --state-zmq-port 5557 \
+    --robot-config-timeout 10
+)
+```
+
+Expected: the exporter receives the pinned robot configuration and state from
+PC2, manager pose data from workstation-local port 5556, and camera frames
+from PC2 without a timeout. Keep it running.
+
+Then start the viewer in a third workstation terminal.
+
+**Workstation Terminal 3 — `$WORKSTATION_REPO_DIR`**
+
+```bash
+(
+  set -euo pipefail
+  cd "$WORKSTATION_REPO_DIR"
+  .venv_data_collection/bin/python gear_sonic/scripts/run_camera_viewer.py \
+    --camera-host "$PC2_IP" \
+    --camera-port "$CAMERA_PORT"
+)
+```
+
+Expected: the configured streams appear and live frames continue updating.
+Keep the viewer running.
+
+The recording controls are exact:
+
+- **Left Grip + A** starts an episode; pressing **Left Grip + A** again saves
+  it.
+- **Left Grip + B** saves the active episode to disk marked discarded in
+  `discarded_episode_indices` and returns the exporter to idle. It does not
+  delete the episode.
+
+### Normal Shutdown: Finalize, Then Stop the Robot Process First
+
+Normal shutdown must follow this exact order. While robot state, camera, and
+manager streams are still healthy, first finish the active episode and require
+the exporter to become idle. The robot is then the first **process** stopped;
+only after confirmed robot shutdown may the supporting processes stop.
+
+1. If an episode is active, press **Left Grip + A**. For a nonempty episode,
+   wait for `Finished saving episode`; for a zero-frame episode, wait for
+   `Skipping save: no frames collected`. Either outcome returns the exporter to
+   idle. Alternatively, press **Left Grip + B** and wait for `Discarded episode`,
+   which saves the episode to disk marked in `discarded_episode_indices` and
+   returns the exporter to idle. Do not begin process shutdown without the
+   applicable confirmation and idle state.
+2. Press uppercase `O` in the focused PC2 deployment terminal. Require it to
+   print `Stop` after the damping-only LowCommandWriter, then
+   `[DEBUG] Program exiting normally...`, and require the `just run` command to
+   return to the shell. If these markers and terminal return do not occur
+   promptly, or if the result is uncertain, use the independent hardware stop
+   or power-cut; the harness must carry the robot's dead weight. Keep the stop
+   secured and complete the {ref}`Independent hardware-stop process cleanup
+   <independent-hardware-stop-process-cleanup>` before continuing shutdown or
+   any remediation.
+3. Only after the exporter is idle, press `Ctrl+C` in Workstation Terminal 2.
+   Never interrupt during `save_episode()`; wait for
+   `Finished saving episode` or the zero-frame
+   `Skipping save: no frames collected` outcome and idle. `Ctrl+C` attempts to
+   mark a still-intact unsaved buffer discarded only when its size is greater
+   than zero. It cannot guarantee recovery or marking if interruption occurs
+   inside `save_episode()` after the buffer has already been consumed or popped.
+4. Press lowercase `q` in the focused viewer window.
+5. Press `Ctrl+C` in Workstation Terminal 1 to stop the manager.
+6. Press `Ctrl+C` in the PC2 foreground camera terminal to stop the camera
+   server. Require the exact lines `Stopping composed camera server...` and
+   `Composed camera server stopped.`, followed by return to the shell. Then run
+   the port-release check below.
+
+**PC2 camera terminal after it returns — any working directory**
+
+```bash
+(
+  set -euo pipefail
+  if ! CAMERA_LISTENER="$(ss -H -ltn "sport = :$CAMERA_PORT")"; then
+    echo 'ERROR: could not query camera listener state' >&2
+    exit 1
+  fi
+  if [[ -n "$CAMERA_LISTENER" ]]; then
+    printf 'ERROR: camera port is still listening after shutdown: %s\n' "$CAMERA_LISTENER" >&2
+    exit 1
+  fi
+  echo 'PASS: camera port released after shutdown'
+)
+```
+
+Expected: the final line is exactly
+`PASS: camera port released after shutdown`, and the check exits 0.
+
+```{danger}
+A robot or hardware fault during recording is not a normal shutdown. Use
+`<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` immediately; do not delay the hardware
+stop to finalize data. Keep the stop secured and complete the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`. If the manager and exporter remain
+responsive afterward, press **Left Grip + B**, wait for `Discarded episode`, and
+require idle. Never use **Left Grip + A** to normally save an episode whose robot
+stream was interrupted by a fault. If discard cannot be confirmed, stop the
+exporter and treat that episode as unusable.
+```
+
+During normal shutdown, episode finalization is the only action before robot
+process shutdown; the robot remains the first process stopped. Exporter
+cleanup, viewer, manager, or camera shutdown is never a substitute for
+confirmed robot shutdown. A fault during the five-second startup interval or
+any failed or bad state probe always bypasses the normal sequence and uses the
+independent hardware stop immediately, followed by the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`.
+
+### Troubleshooting
+
+Do not perform any troubleshooting in this table while deployment remains
+actuated. Before engagement, execute the universal pre-engagement stop rule and
+confirm shutdown first. During or after engagement, use the documented
+independent hardware fault-stop rule, keep the stop secured, and complete the
+{ref}`Independent hardware-stop process cleanup
+<independent-hardware-stop-process-cleanup>`. Only after the cleanup `PASS` and
+robot-owner confirmation may you perform the matching remediation and restart
+from the Safe Execution Order.
+
+| Symptom | Required action |
+| --- | --- |
+| An ONNX or other deployment artifact is a Git LFS pointer or is missing | Stop. Restore the pinned Hugging Face revision and verify the documented SHA-256 hashes from Section 1; do not substitute an unpinned artifact. |
+| Imports or CLI options are missing | Confirm the command uses `.venv_teleop` for the manager, `.venv_data_collection` for exporter/viewer/probes, and `.venv_camera` for the PC2 camera server. Rerun the matching focused Section 1 checks. |
+| A cross-machine command uses `localhost` | If deployment has been actuated but PICO has not engaged, first execute the universal pre-engagement stop rule and confirm shutdown. Only then replace it with the configured PC2 or workstation IP. The workstation-local manager-to-exporter pose path is the sole use of `localhost:5556`. |
+| Port 5556, 5557, or the configured camera port is missing, unexpected, or blocked | If this is discovered after `ACTUATE` and before engagement, immediately execute the universal pre-engagement stop rule and confirm shutdown. Only then correct binding, routing, or firewall policy and restart the entire Safe Execution Order; never repeat the checks while actuated. |
+| `robot_config` schema or a value differs from the pinned contract | Immediately execute the universal pre-engagement stop rule and confirm shutdown. Only then check deploy arguments, artifacts, and revisions; restart the Safe Execution Order with the exact pinned configuration before rerunning the bounded probe. |
+| The planner-ready marker is absent, an initialization error appears, or `g1_debug` is absent, malformed, or non-finite after ready | Immediately use `<LAB_APPROVED_HARDWARE_ESTOP_PROCEDURE>` without waiting for uppercase `O` or PICO stop, keep it secured, and complete the Independent hardware-stop process cleanup. Inspect logs only after its `PASS` and robot-owner confirmation; do not continue collection. |
+| Camera discovery fails, frames time out, or foreground launch collides with systemd | Before actuation, stop setup and correct Section 4. After `ACTUATE` but before engagement, first execute the universal pre-engagement stop rule and confirm shutdown. Only then verify the device ID and listener or resolve the service collision; restart the Safe Execution Order before retrying. |
+| The two repository revisions differ | Stop. Check out the same explicit 40-character `$REPO_REVISION` on both machines, update submodules and LFS, and repeat the artifact and environment checks. |
