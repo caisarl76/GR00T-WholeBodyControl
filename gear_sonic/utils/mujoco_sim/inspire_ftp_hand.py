@@ -55,6 +55,7 @@ class InspireFtpMujocoPlant:
         self.qpos_addresses = qpos_addresses
         self.qvel_addresses = qvel_addresses
         self.actuator_ids = actuator_ids
+        self.last_measurement_limit_error_rad = 0.0
 
     @classmethod
     def resolve(
@@ -142,8 +143,24 @@ class InspireFtpMujocoPlant:
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Read the twelve active joint positions in the normalized FTP convention."""
 
-        left = radians_to_normalized(self.data.qpos[self.qpos_addresses["left"]])
-        right = radians_to_normalized(self.data.qpos[self.qpos_addresses["right"]])
+        raw_left = self.data.qpos[self.qpos_addresses["left"]].copy()
+        raw_right = self.data.qpos[self.qpos_addresses["right"]].copy()
+        if not np.all(np.isfinite(raw_left)) or not np.all(np.isfinite(raw_right)):
+            raise ValueError("Inspire active-joint measurements must be finite")
+        violations = np.concatenate(
+            (
+                np.maximum(-raw_left, 0.0),
+                np.maximum(raw_left - CLOSED_RADIANS, 0.0),
+                np.maximum(-raw_right, 0.0),
+                np.maximum(raw_right - CLOSED_RADIANS, 0.0),
+            )
+        )
+        self.last_measurement_limit_error_rad = float(np.max(violations))
+        # MuJoCo joint limits are soft constraints and can transiently exceed
+        # their ranges under contact. Command validation remains strict; only
+        # measured state is projected onto the normalized hardware endpoints.
+        left = radians_to_normalized(np.clip(raw_left, 0.0, CLOSED_RADIANS))
+        right = radians_to_normalized(np.clip(raw_right, 0.0, CLOSED_RADIANS))
         return left, right
 
 

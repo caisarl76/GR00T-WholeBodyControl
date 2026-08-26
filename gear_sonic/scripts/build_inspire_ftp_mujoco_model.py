@@ -192,8 +192,30 @@ def _add_mimic_constraints(base_root: ET.Element) -> None:
                     "joint1": f"{side}_{dependent}",
                     "joint2": f"{side}_{driver}",
                     "polycoef": f"0 {ratio} 0 0 0",
+                    "solref": "0.005 1",
+                    "solimp": "0.99 0.999 0.001 0.5 2",
                 },
             )
+
+
+def _add_open_hand_contact_exclusions(base_root: ET.Element) -> None:
+    previous = base_root.find("contact")
+    if previous is not None:
+        base_root.remove(previous)
+    contact = ET.Element("contact")
+    for side in ("left", "right"):
+        ET.SubElement(
+            contact,
+            "exclude",
+            {
+                "name": f"{side}_palm_thumb_2",
+                "body1": f"{side}_wrist_yaw_link",
+                "body2": f"{side}_thumb_2",
+            },
+        )
+    equality = base_root.find("equality")
+    insert_at = list(base_root).index(equality) if equality is not None else len(base_root)
+    base_root.insert(insert_at, contact)
 
 
 def _add_hand_default(base_root: ET.Element) -> None:
@@ -223,6 +245,7 @@ def build_model_bytes() -> bytes:
     _replace_actuators(base_root)
     _remove_dex3_sensors(base_root)
     _add_mimic_constraints(base_root)
+    _add_open_hand_contact_exclusions(base_root)
     _add_hand_default(base_root)
 
     ET.indent(base_root, space="  ")
@@ -238,8 +261,8 @@ def _validate_generated_model(model_bytes: bytes) -> None:
         if file_name:
             assets[file_name] = (mesh_root / file_name).read_bytes()
     model = mujoco.MjModel.from_xml_string(model_bytes.decode("utf-8"), assets)
-    actual = (model.njnt, model.nu, model.neq)
-    expected = (54, 41, 12)
+    actual = (model.njnt, model.nu, model.neq, model.nexclude)
+    expected = (54, 41, 12, 2)
     if actual != expected:
         raise RuntimeError(f"generated model counts {actual} do not match {expected}")
 

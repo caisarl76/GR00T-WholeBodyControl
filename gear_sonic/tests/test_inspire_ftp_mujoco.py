@@ -6,6 +6,10 @@ import numpy as np
 import pytest
 import yaml
 
+from gear_sonic.scripts.verify_inspire_ftp_mujoco import (
+    run_contact_cycle,
+    run_motor_sweep,
+)
 import gear_sonic.utils.mujoco_sim.base_sim as base_sim_module
 from gear_sonic.utils.mujoco_sim.base_sim import DefaultEnv
 from gear_sonic.utils.mujoco_sim.inspire_ftp_hand import InspireFtpMujocoPlant
@@ -62,6 +66,7 @@ def test_inspire_scene_has_expected_joint_actuator_and_equality_counts(model):
     assert model.njnt == 54  # floating base + 29 G1 body + 24 hand
     assert model.nu == 41  # 29 body + 6 active motors per hand
     assert model.neq == 12  # six URDF mimic constraints per hand
+    assert model.nexclude == 2  # palm/thumb exclusions for open-hand stability
 
 
 @pytest.mark.parametrize("side", ("left", "right"))
@@ -156,6 +161,44 @@ def test_named_plant_reads_active_joint_state_in_normalized_contract(plant):
     np.testing.assert_allclose(actual_right, expected_right)
 
 
+def test_named_plant_projects_soft_limit_measurements_to_normalized_endpoints(plant):
+    left_radians = np.zeros(6)
+    right_radians = CLOSED_RADIANS.copy()
+    left_radians[4] = -0.01
+    right_radians[5] += 0.02
+    plant.data.qpos[plant.qpos_addresses["left"]] = left_radians
+    plant.data.qpos[plant.qpos_addresses["right"]] = right_radians
+
+    left, right = plant.read_normalized_state()
+
+    np.testing.assert_allclose(left, OPEN)
+    np.testing.assert_allclose(right, np.zeros(6))
+    assert plant.last_measurement_limit_error_rad == pytest.approx(0.02)
+
+
+def test_open_hand_excludes_palm_thumb_mesh_penetration():
+    local_model = mujoco.MjModel.from_xml_path(str(SCENE_PATH))
+    local_model.opt.gravity[:] = 0.0
+    data = mujoco.MjData(local_model)
+    plant = InspireFtpMujocoPlant.resolve(local_model, data)
+    plant.write_targets(OPEN, OPEN)
+
+    for _ in range(5):
+        mujoco.mj_step(local_model, data)
+
+    contact_body_pairs = {
+        frozenset(
+            (
+                local_model.body(local_model.geom_bodyid[contact.geom1]).name,
+                local_model.body(local_model.geom_bodyid[contact.geom2]).name,
+            )
+        )
+        for contact in data.contact
+    }
+    assert frozenset(("left_wrist_yaw_link", "left_thumb_2")) not in contact_body_pairs
+    assert frozenset(("right_wrist_yaw_link", "right_thumb_2")) not in contact_body_pairs
+
+
 class _NoNetworkSubscriber:
     def __init__(self, *, state, **kwargs):
         del kwargs
@@ -229,3 +272,29 @@ def test_default_env_installs_inspire_plant_with_physical_and_motor_counts(
         )
     finally:
         env.close()
+
+
+def test_headless_motor_sweep_isolated_motion_coupling_and_limits():
+    report = run_motor_sweep(SCENE_PATH, duration_s=2.0)
+
+    assert report["passed"] is True
+    assert report["model"] == {"njnt": 54, "nu": 41, "neq": 12}
+    assert len(report["motors"]) == 12
+    assert report["max_constraint_error_rad"] < 2e-3
+    assert report["max_joint_limit_error_rad"] <= 1e-6
+    for result in report["motors"]:
+        assert result["passed"] is True
+        assert result["finite"] is True
+        assert result["target_progress"] > 0.5
+        assert result["max_unrelated_active_rad"] < 1e-3
+
+
+def test_contact_enabled_smooth_cycle_keeps_mimic_coupling_stiff():
+    report = run_contact_cycle(SCENE_PATH, duration_s=15.0, open_hold_s=5.0)
+
+    assert report["passed"] is True
+    assert report["contacts_enabled"] is True
+    assert report["max_contacts"] > 0
+    assert report["finite"] is True
+    assert report["max_constraint_error_rad"] < 2e-3
+    assert report["max_joint_limit_error_rad"] <= 1e-6

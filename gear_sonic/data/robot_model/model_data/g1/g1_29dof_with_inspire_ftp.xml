@@ -661,18 +661,22 @@
     <framepos name="frame_pos" objtype="site" objname="imu" />
     <framelinvel name="frame_vel" objtype="site" objname="imu" />
   </sensor>
+  <contact>
+    <exclude name="left_palm_thumb_2" body1="left_wrist_yaw_link" body2="left_thumb_2" />
+    <exclude name="right_palm_thumb_2" body1="right_wrist_yaw_link" body2="right_thumb_2" />
+  </contact>
   <equality>
-    <joint name="left_index_2_joint_mimic" joint1="left_index_2_joint" joint2="left_index_1_joint" polycoef="0 1.0843 0 0 0" />
-    <joint name="left_middle_2_joint_mimic" joint1="left_middle_2_joint" joint2="left_middle_1_joint" polycoef="0 1.0843 0 0 0" />
-    <joint name="left_ring_2_joint_mimic" joint1="left_ring_2_joint" joint2="left_ring_1_joint" polycoef="0 1.0843 0 0 0" />
-    <joint name="left_little_2_joint_mimic" joint1="left_little_2_joint" joint2="left_little_1_joint" polycoef="0 1.0843 0 0 0" />
-    <joint name="left_thumb_3_joint_mimic" joint1="left_thumb_3_joint" joint2="left_thumb_2_joint" polycoef="0 0.8024 0 0 0" />
-    <joint name="left_thumb_4_joint_mimic" joint1="left_thumb_4_joint" joint2="left_thumb_3_joint" polycoef="0 0.9487 0 0 0" />
-    <joint name="right_index_2_joint_mimic" joint1="right_index_2_joint" joint2="right_index_1_joint" polycoef="0 1.0843 0 0 0" />
-    <joint name="right_middle_2_joint_mimic" joint1="right_middle_2_joint" joint2="right_middle_1_joint" polycoef="0 1.0843 0 0 0" />
-    <joint name="right_ring_2_joint_mimic" joint1="right_ring_2_joint" joint2="right_ring_1_joint" polycoef="0 1.0843 0 0 0" />
-    <joint name="right_little_2_joint_mimic" joint1="right_little_2_joint" joint2="right_little_1_joint" polycoef="0 1.0843 0 0 0" />
-    <joint name="right_thumb_3_joint_mimic" joint1="right_thumb_3_joint" joint2="right_thumb_2_joint" polycoef="0 0.8024 0 0 0" />
-    <joint name="right_thumb_4_joint_mimic" joint1="right_thumb_4_joint" joint2="right_thumb_3_joint" polycoef="0 0.9487 0 0 0" />
+    <joint name="left_index_2_joint_mimic" joint1="left_index_2_joint" joint2="left_index_1_joint" polycoef="0 1.0843 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="left_middle_2_joint_mimic" joint1="left_middle_2_joint" joint2="left_middle_1_joint" polycoef="0 1.0843 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="left_ring_2_joint_mimic" joint1="left_ring_2_joint" joint2="left_ring_1_joint" polycoef="0 1.0843 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="left_little_2_joint_mimic" joint1="left_little_2_joint" joint2="left_little_1_joint" polycoef="0 1.0843 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="left_thumb_3_joint_mimic" joint1="left_thumb_3_joint" joint2="left_thumb_2_joint" polycoef="0 0.8024 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="left_thumb_4_joint_mimic" joint1="left_thumb_4_joint" joint2="left_thumb_3_joint" polycoef="0 0.9487 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="right_index_2_joint_mimic" joint1="right_index_2_joint" joint2="right_index_1_joint" polycoef="0 1.0843 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="right_middle_2_joint_mimic" joint1="right_middle_2_joint" joint2="right_middle_1_joint" polycoef="0 1.0843 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="right_ring_2_joint_mimic" joint1="right_ring_2_joint" joint2="right_ring_1_joint" polycoef="0 1.0843 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="right_little_2_joint_mimic" joint1="right_little_2_joint" joint2="right_little_1_joint" polycoef="0 1.0843 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="right_thumb_3_joint_mimic" joint1="right_thumb_3_joint" joint2="right_thumb_2_joint" polycoef="0 0.8024 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
+    <joint name="right_thumb_4_joint_mimic" joint1="right_thumb_4_joint" joint2="right_thumb_3_joint" polycoef="0 0.9487 0 0 0" solref="0.005 1" solimp="0.99 0.999 0.001 0.5 2" />
   </equality>
 </mujoco>
