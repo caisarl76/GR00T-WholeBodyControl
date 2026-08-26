@@ -35,9 +35,9 @@ e.g.
 import functools
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
 
 try:
     from pytorch3d.transforms.rotation_conversions import matrix_to_axis_angle
