@@ -146,6 +146,9 @@ class BaseConfig(ArgsConfigTemplate):
     with_hands: bool = True
     """Enable hand functionality."""
 
+    hand_profile: Literal["dex3", "inspire_ftp"] = "dex3"
+    """Hand model and command owner used by simulation and teleoperation."""
+
     high_elbow_pose: bool = False
     """Enable high elbow pose configuration."""
 
@@ -314,7 +317,7 @@ class BaseConfig(ArgsConfigTemplate):
         configs_dir = gear_sonic_path / "utils" / "mujoco_sim" / "wbc_configs"
 
         if self.wbc_version == "sonic_model12":
-            config_path = str(configs_dir / "g1_29dof_sonic_model12.yaml")
+            config_path = configs_dir / "g1_29dof_sonic_model12.yaml"
         else:
             raise ValueError(
                 f"Invalid wbc_version: {self.wbc_version}, please use one of: "
@@ -323,6 +326,16 @@ class BaseConfig(ArgsConfigTemplate):
 
         with open(config_path) as file:
             wbc_config = yaml.load(file, Loader=yaml.FullLoader)
+
+        if self.hand_profile == "inspire_ftp":
+            inspire_path = (
+                configs_dir / "g1_29dof_sonic_model12_inspire_ftp.yaml"
+            )
+            with open(inspire_path) as file:
+                inspire_overlay = yaml.load(file, Loader=yaml.FullLoader)
+            wbc_config.update(inspire_overlay)
+        elif self.hand_profile != "dex3":
+            raise ValueError(f"Invalid hand profile: {self.hand_profile!r}")
 
         wbc_config = override_wbc_config(wbc_config, self)
 
