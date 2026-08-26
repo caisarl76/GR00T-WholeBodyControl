@@ -88,21 +88,52 @@ def test_decoder_rejects_malformed_header_or_payload(message):
         unpack_pose_message(message, topic="pose")
 
 
-def test_command_state_starts_open_and_follows_fresh_command():
-    state = InspireCommandState(stale_after_s=0.25)
+def test_command_state_starts_open_and_slews_toward_fresh_command():
+    speed = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    state = InspireCommandState(stale_after_s=0.25, max_slew_speed=speed)
 
     startup_left, startup_right = state.advance(now=10.0, dt=0.01)
     np.testing.assert_array_equal(startup_left, OPEN)
     np.testing.assert_array_equal(startup_right, OPEN)
 
-    state.accept(LEFT, RIGHT, now=10.0)
-    fresh_left, fresh_right = state.advance(now=10.249, dt=0.01)
-    np.testing.assert_allclose(fresh_left, LEFT)
-    np.testing.assert_allclose(fresh_right, RIGHT)
+    state.accept(np.zeros(6), np.zeros(6), now=10.0)
+    fresh_left, fresh_right = state.advance(now=10.1, dt=0.5)
+    expected = OPEN - speed * 0.5
+    np.testing.assert_allclose(fresh_left, expected)
+    np.testing.assert_allclose(fresh_right, expected)
+
+
+def test_command_state_slew_reverses_without_overshoot():
+    state = InspireCommandState(max_slew_speed=np.ones(6))
+    state.accept(np.zeros(6), np.zeros(6), now=0.0)
+    closed_left, _ = state.advance(now=0.1, dt=0.4)
+    np.testing.assert_allclose(closed_left, 0.6)
+
+    state.accept(OPEN, OPEN, now=0.1)
+    reopened_left, reopened_right = state.advance(now=0.2, dt=0.25)
+    np.testing.assert_allclose(reopened_left, 0.85)
+    np.testing.assert_allclose(reopened_right, 0.85)
+
+
+def test_command_state_dt_zero_keeps_applied_output_unchanged():
+    state = InspireCommandState(max_slew_speed=np.ones(6))
+    state.accept(np.zeros(6), np.zeros(6), now=0.0)
+    left, right = state.advance(now=0.1, dt=0.0)
+    np.testing.assert_array_equal(left, OPEN)
+    np.testing.assert_array_equal(right, OPEN)
+
+
+def test_max_open_speed_remains_a_legacy_alias():
+    speed = np.full(6, 0.25)
+    state = InspireCommandState(max_open_speed=speed)
+    np.testing.assert_array_equal(state.max_slew_speed, speed)
+
+    with pytest.raises(ValueError, match="only one"):
+        InspireCommandState(max_slew_speed=speed, max_open_speed=speed)
 
 
 def test_command_state_rejects_hand_pair_atomically():
-    state = InspireCommandState()
+    state = InspireCommandState(max_slew_speed=np.full(6, 100.0))
     state.accept(LEFT, RIGHT, now=1.0)
 
     with pytest.raises(ValueError):
@@ -116,9 +147,11 @@ def test_command_state_rejects_hand_pair_atomically():
 
 def test_stale_command_monotonically_ramps_toward_open_at_configured_speed():
     speed = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
-    state = InspireCommandState(stale_after_s=0.25, max_open_speed=speed)
+    state = InspireCommandState(stale_after_s=0.25, max_slew_speed=speed)
     state.accept(np.zeros(6), np.zeros(6), now=0.0)
-    state.advance(now=0.1, dt=0.1)
+    closed_left, closed_right = state.advance(now=0.1, dt=10.0)
+    np.testing.assert_array_equal(closed_left, np.zeros(6))
+    np.testing.assert_array_equal(closed_right, np.zeros(6))
 
     first_left, first_right = state.advance(now=0.251, dt=0.5)
     second_left, second_right = state.advance(now=0.751, dt=0.5)
@@ -152,7 +185,10 @@ def test_subscriber_drains_to_latest_valid_complete_hand_pair():
             _planner_message(newest_left, newest_right),
         ]
     )
-    subscriber = InspireFtpZmqSubscriber.from_socket(socket)
+    subscriber = InspireFtpZmqSubscriber.from_socket(
+        socket,
+        state=InspireCommandState(max_slew_speed=np.full(6, 100.0)),
+    )
 
     assert subscriber.poll(now=5.0)
     left, right = subscriber.state.advance(now=5.1, dt=0.01)
@@ -163,7 +199,10 @@ def test_subscriber_drains_to_latest_valid_complete_hand_pair():
 
 def test_subscriber_ignores_message_missing_one_hand():
     socket = _FakeSocket([pack_pose_message({"left_hand_joints": LEFT}), _pose_message(LEFT, RIGHT)])
-    subscriber = InspireFtpZmqSubscriber.from_socket(socket)
+    subscriber = InspireFtpZmqSubscriber.from_socket(
+        socket,
+        state=InspireCommandState(max_slew_speed=np.full(6, 100.0)),
+    )
 
     assert subscriber.poll(now=7.0)
     left, right = subscriber.state.advance(now=7.1, dt=0.01)

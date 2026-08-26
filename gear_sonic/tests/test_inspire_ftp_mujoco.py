@@ -260,15 +260,17 @@ def test_default_env_installs_inspire_plant_with_physical_and_motor_counts(
         env.set_unitree_bridge(_BodyOnlyBridge())
         env.elastic_band = None
         env.check_fall = lambda: None
-        env.inspire_hand_subscriber.state.accept(np.zeros(6), np.zeros(6), now=time.monotonic())
+        env.inspire_hand_subscriber.state.accept(
+            np.zeros(6), np.zeros(6), now=time.monotonic()
+        )
         env.sim_step()
         np.testing.assert_allclose(
             env.mj_data.ctrl[env.inspire_hand_plant.actuator_ids["left"]],
-            CLOSED_RADIANS,
+            np.full(6, env.sim_dt),
         )
         np.testing.assert_allclose(
             env.mj_data.ctrl[env.inspire_hand_plant.actuator_ids["right"]],
-            CLOSED_RADIANS,
+            np.full(6, env.sim_dt),
         )
     finally:
         env.close()

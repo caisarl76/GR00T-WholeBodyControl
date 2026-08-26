@@ -19,7 +19,9 @@ from gear_sonic.utils.teleop.inspire_ftp import (
 )
 from gear_sonic.utils.teleop.zmq.zmq_message_decoder import unpack_pose_message
 
-DEFAULT_MAX_OPEN_SPEED = 1.0 / CLOSED_RADIANS
+DEFAULT_MAX_SLEW_SPEED = 1.0 / CLOSED_RADIANS
+# Backward-compatible import alias. New code should use the symmetric name.
+DEFAULT_MAX_OPEN_SPEED = DEFAULT_MAX_SLEW_SPEED
 ACTIVE_JOINT_SUFFIXES = (
     "little_1_joint",
     "ring_1_joint",
@@ -165,22 +167,31 @@ class InspireFtpMujocoPlant:
 
 
 class InspireCommandState:
-    """Latest valid hand pair with a gradual open-on-stale watchdog."""
+    """Latest valid hand pair with bounded tracking and fail-open slew."""
 
     def __init__(
         self,
         *,
         stale_after_s: float = 0.25,
-        max_open_speed: Sequence[float] | NDArray[np.floating] = DEFAULT_MAX_OPEN_SPEED,
+        max_slew_speed: Sequence[float] | NDArray[np.floating] | None = None,
+        max_open_speed: Sequence[float] | NDArray[np.floating] | None = None,
     ) -> None:
         if not np.isfinite(stale_after_s) or stale_after_s <= 0.0:
             raise ValueError("stale_after_s must be finite and positive")
-        speed = np.asarray(max_open_speed, dtype=np.float64)
+        if max_slew_speed is not None and max_open_speed is not None:
+            raise ValueError("specify only one of max_slew_speed and max_open_speed")
+        selected_speed = (
+            max_slew_speed if max_slew_speed is not None else max_open_speed
+        )
+        if selected_speed is None:
+            selected_speed = DEFAULT_MAX_SLEW_SPEED
+        speed = np.asarray(selected_speed, dtype=np.float64)
         if speed.shape != (6,) or not np.all(np.isfinite(speed)) or np.any(speed <= 0.0):
-            raise ValueError("max_open_speed must contain six finite positive values")
+            raise ValueError("max_slew_speed must contain six finite positive values")
 
         self.stale_after_s = float(stale_after_s)
-        self.max_open_speed = speed.copy()
+        self.max_slew_speed = speed.copy()
+        self.max_open_speed = self.max_slew_speed
         self.last_valid: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None
         self.last_receive_monotonic: float | None = None
         self.output = (OPEN.copy(), OPEN.copy())
@@ -218,13 +229,18 @@ class InspireCommandState:
         if not np.isfinite(step) or step < 0.0:
             raise ValueError("dt must be finite and non-negative")
 
-        if self.last_valid is None or self.last_receive_monotonic is None:
-            self.output = (OPEN.copy(), OPEN.copy())
-        elif timestamp - self.last_receive_monotonic <= self.stale_after_s:
-            self.output = tuple(command.copy() for command in self.last_valid)
-        else:
-            delta = self.max_open_speed * step
-            self.output = tuple(np.minimum(command + delta, OPEN) for command in self.output)
+        fresh = (
+            self.last_valid is not None
+            and self.last_receive_monotonic is not None
+            and timestamp - self.last_receive_monotonic <= self.stale_after_s
+        )
+        target = self.last_valid if fresh else (OPEN, OPEN)
+        maximum_delta = self.max_slew_speed * step
+        self.output = tuple(
+            current
+            + np.clip(goal - current, -maximum_delta, maximum_delta)
+            for current, goal in zip(self.output, target)
+        )
         return tuple(command.copy() for command in self.output)
 
 

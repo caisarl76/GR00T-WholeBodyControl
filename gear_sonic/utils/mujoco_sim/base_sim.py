@@ -22,7 +22,7 @@ from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
 from gear_sonic.utils.mujoco_sim.inspire_ftp_hand import (
-    DEFAULT_MAX_OPEN_SPEED,
+    DEFAULT_MAX_SLEW_SPEED,
     InspireCommandState,
     InspireFtpMujocoPlant,
     InspireFtpZmqSubscriber,
@@ -170,8 +170,11 @@ class DefaultEnv:
         if self.hand_type == "inspire_ftp":
             hand_state = InspireCommandState(
                 stale_after_s=self.config.get("INSPIRE_HAND_COMMAND_TIMEOUT_S", 0.25),
-                max_open_speed=self.config.get(
-                    "INSPIRE_HAND_MAX_OPEN_SPEED", DEFAULT_MAX_OPEN_SPEED
+                max_slew_speed=self.config.get(
+                    "INSPIRE_HAND_MAX_SLEW_SPEED",
+                    self.config.get(
+                        "INSPIRE_HAND_MAX_OPEN_SPEED", DEFAULT_MAX_SLEW_SPEED
+                    ),
                 ),
             )
             self.inspire_hand_plant = InspireFtpMujocoPlant.resolve(
