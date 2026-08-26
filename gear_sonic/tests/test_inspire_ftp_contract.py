@@ -1,6 +1,11 @@
 import numpy as np
 import pytest
 
+from gear_sonic.scripts.pico_manager_thread_server import (
+    PlannerStreamer,
+    PoseStreamer,
+    compute_hand_joints_from_inputs,
+)
 from gear_sonic.utils.teleop.inspire_ftp import (
     CLOSED_RADIANS,
     MOTOR_NAMES,
@@ -85,3 +90,71 @@ def test_pico_mapping_rejects_invalid_controls(trigger, grip):
 def test_pico_mapping_rejects_invalid_deadzone(deadzone):
     with pytest.raises(ValueError):
         map_pico_controls(0.0, 0.0, deadzone=deadzone)
+
+
+def test_pico_manager_inspire_profile_returns_six_motors_per_hand():
+    left, right = compute_hand_joints_from_inputs(
+        None,
+        None,
+        left_trigger=1.0,
+        left_grip=0.0,
+        right_trigger=0.0,
+        right_grip=1.0,
+        hand_profile="inspire_ftp",
+    )
+
+    assert left.shape == (1, 6)
+    assert right.shape == (1, 6)
+    np.testing.assert_allclose(left[0], [0, 0, 0, 0, 0, 1])
+    np.testing.assert_allclose(right[0], [1, 1, 1, 1, 1, 0])
+
+
+def test_pico_manager_inspire_profile_bypasses_dex3_solvers():
+    def fail_if_called(_):
+        raise AssertionError("Dex3 solver must not own Inspire commands")
+
+    left, right = compute_hand_joints_from_inputs(
+        fail_if_called,
+        fail_if_called,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        hand_profile="inspire_ftp",
+    )
+
+    np.testing.assert_allclose(left, np.ones((1, 6)))
+    np.testing.assert_allclose(right, np.ones((1, 6)))
+
+
+def test_pico_manager_default_profile_preserves_dex3_shape():
+    left, right = compute_hand_joints_from_inputs(None, None, 0.0, 0.0, 0.0, 0.0)
+
+    assert left.shape == (1, 7)
+    assert right.shape == (1, 7)
+
+
+def test_pico_manager_rejects_unknown_hand_profile():
+    with pytest.raises(ValueError, match="hand profile"):
+        compute_hand_joints_from_inputs(
+            None,
+            None,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            hand_profile="unknown",
+        )
+
+
+@pytest.mark.parametrize("streamer_type", (PoseStreamer, PlannerStreamer))
+def test_pose_and_planner_streamers_use_selected_hand_profile(streamer_type):
+    streamer = object.__new__(streamer_type)
+    streamer.left_hand_ik_solver = None
+    streamer.right_hand_ik_solver = None
+    streamer.hand_profile = "inspire_ftp"
+
+    left, right = streamer.compute_hand_joints(1.0, 0.0, 0.0, 1.0)
+
+    np.testing.assert_allclose(left, [[0, 0, 0, 0, 0, 1]])
+    np.testing.assert_allclose(right, [[1, 1, 1, 1, 1, 0]])
