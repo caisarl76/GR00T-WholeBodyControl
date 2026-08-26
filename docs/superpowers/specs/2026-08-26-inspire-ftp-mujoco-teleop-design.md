@@ -175,7 +175,7 @@ one-value latest-message buffer. It accepts a hand pair only when both vectors:
 
 - contain exactly six values;
 - contain only finite numbers; and
-- lie within `[0, 1]` after a small floating-point tolerance.
+- lie exactly within `[0, 1]` without silent clipping.
 
 The safety states are:
 
@@ -186,7 +186,6 @@ ACTIVE + stale for 250 ms -> OPENING
 OPENING -> rate-limited open command
 OPENING + valid command -> ACTIVE
 invalid command -> reject and retain current state
-shutdown -> rate-limited open, then stop
 ```
 
 Startup never reuses an uninitialized or zero vector because zero is fully
@@ -226,6 +225,14 @@ actuators, while the Unitree SDK bridge continues to carry only the 29 body
 motors. Dex3 DDS hand publishers/subscribers are not initialized in Inspire
 mode.
 
+MuJoCo joint limits are soft constraints, so measured active-joint state is
+projected onto the physical range before it is reported in the normalized
+hardware convention. Command validation remains strict, and the plant records
+the largest projection error for diagnostics. The generated model also
+excludes the bilateral palm/`thumb_2` mesh pairs that overlap at the official
+zero-angle open pose, and uses stiff equality parameters for the mechanical
+mimic couplings. All other contact pairs remain enabled.
+
 The Inspire configuration uses:
 
 ```text
@@ -259,17 +266,19 @@ Verification proceeds from the smallest boundary outward:
    and invalid-input rejection.
 2. Pure contract tests confirm normalized/radian round trips at open, closed,
    and mid-range commands.
-3. Model-load tests require 29 body joints, 24 hand joints, 41 actuators, and
-   12 hand equality constraints.
+3. Model-load tests require 29 body joints, 24 hand joints, 41 actuators, 12
+   hand equality constraints, and the two verified open-pose contact
+   exclusions.
 4. A headless per-motor sweep confirms only the intended finger chain moves,
    the dependent-joint ratios hold, values remain within limits, and no state
    becomes non-finite.
 5. Receiver tests confirm latest-value behavior, six-value validation, startup
    open state, stale-command ramp-to-open, and command recovery.
 6. Existing MuJoCo smoke tests run against the unchanged Dex3 profile.
-7. A headless SONIC regression runs the G1 body with open hands and then with
-   a scripted hand cycle. Pelvis height, body finite-state checks, and hand
-   constraint errors are recorded.
+7. A contact-enabled hand regression records finite state, joint-limit error,
+   contact count, and maximum mimic error through an open/close/open cycle. A
+   separate bounded full-stack run verifies the TensorRT SONIC body loop,
+   loopback DDS, C++ Dex3 disable flag, and the same scripted ZMQ hand cycle.
 8. A live PICO-to-MuJoCo session is run only with user approval because it
    opens a viewer and depends on external headset state.
 
