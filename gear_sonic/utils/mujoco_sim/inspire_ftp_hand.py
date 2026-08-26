@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import time
 
+import mujoco
 import numpy as np
 from numpy.typing import NDArray
 import zmq
@@ -12,11 +13,138 @@ import zmq
 from gear_sonic.utils.teleop.inspire_ftp import (
     CLOSED_RADIANS,
     OPEN,
+    normalized_to_radians,
+    radians_to_normalized,
     validate_hand_pair,
 )
 from gear_sonic.utils.teleop.zmq.zmq_message_decoder import unpack_pose_message
 
 DEFAULT_MAX_OPEN_SPEED = 1.0 / CLOSED_RADIANS
+ACTIVE_JOINT_SUFFIXES = (
+    "little_1_joint",
+    "ring_1_joint",
+    "middle_1_joint",
+    "index_1_joint",
+    "thumb_2_joint",
+    "thumb_1_joint",
+)
+
+
+def active_joint_names(side: str) -> tuple[str, ...]:
+    if side not in ("left", "right"):
+        raise ValueError(f"invalid Inspire hand side: {side!r}")
+    return tuple(f"{side}_{suffix}" for suffix in ACTIVE_JOINT_SUFFIXES)
+
+
+class InspireFtpMujocoPlant:
+    """Name-resolved adapter between normalized FTP commands and MuJoCo."""
+
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        data: mujoco.MjData,
+        *,
+        joint_ids: dict[str, NDArray[np.int64]],
+        qpos_addresses: dict[str, NDArray[np.int64]],
+        qvel_addresses: dict[str, NDArray[np.int64]],
+        actuator_ids: dict[str, NDArray[np.int64]],
+    ) -> None:
+        self.model = model
+        self.data = data
+        self.joint_ids = joint_ids
+        self.qpos_addresses = qpos_addresses
+        self.qvel_addresses = qvel_addresses
+        self.actuator_ids = actuator_ids
+
+    @classmethod
+    def resolve(
+        cls,
+        model: mujoco.MjModel,
+        data: mujoco.MjData,
+        *,
+        left_joint_names: Sequence[str] | None = None,
+        right_joint_names: Sequence[str] | None = None,
+        left_actuator_names: Sequence[str] | None = None,
+        right_actuator_names: Sequence[str] | None = None,
+    ) -> InspireFtpMujocoPlant:
+        """Resolve every active joint and actuator by exact MuJoCo name."""
+
+        configured_joints = {
+            "left": tuple(left_joint_names or active_joint_names("left")),
+            "right": tuple(right_joint_names or active_joint_names("right")),
+        }
+        configured_actuators = {
+            "left": tuple(left_actuator_names or configured_joints["left"]),
+            "right": tuple(right_actuator_names or configured_joints["right"]),
+        }
+        for side in ("left", "right"):
+            if len(configured_joints[side]) != 6:
+                raise ValueError(f"{side} active joint list must contain six names")
+            if len(configured_actuators[side]) != 6:
+                raise ValueError(f"{side} actuator list must contain six names")
+
+        joint_ids = {}
+        qpos_addresses = {}
+        qvel_addresses = {}
+        actuator_ids = {}
+        for side in ("left", "right"):
+            resolved_joint_ids = np.array(
+                [cls._require_id(model, mujoco.mjtObj.mjOBJ_JOINT, name) for name in configured_joints[side]],
+                dtype=np.int64,
+            )
+            resolved_actuator_ids = np.array(
+                [
+                    cls._require_id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+                    for name in configured_actuators[side]
+                ],
+                dtype=np.int64,
+            )
+            driven_joint_ids = model.actuator_trnid[resolved_actuator_ids, 0]
+            if not np.array_equal(driven_joint_ids, resolved_joint_ids):
+                raise ValueError(f"{side} Inspire actuators do not drive configured joints")
+            joint_ids[side] = resolved_joint_ids
+            qpos_addresses[side] = model.jnt_qposadr[resolved_joint_ids].astype(np.int64, copy=True)
+            qvel_addresses[side] = model.jnt_dofadr[resolved_joint_ids].astype(np.int64, copy=True)
+            actuator_ids[side] = resolved_actuator_ids
+
+        all_actuator_ids = np.concatenate(tuple(actuator_ids.values()))
+        if len(set(all_actuator_ids.tolist())) != 12:
+            raise ValueError("Inspire hand actuator names must resolve to twelve distinct IDs")
+        return cls(
+            model,
+            data,
+            joint_ids=joint_ids,
+            qpos_addresses=qpos_addresses,
+            qvel_addresses=qvel_addresses,
+            actuator_ids=actuator_ids,
+        )
+
+    @staticmethod
+    def _require_id(model: mujoco.MjModel, object_type, name: str) -> int:
+        object_id = mujoco.mj_name2id(model, object_type, name)
+        if object_id < 0:
+            raise ValueError(f"MuJoCo model does not define required object {name!r}")
+        return object_id
+
+    def write_targets(
+        self,
+        left: Sequence[float] | NDArray[np.floating],
+        right: Sequence[float] | NDArray[np.floating],
+    ) -> None:
+        """Write twelve validated normalized commands as radian position targets."""
+
+        left_command, right_command = validate_hand_pair(left, right)
+        self.data.ctrl[self.actuator_ids["left"]] = normalized_to_radians(left_command)
+        self.data.ctrl[self.actuator_ids["right"]] = normalized_to_radians(right_command)
+
+    def read_normalized_state(
+        self,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Read the twelve active joint positions in the normalized FTP convention."""
+
+        left = radians_to_normalized(self.data.qpos[self.qpos_addresses["left"]])
+        right = radians_to_normalized(self.data.qpos[self.qpos_addresses["right"]])
+        return left, right
 
 
 class InspireCommandState:
@@ -38,6 +166,13 @@ class InspireCommandState:
         self.max_open_speed = speed.copy()
         self.last_valid: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None
         self.last_receive_monotonic: float | None = None
+        self.output = (OPEN.copy(), OPEN.copy())
+
+    def reset(self) -> None:
+        """Forget external commands and restore the fail-open startup state."""
+
+        self.last_valid = None
+        self.last_receive_monotonic = None
         self.output = (OPEN.copy(), OPEN.copy())
 
     def accept(
