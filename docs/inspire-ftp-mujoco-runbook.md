@@ -22,6 +22,11 @@ PICO grip independently closes thumb rotation. Both `pose` and `planner`
 messages must contain `left_hand_joints` and `right_hand_joints`, each with
 shape `(6,)`.
 
+MuJoCo applies a per-motor slew corresponding to 1 rad/s in each active
+physical joint. Full travel is approximately 1.44 s for the four fingers,
+0.59 s for thumb bend, and 1.16 s for thumb rotation. The ZMQ logger displays
+raw PICO intent, while the viewer displays this slew-limited applied motion.
+
 ## Automated headless verification
 
 Run from the repository root with no viewer, PICO, DDS, or hardware:
@@ -126,6 +131,10 @@ This command depends on live XRoboToolkit/PICO state and may open configured
 visual components. Use it only when the headset and trackers are ready. The
 launcher intentionally rejects `hand_profile=inspire_ftp` without `--sim` in
 this phase.
+
+An exact neutral elbow rotation is valid input and must not terminate `POSE`
+streaming. Keep `POSE` active through a neutral-arm hold for at least 15
+seconds before considering the live validation passed.
 
 ## Watchdog behavior
 
