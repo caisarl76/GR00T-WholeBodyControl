@@ -21,10 +21,17 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
-from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
+from gear_sonic.utils.mujoco_sim.inspire_ftp_hand import (
+    DEFAULT_MAX_SLEW_SPEED,
+    InspireCommandState,
+    InspireFtpMujocoPlant,
+    InspireFtpZmqSubscriber,
+)
+from gear_sonic.utils.mujoco_sim.metric_utils import check_contact
+from gear_sonic.utils.mujoco_sim.robot import Robot
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
-from gear_sonic.utils.mujoco_sim.robot import Robot
+from gear_sonic.utils.teleop.inspire_ftp import OPEN
 
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
@@ -46,10 +53,19 @@ class DefaultEnv:
         self.robot = Robot(self.config)
         self.num_body_dof = self.robot.NUM_JOINTS
         self.num_hand_dof = self.robot.NUM_HAND_JOINTS
+        self.hand_type = self.robot.HAND_TYPE
+        self.inspire_hand_plant = None
+        self.inspire_hand_subscriber = None
         self.sim_dt = self.config["SIMULATE_DT"]
         self.obs = None
-        self.torques = np.zeros(self.num_body_dof + self.num_hand_dof * 2)
-        self.torque_limit = np.array(self.robot.MOTOR_EFFORT_LIMIT_LIST)
+        if self.hand_type == "inspire_ftp":
+            self.torques = np.zeros(self.num_body_dof)
+            self.torque_limit = np.asarray(
+                self.robot.MOTOR_EFFORT_LIMIT_LIST[: self.num_body_dof]
+            )
+        else:
+            self.torques = np.zeros(self.num_body_dof + self.num_hand_dof * 2)
+            self.torque_limit = np.array(self.robot.MOTOR_EFFORT_LIMIT_LIST)
         self.camera_configs = camera_configs
 
         if not camera_configs and offscreen and enable_image_publish:
@@ -60,6 +76,7 @@ class DefaultEnv:
         self.reward_lock = Lock()
         self.unitree_bridge = None
         self.onscreen = onscreen
+        self.elastic_band = None
 
         self.init_scene()
         self.last_reward = 0
@@ -150,6 +167,30 @@ class DefaultEnv:
         self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
         self.mj_data = mujoco.MjData(self.mj_model)
         self.mj_model.opt.timestep = self.sim_dt
+        if self.hand_type == "inspire_ftp":
+            hand_state = InspireCommandState(
+                stale_after_s=self.config.get("INSPIRE_HAND_COMMAND_TIMEOUT_S", 0.25),
+                max_slew_speed=self.config.get(
+                    "INSPIRE_HAND_MAX_SLEW_SPEED",
+                    self.config.get(
+                        "INSPIRE_HAND_MAX_OPEN_SPEED", DEFAULT_MAX_SLEW_SPEED
+                    ),
+                ),
+            )
+            self.inspire_hand_plant = InspireFtpMujocoPlant.resolve(
+                self.mj_model,
+                self.mj_data,
+                left_joint_names=self.robot.LEFT_HAND_ACTUATOR_NAMES or None,
+                right_joint_names=self.robot.RIGHT_HAND_ACTUATOR_NAMES or None,
+                left_actuator_names=self.robot.LEFT_HAND_ACTUATOR_NAMES or None,
+                right_actuator_names=self.robot.RIGHT_HAND_ACTUATOR_NAMES or None,
+            )
+            self.inspire_hand_subscriber = InspireFtpZmqSubscriber(
+                host=self.config.get("INSPIRE_HAND_ZMQ_HOST", "localhost"),
+                port=self.config.get("INSPIRE_HAND_ZMQ_PORT", 5556),
+                state=hand_state,
+            )
+            self.inspire_hand_plant.write_targets(OPEN, OPEN)
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
         self.root_body_id = self.mj_model.body(self.root_body).id
@@ -223,20 +264,31 @@ class DefaultEnv:
             self.viewer.cam.trackbodyid = self.mj_model.body("pelvis").id
 
         self.body_joint_index = []
-        self.left_hand_index = []
-        self.right_hand_index = []
+        if self.hand_type == "inspire_ftp":
+            self.left_hand_index = self._resolve_named_joints(
+                self.robot.LEFT_HAND_JOINT_NAMES, side="left"
+            )
+            self.right_hand_index = self._resolve_named_joints(
+                self.robot.RIGHT_HAND_JOINT_NAMES, side="right"
+            )
+            hand_joint_ids = set(self.left_hand_index) | set(self.right_hand_index)
+        else:
+            self.left_hand_index = []
+            self.right_hand_index = []
+            hand_joint_ids = set()
+
         for i in range(self.mj_model.njnt):
             name = self.mj_model.joint(i).name
+            if i in hand_joint_ids:
+                continue
             if any(
-                [
-                    part_name in name
-                    for part_name in ["hip", "knee", "ankle", "waist", "shoulder", "elbow", "wrist"]
-                ]
+                part_name in name
+                for part_name in ["hip", "knee", "ankle", "waist", "shoulder", "elbow", "wrist"]
             ):
                 self.body_joint_index.append(i)
-            elif "left_hand" in name:
+            elif self.hand_type != "inspire_ftp" and "left_hand" in name:
                 self.left_hand_index.append(i)
-            elif "right_hand" in name:
+            elif self.hand_type != "inspire_ftp" and "right_hand" in name:
                 self.right_hand_index.append(i)
 
         assert len(self.body_joint_index) == self.robot.NUM_JOINTS
@@ -246,6 +298,51 @@ class DefaultEnv:
         self.body_joint_index = np.array(self.body_joint_index)
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
+        if self.hand_type == "inspire_ftp":
+            self.body_qpos_adr = self.mj_model.jnt_qposadr[self.body_joint_index]
+            self.body_qvel_adr = self.mj_model.jnt_dofadr[self.body_joint_index]
+            self.left_hand_qpos_adr = self.mj_model.jnt_qposadr[
+                self.left_hand_index
+            ]
+            self.left_hand_qvel_adr = self.mj_model.jnt_dofadr[
+                self.left_hand_index
+            ]
+            self.right_hand_qpos_adr = self.mj_model.jnt_qposadr[
+                self.right_hand_index
+            ]
+            self.right_hand_qvel_adr = self.mj_model.jnt_dofadr[
+                self.right_hand_index
+            ]
+            body_actuator_ids = []
+            for joint_id in self.body_joint_index:
+                matches = np.flatnonzero(
+                    self.mj_model.actuator_trnid[:, 0] == joint_id
+                )
+                if matches.shape != (1,):
+                    joint_name = self.mj_model.joint(joint_id).name
+                    raise ValueError(
+                        f"body joint {joint_name!r} must have exactly one actuator"
+                    )
+                body_actuator_ids.append(matches[0])
+            self.body_actuator_index = np.asarray(
+                body_actuator_ids, dtype=np.int64
+            )
+
+    def _resolve_named_joints(self, names, *, side: str) -> list[int]:
+        if len(names) != self.robot.NUM_HAND_JOINTS:
+            raise ValueError(
+                f"{side} hand config must name {self.robot.NUM_HAND_JOINTS} physical joints"
+            )
+        joint_ids = [
+            mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            for name in names
+        ]
+        missing = [name for name, joint_id in zip(names, joint_ids) if joint_id < 0]
+        if missing:
+            raise ValueError(f"MuJoCo model is missing {side} hand joints: {missing}")
+        if len(set(joint_ids)) != len(joint_ids):
+            raise ValueError(f"{side} hand joint names must be distinct")
+        return joint_ids
 
     def init_renderers(self):
         self.renderers = {}
@@ -272,17 +369,27 @@ class DefaultEnv:
                         )
                     )
                 else:
+                    qpos_address = (
+                        self.body_qpos_adr[i]
+                        if self.hand_type == "inspire_ftp"
+                        else self.body_joint_index[i] + self.qpos_offset - 1
+                    )
+                    qvel_address = (
+                        self.body_qvel_adr[i]
+                        if self.hand_type == "inspire_ftp"
+                        else self.body_joint_index[i] + self.qvel_offset - 1
+                    )
                     body_torques[i] = (
                         self.unitree_bridge.low_cmd.motor_cmd[i].tau
                         + self.unitree_bridge.low_cmd.motor_cmd[i].kp
                         * (
                             self.unitree_bridge.low_cmd.motor_cmd[i].q
-                            - self.mj_data.qpos[self.body_joint_index[i] + self.qpos_offset - 1]
+                            - self.mj_data.qpos[qpos_address]
                         )
                         + self.unitree_bridge.low_cmd.motor_cmd[i].kd
                         * (
                             self.unitree_bridge.low_cmd.motor_cmd[i].dq
-                            - self.mj_data.qvel[self.body_joint_index[i] + self.qvel_offset - 1]
+                            - self.mj_data.qvel[qvel_address]
                         )
                     )
         return body_torques
@@ -370,19 +477,63 @@ class DefaultEnv:
         )
         obs["secondary_imu_vel"] = pose[7:13]
 
-        obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
-        obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
-        obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
-        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
+        if self.hand_type == "inspire_ftp":
+            obs["body_q"] = self.mj_data.qpos[self.body_qpos_adr]
+            obs["body_dq"] = self.mj_data.qvel[self.body_qvel_adr]
+            obs["body_ddq"] = self.mj_data.qacc[self.body_qvel_adr]
+            obs["body_tau_est"] = self.mj_data.actuator_force[
+                self.body_actuator_index
+            ]
+        else:
+            obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
+            obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
+            obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
+            obs["body_tau_est"] = self.mj_data.actuator_force[
+                self.body_joint_index - 1
+            ]
         if self.num_hand_dof > 0:
-            obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + self.qpos_offset - 1]
-            obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
-            obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
-            obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
+            if self.hand_type == "inspire_ftp":
+                obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_qpos_adr]
+                obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_qvel_adr]
+                obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_qvel_adr]
+                obs["left_hand_tau_est"] = self.mj_data.qfrc_actuator[
+                    self.left_hand_qvel_adr
+                ]
+                obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_qpos_adr]
+                obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_qvel_adr]
+                obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_qvel_adr]
+                obs["right_hand_tau_est"] = self.mj_data.qfrc_actuator[
+                    self.right_hand_qvel_adr
+                ]
+                (
+                    obs["left_hand_normalized"],
+                    obs["right_hand_normalized"],
+                ) = self.inspire_hand_plant.read_normalized_state()
+            else:
+                obs["left_hand_q"] = self.mj_data.qpos[
+                    self.left_hand_index + self.qpos_offset - 1
+                ]
+                obs["left_hand_dq"] = self.mj_data.qvel[
+                    self.left_hand_index + self.qvel_offset - 1
+                ]
+                obs["left_hand_ddq"] = self.mj_data.qacc[
+                    self.left_hand_index + self.qvel_offset - 1
+                ]
+                obs["left_hand_tau_est"] = self.mj_data.actuator_force[
+                    self.left_hand_index - 1
+                ]
+                obs["right_hand_q"] = self.mj_data.qpos[
+                    self.right_hand_index + self.qpos_offset - 1
+                ]
+                obs["right_hand_dq"] = self.mj_data.qvel[
+                    self.right_hand_index + self.qvel_offset - 1
+                ]
+                obs["right_hand_ddq"] = self.mj_data.qacc[
+                    self.right_hand_index + self.qvel_offset - 1
+                ]
+                obs["right_hand_tau_est"] = self.mj_data.actuator_force[
+                    self.right_hand_index - 1
+                ]
         obs["time"] = self.mj_data.time
         return obs
 
@@ -413,20 +564,38 @@ class DefaultEnv:
             else:
                 self.mj_data.xfrc_applied[self.band_attached_link] = np.zeros(6)
         body_torques = self.compute_body_torques()
-        hand_torques = self.compute_hand_torques()
-        # -1: actuator array is 0-based while joint indices from the model are 1-based
-        self.torques[self.body_joint_index - 1] = body_torques
-        if self.num_hand_dof > 0:
-            self.torques[self.left_hand_index - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
-
-        self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
-
-        if self.config["FREE_BASE"]:
-            # Prepend 6 zeros for the floating-base root DOF actuators
-            self.mj_data.ctrl = np.concatenate((np.zeros(6), self.torques))
+        if self.hand_type == "inspire_ftp":
+            self.torques[:] = np.clip(
+                body_torques, -self.torque_limit, self.torque_limit
+            )
+            self.mj_data.ctrl[self.body_actuator_index] = self.torques
+            now = time.monotonic()
+            self.inspire_hand_subscriber.poll(now=now)
+            left_command, right_command = self.inspire_hand_subscriber.state.advance(
+                now=now, dt=self.sim_dt
+            )
+            self.inspire_hand_plant.write_targets(left_command, right_command)
         else:
-            self.mj_data.ctrl = self.torques
+            hand_torques = self.compute_hand_torques()
+            # -1: actuator array is 0-based while joint indices from the model are 1-based
+            self.torques[self.body_joint_index - 1] = body_torques
+            if self.num_hand_dof > 0:
+                self.torques[self.left_hand_index - 1] = hand_torques[
+                    : self.num_hand_dof
+                ]
+                self.torques[self.right_hand_index - 1] = hand_torques[
+                    self.num_hand_dof :
+                ]
+
+            self.torques = np.clip(
+                self.torques, -self.torque_limit, self.torque_limit
+            )
+
+            if self.config["FREE_BASE"]:
+                # Prepend 6 zeros for the floating-base root DOF actuators
+                self.mj_data.ctrl = np.concatenate((np.zeros(6), self.torques))
+            else:
+                self.mj_data.ctrl = self.torques
         mujoco.mj_step(self.mj_model, self.mj_data)
 
         self.check_fall()
@@ -525,6 +694,14 @@ class DefaultEnv:
 
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
+        if self.inspire_hand_plant is not None:
+            self.inspire_hand_subscriber.state.reset()
+            self.inspire_hand_plant.write_targets(OPEN, OPEN)
+
+    def close(self):
+        if self.inspire_hand_subscriber is not None:
+            self.inspire_hand_subscriber.close()
+            self.inspire_hand_subscriber = None
 
 
 class BaseSimulator:
@@ -649,6 +826,7 @@ class BaseSimulator:
                 self.sim_env.image_publish_process.stop()
             if self.sim_env.viewer is not None:
                 self.sim_env.viewer.close()
+            self.sim_env.close()
         except Exception as e:
             print(f"Warning during close: {e}")
 

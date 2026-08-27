@@ -2490,7 +2490,8 @@ class G1Deploy {
       }
       else if (input_type == "zmq") {
         input_interface_ = std::make_unique<ZMQEndpointInterface>(
-          zmq_host, zmq_port, zmq_topic, zmq_conflate, zmq_verbose
+          zmq_host, zmq_port, zmq_topic, zmq_conflate, zmq_verbose,
+          enable_dex3_hands_
         );
         std::cout << "Initialized ZMQ endpoint interface" << std::endl;
         std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
@@ -2501,7 +2502,7 @@ class G1Deploy {
       else if (input_type == "zmq_manager") {
         input_interface_ = std::make_unique<ZMQManager>(
           zmq_host, zmq_port, zmq_topic, "command", "planner", zmq_conflate,
-          zmq_verbose, vr3pt_filter_config
+          zmq_verbose, vr3pt_filter_config, enable_dex3_hands_
         );
         std::cout << "Initialized ZMQ manager" << std::endl;
         std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;

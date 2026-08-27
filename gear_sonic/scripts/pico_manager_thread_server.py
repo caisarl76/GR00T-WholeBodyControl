@@ -36,7 +36,6 @@ from scipy.spatial.transform import Rotation as R, Rotation as sRot
 import torch
 import zmq
 
-from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -46,6 +45,8 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_angle_axis,
     quaternion_to_rotation_matrix,
 )
+from gear_sonic.utils.teleop.inspire_ftp import map_pico_controls
+from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
 try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -950,9 +951,24 @@ def get_abxy_buttons():
 
 
 def compute_hand_joints_from_inputs(
-    left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
+    left_solver,
+    right_solver,
+    left_trigger,
+    left_grip,
+    right_trigger,
+    right_grip,
+    hand_profile: str = "dex3",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute left/right hand joints using IK solvers, or zeros if unavailable."""
+    """Map controller inputs to the selected end-effector command contract."""
+    if hand_profile == "inspire_ftp":
+        left_hand_joints = map_pico_controls(left_trigger, left_grip).astype(np.float32)[None, :]
+        right_hand_joints = map_pico_controls(right_trigger, right_grip).astype(np.float32)[
+            None, :
+        ]
+        return left_hand_joints, right_hand_joints
+    if hand_profile != "dex3":
+        raise ValueError(f"unsupported hand profile: {hand_profile}")
+
     if left_solver is not None and right_solver is not None:
         left_finger_data = generate_finger_data("left", left_trigger, left_grip)
         right_finger_data = generate_finger_data("right", right_trigger, right_grip)
@@ -1267,6 +1283,7 @@ def _pose_stream_common(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    hand_profile: str = "dex3",
 ):
     """Shared pose streaming loop used by run_pico."""
     if xrt is None:
@@ -1297,6 +1314,7 @@ def _pose_stream_common(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix=log_prefix,
+        hand_profile=hand_profile,
     )
 
     if stop_event is None:
@@ -1694,6 +1712,7 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        hand_profile: str = "dex3",
     ):
         self.socket = socket
         self.reader = reader
@@ -1701,6 +1720,7 @@ class PoseStreamer:
         self.target_fps = target_fps
         self.record_dir = record_dir
         self.log_prefix = log_prefix
+        self.hand_profile = hand_profile
 
         # Injected dependencies
         self.reader = reader
@@ -1714,7 +1734,12 @@ class PoseStreamer:
             os.makedirs(record_dir, exist_ok=True)
         self.record_idx = 0
 
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        if hand_profile == "inspire_ftp":
+            self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
+        elif hand_profile == "dex3":
+            self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        else:
+            raise ValueError(f"unsupported hand profile: {hand_profile}")
         self.parent_indices = [
             -1,
             0,
@@ -1782,6 +1807,23 @@ class PoseStreamer:
         self.buffer_cleared = True
         self.step = 0
 
+    def compute_hand_joints(
+        self,
+        left_trigger: float,
+        left_grip: float,
+        right_trigger: float,
+        right_grip: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return compute_hand_joints_from_inputs(
+            self.left_hand_ik_solver,
+            self.right_hand_ik_solver,
+            left_trigger,
+            left_grip,
+            right_trigger,
+            right_grip,
+            hand_profile=self.hand_profile,
+        )
+
     def run_once(self):
         """Execute one iteration of the pose streaming loop."""
         sample = self.reader.get_latest()
@@ -1811,13 +1853,8 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
-            self.left_hand_ik_solver,
-            self.right_hand_ik_solver,
-            left_trigger,
-            left_grip,
-            right_trigger,
-            right_grip,
+        left_hand_joints, right_hand_joints = self.compute_hand_joints(
+            left_trigger, left_grip, right_trigger, right_grip
         )
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
@@ -2022,6 +2059,7 @@ def run_pico(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    hand_profile: str = "dex3",
 ):
     """Run Pico body tracking with real-time visualization and ZMQ streaming."""
     if xrt is None:
@@ -2060,6 +2098,7 @@ def run_pico(
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
+            hand_profile=hand_profile,
         )
     finally:
         socket.close()
@@ -2438,6 +2477,7 @@ class PlannerStreamer:
         vr3pt_entry_wrist_pos_max_m: float = 0.25,
         vr3pt_entry_torso_pos_max_m: float = 0.20,
         vr3pt_entry_wrist_orn_max_deg: float = 45.0,
+        hand_profile: str = "dex3",
     ):
         self.socket = socket
         self.reader = reader
@@ -2448,6 +2488,7 @@ class PlannerStreamer:
         self.vr3pt_entry_wrist_pos_max_m = float(vr3pt_entry_wrist_pos_max_m)
         self.vr3pt_entry_torso_pos_max_m = float(vr3pt_entry_torso_pos_max_m)
         self.vr3pt_entry_wrist_orn_max_deg = float(vr3pt_entry_wrist_orn_max_deg)
+        self.hand_profile = hand_profile
         self.feedback_reader = FeedbackReader(
             zmq_feedback_host=zmq_feedback_host, zmq_feedback_port=zmq_feedback_port
         )
@@ -2463,7 +2504,12 @@ class PlannerStreamer:
         self.last_xrt_timestamp = None
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        if hand_profile == "inspire_ftp":
+            self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
+        elif hand_profile == "dex3":
+            self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        else:
+            raise ValueError(f"unsupported hand profile: {hand_profile}")
         self._vr3pt_ramp_start_pose: np.ndarray | None = None
         self._vr3pt_ramp_start_time: float | None = None
         self._vr3pt_ramp_active = False
@@ -2471,6 +2517,23 @@ class PlannerStreamer:
         self.freeze_vr3pt_target_once = False
         self._vr3pt_entry_gate_passed = False
         self._vr3pt_recalibrated_since_gate = False
+
+    def compute_hand_joints(
+        self,
+        left_trigger: float,
+        left_grip: float,
+        right_trigger: float,
+        right_grip: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return compute_hand_joints_from_inputs(
+            self.left_hand_ik_solver,
+            self.right_hand_ik_solver,
+            left_trigger,
+            left_grip,
+            right_trigger,
+            right_grip,
+            hand_profile=self.hand_profile,
+        )
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -2735,13 +2798,8 @@ class PlannerStreamer:
                     left_grip,
                     right_grip,
                 ) = get_controller_inputs()
-                lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                    self.left_hand_ik_solver,
-                    self.right_hand_ik_solver,
-                    left_trigger,
-                    left_grip,
-                    right_trigger,
-                    right_grip,
+                lh_joints, rh_joints = self.compute_hand_joints(
+                    left_trigger, left_grip, right_trigger, right_grip
                 )
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
@@ -2803,6 +2861,7 @@ def run_pico_manager(
     controller_3pt_log_dir: str = "",
     controller_3pt_log_interval: float = 1.0,
     disable_xr_staleness_watchdog: bool = False,
+    hand_profile: str = "dex3",
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2905,6 +2964,7 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        hand_profile=hand_profile,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2919,6 +2979,7 @@ def run_pico_manager(
         vr3pt_entry_wrist_pos_max_m=vr3pt_entry_wrist_pos_max_m,
         vr3pt_entry_torso_pos_max_m=vr3pt_entry_torso_pos_max_m,
         vr3pt_entry_wrist_orn_max_deg=vr3pt_entry_wrist_orn_max_deg,
+        hand_profile=hand_profile,
     )
 
     # State machine diagram:
@@ -3231,6 +3292,12 @@ if __name__ == "__main__":
         help="Run manager with planner and pose threads (interactive)",
     )
     parser.add_argument(
+        "--hand-profile",
+        choices=("dex3", "inspire_ftp"),
+        default="dex3",
+        help="Hand command contract published in pose/planner messages (default: dex3)",
+    )
+    parser.add_argument(
         "--zmq_feedback_host",
         type=str,
         default="localhost",
@@ -3468,6 +3535,7 @@ if __name__ == "__main__":
             controller_3pt_log_dir=args.controller_3pt_log_dir,
             controller_3pt_log_interval=args.controller_3pt_log_interval,
             disable_xr_staleness_watchdog=args.disable_xr_staleness_watchdog,
+            hand_profile=args.hand_profile,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -3483,4 +3551,5 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            hand_profile=args.hand_profile,
         )
