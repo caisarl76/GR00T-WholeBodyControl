@@ -89,7 +89,7 @@ Terminal 2 — SONIC body process with no Dex3 DDS endpoints:
 
 ```bash
 cd gear_sonic_deploy
-./deploy.sh --disable-dex3-hands sim
+./deploy.sh --disable-dex3-hands --input-type zmq_manager sim
 ```
 
 Confirm the printed final command contains both `--disable-crc-check` and
@@ -98,7 +98,7 @@ or launching:
 
 ```bash
 cd gear_sonic_deploy
-./deploy.sh --dry-run --disable-dex3-hands sim
+./deploy.sh --dry-run --disable-dex3-hands --input-type zmq_manager sim
 ```
 
 Terminal 3 — bounded local hand/planner publisher:

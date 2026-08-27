@@ -101,7 +101,15 @@ def test_inspire_launcher_does_not_start_dex3_schema_exporter(monkeypatch):
 
 def test_deploy_shell_dry_run_forwards_disable_dex3_flag():
     result = subprocess.run(
-        ["bash", "deploy.sh", "--dry-run", "--disable-dex3-hands", "sim"],
+        [
+            "bash",
+            "deploy.sh",
+            "--dry-run",
+            "--disable-dex3-hands",
+            "--input-type",
+            "zmq_manager",
+            "sim",
+        ],
         cwd=REPO_ROOT / "gear_sonic_deploy",
         check=True,
         capture_output=True,
@@ -111,3 +119,4 @@ def test_deploy_shell_dry_run_forwards_disable_dex3_flag():
     assert "g1_deploy_onnx_ref" in result.stdout
     assert "--disable-crc-check" in result.stdout
     assert "--disable-dex3-hands" in result.stdout
+    assert "--input-type zmq_manager" in result.stdout
