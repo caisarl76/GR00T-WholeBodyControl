@@ -6,6 +6,25 @@ set(EXECUTABLE_NAME g1_deploy_onnx_ref)
 option(BUILD_ROS2 "Build optional ROS2 input/output support" OFF)
 option(BUILD_DEPLOY_TESTS "Build deploy-side test executables" OFF)
 
+if(BUILD_DEPLOY_TESTS)
+  enable_testing()
+  add_executable(dex3_hand_field_decoder_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/dex3_hand_field_decoder_test.cpp)
+  target_include_directories(dex3_hand_field_decoder_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  set_target_properties(dex3_hand_field_decoder_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(dex3_hand_field_decoder_test PRIVATE
+      -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(dex3_hand_field_decoder_test PRIVATE
+      -fsanitize=address,undefined)
+  endif()
+  add_test(NAME dex3_hand_field_decoder_test COMMAND dex3_hand_field_decoder_test)
+endif()
+
 if(BUILD_ROS2)
   find_package(rclcpp QUIET)
   find_package(std_msgs QUIET)

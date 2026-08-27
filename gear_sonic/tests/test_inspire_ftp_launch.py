@@ -1,8 +1,10 @@
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
+import gear_sonic.scripts.launch_data_collection as launch_module
 from gear_sonic.scripts.launch_data_collection import (
     DataCollectionLaunchConfig,
     _build_deploy_command,
@@ -64,6 +66,37 @@ def test_default_launcher_keeps_dex3_flags_implicit():
 def test_launcher_rejects_real_inspire_before_external_actions():
     with pytest.raises(ValueError, match="simulation-only"):
         main(DataCollectionLaunchConfig(sim=False, hand_profile="inspire_ftp"))
+
+
+def test_inspire_launcher_does_not_start_dex3_schema_exporter(monkeypatch):
+    sent_commands = []
+
+    monkeypatch.setattr(launch_module, "_check_prerequisites", lambda **_: None)
+    monkeypatch.setattr(launch_module, "_kill_existing_session", lambda: None)
+    monkeypatch.setattr(launch_module, "_create_tmux_session", lambda: None)
+    monkeypatch.setattr(launch_module, "_check_pane_alive", lambda _: True)
+    monkeypatch.setattr(launch_module, "_get_local_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(launch_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        launch_module,
+        "_send_to_pane",
+        lambda pane, command, wait=0.0: sent_commands.append((pane, command)),
+    )
+    monkeypatch.setattr(
+        launch_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+
+    main(DataCollectionLaunchConfig(sim=True, hand_profile="inspire_ftp"))
+
+    assert any("deploy.sh" in command for _, command in sent_commands)
+    assert any("pico_manager_thread_server.py" in command for _, command in sent_commands)
+    assert not any("run_data_exporter.py" in command for _, command in sent_commands)
+
+    sent_commands.clear()
+    main(DataCollectionLaunchConfig(sim=True, hand_profile="dex3"))
+    assert any("run_data_exporter.py" in command for _, command in sent_commands)
 
 
 def test_deploy_shell_dry_run_forwards_disable_dex3_flag():

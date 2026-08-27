@@ -359,6 +359,14 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
+    print(
+        "  Data exporter:   "
+        + (
+            "Disabled (Inspire six-motor schema not implemented)"
+            if config.hand_profile == "inspire_ftp"
+            else "Enabled"
+        )
+    )
     print(f"  PICO vis:        vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
     print("=" * 60)
@@ -411,29 +419,39 @@ def main(config: DataCollectionLaunchConfig):
         print("Starting camera viewer (pane 3)...")
         _send_to_pane(3, viewer_cmd, wait=2.0)
 
-    # --- Pane 1 (top-right): Data Exporter ---
-    exporter_cmd = (
-        f"cd {repo_root} && "
-        f"source .venv_data_collection/bin/activate && "
-        f"python gear_sonic/scripts/run_data_exporter.py "
-        f"--task-prompt '{config.task_prompt}' "
-        f"--data-collection-frequency {config.data_exporter_frequency} "
-        f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
-    )
-    if config.dataset_name:
-        exporter_cmd += f" --dataset-name '{config.dataset_name}'"
-    if config.record_wrist_cameras:
-        exporter_cmd += " --record-wrist-cameras"
-    if not config.text_to_speech:
-        exporter_cmd += " --no-text-to-speech"
+    # The current LeRobot feature schema is Dex3-specific (seven values per
+    # hand). Do not start an exporter that would reject or mislabel Inspire's
+    # six-motor commands.
+    if config.hand_profile == "inspire_ftp":
+        print("Skipping data exporter: Inspire six-motor schema is not implemented.")
+    else:
+        exporter_cmd = (
+            f"cd {repo_root} && "
+            f"source .venv_data_collection/bin/activate && "
+            f"python gear_sonic/scripts/run_data_exporter.py "
+            f"--task-prompt '{config.task_prompt}' "
+            f"--data-collection-frequency {config.data_exporter_frequency} "
+            f"--camera-host {config.camera_host} "
+            f"--camera-port {config.camera_port}"
+        )
+        if config.dataset_name:
+            exporter_cmd += f" --dataset-name '{config.dataset_name}'"
+        if config.record_wrist_cameras:
+            exporter_cmd += " --record-wrist-cameras"
+        if not config.text_to_speech:
+            exporter_cmd += " --no-text-to-speech"
 
-    print("Starting data exporter (pane 1)...")
-    _send_to_pane(2, exporter_cmd, wait=1.0)
+        print("Starting data exporter (pane 1)...")
+        _send_to_pane(2, exporter_cmd, wait=1.0)
 
-    # Select the data exporter pane so the user lands there for interactive input
+    # Select the interactive exporter pane for Dex3, or PICO for Inspire.
     subprocess.run(
-        ["tmux", "select-pane", "-t", f"{SESSION_NAME}:0.2"],
+        [
+            "tmux",
+            "select-pane",
+            "-t",
+            f"{SESSION_NAME}:0.{2 if config.hand_profile == 'dex3' else 1}",
+        ],
     )
 
     print()
@@ -449,7 +467,11 @@ def main(config: DataCollectionLaunchConfig):
     print("  Window 'data_collection':")
     print("    Pane 0 (top-left):     C++ Deploy")
     print("    Pane 1 (bottom-left):  PICO Teleop")
-    print("    Pane 2 (top-right):    Data Exporter  <-- you are here")
+    if config.hand_profile == "dex3":
+        print("    Pane 2 (top-right):    Data Exporter  <-- you are here")
+    else:
+        print("    Pane 2 (top-right):    Data Exporter disabled for Inspire")
+        print("                              PICO Teleop  <-- you are here")
     if config.camera_viewer:
         print("    Pane 3 (bottom-right): Camera Viewer")
     print()

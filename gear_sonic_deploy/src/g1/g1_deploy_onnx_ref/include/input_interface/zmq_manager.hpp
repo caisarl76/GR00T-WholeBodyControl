@@ -54,6 +54,7 @@
 
 #include "input_interface.hpp"
 #include "input_command.hpp"
+#include "dex3_hand_field_decoder.hpp"
 #include "vr3pt_safety_filter.hpp"
 #include "zmq_endpoint_interface.hpp"
 #include "zmq_packed_message_subscriber.hpp"
@@ -89,7 +90,8 @@ class ZMQManager : public InputInterface {
       const std::string& planner_topic = "planner",
       bool zmq_conflate = false,
       bool zmq_verbose = false,
-      Vr3PtSafetyFilter::Config vr3pt_filter_config = Vr3PtSafetyFilter::Config{}
+      Vr3PtSafetyFilter::Config vr3pt_filter_config = Vr3PtSafetyFilter::Config{},
+      bool decode_dex3_hands = true
     ) : InputInterface(), 
         zmq_host_(zmq_host), 
         zmq_port_(zmq_port), 
@@ -98,6 +100,7 @@ class ZMQManager : public InputInterface {
         planner_topic_(planner_topic),
         zmq_conflate_(zmq_conflate), 
         zmq_verbose_(zmq_verbose),
+        decode_dex3_hands_(decode_dex3_hands),
         vr3pt_filter_(vr3pt_filter_config) {
       
       type_ = InputType::NETWORK;
@@ -105,7 +108,8 @@ class ZMQManager : public InputInterface {
       
       // Create pose interface (for streamed motion mode)
       pose_interface_ = std::make_unique<ZMQEndpointInterface>(
-        zmq_host_, zmq_port_, pose_topic_, zmq_conflate_, zmq_verbose_
+        zmq_host_, zmq_port_, pose_topic_, zmq_conflate_, zmq_verbose_,
+        decode_dex3_hands_
       );
       
       // Create command subscriber
@@ -973,66 +977,30 @@ class ZMQManager : public InputInterface {
         upper_body_joint_velocities_.SetData(upper_body_velocity_data);
       }
       
-      // Optional: left_hand_joints (7 DOF, decode based on dtype)
-      if (left_hand_joints_idx >= 0) {
+      // Optional Dex3 hand fields. Other hand profiles use a different shape
+      // and are intentionally ignored by this 7-DOF consumer.
+      if (decode_dex3_hands_ && left_hand_joints_idx >= 0 &&
+          static_cast<std::size_t>(left_hand_joints_idx) < bufs.size()) {
         const auto& lh_buf = bufs[left_hand_joints_idx];
         const auto& lh_field = hdr.fields[left_hand_joints_idx];
-
-        std::array<double, 7> left_hand_joints_data{};
-        if (lh_field.dtype == "f32") {
-          for (int i = 0; i < 7; ++i) {
-            float val;
-            std::memcpy(&val,
-                        static_cast<const uint8_t*>(lh_buf.data) + i * sizeof(float),
-                        sizeof(float));
-            if (needs_swap) val = byte_swap(val);
-            left_hand_joints_data[i] = static_cast<double>(val);
-          }
-        } else { // f64 or default
-          for (int i = 0; i < 7; ++i) {
-            double val;
-            std::memcpy(&val,
-                        static_cast<const uint8_t*>(lh_buf.data) + i * sizeof(double),
-                        sizeof(double));
-            if (needs_swap) val = byte_swap(val);
-            left_hand_joints_data[i] = val;
-          }
+        const auto decoded = gear_sonic::deploy::DecodeDex3HandField(
+            lh_field.dtype, lh_field.shape, lh_buf.data, lh_buf.size, needs_swap);
+        if (decoded.values.has_value()) {
+          msg.left_hand_joints = decoded.values.value();
+          left_hand_joint_.SetData(decoded.values.value());
         }
-        msg.left_hand_joints = left_hand_joints_data;
-
-        // Push into left hand joint buffer
-        left_hand_joint_.SetData(left_hand_joints_data);
       }
 
-      // Optional: right_hand_joints (7 DOF, decode based on dtype)
-      if (right_hand_joints_idx >= 0) {
+      if (decode_dex3_hands_ && right_hand_joints_idx >= 0 &&
+          static_cast<std::size_t>(right_hand_joints_idx) < bufs.size()) {
         const auto& rh_buf = bufs[right_hand_joints_idx];
         const auto& rh_field = hdr.fields[right_hand_joints_idx];
-
-        std::array<double, 7> right_hand_joints_data{};
-        if (rh_field.dtype == "f32") {
-          for (int i = 0; i < 7; ++i) {
-            float val;
-            std::memcpy(&val,
-                        static_cast<const uint8_t*>(rh_buf.data) + i * sizeof(float),
-                        sizeof(float));
-            if (needs_swap) val = byte_swap(val);
-            right_hand_joints_data[i] = static_cast<double>(val);
-          }
-        } else { // f64 or default
-          for (int i = 0; i < 7; ++i) {
-            double val;
-            std::memcpy(&val,
-                        static_cast<const uint8_t*>(rh_buf.data) + i * sizeof(double),
-                        sizeof(double));
-            if (needs_swap) val = byte_swap(val);
-            right_hand_joints_data[i] = val;
-          }
+        const auto decoded = gear_sonic::deploy::DecodeDex3HandField(
+            rh_field.dtype, rh_field.shape, rh_buf.data, rh_buf.size, needs_swap);
+        if (decoded.values.has_value()) {
+          msg.right_hand_joints = decoded.values.value();
+          right_hand_joint_.SetData(decoded.values.value());
         }
-        msg.right_hand_joints = right_hand_joints_data;
-
-        // Push into right hand joint buffer
-        right_hand_joint_.SetData(right_hand_joints_data);
       }
 
       // Decode VR 3-point tracking data if present (9 doubles for position, 12 doubles for orientation, 3 doubles for compliance)
@@ -1250,6 +1218,7 @@ class ZMQManager : public InputInterface {
     std::string planner_topic_;      ///< Topic for planner movement commands.
     bool zmq_conflate_;              ///< ZMQ conflate option for pose topic.
     bool zmq_verbose_;               ///< Verbose logging flag.
+    bool decode_dex3_hands_;         ///< Decode only the legacy 7-DOF Dex3 fields.
     
     // ------------------------------------------------------------------
     // Owned sub-components

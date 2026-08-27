@@ -130,7 +130,9 @@ profile to MuJoCo, PICO, and C++:
 This command depends on live XRoboToolkit/PICO state and may open configured
 visual components. Use it only when the headset and trackers are ready. The
 launcher intentionally rejects `hand_profile=inspire_ftp` without `--sim` in
-this phase.
+this phase. It also skips `run_data_exporter.py`: the current SONIC VLA feature
+schema is Dex3-specific and requires seven values per hand, so Inspire recording
+remains disabled until a profile-aware six-motor dataset contract is added.
 
 An exact neutral elbow rotation is valid input and must not terminate `POSE`
 streaming. Keep `POSE` active through a neutral-arm hold for at least 15
