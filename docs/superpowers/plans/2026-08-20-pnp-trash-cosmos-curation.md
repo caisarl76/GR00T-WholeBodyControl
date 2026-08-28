@@ -22,7 +22,13 @@ The source dataset is immutable and currently has these verified properties:
 - root: `/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash`;
 - LeRobot version: `v2.1`;
 - 92 episodes, 198,846 parquet/video frames, 50 Hz, one ego H.264 stream;
-- 189 regular files and approximately 1.4 GiB;
+- 190 regular files and approximately 1.4 GiB, approved by the user on
+  2026-08-28 under canonical manifest SHA-256
+  `5962d8630f06e6260adbae15a3d7ee5f0a1a745c3a12466add8722c2e0da9577`;
+  this includes the immutable top-level ancillary asset `pnp_trash.xlsx`
+  (13,644 bytes, SHA-256
+  `989f6968e5cf8ee0972b850199c948dd75ce140480c82cbe368053cde6ab34c9`),
+  which is preserved as source evidence and is not annotation authority;
 - one source prompt and an existing `task_index: int64` column;
 - `modality.json` already maps `annotation.human.task_description` to `task_index`;
 - left/right hands occupy `observation.state[22:29]` and `[36:43]`.
@@ -1008,7 +1014,7 @@ git commit -m "docs: add trash curation operations runbook"
 - Write only under: `/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation`
 - Read only: `/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash`
 
-- [ ] Start the configured FastAPI and Next.js services and open the workspace. Confirm the displayed source fingerprint matches the 189-file manifest and the review summary is 92 `pending` on a fresh workspace.
+- [ ] Start the configured FastAPI and Next.js services and open the workspace. Confirm the displayed source fingerprint matches the user-approved 2026-08-28 190-file manifest, including immutable ancillary `pnp_trash.xlsx`, and the review summary is 92 `pending` on a fresh workspace.
 
 - [ ] Run Cosmos capability preflight and a single representative episode smoke. Inspect `request.json`, response text, parsed v2 result, sampled frame indices/timestamps, proposal contact sheet, and UI rendering. Confirm the source FPS in `media_io_kwargs` is 50 and the sample cadence is 2 fps.
 

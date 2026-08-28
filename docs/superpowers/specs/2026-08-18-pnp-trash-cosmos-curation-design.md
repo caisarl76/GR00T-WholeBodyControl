@@ -1000,11 +1000,11 @@ need a schema-version increment:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "source": {
     "dataset_alias": "local/pnp_trash",
     "manifest_sha256": "<64 lowercase hex>",
-    "file_count": 189,
+    "file_count": 190,
     "original_tasks": [{ "task_index": 0, "task": "<original whole-task prompt>" }]
   },
   "approval": {
@@ -1067,6 +1067,14 @@ need a schema-version increment:
   }]
 }
 ```
+
+For `local/pnp_trash`, the user approved this 190-file source contract on
+2026-08-28 under canonical manifest SHA-256
+`5962d8630f06e6260adbae15a3d7ee5f0a1a745c3a12466add8722c2e0da9577`.
+It includes immutable top-level ancillary source asset `pnp_trash.xlsx`
+(13,644 bytes, SHA-256
+`989f6968e5cf8ee0972b850199c948dd75ce140480c82cbe368053cde6ab34c9`),
+which is preserved byte for byte and is not annotation authority.
 
 The example shows representative array entries; actual arrays contain all
 templates, contributing attempts, decisions, tasks, and copied artifacts.
