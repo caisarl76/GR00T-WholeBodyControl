@@ -486,6 +486,40 @@ All commands below run in the **data collection virtual environment**:
 source .venv_data_collection/bin/activate
 ```
 
+### Apply XLSX validity and language annotations
+
+For the PnP trash recordings, create two independent LeRobot v2.1 datasets
+from `pnp_trash.xlsx`:
+
+```bash
+python gear_sonic/scripts/annotate_pnp_trash_dataset.py \
+  --dataset-path outputs/pnp_trash \
+  --annotations-path outputs/pnp_trash/pnp_trash.xlsx \
+  --subtasks-output-path outputs/pnp_trash_subtasks \
+  --full-prompt-output-path outputs/pnp_trash_full_prompt
+```
+
+The source is never modified, and either final output already existing is a
+hard error. Both outputs retain only rows whose `Valid` value is `1`:
+
+- `pnp_trash_subtasks` uses `[0,time1)`, `[time1,time2)`, `[time2,time3)`,
+  and `[time3,end]` for the four spreadsheet subtask prompts.
+- `pnp_trash_full_prompt` assigns the spreadsheet `Full Prompt` to every frame
+  of its episode.
+
+For the current workbook, each output contains 72 episodes, 154,625 frames,
+72 ego videos, and 9 unique prompt strings. Re-run all structural checks
+without changing either dataset with:
+
+```bash
+python gear_sonic/scripts/annotate_pnp_trash_dataset.py \
+  --dataset-path outputs/pnp_trash \
+  --annotations-path outputs/pnp_trash/pnp_trash.xlsx \
+  --subtasks-output-path outputs/pnp_trash_subtasks \
+  --full-prompt-output-path outputs/pnp_trash_full_prompt \
+  --validate-only
+```
+
 ### Remove Stale SMPL Frames
 
 Teleop pauses or ZMQ frame drops create frames where `teleop.smpl_pose` is all
