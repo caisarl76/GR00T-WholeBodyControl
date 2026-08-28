@@ -641,8 +641,8 @@ def validate_variant(
     output: Path,
     annotations: Sequence[EpisodeAnnotation],
     variant: AnnotationVariant,
+    workbook_sha256: str,
     source_manifest_sha256: str | None = None,
-    workbook_sha256: str | None = None,
 ) -> dict[str, object]:
     """Validate an output against its source and annotation contract."""
 
@@ -751,7 +751,7 @@ def validate_variant(
         or re.fullmatch(r"[0-9a-f]{64}", recorded_workbook_sha256) is None
     ):
         raise DatasetValidationError("provenance workbook_sha256 must be a lowercase SHA-256 digest")
-    if workbook_sha256 is not None and recorded_workbook_sha256 != workbook_sha256:
+    if recorded_workbook_sha256 != workbook_sha256:
         raise DatasetValidationError("provenance workbook_sha256 does not match the current annotation workbook")
     if provenance.get("variant") != variant:
         raise DatasetValidationError("provenance variant does not match output variant")

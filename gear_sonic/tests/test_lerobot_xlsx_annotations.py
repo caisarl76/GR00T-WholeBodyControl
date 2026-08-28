@@ -536,6 +536,7 @@ def test_validate_variant_accepts_complete_export(tmp_path: Path, variant: str) 
         output,
         [annotation],
         variant,  # type: ignore[arg-type]
+        workbook_sha256="b" * 64,
     )
 
     assert report == {
@@ -546,6 +547,27 @@ def test_validate_variant_accepts_complete_export(tmp_path: Path, variant: str) 
         "videos": 1,
         "expected_runs_per_episode": 4 if variant == "subtasks" else 1,
     }
+
+
+def test_validate_variant_requires_exact_workbook_digest(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    annotation = _annotation(
+        1,
+        ("approach", "pick", "turn and approach", "drop"),
+        "approach, pick, turn and approach, drop",
+    )
+    output = tmp_path / "subtasks"
+    export_variant(
+        source,
+        output,
+        [annotation],
+        "subtasks",
+        source_manifest_sha256=dataset_manifest_sha256(source),
+        workbook_sha256="b" * 64,
+    )
+
+    with pytest.raises(TypeError):
+        validate_variant(source, output, [annotation], "subtasks")
 
 
 @pytest.mark.parametrize(
@@ -642,7 +664,7 @@ def test_validate_variant_rejects_corruption(
         provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
     elif corruption == "provenance_workbook_hash":
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-        provenance["annotations"]["workbook_sha256"] = "bad"
+        provenance["annotations"]["workbook_sha256"] = "c" * 64
         provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
     elif corruption == "source_hash":
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
@@ -652,7 +674,13 @@ def test_validate_variant_rejects_corruption(
         raise AssertionError(f"unknown test corruption {corruption}")
 
     with pytest.raises(DatasetValidationError, match=match):
-        validate_variant(source, output, [annotation], "subtasks")
+        validate_variant(
+            source,
+            output,
+            [annotation],
+            "subtasks",
+            workbook_sha256="b" * 64,
+        )
 
 
 def _write_fixture_annotations(source: Path) -> Path:
@@ -811,6 +839,7 @@ def test_export_both_publishes_two_validated_outputs(tmp_path: Path) -> None:
             subtasks,
             load_annotations(workbook, expected_episodes={0, 1}),
             "subtasks",
+            workbook_sha256=annotations_module.file_sha256(workbook),
         )["episodes"]
         == 1
     )
