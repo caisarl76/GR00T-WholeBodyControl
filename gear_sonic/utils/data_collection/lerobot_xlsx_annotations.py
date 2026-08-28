@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import tempfile
 from typing import Any, Literal, Sequence
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
@@ -16,7 +18,6 @@ from zipfile import BadZipFile, ZipFile
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-
 
 _SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -41,6 +42,10 @@ class AnnotationError(ValueError):
     """Raised when the annotation workbook violates the export contract."""
 
 
+class DatasetValidationError(AnnotationError):
+    """Raised when an emitted dataset fails structural validation."""
+
+
 @dataclass(frozen=True)
 class EpisodeAnnotation:
     """Validated annotations for one retained source episode."""
@@ -57,8 +62,7 @@ AnnotationVariant = Literal["subtasks", "full_prompt"]
 def _validate_nonempty_runs(length: int, starts: tuple[int, int, int]) -> None:
     if length < 4 or not 0 < starts[0] < starts[1] < starts[2] < length:
         raise AnnotationError(
-            f"snapped boundaries must create four nonempty subtask runs, got length={length}, "
-            f"starts={starts}"
+            f"snapped boundaries must create four nonempty subtask runs, got length={length}, starts={starts}"
         )
 
 
@@ -168,9 +172,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                     continue
                 value = json.loads(line)
                 if not isinstance(value, dict):
-                    raise AnnotationError(
-                        f"JSONL row must contain an object: {path}:{line_number}"
-                    )
+                    raise AnnotationError(f"JSONL row must contain an object: {path}:{line_number}")
                 rows.append(value)
     except (OSError, json.JSONDecodeError) as error:
         raise AnnotationError(f"cannot read JSONL file {path}: {error}") from error
@@ -240,9 +242,7 @@ def _video_keys(info: dict[str, Any]) -> list[str]:
     if not isinstance(features, dict):
         raise AnnotationError("info.json features must be an object")
     return sorted(
-        key
-        for key, feature in features.items()
-        if isinstance(feature, dict) and feature.get("dtype") == "video"
+        key for key, feature in features.items() if isinstance(feature, dict) and feature.get("dtype") == "video"
     )
 
 
@@ -264,9 +264,7 @@ def _assert_source_identifiers(table: pa.Table, source_episode: int) -> None:
     episode_values = np.asarray(table["episode_index"].to_pylist())
     frame_values = np.asarray(table["frame_index"].to_pylist())
     if not np.array_equal(episode_values, np.full(length, source_episode)):
-        raise AnnotationError(
-            f"source episode {source_episode} has inconsistent episode_index values"
-        )
+        raise AnnotationError(f"source episode {source_episode} has inconsistent episode_index values")
     if not np.array_equal(frame_values, np.arange(length)):
         raise AnnotationError(f"source episode {source_episode} has noncontiguous frame_index")
 
@@ -359,9 +357,7 @@ def export_variant(
     copied_videos = 0
 
     for output_episode, annotation in enumerate(ordered_annotations):
-        source_data_path = source / _format_episode_path(
-            source_info, "data_path", annotation.episode
-        )
+        source_data_path = source / _format_episode_path(source_info, "data_path", annotation.episode)
         if not source_data_path.is_file():
             raise AnnotationError(f"source parquet does not exist: {source_data_path}")
         table = pq.read_table(source_data_path)
@@ -376,9 +372,7 @@ def export_variant(
                 f"source episode {annotation.episode} metadata length {source_length} "
                 f"does not match parquet length {length}"
             )
-        boundary_frames = snap_boundary_frames(
-            table["timestamp"], annotation.boundaries_s, fps
-        )
+        boundary_frames = snap_boundary_frames(table["timestamp"], annotation.boundaries_s, fps)
         task_indices, episode_prompts = _episode_prompt_indices(
             annotation, variant, task_map, length, boundary_frames
         )
@@ -394,21 +388,15 @@ def export_variant(
             np.arange(global_index, global_index + length, dtype=np.int64),
         )
         rewritten = _replace_column(rewritten, "task_index", task_indices)
-        output_data_path = destination / _format_episode_path(
-            source_info, "data_path", output_episode
-        )
+        output_data_path = destination / _format_episode_path(source_info, "data_path", output_episode)
         output_data_path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(rewritten, output_data_path)
 
         for video_key in video_keys:
-            source_video = source / _format_video_path(
-                source_info, annotation.episode, video_key
-            )
+            source_video = source / _format_video_path(source_info, annotation.episode, video_key)
             if not source_video.is_file() or source_video.is_symlink():
                 raise AnnotationError(f"source video is missing or not regular: {source_video}")
-            output_video = destination / _format_video_path(
-                source_info, output_episode, video_key
-            )
+            output_video = destination / _format_video_path(source_info, output_episode, video_key)
             output_video.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_video, output_video)
             copied_videos += 1
@@ -422,21 +410,13 @@ def export_variant(
         )
         stats_row = deepcopy(source_stats.get(annotation.episode))
         if stats_row is None:
-            raise AnnotationError(
-                f"source statistics are missing episode {annotation.episode}"
-            )
+            raise AnnotationError(f"source statistics are missing episode {annotation.episode}")
         stats = stats_row.get("stats")
         if not isinstance(stats, dict):
-            raise AnnotationError(
-                f"source statistics for episode {annotation.episode} have no stats object"
-            )
+            raise AnnotationError(f"source statistics for episode {annotation.episode} have no stats object")
         stats_row["episode_index"] = output_episode
-        stats["episode_index"] = _scalar_stats(
-            np.full(length, output_episode, dtype=np.int64)
-        )
-        stats["index"] = _scalar_stats(
-            np.arange(global_index, global_index + length, dtype=np.int64)
-        )
+        stats["episode_index"] = _scalar_stats(np.full(length, output_episode, dtype=np.int64))
+        stats["index"] = _scalar_stats(np.arange(global_index, global_index + length, dtype=np.int64))
         stats["task_index"] = _scalar_stats(task_indices)
         output_stats.append(stats_row)
 
@@ -448,9 +428,7 @@ def export_variant(
                 "length": length,
                 "boundaries_s": list(annotation.boundaries_s),
                 "boundary_frames": list(boundary_frames),
-                "boundary_timestamps_s": [
-                    float(timestamps[frame]) for frame in boundary_frames
-                ],
+                "boundary_timestamps_s": [float(timestamps[frame]) for frame in boundary_frames],
                 "prompts": episode_prompts,
             }
         )
@@ -506,6 +484,375 @@ def export_variant(
         frames=global_index,
         tasks=len(task_map),
     )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dataset_manifest_sha256(dataset_path: Path) -> str:
+    """Hash every regular dataset file and its POSIX relative path."""
+
+    if not dataset_path.is_dir():
+        raise AnnotationError(f"dataset path is not a directory: {dataset_path}")
+    digest = hashlib.sha256()
+    file_count = 0
+    for path in sorted(dataset_path.rglob("*"), key=lambda item: item.as_posix().encode("utf-8")):
+        if path.is_symlink():
+            raise AnnotationError(f"source dataset contains a symlink: {path}")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(dataset_path).as_posix()
+        record = {
+            "path": relative,
+            "bytes": path.stat().st_size,
+            "sha256": _file_sha256(path),
+        }
+        digest.update(json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        digest.update(b"\n")
+        file_count += 1
+    if file_count == 0:
+        raise AnnotationError(f"dataset contains no files: {dataset_path}")
+    return digest.hexdigest()
+
+
+def _expected_task_rows(task_map: dict[str, int]) -> list[dict[str, Any]]:
+    return [
+        {"task_index": task_index, "task": prompt}
+        for prompt, task_index in sorted(task_map.items(), key=lambda item: item[1])
+    ]
+
+
+def _expected_stats_row(
+    source_row: dict[str, Any],
+    output_episode: int,
+    global_index: int,
+    task_indices: np.ndarray,
+) -> dict[str, Any]:
+    expected = deepcopy(source_row)
+    length = len(task_indices)
+    expected["episode_index"] = output_episode
+    stats = expected.get("stats")
+    if not isinstance(stats, dict):
+        raise DatasetValidationError("source episode statistics have no stats object")
+    stats["episode_index"] = _scalar_stats(np.full(length, output_episode, dtype=np.int64))
+    stats["index"] = _scalar_stats(np.arange(global_index, global_index + length, dtype=np.int64))
+    stats["task_index"] = _scalar_stats(task_indices)
+    return expected
+
+
+def validate_variant(
+    source: Path,
+    output: Path,
+    annotations: Sequence[EpisodeAnnotation],
+    variant: AnnotationVariant,
+    source_manifest_sha256: str | None = None,
+) -> dict[str, object]:
+    """Validate an output against its source and annotation contract."""
+
+    if variant not in {"subtasks", "full_prompt"}:
+        raise DatasetValidationError(f"unknown annotation variant: {variant!r}")
+    if not output.is_dir():
+        raise DatasetValidationError(f"output dataset is not a directory: {output}")
+    try:
+        source_info = _read_json(source / "meta/info.json")
+        output_info = _read_json(output / "meta/info.json")
+        source_episode_rows = _read_jsonl(source / "meta/episodes.jsonl")
+        output_episode_rows = _read_jsonl(output / "meta/episodes.jsonl")
+        source_stats_rows = _read_jsonl(source / "meta/episodes_stats.jsonl")
+        output_stats_rows = _read_jsonl(output / "meta/episodes_stats.jsonl")
+        output_task_rows = _read_jsonl(output / "meta/tasks.jsonl")
+        provenance = _read_json(output / "meta/annotation_provenance.json")
+    except AnnotationError as error:
+        raise DatasetValidationError(str(error)) from error
+
+    ordered_annotations = sorted(annotations, key=lambda item: item.episode)
+    task_map = build_task_map(ordered_annotations, variant)
+    expected_task_rows = _expected_task_rows(task_map)
+    if output_task_rows != expected_task_rows:
+        raise DatasetValidationError(
+            f"tasks.jsonl does not match the expected task_index map: "
+            f"expected={expected_task_rows!r}, actual={output_task_rows!r}"
+        )
+
+    source_episodes = {
+        _integer_cell(row.get("episode_index"), "episode_index"): row for row in source_episode_rows
+    }
+    source_stats = {_integer_cell(row.get("episode_index"), "episode_index"): row for row in source_stats_rows}
+    fps = _integer_cell(source_info.get("fps"), "fps")
+    video_keys = _video_keys(source_info)
+    expected_videos = len(ordered_annotations) * len(video_keys)
+    fixed_info_values = {
+        "total_episodes": len(ordered_annotations),
+        "total_tasks": len(task_map),
+        "total_videos": expected_videos,
+        "splits": {"train": f"0:{len(ordered_annotations)}"},
+    }
+    for name, expected in fixed_info_values.items():
+        if output_info.get(name) != expected:
+            raise DatasetValidationError(
+                f"info.json {name} mismatch: expected={expected!r}, actual={output_info.get(name)!r}"
+            )
+    if output_info.get("codebase_version") != "v2.1":
+        raise DatasetValidationError("output codebase_version must be v2.1")
+    if output_info.get("data_path") != source_info.get("data_path"):
+        raise DatasetValidationError("output data_path differs from source")
+    if output_info.get("video_path") != source_info.get("video_path"):
+        raise DatasetValidationError("output video_path differs from source")
+    if output_info.get("features") != source_info.get("features"):
+        raise DatasetValidationError("output features differ from source")
+    if len(output_episode_rows) != len(ordered_annotations):
+        raise DatasetValidationError("episodes.jsonl row count does not match retained episodes")
+    if len(output_stats_rows) != len(ordered_annotations):
+        raise DatasetValidationError("episodes_stats.jsonl row count does not match retained episodes")
+
+    current_manifest = source_manifest_sha256 or dataset_manifest_sha256(source)
+    provenance_source = provenance.get("source")
+    if not isinstance(provenance_source, dict) or provenance_source.get("manifest_sha256") != current_manifest:
+        raise DatasetValidationError("provenance source manifest does not match the current source manifest")
+    if provenance.get("variant") != variant:
+        raise DatasetValidationError("provenance variant does not match output variant")
+    if provenance.get("tasks") != expected_task_rows:
+        raise DatasetValidationError("provenance task map does not match tasks.jsonl")
+
+    total_frames = 0
+    validated_videos = 0
+    expected_provenance_episodes: list[dict[str, Any]] = []
+    expected_output_episodes: list[dict[str, Any]] = []
+    expected_output_stats: list[dict[str, Any]] = []
+    for output_episode, annotation in enumerate(ordered_annotations):
+        source_episode_row = source_episodes.get(annotation.episode)
+        if source_episode_row is None:
+            raise DatasetValidationError(f"source metadata is missing episode {annotation.episode}")
+        source_path = source / _format_episode_path(source_info, "data_path", annotation.episode)
+        output_path = output / _format_episode_path(output_info, "data_path", output_episode)
+        if not output_path.is_file() or output_path.is_symlink():
+            raise DatasetValidationError(f"output parquet is not a regular non-symlink file: {output_path}")
+        source_table = pq.read_table(source_path)
+        output_table = pq.read_table(output_path)
+        if not source_table.schema.equals(output_table.schema, check_metadata=True):
+            raise DatasetValidationError(f"episode {output_episode} Arrow schema differs from its source")
+        length = len(source_table)
+        if len(output_table) != length:
+            raise DatasetValidationError(f"episode {output_episode} output length differs from source")
+        source_length = _integer_cell(
+            source_episode_row.get("length"),
+            f"source episode {annotation.episode} length",
+        )
+        if length != source_length:
+            raise DatasetValidationError(f"source episode {annotation.episode} metadata/parquet length mismatch")
+
+        boundary_frames = snap_boundary_frames(source_table["timestamp"], annotation.boundaries_s, fps)
+        expected_task_indices, prompts = _episode_prompt_indices(
+            annotation, variant, task_map, length, boundary_frames
+        )
+        actual_episode_indices = np.asarray(output_table["episode_index"].to_pylist(), dtype=np.int64)
+        if not np.array_equal(
+            actual_episode_indices,
+            np.full(length, output_episode, dtype=np.int64),
+        ):
+            raise DatasetValidationError(f"episode {output_episode} has noncontiguous episode_index values")
+        actual_frames = np.asarray(output_table["frame_index"].to_pylist(), dtype=np.int64)
+        if not np.array_equal(actual_frames, np.arange(length, dtype=np.int64)):
+            raise DatasetValidationError(f"episode {output_episode} has noncontiguous frame_index values")
+        actual_global_indices = np.asarray(output_table["index"].to_pylist(), dtype=np.int64)
+        expected_global_indices = np.arange(total_frames, total_frames + length, dtype=np.int64)
+        if not np.array_equal(actual_global_indices, expected_global_indices):
+            raise DatasetValidationError(f"episode {output_episode} has a noncontiguous global index")
+        actual_task_indices = np.asarray(output_table["task_index"].to_pylist(), dtype=np.int64)
+        if not np.array_equal(actual_task_indices, expected_task_indices):
+            raise DatasetValidationError(f"episode {output_episode} task_index values do not match annotations")
+        unresolved = sorted(set(actual_task_indices.tolist()) - set(task_map.values()))
+        if unresolved:
+            raise DatasetValidationError(
+                f"episode {output_episode} has unresolved task_index values: {unresolved}"
+            )
+
+        for column in source_table.column_names:
+            if column in {"episode_index", "index", "task_index"}:
+                continue
+            if not source_table[column].equals(output_table[column]):
+                raise DatasetValidationError(
+                    f"episode {output_episode} payload column {column!r} differs from source"
+                )
+
+        expected_output_episodes.append({"episode_index": output_episode, "tasks": prompts, "length": length})
+        source_stats_row = source_stats.get(annotation.episode)
+        if source_stats_row is None:
+            raise DatasetValidationError(f"source statistics are missing episode {annotation.episode}")
+        expected_output_stats.append(
+            _expected_stats_row(
+                source_stats_row,
+                output_episode,
+                total_frames,
+                expected_task_indices,
+            )
+        )
+        timestamps = np.asarray(source_table["timestamp"].to_pylist(), dtype=np.float64)
+        expected_provenance_episodes.append(
+            {
+                "source_episode_index": annotation.episode,
+                "output_episode_index": output_episode,
+                "length": length,
+                "boundaries_s": list(annotation.boundaries_s),
+                "boundary_frames": list(boundary_frames),
+                "boundary_timestamps_s": [float(timestamps[frame]) for frame in boundary_frames],
+                "prompts": prompts,
+            }
+        )
+
+        for video_key in video_keys:
+            source_video = source / _format_video_path(source_info, annotation.episode, video_key)
+            output_video = output / _format_video_path(output_info, output_episode, video_key)
+            if output_video.is_symlink() or not output_video.is_file():
+                raise DatasetValidationError(f"output video is not a regular non-symlink file: {output_video}")
+            source_stat = source_video.stat()
+            output_stat = output_video.stat()
+            if (source_stat.st_dev, source_stat.st_ino) == (
+                output_stat.st_dev,
+                output_stat.st_ino,
+            ):
+                raise DatasetValidationError(f"output video is not independent from source: {output_video}")
+            if _file_sha256(source_video) != _file_sha256(output_video):
+                raise DatasetValidationError(f"output video hash mismatch: {output_video}")
+            validated_videos += 1
+        total_frames += length
+
+    if output_episode_rows != expected_output_episodes:
+        raise DatasetValidationError("episodes.jsonl does not match expected episode metadata")
+    if output_stats_rows != expected_output_stats:
+        raise DatasetValidationError("episodes_stats.jsonl does not match rewritten identifier/task statistics")
+    if provenance.get("episodes") != expected_provenance_episodes:
+        raise DatasetValidationError("provenance episode mapping or boundaries are incorrect")
+    if output_info.get("total_frames") != total_frames:
+        raise DatasetValidationError(
+            f"info.json total_frames mismatch: expected={total_frames}, actual={output_info.get('total_frames')!r}"
+        )
+    if validated_videos != expected_videos:
+        raise DatasetValidationError(
+            f"validated video count mismatch: expected={expected_videos}, actual={validated_videos}"
+        )
+    return {
+        "variant": variant,
+        "episodes": len(ordered_annotations),
+        "frames": total_frames,
+        "tasks": len(task_map),
+        "videos": validated_videos,
+        "expected_runs_per_episode": 4 if variant == "subtasks" else 1,
+    }
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    resolved_path = path.resolve()
+    resolved_parent = parent.resolve()
+    return resolved_path == resolved_parent or resolved_parent in resolved_path.parents
+
+
+def export_both(
+    dataset_path: Path,
+    annotations_path: Path,
+    subtasks_output_path: Path,
+    full_prompt_output_path: Path,
+) -> tuple[ExportResult, ExportResult]:
+    """Stage, validate, and publish both requested dataset variants."""
+
+    source = dataset_path.resolve()
+    workbook = annotations_path.resolve()
+    outputs = [subtasks_output_path.resolve(), full_prompt_output_path.resolve()]
+    if outputs[0] == outputs[1]:
+        raise AnnotationError("subtasks and full-prompt output paths must differ")
+    for output in outputs:
+        if output.exists():
+            raise AnnotationError(f"output path already exists: {output}")
+        if _path_is_within(output, source):
+            raise AnnotationError(f"output path must be outside the source dataset: {output}")
+    source_episode_rows = _read_jsonl(source / "meta/episodes.jsonl")
+    expected_episodes = {_integer_cell(row.get("episode_index"), "episode_index") for row in source_episode_rows}
+    annotations = load_annotations(workbook, expected_episodes=expected_episodes)
+    before_manifest = dataset_manifest_sha256(source)
+    workbook_sha256 = _file_sha256(workbook)
+
+    for output in outputs:
+        output.parent.mkdir(parents=True, exist_ok=True)
+    staging = [
+        Path(
+            tempfile.mkdtemp(
+                prefix=f".{output.name}.staging-",
+                dir=output.parent,
+            )
+        )
+        for output in outputs
+    ]
+    published_first = False
+    try:
+        subtask_result = export_variant(
+            source,
+            staging[0],
+            annotations,
+            "subtasks",
+            before_manifest,
+            workbook_sha256,
+        )
+        full_result = export_variant(
+            source,
+            staging[1],
+            annotations,
+            "full_prompt",
+            before_manifest,
+            workbook_sha256,
+        )
+        validate_variant(
+            source,
+            staging[0],
+            annotations,
+            "subtasks",
+            source_manifest_sha256=before_manifest,
+        )
+        validate_variant(
+            source,
+            staging[1],
+            annotations,
+            "full_prompt",
+            source_manifest_sha256=before_manifest,
+        )
+        after_manifest = dataset_manifest_sha256(source)
+        if before_manifest != after_manifest:
+            raise DatasetValidationError("source manifest changed during export")
+
+        staging[0].replace(outputs[0])
+        published_first = True
+        try:
+            staging[1].replace(outputs[1])
+        except Exception:
+            outputs[0].replace(staging[0])
+            published_first = False
+            raise
+        return (
+            ExportResult(
+                output_path=outputs[0],
+                variant=subtask_result.variant,
+                episodes=subtask_result.episodes,
+                frames=subtask_result.frames,
+                tasks=subtask_result.tasks,
+            ),
+            ExportResult(
+                output_path=outputs[1],
+                variant=full_result.variant,
+                episodes=full_result.episodes,
+                frames=full_result.frames,
+                tasks=full_result.tasks,
+            ),
+        )
+    finally:
+        for path in staging:
+            if path.exists():
+                shutil.rmtree(path)
+        if published_first and not outputs[1].exists():
+            raise DatasetValidationError("first output published without the second and rollback did not complete")
 
 
 def _column_index(cell_reference: str) -> int:
@@ -677,12 +1024,8 @@ def _validate_and_select_rows(
         if valid == 0:
             continue
 
-        subtasks = tuple(
-            _required_text(values, f"subtask{number}", episode) for number in range(1, 5)
-        )
-        boundaries = tuple(
-            _required_time(values, f"time{number}", episode) for number in range(1, 4)
-        )
+        subtasks = tuple(_required_text(values, f"subtask{number}", episode) for number in range(1, 5))
+        boundaries = tuple(_required_time(values, f"time{number}", episode) for number in range(1, 4))
         if not 0 < boundaries[0] < boundaries[1] < boundaries[2]:
             raise AnnotationError(
                 f"episode {episode}: time1, time2, and time3 must be strictly increasing and positive"

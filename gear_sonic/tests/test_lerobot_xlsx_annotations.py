@@ -11,16 +11,24 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from gear_sonic.scripts.annotate_pnp_trash_dataset import (
+    AnnotatePnpTrashConfig,
+    main as annotation_cli_main,
+)
+import gear_sonic.utils.data_collection.lerobot_xlsx_annotations as annotations_module
 from gear_sonic.utils.data_collection.lerobot_xlsx_annotations import (
     AnnotationError,
+    DatasetValidationError,
     EpisodeAnnotation,
     build_run_steps,
     build_task_map,
+    dataset_manifest_sha256,
+    export_both,
     export_variant,
     load_annotations,
     snap_boundary_frames,
+    validate_variant,
 )
-
 
 HEADERS = [
     "episode",
@@ -67,9 +75,7 @@ def write_xlsx(path: Path, rows: list[list[object]]) -> Path:
                 continue
             reference = f"{_column_name(column_number)}{row_number}"
             if isinstance(value, InlineText):
-                cells.append(
-                    f'<c r="{reference}" t="inlineStr"><is><t>{escape(value.value)}</t></is></c>'
-                )
+                cells.append(f'<c r="{reference}" t="inlineStr"><is><t>{escape(value.value)}</t></is></c>')
             elif isinstance(value, str):
                 cells.append(f'<c r="{reference}" t="s"><v>{shared_index(value)}</v></c>')
             elif isinstance(value, bool):
@@ -81,7 +87,7 @@ def write_xlsx(path: Path, rows: list[list[object]]) -> Path:
     worksheet = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        f'<sheetData>{"".join(row_xml)}</sheetData></worksheet>'
+        f"<sheetData>{''.join(row_xml)}</sheetData></worksheet>"
     )
     shared_strings = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -190,9 +196,7 @@ def test_snap_boundaries_assigns_boundary_frame_to_later_subtask() -> None:
     frames = snap_boundary_frames(timestamps, (1.0, 2.0, 3.0), fps=50)
 
     assert frames == (50, 100, 150)
-    assert build_run_steps(len(timestamps), frames).tolist() == (
-        [0] * 50 + [1] * 50 + [2] * 50 + [3] * 51
-    )
+    assert build_run_steps(len(timestamps), frames).tolist() == ([0] * 50 + [1] * 50 + [2] * 50 + [3] * 51)
 
 
 def test_snap_boundaries_rejects_excessive_snap_error() -> None:
@@ -268,9 +272,7 @@ def _make_source_dataset(root: Path) -> Path:
         table = pa.table(
             {
                 "observation.state": state,
-                "timestamp": pa.array(
-                    np.arange(episode_length, dtype=np.float32) * np.float32(0.02)
-                ),
+                "timestamp": pa.array(np.arange(episode_length, dtype=np.float32) * np.float32(0.02)),
                 "frame_index": pa.array(np.arange(episode_length), type=pa.int64()),
                 "episode_index": pa.array([episode] * episode_length, type=pa.int64()),
                 "index": pa.array(
@@ -294,10 +296,7 @@ def _make_source_dataset(root: Path) -> Path:
         "fps": 50,
         "splits": {"train": "0:2"},
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-        "video_path": (
-            "videos/chunk-{episode_chunk:03d}/{video_key}/"
-            "episode_{episode_index:06d}.mp4"
-        ),
+        "video_path": ("videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"),
         "features": {
             "observation.images.ego_view": {"dtype": "video", "shape": [2, 2, 3]},
             "observation.state": {"dtype": "float64", "shape": [2]},
@@ -312,10 +311,7 @@ def _make_source_dataset(root: Path) -> Path:
     (root / "meta/modality.json").write_text('{"annotation":{}}', encoding="utf-8")
     _write_jsonl(
         root / "meta/episodes.jsonl",
-        [
-            {"episode_index": episode, "tasks": ["source task"], "length": episode_length}
-            for episode in range(2)
-        ],
+        [{"episode_index": episode, "tasks": ["source task"], "length": episode_length} for episode in range(2)],
     )
     _write_jsonl(root / "meta/tasks.jsonl", [{"task_index": 0, "task": "source task"}])
     _write_jsonl(
@@ -449,9 +445,7 @@ def test_export_variant_builds_self_contained_lerobot_datasets(tmp_path: Path) -
     assert output_video.read_bytes() == source_video.read_bytes()
     assert output_video.stat().st_ino != source_video.stat().st_ino
 
-    provenance = json.loads(
-        (subtasks / "meta/annotation_provenance.json").read_text(encoding="utf-8")
-    )
+    provenance = json.loads((subtasks / "meta/annotation_provenance.json").read_text(encoding="utf-8"))
     assert provenance["variant"] == "subtasks"
     assert provenance["source"]["manifest_sha256"] == "a" * 64
     assert provenance["annotations"]["workbook_sha256"] == "b" * 64
@@ -466,3 +460,216 @@ def test_export_variant_builds_self_contained_lerobot_datasets(tmp_path: Path) -
             "prompts": ["approach", "pick", "turn and approach", "drop"],
         }
     ]
+
+
+def _rewrite_column(path: Path, name: str, values: list[object]) -> None:
+    table = pq.read_table(path)
+    index = table.schema.get_field_index(name)
+    field = table.schema.field(index)
+    replacement = pa.array(values, type=field.type)
+    pq.write_table(table.set_column(index, field, replacement), path)
+
+
+@pytest.mark.parametrize("variant", ["subtasks", "full_prompt"])
+def test_validate_variant_accepts_complete_export(tmp_path: Path, variant: str) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    annotation = _annotation(
+        1,
+        ("approach", "pick", "turn and approach", "drop"),
+        "approach, pick, turn and approach, drop",
+    )
+    manifest_sha256 = dataset_manifest_sha256(source)
+    output = tmp_path / variant
+    export_variant(
+        source,
+        output,
+        [annotation],
+        variant,  # type: ignore[arg-type]
+        source_manifest_sha256=manifest_sha256,
+        workbook_sha256="b" * 64,
+    )
+
+    report = validate_variant(
+        source,
+        output,
+        [annotation],
+        variant,  # type: ignore[arg-type]
+    )
+
+    assert report == {
+        "variant": variant,
+        "episodes": 1,
+        "frames": 201,
+        "tasks": 4 if variant == "subtasks" else 1,
+        "videos": 1,
+        "expected_runs_per_episode": 4 if variant == "subtasks" else 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("corruption", "match"),
+    [
+        ("metadata", "total_frames"),
+        ("episode_index", "episode_index"),
+        ("global_index", "global index"),
+        ("task_resolution", "task_index"),
+        ("task_runs", "task_index"),
+        ("sensor", "payload column"),
+        ("video_hash", "video hash"),
+        ("video_symlink", "regular non-symlink"),
+        ("provenance_mapping", "provenance"),
+        ("source_hash", "source manifest"),
+    ],
+)
+def test_validate_variant_rejects_corruption(
+    tmp_path: Path,
+    corruption: str,
+    match: str,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    annotation = _annotation(
+        1,
+        ("approach", "pick", "turn and approach", "drop"),
+        "approach, pick, turn and approach, drop",
+    )
+    output = tmp_path / "subtasks"
+    export_variant(
+        source,
+        output,
+        [annotation],
+        "subtasks",
+        source_manifest_sha256=dataset_manifest_sha256(source),
+        workbook_sha256="b" * 64,
+    )
+    parquet = output / "data/chunk-000/episode_000000.parquet"
+    video = output / "videos/chunk-000/observation.images.ego_view/episode_000000.mp4"
+    provenance_path = output / "meta/annotation_provenance.json"
+
+    if corruption == "metadata":
+        info_path = output / "meta/info.json"
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        info["total_frames"] += 1
+        info_path.write_text(json.dumps(info), encoding="utf-8")
+    elif corruption == "episode_index":
+        _rewrite_column(parquet, "episode_index", [7] + [0] * 200)
+    elif corruption == "global_index":
+        _rewrite_column(parquet, "index", [9] + list(range(1, 201)))
+    elif corruption == "task_resolution":
+        _rewrite_column(parquet, "task_index", [99] + [0] * 49 + [1] * 50 + [2] * 50 + [3] * 51)
+    elif corruption == "task_runs":
+        _rewrite_column(parquet, "task_index", [1] + [0] * 49 + [1] * 50 + [2] * 50 + [3] * 51)
+    elif corruption == "sensor":
+        table = pq.read_table(parquet)
+        values = table["observation.state"].to_pylist()
+        values[0] = [999.0, 999.0]
+        _rewrite_column(parquet, "observation.state", values)
+    elif corruption == "video_hash":
+        video.write_bytes(b"corrupt")
+    elif corruption == "video_symlink":
+        video.unlink()
+        video.symlink_to(source / "videos/chunk-000/observation.images.ego_view/episode_000001.mp4")
+    elif corruption == "provenance_mapping":
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance["episodes"][0]["source_episode_index"] = 0
+        provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    elif corruption == "source_hash":
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance["source"]["manifest_sha256"] = "0" * 64
+        provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    else:
+        raise AssertionError(f"unknown test corruption {corruption}")
+
+    with pytest.raises(DatasetValidationError, match=match):
+        validate_variant(source, output, [annotation], "subtasks")
+
+
+def _write_fixture_annotations(source: Path) -> Path:
+    return write_xlsx(
+        source / "pnp_trash.xlsx",
+        [HEADERS, [0, 0], valid_row(episode=1)],
+    )
+
+
+def test_export_both_refuses_preexisting_output(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    subtasks.mkdir()
+
+    with pytest.raises(AnnotationError, match="already exists"):
+        export_both(source, workbook, subtasks, tmp_path / "full_prompt")
+
+
+def test_export_both_publishes_neither_output_when_second_export_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    real_export = annotations_module.export_variant
+
+    def fail_full_prompt(*args: object, **kwargs: object):
+        variant = args[3]
+        if variant == "full_prompt":
+            raise AnnotationError("forced full prompt failure")
+        return real_export(*args, **kwargs)
+
+    monkeypatch.setattr(annotations_module, "export_variant", fail_full_prompt)
+
+    with pytest.raises(AnnotationError, match="forced full prompt failure"):
+        export_both(source, workbook, subtasks, full_prompt)
+
+    assert not subtasks.exists()
+    assert not full_prompt.exists()
+    assert not list(tmp_path.glob(".*.staging-*"))
+
+
+def test_export_both_publishes_two_validated_outputs(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+
+    results = export_both(source, workbook, subtasks, full_prompt)
+
+    assert [result.output_path for result in results] == [subtasks, full_prompt]
+    assert subtasks.is_dir()
+    assert full_prompt.is_dir()
+    assert (
+        validate_variant(
+            source,
+            subtasks,
+            load_annotations(workbook, expected_episodes={0, 1}),
+            "subtasks",
+        )["episodes"]
+        == 1
+    )
+
+
+def test_cli_validate_only_reports_both_existing_outputs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    export_both(source, workbook, subtasks, full_prompt)
+
+    reports = annotation_cli_main(
+        AnnotatePnpTrashConfig(
+            dataset_path=source,
+            annotations_path=workbook,
+            subtasks_output_path=subtasks,
+            full_prompt_output_path=full_prompt,
+            validate_only=True,
+        )
+    )
+
+    assert [report["variant"] for report in reports] == ["subtasks", "full_prompt"]
+    printed = capsys.readouterr().out
+    assert '"episodes": 1' in printed
+    assert '"expected_runs_per_episode": 4' in printed
+    assert '"expected_runs_per_episode": 1' in printed
