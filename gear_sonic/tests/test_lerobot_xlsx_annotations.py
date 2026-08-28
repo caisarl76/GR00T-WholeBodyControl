@@ -5,11 +5,17 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import numpy as np
+import pyarrow as pa
 import pytest
 
 from gear_sonic.utils.data_collection.lerobot_xlsx_annotations import (
     AnnotationError,
+    EpisodeAnnotation,
+    build_run_steps,
+    build_task_map,
     load_annotations,
+    snap_boundary_frames,
 )
 
 
@@ -173,3 +179,66 @@ def test_load_annotations_rejects_invalid_workbooks(
 
     with pytest.raises(AnnotationError, match=match):
         load_annotations(xlsx, expected_episodes=expected_episodes)
+
+
+def test_snap_boundaries_assigns_boundary_frame_to_later_subtask() -> None:
+    timestamps = pa.array(np.arange(0, 4.02, 0.02), type=pa.float32())
+
+    frames = snap_boundary_frames(timestamps, (1.0, 2.0, 3.0), fps=50)
+
+    assert frames == (50, 100, 150)
+    assert build_run_steps(len(timestamps), frames).tolist() == (
+        [0] * 50 + [1] * 50 + [2] * 50 + [3] * 51
+    )
+
+
+def test_snap_boundaries_rejects_excessive_snap_error() -> None:
+    timestamps = pa.array([0.0, 0.02, 0.10, 0.12, 0.14], type=pa.float32())
+
+    with pytest.raises(AnnotationError, match="farther than half a frame"):
+        snap_boundary_frames(timestamps, (0.06, 0.10, 0.12), fps=50)
+
+
+def test_snap_boundaries_rejects_empty_runs() -> None:
+    timestamps = pa.array(np.arange(0, 1.02, 0.02), type=pa.float32())
+
+    with pytest.raises(AnnotationError, match="nonempty subtask runs"):
+        snap_boundary_frames(timestamps, (0.001, 0.002, 0.003), fps=50)
+
+
+def _annotation(
+    episode: int,
+    subtasks: tuple[str, str, str, str],
+    full_prompt: str,
+) -> EpisodeAnnotation:
+    return EpisodeAnnotation(
+        episode=episode,
+        subtasks=subtasks,
+        boundaries_s=(1.0, 2.0, 3.0),
+        full_prompt=full_prompt,
+    )
+
+
+def test_build_task_map_is_stable_under_annotation_order() -> None:
+    first = _annotation(1, ("approach a", "pick", "turn left", "drop"), "full z")
+    second = _annotation(2, ("approach z", "pick", "turn right", "drop"), "full a")
+
+    expected_subtasks = {
+        "approach a": 0,
+        "approach z": 1,
+        "pick": 2,
+        "turn left": 3,
+        "turn right": 4,
+        "drop": 5,
+    }
+    assert build_task_map([first, second], "subtasks") == expected_subtasks
+    assert build_task_map([second, first], "subtasks") == expected_subtasks
+    assert build_task_map([first, second], "full_prompt") == {"full a": 0, "full z": 1}
+    assert build_task_map([second, first], "full_prompt") == {"full a": 0, "full z": 1}
+
+
+def test_build_task_map_rejects_unknown_variant() -> None:
+    annotation = _annotation(1, ("a", "b", "c", "d"), "full")
+
+    with pytest.raises(AnnotationError, match="unknown annotation variant"):
+        build_task_map([annotation], "invalid")  # type: ignore[arg-type]

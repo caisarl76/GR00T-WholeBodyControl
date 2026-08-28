@@ -6,9 +6,12 @@ from dataclasses import dataclass
 import math
 from pathlib import Path, PurePosixPath
 import re
-from typing import Any
+from typing import Any, Literal, Sequence
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
+
+import numpy as np
+import pyarrow as pa
 
 
 _SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -42,6 +45,93 @@ class EpisodeAnnotation:
     subtasks: tuple[str, str, str, str]
     boundaries_s: tuple[float, float, float]
     full_prompt: str
+
+
+AnnotationVariant = Literal["subtasks", "full_prompt"]
+
+
+def _validate_nonempty_runs(length: int, starts: tuple[int, int, int]) -> None:
+    if length < 4 or not 0 < starts[0] < starts[1] < starts[2] < length:
+        raise AnnotationError(
+            f"snapped boundaries must create four nonempty subtask runs, got length={length}, "
+            f"starts={starts}"
+        )
+
+
+def snap_boundary_frames(
+    timestamps: pa.Array | pa.ChunkedArray,
+    boundaries_s: tuple[float, float, float],
+    fps: int,
+) -> tuple[int, int, int]:
+    """Snap annotated seconds to nearest timestamp indices.
+
+    Equal-distance ties use the earlier frame. The selected boundary frame is
+    the first frame of the later subtask.
+    """
+
+    if fps <= 0:
+        raise AnnotationError(f"fps must be positive, got {fps}")
+    values = np.asarray(timestamps.to_pylist(), dtype=np.float64)
+    if values.ndim != 1 or len(values) == 0:
+        raise AnnotationError("timestamps must be a nonempty one-dimensional array")
+    if not np.all(np.isfinite(values)) or np.any(np.diff(values) <= 0):
+        raise AnnotationError("timestamps must be finite and strictly increasing")
+
+    maximum_error = 0.5 / fps + 1e-6
+    selected: list[int] = []
+    for boundary in boundaries_s:
+        if not math.isfinite(boundary):
+            raise AnnotationError(f"boundary must be finite, got {boundary!r}")
+        insertion = int(np.searchsorted(values, boundary, side="left"))
+        candidates = {max(0, insertion - 1), min(len(values) - 1, insertion)}
+        frame = min(candidates, key=lambda index: (abs(values[index] - boundary), index))
+        error = abs(values[frame] - boundary)
+        if error > maximum_error:
+            raise AnnotationError(
+                f"boundary {boundary:g}s is farther than half a frame from a timestamp "
+                f"(nearest={values[frame]:g}s, error={error:g}s, fps={fps})"
+            )
+        selected.append(frame)
+
+    starts = tuple(selected)
+    _validate_nonempty_runs(len(values), starts)
+    return starts
+
+
+def build_run_steps(length: int, starts: tuple[int, int, int]) -> np.ndarray:
+    """Return subtask step numbers 0..3 for every frame."""
+
+    _validate_nonempty_runs(length, starts)
+    return np.repeat(np.arange(4, dtype=np.int64), np.diff((0, *starts, length)))
+
+
+def build_task_map(
+    annotations: Sequence[EpisodeAnnotation],
+    variant: AnnotationVariant,
+) -> dict[str, int]:
+    """Build a deterministic exact-string prompt-to-index map."""
+
+    if variant == "subtasks":
+        prompt_steps = {
+            (step, annotation.subtasks[step])
+            for annotation in annotations
+            for step in range(4)
+        }
+        prompts = [
+            prompt
+            for _step, prompt in sorted(
+                prompt_steps,
+                key=lambda item: (item[0], item[1].encode("utf-8")),
+            )
+        ]
+    elif variant == "full_prompt":
+        prompts = sorted(
+            {annotation.full_prompt for annotation in annotations},
+            key=lambda prompt: prompt.encode("utf-8"),
+        )
+    else:
+        raise AnnotationError(f"unknown annotation variant: {variant!r}")
+    return {prompt: index for index, prompt in enumerate(prompts)}
 
 
 def _column_index(cell_reference: str) -> int:
