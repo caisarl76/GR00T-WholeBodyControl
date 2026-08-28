@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from gear_sonic.utils.data_collection.lerobot_xlsx_annotations import (
@@ -14,6 +16,7 @@ from gear_sonic.utils.data_collection.lerobot_xlsx_annotations import (
     EpisodeAnnotation,
     build_run_steps,
     build_task_map,
+    export_variant,
     load_annotations,
     snap_boundary_frames,
 )
@@ -242,3 +245,224 @@ def test_build_task_map_rejects_unknown_variant() -> None:
 
     with pytest.raises(AnnotationError, match="unknown annotation variant"):
         build_task_map([annotation], "invalid")  # type: ignore[arg-type]
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row) + "\n")
+
+
+def _make_source_dataset(root: Path) -> Path:
+    (root / "meta").mkdir(parents=True)
+    (root / "data/chunk-000").mkdir(parents=True)
+    video_dir = root / "videos/chunk-000/observation.images.ego_view"
+    video_dir.mkdir(parents=True)
+
+    episode_length = 201
+    for episode in range(2):
+        state = pa.array(
+            [[float(episode), float(frame)] for frame in range(episode_length)],
+            type=pa.list_(pa.float64(), 2),
+        )
+        table = pa.table(
+            {
+                "observation.state": state,
+                "timestamp": pa.array(
+                    np.arange(episode_length, dtype=np.float32) * np.float32(0.02)
+                ),
+                "frame_index": pa.array(np.arange(episode_length), type=pa.int64()),
+                "episode_index": pa.array([episode] * episode_length, type=pa.int64()),
+                "index": pa.array(
+                    np.arange(episode * episode_length, (episode + 1) * episode_length),
+                    type=pa.int64(),
+                ),
+                "task_index": pa.array([0] * episode_length, type=pa.int64()),
+            }
+        ).replace_schema_metadata({b"huggingface": b'{"fixture":true}'})
+        pq.write_table(table, root / f"data/chunk-000/episode_{episode:06d}.parquet")
+        (video_dir / f"episode_{episode:06d}.mp4").write_bytes(f"video-{episode}".encode())
+
+    info = {
+        "codebase_version": "v2.1",
+        "total_episodes": 2,
+        "total_frames": 402,
+        "total_tasks": 1,
+        "total_videos": 2,
+        "total_chunks": 1,
+        "chunks_size": 1000,
+        "fps": 50,
+        "splits": {"train": "0:2"},
+        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path": (
+            "videos/chunk-{episode_chunk:03d}/{video_key}/"
+            "episode_{episode_index:06d}.mp4"
+        ),
+        "features": {
+            "observation.images.ego_view": {"dtype": "video", "shape": [2, 2, 3]},
+            "observation.state": {"dtype": "float64", "shape": [2]},
+            "timestamp": {"dtype": "float32", "shape": [1]},
+            "frame_index": {"dtype": "int64", "shape": [1]},
+            "episode_index": {"dtype": "int64", "shape": [1]},
+            "index": {"dtype": "int64", "shape": [1]},
+            "task_index": {"dtype": "int64", "shape": [1]},
+        },
+    }
+    (root / "meta/info.json").write_text(json.dumps(info), encoding="utf-8")
+    (root / "meta/modality.json").write_text('{"annotation":{}}', encoding="utf-8")
+    _write_jsonl(
+        root / "meta/episodes.jsonl",
+        [
+            {"episode_index": episode, "tasks": ["source task"], "length": episode_length}
+            for episode in range(2)
+        ],
+    )
+    _write_jsonl(root / "meta/tasks.jsonl", [{"task_index": 0, "task": "source task"}])
+    _write_jsonl(
+        root / "meta/episodes_stats.jsonl",
+        [
+            {
+                "episode_index": episode,
+                "stats": {
+                    "observation.state": {"count": [episode_length]},
+                    "timestamp": {
+                        "min": [0.0],
+                        "max": [4.0],
+                        "mean": [2.0],
+                        "std": [1.1604596790352808],
+                        "count": [episode_length],
+                    },
+                    "frame_index": {
+                        "min": [0],
+                        "max": [200],
+                        "mean": [100.0],
+                        "std": [58.02298395176403],
+                        "count": [episode_length],
+                    },
+                    "episode_index": {
+                        "min": [episode],
+                        "max": [episode],
+                        "mean": [float(episode)],
+                        "std": [0.0],
+                        "count": [episode_length],
+                    },
+                    "index": {
+                        "min": [episode * episode_length],
+                        "max": [(episode + 1) * episode_length - 1],
+                        "mean": [episode * episode_length + 100.0],
+                        "std": [58.02298395176403],
+                        "count": [episode_length],
+                    },
+                    "task_index": {
+                        "min": [0],
+                        "max": [0],
+                        "mean": [0.0],
+                        "std": [0.0],
+                        "count": [episode_length],
+                    },
+                },
+            }
+            for episode in range(2)
+        ],
+    )
+    return root
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_export_variant_builds_self_contained_lerobot_datasets(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    annotation = _annotation(
+        1,
+        ("approach", "pick", "turn and approach", "drop"),
+        "approach, pick, turn and approach, drop",
+    )
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+
+    subtask_result = export_variant(
+        source,
+        subtasks,
+        [annotation],
+        "subtasks",
+        source_manifest_sha256="a" * 64,
+        workbook_sha256="b" * 64,
+    )
+    full_result = export_variant(
+        source,
+        full_prompt,
+        [annotation],
+        "full_prompt",
+        source_manifest_sha256="a" * 64,
+        workbook_sha256="b" * 64,
+    )
+
+    assert (subtask_result.episodes, subtask_result.frames, subtask_result.tasks) == (1, 201, 4)
+    assert (full_result.episodes, full_result.frames, full_result.tasks) == (1, 201, 1)
+    subtask_info = json.loads((subtasks / "meta/info.json").read_text(encoding="utf-8"))
+    full_info = json.loads((full_prompt / "meta/info.json").read_text(encoding="utf-8"))
+    assert subtask_info["total_episodes"] == full_info["total_episodes"] == 1
+    assert subtask_info["total_frames"] == full_info["total_frames"] == 201
+    assert subtask_info["total_tasks"] == 4
+    assert full_info["total_tasks"] == 1
+    assert subtask_info["splits"] == full_info["splits"] == {"train": "0:1"}
+
+    source_table = pq.read_table(source / "data/chunk-000/episode_000001.parquet")
+    subtask_table = pq.read_table(subtasks / "data/chunk-000/episode_000000.parquet")
+    full_table = pq.read_table(full_prompt / "data/chunk-000/episode_000000.parquet")
+    assert subtask_table["episode_index"].to_pylist() == [0] * 201
+    assert subtask_table["index"].to_pylist() == list(range(201))
+    assert subtask_table["frame_index"].to_pylist() == list(range(201))
+    assert full_table["task_index"].to_pylist() == [0] * 201
+    assert np.bincount(subtask_table["task_index"].to_numpy()).tolist() == [50, 50, 50, 51]
+    assert source_table["observation.state"].equals(subtask_table["observation.state"])
+    assert source_table["timestamp"].equals(subtask_table["timestamp"])
+    assert source_table.schema.metadata == subtask_table.schema.metadata
+
+    assert _read_jsonl(subtasks / "meta/tasks.jsonl") == [
+        {"task": "approach", "task_index": 0},
+        {"task": "pick", "task_index": 1},
+        {"task": "turn and approach", "task_index": 2},
+        {"task": "drop", "task_index": 3},
+    ]
+    assert _read_jsonl(full_prompt / "meta/tasks.jsonl") == [
+        {"task": "approach, pick, turn and approach, drop", "task_index": 0}
+    ]
+    assert _read_jsonl(subtasks / "meta/episodes.jsonl") == [
+        {
+            "episode_index": 0,
+            "length": 201,
+            "tasks": ["approach", "pick", "turn and approach", "drop"],
+        }
+    ]
+
+    stats = _read_jsonl(subtasks / "meta/episodes_stats.jsonl")
+    assert stats[0]["episode_index"] == 0
+    assert stats[0]["stats"]["episode_index"]["min"] == [0]
+    assert stats[0]["stats"]["index"]["max"] == [200]
+    assert stats[0]["stats"]["task_index"]["max"] == [3]
+
+    source_video = source / "videos/chunk-000/observation.images.ego_view/episode_000001.mp4"
+    output_video = subtasks / "videos/chunk-000/observation.images.ego_view/episode_000000.mp4"
+    assert output_video.read_bytes() == source_video.read_bytes()
+    assert output_video.stat().st_ino != source_video.stat().st_ino
+
+    provenance = json.loads(
+        (subtasks / "meta/annotation_provenance.json").read_text(encoding="utf-8")
+    )
+    assert provenance["variant"] == "subtasks"
+    assert provenance["source"]["manifest_sha256"] == "a" * 64
+    assert provenance["annotations"]["workbook_sha256"] == "b" * 64
+    assert provenance["episodes"] == [
+        {
+            "source_episode_index": 1,
+            "output_episode_index": 0,
+            "length": 201,
+            "boundaries_s": [1.0, 2.0, 3.0],
+            "boundary_frames": [50, 100, 150],
+            "boundary_timestamps_s": pytest.approx([1.0, 2.0, 3.0]),
+            "prompts": ["approach", "pick", "turn and approach", "drop"],
+        }
+    ]

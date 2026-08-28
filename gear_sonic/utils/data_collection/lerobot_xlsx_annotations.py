@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
+import json
 import math
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 from typing import Any, Literal, Sequence
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 _SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -112,16 +116,15 @@ def build_task_map(
     """Build a deterministic exact-string prompt-to-index map."""
 
     if variant == "subtasks":
-        prompt_steps = {
-            (step, annotation.subtasks[step])
-            for annotation in annotations
-            for step in range(4)
-        }
+        minimum_step: dict[str, int] = {}
+        for annotation in annotations:
+            for step, prompt in enumerate(annotation.subtasks):
+                minimum_step[prompt] = min(step, minimum_step.get(prompt, step))
         prompts = [
             prompt
-            for _step, prompt in sorted(
-                prompt_steps,
-                key=lambda item: (item[0], item[1].encode("utf-8")),
+            for prompt, _step in sorted(
+                minimum_step.items(),
+                key=lambda item: (item[1], item[0].encode("utf-8")),
             )
         ]
     elif variant == "full_prompt":
@@ -132,6 +135,377 @@ def build_task_map(
     else:
         raise AnnotationError(f"unknown annotation variant: {variant!r}")
     return {prompt: index for index, prompt in enumerate(prompts)}
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    """Summary of one emitted annotation variant."""
+
+    output_path: Path
+    variant: AnnotationVariant
+    episodes: int
+    frames: int
+    tasks: int
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        raise AnnotationError(f"cannot read JSON file {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise AnnotationError(f"JSON file must contain an object: {path}")
+    return value
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise AnnotationError(
+                        f"JSONL row must contain an object: {path}:{line_number}"
+                    )
+                rows.append(value)
+    except (OSError, json.JSONDecodeError) as error:
+        raise AnnotationError(f"cannot read JSONL file {path}: {error}") from error
+    return rows
+
+
+def _write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=4)
+        stream.write("\n")
+
+
+def _write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(
+                json.dumps(
+                    row,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+
+
+def _format_episode_path(info: dict[str, Any], key: str, episode_index: int) -> Path:
+    chunks_size = _integer_cell(info.get("chunks_size", 1000), "chunks_size")
+    if chunks_size <= 0:
+        raise AnnotationError(f"chunks_size must be positive, got {chunks_size}")
+    pattern = info[key]
+    if not isinstance(pattern, str):
+        raise AnnotationError(f"info.json {key} must be a string")
+    return Path(
+        pattern.format(
+            episode_chunk=episode_index // chunks_size,
+            episode_index=episode_index,
+        )
+    )
+
+
+def _format_video_path(
+    info: dict[str, Any],
+    episode_index: int,
+    video_key: str,
+) -> Path:
+    chunks_size = _integer_cell(info.get("chunks_size", 1000), "chunks_size")
+    pattern = info.get(
+        "video_path",
+        "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+    )
+    if not isinstance(pattern, str):
+        raise AnnotationError("info.json video_path must be a string")
+    return Path(
+        pattern.format(
+            episode_chunk=episode_index // chunks_size,
+            episode_index=episode_index,
+            video_key=video_key,
+        )
+    )
+
+
+def _video_keys(info: dict[str, Any]) -> list[str]:
+    features = info.get("features")
+    if not isinstance(features, dict):
+        raise AnnotationError("info.json features must be an object")
+    return sorted(
+        key
+        for key, feature in features.items()
+        if isinstance(feature, dict) and feature.get("dtype") == "video"
+    )
+
+
+def _replace_column(table: pa.Table, name: str, values: np.ndarray) -> pa.Table:
+    index = table.schema.get_field_index(name)
+    if index < 0:
+        raise AnnotationError(f"source parquet is missing required column {name!r}")
+    field = table.schema.field(index)
+    replacement = pa.array(values, type=field.type)
+    return table.set_column(index, field, replacement)
+
+
+def _assert_source_identifiers(table: pa.Table, source_episode: int) -> None:
+    length = len(table)
+    required = ("episode_index", "frame_index", "index", "task_index", "timestamp")
+    missing = [name for name in required if name not in table.column_names]
+    if missing:
+        raise AnnotationError(f"source parquet is missing required columns: {missing}")
+    episode_values = np.asarray(table["episode_index"].to_pylist())
+    frame_values = np.asarray(table["frame_index"].to_pylist())
+    if not np.array_equal(episode_values, np.full(length, source_episode)):
+        raise AnnotationError(
+            f"source episode {source_episode} has inconsistent episode_index values"
+        )
+    if not np.array_equal(frame_values, np.arange(length)):
+        raise AnnotationError(f"source episode {source_episode} has noncontiguous frame_index")
+
+
+def _scalar_stats(values: np.ndarray) -> dict[str, list[int | float]]:
+    if len(values) == 0:
+        raise AnnotationError("cannot compute statistics for an empty array")
+    is_integer = np.issubdtype(values.dtype, np.integer)
+
+    def scalar(value: np.generic) -> int | float:
+        return int(value) if is_integer else float(value)
+
+    return {
+        "min": [scalar(values.min())],
+        "max": [scalar(values.max())],
+        "mean": [float(values.astype(np.float64).mean())],
+        "std": [float(values.astype(np.float64).std())],
+        "count": [len(values)],
+    }
+
+
+def _episode_prompt_indices(
+    annotation: EpisodeAnnotation,
+    variant: AnnotationVariant,
+    task_map: dict[str, int],
+    length: int,
+    boundary_frames: tuple[int, int, int],
+) -> tuple[np.ndarray, list[str]]:
+    if variant == "subtasks":
+        steps = build_run_steps(length, boundary_frames)
+        prompt_ids = np.asarray(
+            [task_map[annotation.subtasks[step]] for step in range(4)],
+            dtype=np.int64,
+        )
+        return prompt_ids[steps], list(annotation.subtasks)
+    if variant == "full_prompt":
+        return (
+            np.full(length, task_map[annotation.full_prompt], dtype=np.int64),
+            [annotation.full_prompt],
+        )
+    raise AnnotationError(f"unknown annotation variant: {variant!r}")
+
+
+def export_variant(
+    source: Path,
+    destination: Path,
+    annotations: Sequence[EpisodeAnnotation],
+    variant: AnnotationVariant,
+    source_manifest_sha256: str,
+    workbook_sha256: str,
+) -> ExportResult:
+    """Materialize one self-contained LeRobot annotation variant."""
+
+    if variant not in {"subtasks", "full_prompt"}:
+        raise AnnotationError(f"unknown annotation variant: {variant!r}")
+    if not annotations:
+        raise AnnotationError("cannot export an empty annotation set")
+    if destination.exists():
+        if any(destination.iterdir()):
+            raise AnnotationError(f"destination already exists and is not empty: {destination}")
+    else:
+        destination.mkdir(parents=True)
+
+    source_info = _read_json(source / "meta/info.json")
+    if source_info.get("codebase_version") != "v2.1":
+        raise AnnotationError("source dataset must use LeRobot codebase_version v2.1")
+    fps = _integer_cell(source_info.get("fps"), "fps")
+    source_episodes = {
+        _integer_cell(row.get("episode_index"), "episode_index"): row
+        for row in _read_jsonl(source / "meta/episodes.jsonl")
+    }
+    source_stats = {
+        _integer_cell(row.get("episode_index"), "episode_index"): row
+        for row in _read_jsonl(source / "meta/episodes_stats.jsonl")
+    }
+    ordered_annotations = sorted(annotations, key=lambda item: item.episode)
+    annotation_episodes = [annotation.episode for annotation in ordered_annotations]
+    if len(set(annotation_episodes)) != len(annotation_episodes):
+        raise AnnotationError("annotations contain duplicate source episodes")
+    missing_episodes = sorted(set(annotation_episodes) - source_episodes.keys())
+    if missing_episodes:
+        raise AnnotationError(f"annotations reference missing source episodes: {missing_episodes}")
+
+    task_map = build_task_map(ordered_annotations, variant)
+    video_keys = _video_keys(source_info)
+    output_episodes: list[dict[str, Any]] = []
+    output_stats: list[dict[str, Any]] = []
+    provenance_episodes: list[dict[str, Any]] = []
+    global_index = 0
+    copied_videos = 0
+
+    for output_episode, annotation in enumerate(ordered_annotations):
+        source_data_path = source / _format_episode_path(
+            source_info, "data_path", annotation.episode
+        )
+        if not source_data_path.is_file():
+            raise AnnotationError(f"source parquet does not exist: {source_data_path}")
+        table = pq.read_table(source_data_path)
+        _assert_source_identifiers(table, annotation.episode)
+        length = len(table)
+        source_length = _integer_cell(
+            source_episodes[annotation.episode].get("length"),
+            f"source episode {annotation.episode} length",
+        )
+        if length != source_length:
+            raise AnnotationError(
+                f"source episode {annotation.episode} metadata length {source_length} "
+                f"does not match parquet length {length}"
+            )
+        boundary_frames = snap_boundary_frames(
+            table["timestamp"], annotation.boundaries_s, fps
+        )
+        task_indices, episode_prompts = _episode_prompt_indices(
+            annotation, variant, task_map, length, boundary_frames
+        )
+
+        rewritten = _replace_column(
+            table,
+            "episode_index",
+            np.full(length, output_episode, dtype=np.int64),
+        )
+        rewritten = _replace_column(
+            rewritten,
+            "index",
+            np.arange(global_index, global_index + length, dtype=np.int64),
+        )
+        rewritten = _replace_column(rewritten, "task_index", task_indices)
+        output_data_path = destination / _format_episode_path(
+            source_info, "data_path", output_episode
+        )
+        output_data_path.parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(rewritten, output_data_path)
+
+        for video_key in video_keys:
+            source_video = source / _format_video_path(
+                source_info, annotation.episode, video_key
+            )
+            if not source_video.is_file() or source_video.is_symlink():
+                raise AnnotationError(f"source video is missing or not regular: {source_video}")
+            output_video = destination / _format_video_path(
+                source_info, output_episode, video_key
+            )
+            output_video.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_video, output_video)
+            copied_videos += 1
+
+        output_episodes.append(
+            {
+                "episode_index": output_episode,
+                "tasks": episode_prompts,
+                "length": length,
+            }
+        )
+        stats_row = deepcopy(source_stats.get(annotation.episode))
+        if stats_row is None:
+            raise AnnotationError(
+                f"source statistics are missing episode {annotation.episode}"
+            )
+        stats = stats_row.get("stats")
+        if not isinstance(stats, dict):
+            raise AnnotationError(
+                f"source statistics for episode {annotation.episode} have no stats object"
+            )
+        stats_row["episode_index"] = output_episode
+        stats["episode_index"] = _scalar_stats(
+            np.full(length, output_episode, dtype=np.int64)
+        )
+        stats["index"] = _scalar_stats(
+            np.arange(global_index, global_index + length, dtype=np.int64)
+        )
+        stats["task_index"] = _scalar_stats(task_indices)
+        output_stats.append(stats_row)
+
+        timestamps = np.asarray(table["timestamp"].to_pylist(), dtype=np.float64)
+        provenance_episodes.append(
+            {
+                "source_episode_index": annotation.episode,
+                "output_episode_index": output_episode,
+                "length": length,
+                "boundaries_s": list(annotation.boundaries_s),
+                "boundary_frames": list(boundary_frames),
+                "boundary_timestamps_s": [
+                    float(timestamps[frame]) for frame in boundary_frames
+                ],
+                "prompts": episode_prompts,
+            }
+        )
+        global_index += length
+
+    output_info = deepcopy(source_info)
+    chunks_size = _integer_cell(source_info.get("chunks_size", 1000), "chunks_size")
+    output_info.update(
+        {
+            "total_episodes": len(ordered_annotations),
+            "total_frames": global_index,
+            "total_tasks": len(task_map),
+            "total_videos": copied_videos,
+            "total_chunks": max(1, math.ceil(len(ordered_annotations) / chunks_size)),
+            "splits": {"train": f"0:{len(ordered_annotations)}"},
+        }
+    )
+    _write_json(destination / "meta/info.json", output_info)
+    _write_jsonl(destination / "meta/episodes.jsonl", output_episodes)
+    _write_jsonl(
+        destination / "meta/tasks.jsonl",
+        [
+            {"task_index": task_index, "task": prompt}
+            for prompt, task_index in sorted(task_map.items(), key=lambda item: item[1])
+        ],
+    )
+    _write_jsonl(destination / "meta/episodes_stats.jsonl", output_stats)
+    source_modality = source / "meta/modality.json"
+    if not source_modality.is_file():
+        raise AnnotationError(f"source modality metadata does not exist: {source_modality}")
+    shutil.copy2(source_modality, destination / "meta/modality.json")
+    _write_json(
+        destination / "meta/annotation_provenance.json",
+        {
+            "schema_version": 1,
+            "variant": variant,
+            "source": {
+                "dataset_path": str(source.resolve()),
+                "manifest_sha256": source_manifest_sha256,
+            },
+            "annotations": {"workbook_sha256": workbook_sha256},
+            "tasks": [
+                {"task_index": task_index, "task": prompt}
+                for prompt, task_index in sorted(task_map.items(), key=lambda item: item[1])
+            ],
+            "episodes": provenance_episodes,
+        },
+    )
+    return ExportResult(
+        output_path=destination,
+        variant=variant,
+        episodes=len(ordered_annotations),
+        frames=global_index,
+        tasks=len(task_map),
+    )
 
 
 def _column_index(cell_reference: str) -> int:
