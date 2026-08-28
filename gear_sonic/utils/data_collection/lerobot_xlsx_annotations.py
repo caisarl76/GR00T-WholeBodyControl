@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
+from io import BytesIO
 import json
 import math
 from pathlib import Path, PurePosixPath
@@ -201,6 +202,34 @@ def _write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
             )
 
 
+def _format_safe_relative_path(pattern: str, label: str, **values: object) -> Path:
+    try:
+        formatted = pattern.format(**values)
+    except (IndexError, KeyError, ValueError) as error:
+        raise AnnotationError(f"{label} is not a valid path pattern: {error}") from error
+    posix_path = PurePosixPath(formatted)
+    if (
+        not formatted
+        or "\\" in formatted
+        or posix_path.is_absolute()
+        or not posix_path.parts
+        or ".." in posix_path.parts
+    ):
+        raise AnnotationError(f"{label} must format to a safe relative POSIX path, got {formatted!r}")
+    return Path(*posix_path.parts)
+
+
+def _safe_dataset_path(root: Path, relative: Path, label: str) -> Path:
+    resolved_root = root.resolve()
+    candidate = resolved_root / relative
+    if candidate.is_symlink():
+        raise AnnotationError(f"{label} must be a regular non-symlink path: {candidate}")
+    resolved_candidate = candidate.resolve()
+    if resolved_candidate != resolved_root and resolved_root not in resolved_candidate.parents:
+        raise AnnotationError(f"{label} must remain within dataset root {resolved_root}")
+    return candidate
+
+
 def _format_episode_path(info: dict[str, Any], key: str, episode_index: int) -> Path:
     chunks_size = _integer_cell(info.get("chunks_size", 1000), "chunks_size")
     if chunks_size <= 0:
@@ -208,11 +237,11 @@ def _format_episode_path(info: dict[str, Any], key: str, episode_index: int) -> 
     pattern = info[key]
     if not isinstance(pattern, str):
         raise AnnotationError(f"info.json {key} must be a string")
-    return Path(
-        pattern.format(
-            episode_chunk=episode_index // chunks_size,
-            episode_index=episode_index,
-        )
+    return _format_safe_relative_path(
+        pattern,
+        f"info.json {key}",
+        episode_chunk=episode_index // chunks_size,
+        episode_index=episode_index,
     )
 
 
@@ -228,12 +257,12 @@ def _format_video_path(
     )
     if not isinstance(pattern, str):
         raise AnnotationError("info.json video_path must be a string")
-    return Path(
-        pattern.format(
-            episode_chunk=episode_index // chunks_size,
-            episode_index=episode_index,
-            video_key=video_key,
-        )
+    return _format_safe_relative_path(
+        pattern,
+        "info.json video_path",
+        episode_chunk=episode_index // chunks_size,
+        episode_index=episode_index,
+        video_key=video_key,
     )
 
 
@@ -244,6 +273,16 @@ def _video_keys(info: dict[str, Any]) -> list[str]:
     return sorted(
         key for key, feature in features.items() if isinstance(feature, dict) and feature.get("dtype") == "video"
     )
+
+
+def _task_description_original_key(modality: dict[str, Any]) -> object:
+    annotation = modality.get("annotation")
+    if not isinstance(annotation, dict):
+        return None
+    task_description = annotation.get("human.task_description")
+    if not isinstance(task_description, dict):
+        return None
+    return task_description.get("original_key")
 
 
 def _replace_column(table: pa.Table, name: str, values: np.ndarray) -> pa.Table:
@@ -322,11 +361,6 @@ def export_variant(
         raise AnnotationError(f"unknown annotation variant: {variant!r}")
     if not annotations:
         raise AnnotationError("cannot export an empty annotation set")
-    if destination.exists():
-        if any(destination.iterdir()):
-            raise AnnotationError(f"destination already exists and is not empty: {destination}")
-    else:
-        destination.mkdir(parents=True)
 
     source_info = _read_json(source / "meta/info.json")
     if source_info.get("codebase_version") != "v2.1":
@@ -350,6 +384,68 @@ def export_variant(
 
     task_map = build_task_map(ordered_annotations, variant)
     video_keys = _video_keys(source_info)
+    source_modality = source / "meta/modality.json"
+    if not source_modality.is_file() or source_modality.is_symlink():
+        raise AnnotationError(f"source modality metadata does not exist: {source_modality}")
+    modality = _read_json(source_modality)
+    if _task_description_original_key(modality) != "task_index":
+        raise AnnotationError("source modality.json must map annotation.human.task_description to task_index")
+
+    source_data_paths: dict[int, Path] = {}
+    output_data_paths: dict[int, Path] = {}
+    source_video_paths: dict[tuple[int, str], Path] = {}
+    output_video_paths: dict[tuple[int, str], Path] = {}
+    output_targets: set[Path] = set()
+    for output_episode, annotation in enumerate(ordered_annotations):
+        source_data_paths[annotation.episode] = _safe_dataset_path(
+            source,
+            _format_episode_path(source_info, "data_path", annotation.episode),
+            "source data path",
+        )
+        output_data_paths[output_episode] = _safe_dataset_path(
+            destination,
+            _format_episode_path(source_info, "data_path", output_episode),
+            "output data path",
+        )
+        for video_key in video_keys:
+            source_video_paths[(annotation.episode, video_key)] = _safe_dataset_path(
+                source,
+                _format_video_path(source_info, annotation.episode, video_key),
+                "source video path",
+            )
+            output_video_paths[(output_episode, video_key)] = _safe_dataset_path(
+                destination,
+                _format_video_path(source_info, output_episode, video_key),
+                "output video path",
+            )
+        episode_targets = [output_data_paths[output_episode]] + [
+            output_video_paths[(output_episode, video_key)] for video_key in video_keys
+        ]
+        for target in episode_targets:
+            if target in output_targets:
+                raise AnnotationError(f"output path pattern produces duplicate target: {target}")
+            output_targets.add(target)
+
+    for source_path in source_data_paths.values():
+        if not source_path.is_file() or source_path.is_symlink():
+            raise AnnotationError(f"source parquet does not exist or is not regular: {source_path}")
+    for source_path in source_video_paths.values():
+        if not source_path.is_file() or source_path.is_symlink():
+            raise AnnotationError(f"source video is missing or not regular: {source_path}")
+    missing_stats = sorted(set(annotation_episodes) - source_stats.keys())
+    if missing_stats:
+        raise AnnotationError(f"source statistics are missing episodes: {missing_stats}")
+
+    if destination.is_symlink():
+        raise AnnotationError(f"destination must not be a symlink: {destination}")
+    if destination.exists():
+        if not destination.is_dir():
+            raise AnnotationError(f"destination must be a directory: {destination}")
+        if any(destination.iterdir()):
+            raise AnnotationError(f"destination already exists and is not empty: {destination}")
+    else:
+        destination.mkdir(parents=True)
+
     output_episodes: list[dict[str, Any]] = []
     output_stats: list[dict[str, Any]] = []
     provenance_episodes: list[dict[str, Any]] = []
@@ -357,9 +453,7 @@ def export_variant(
     copied_videos = 0
 
     for output_episode, annotation in enumerate(ordered_annotations):
-        source_data_path = source / _format_episode_path(source_info, "data_path", annotation.episode)
-        if not source_data_path.is_file():
-            raise AnnotationError(f"source parquet does not exist: {source_data_path}")
+        source_data_path = source_data_paths[annotation.episode]
         table = pq.read_table(source_data_path)
         _assert_source_identifiers(table, annotation.episode)
         length = len(table)
@@ -388,15 +482,13 @@ def export_variant(
             np.arange(global_index, global_index + length, dtype=np.int64),
         )
         rewritten = _replace_column(rewritten, "task_index", task_indices)
-        output_data_path = destination / _format_episode_path(source_info, "data_path", output_episode)
+        output_data_path = output_data_paths[output_episode]
         output_data_path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(rewritten, output_data_path)
 
         for video_key in video_keys:
-            source_video = source / _format_video_path(source_info, annotation.episode, video_key)
-            if not source_video.is_file() or source_video.is_symlink():
-                raise AnnotationError(f"source video is missing or not regular: {source_video}")
-            output_video = destination / _format_video_path(source_info, output_episode, video_key)
+            source_video = source_video_paths[(annotation.episode, video_key)]
+            output_video = output_video_paths[(output_episode, video_key)]
             output_video.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_video, output_video)
             copied_videos += 1
@@ -456,9 +548,6 @@ def export_variant(
         ],
     )
     _write_jsonl(destination / "meta/episodes_stats.jsonl", output_stats)
-    source_modality = source / "meta/modality.json"
-    if not source_modality.is_file():
-        raise AnnotationError(f"source modality metadata does not exist: {source_modality}")
     shutil.copy2(source_modality, destination / "meta/modality.json")
     _write_json(
         destination / "meta/annotation_provenance.json",
@@ -486,7 +575,9 @@ def export_variant(
     )
 
 
-def _file_sha256(path: Path) -> str:
+def file_sha256(path: Path) -> str:
+    """Return the SHA-256 digest of one regular file."""
+
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         while chunk := stream.read(1024 * 1024):
@@ -510,7 +601,7 @@ def dataset_manifest_sha256(dataset_path: Path) -> str:
         record = {
             "path": relative,
             "bytes": path.stat().st_size,
-            "sha256": _file_sha256(path),
+            "sha256": file_sha256(path),
         }
         digest.update(json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         digest.update(b"\n")
@@ -551,6 +642,7 @@ def validate_variant(
     annotations: Sequence[EpisodeAnnotation],
     variant: AnnotationVariant,
     source_manifest_sha256: str | None = None,
+    workbook_sha256: str | None = None,
 ) -> dict[str, object]:
     """Validate an output against its source and annotation contract."""
 
@@ -567,8 +659,17 @@ def validate_variant(
         output_stats_rows = _read_jsonl(output / "meta/episodes_stats.jsonl")
         output_task_rows = _read_jsonl(output / "meta/tasks.jsonl")
         provenance = _read_json(output / "meta/annotation_provenance.json")
+        source_modality = _read_json(source / "meta/modality.json")
+        output_modality = _read_json(output / "meta/modality.json")
     except AnnotationError as error:
         raise DatasetValidationError(str(error)) from error
+
+    if _task_description_original_key(output_modality) != "task_index":
+        raise DatasetValidationError(
+            "output modality.json must map annotation.human.task_description to task_index"
+        )
+    if output_modality != source_modality:
+        raise DatasetValidationError("output modality.json differs from source modality.json")
 
     ordered_annotations = sorted(annotations, key=lambda item: item.episode)
     task_map = build_task_map(ordered_annotations, variant)
@@ -586,34 +687,72 @@ def validate_variant(
     fps = _integer_cell(source_info.get("fps"), "fps")
     video_keys = _video_keys(source_info)
     expected_videos = len(ordered_annotations) * len(video_keys)
-    fixed_info_values = {
-        "total_episodes": len(ordered_annotations),
-        "total_tasks": len(task_map),
-        "total_videos": expected_videos,
-        "splits": {"train": f"0:{len(ordered_annotations)}"},
-    }
-    for name, expected in fixed_info_values.items():
+    expected_total_frames = 0
+    for annotation in ordered_annotations:
+        source_episode = source_episodes.get(annotation.episode)
+        if source_episode is None:
+            raise DatasetValidationError(f"source metadata is missing episode {annotation.episode}")
+        expected_total_frames += _integer_cell(
+            source_episode.get("length"),
+            f"source episode {annotation.episode} length",
+        )
+    chunks_size = _integer_cell(source_info.get("chunks_size", 1000), "chunks_size")
+    if chunks_size <= 0:
+        raise DatasetValidationError(f"chunks_size must be positive, got {chunks_size}")
+    expected_info = deepcopy(source_info)
+    expected_info.update(
+        {
+            "total_episodes": len(ordered_annotations),
+            "total_frames": expected_total_frames,
+            "total_tasks": len(task_map),
+            "total_videos": expected_videos,
+            "total_chunks": max(1, math.ceil(len(ordered_annotations) / chunks_size)),
+            "splits": {"train": f"0:{len(ordered_annotations)}"},
+        }
+    )
+    if output_info.keys() != expected_info.keys():
+        missing = sorted(expected_info.keys() - output_info.keys())
+        unexpected = sorted(output_info.keys() - expected_info.keys())
+        raise DatasetValidationError(f"info.json keys mismatch: missing={missing!r}, unexpected={unexpected!r}")
+    for name, expected in expected_info.items():
         if output_info.get(name) != expected:
             raise DatasetValidationError(
                 f"info.json {name} mismatch: expected={expected!r}, actual={output_info.get(name)!r}"
             )
-    if output_info.get("codebase_version") != "v2.1":
-        raise DatasetValidationError("output codebase_version must be v2.1")
-    if output_info.get("data_path") != source_info.get("data_path"):
-        raise DatasetValidationError("output data_path differs from source")
-    if output_info.get("video_path") != source_info.get("video_path"):
-        raise DatasetValidationError("output video_path differs from source")
-    if output_info.get("features") != source_info.get("features"):
-        raise DatasetValidationError("output features differ from source")
+    if source_info.get("codebase_version") != "v2.1":
+        raise DatasetValidationError("source and output codebase_version must be v2.1")
+    required_directories = [output / "meta", output / "data"]
+    if video_keys:
+        required_directories.append(output / "videos")
+    for directory in required_directories:
+        if not directory.is_dir() or directory.is_symlink():
+            raise DatasetValidationError(f"required dataset directory is missing or a symlink: {directory}")
     if len(output_episode_rows) != len(ordered_annotations):
         raise DatasetValidationError("episodes.jsonl row count does not match retained episodes")
     if len(output_stats_rows) != len(ordered_annotations):
         raise DatasetValidationError("episodes_stats.jsonl row count does not match retained episodes")
 
     current_manifest = source_manifest_sha256 or dataset_manifest_sha256(source)
+    if provenance.get("schema_version") != 1:
+        raise DatasetValidationError("provenance schema_version must be 1")
     provenance_source = provenance.get("source")
-    if not isinstance(provenance_source, dict) or provenance_source.get("manifest_sha256") != current_manifest:
+    if not isinstance(provenance_source, dict):
+        raise DatasetValidationError("provenance source must be an object")
+    if provenance_source.get("dataset_path") != str(source.resolve()):
+        raise DatasetValidationError("provenance source dataset_path does not match the current source")
+    if provenance_source.get("manifest_sha256") != current_manifest:
         raise DatasetValidationError("provenance source manifest does not match the current source manifest")
+    provenance_annotations = provenance.get("annotations")
+    if not isinstance(provenance_annotations, dict):
+        raise DatasetValidationError("provenance annotations must be an object")
+    recorded_workbook_sha256 = provenance_annotations.get("workbook_sha256")
+    if (
+        not isinstance(recorded_workbook_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", recorded_workbook_sha256) is None
+    ):
+        raise DatasetValidationError("provenance workbook_sha256 must be a lowercase SHA-256 digest")
+    if workbook_sha256 is not None and recorded_workbook_sha256 != workbook_sha256:
+        raise DatasetValidationError("provenance workbook_sha256 does not match the current annotation workbook")
     if provenance.get("variant") != variant:
         raise DatasetValidationError("provenance variant does not match output variant")
     if provenance.get("tasks") != expected_task_rows:
@@ -628,8 +767,19 @@ def validate_variant(
         source_episode_row = source_episodes.get(annotation.episode)
         if source_episode_row is None:
             raise DatasetValidationError(f"source metadata is missing episode {annotation.episode}")
-        source_path = source / _format_episode_path(source_info, "data_path", annotation.episode)
-        output_path = output / _format_episode_path(output_info, "data_path", output_episode)
+        try:
+            source_path = _safe_dataset_path(
+                source,
+                _format_episode_path(source_info, "data_path", annotation.episode),
+                "source data path",
+            )
+            output_path = _safe_dataset_path(
+                output,
+                _format_episode_path(output_info, "data_path", output_episode),
+                "output data path",
+            )
+        except AnnotationError as error:
+            raise DatasetValidationError(str(error)) from error
         if not output_path.is_file() or output_path.is_symlink():
             raise DatasetValidationError(f"output parquet is not a regular non-symlink file: {output_path}")
         source_table = pq.read_table(source_path)
@@ -706,8 +856,19 @@ def validate_variant(
         )
 
         for video_key in video_keys:
-            source_video = source / _format_video_path(source_info, annotation.episode, video_key)
-            output_video = output / _format_video_path(output_info, output_episode, video_key)
+            try:
+                source_video = _safe_dataset_path(
+                    source,
+                    _format_video_path(source_info, annotation.episode, video_key),
+                    "source video path",
+                )
+                output_video = _safe_dataset_path(
+                    output,
+                    _format_video_path(output_info, output_episode, video_key),
+                    "output video path",
+                )
+            except AnnotationError as error:
+                raise DatasetValidationError(str(error)) from error
             if output_video.is_symlink() or not output_video.is_file():
                 raise DatasetValidationError(f"output video is not a regular non-symlink file: {output_video}")
             source_stat = source_video.stat()
@@ -717,7 +878,7 @@ def validate_variant(
                 output_stat.st_ino,
             ):
                 raise DatasetValidationError(f"output video is not independent from source: {output_video}")
-            if _file_sha256(source_video) != _file_sha256(output_video):
+            if file_sha256(source_video) != file_sha256(output_video):
                 raise DatasetValidationError(f"output video hash mismatch: {output_video}")
             validated_videos += 1
         total_frames += length
@@ -765,6 +926,8 @@ def export_both(
     outputs = [subtasks_output_path.resolve(), full_prompt_output_path.resolve()]
     if outputs[0] == outputs[1]:
         raise AnnotationError("subtasks and full-prompt output paths must differ")
+    if _path_is_within(outputs[0], outputs[1]) or _path_is_within(outputs[1], outputs[0]):
+        raise AnnotationError("subtasks and full-prompt output paths must not overlap")
     for output in outputs:
         if output.exists():
             raise AnnotationError(f"output path already exists: {output}")
@@ -772,23 +935,27 @@ def export_both(
             raise AnnotationError(f"output path must be outside the source dataset: {output}")
     source_episode_rows = _read_jsonl(source / "meta/episodes.jsonl")
     expected_episodes = {_integer_cell(row.get("episode_index"), "episode_index") for row in source_episode_rows}
-    annotations = load_annotations(workbook, expected_episodes=expected_episodes)
+    try:
+        workbook_bytes = workbook.read_bytes()
+    except OSError as error:
+        raise AnnotationError(f"cannot read XLSX workbook {workbook}: {error}") from error
+    annotations = load_annotations_bytes(workbook_bytes, expected_episodes=expected_episodes)
     before_manifest = dataset_manifest_sha256(source)
-    workbook_sha256 = _file_sha256(workbook)
+    workbook_sha256 = hashlib.sha256(workbook_bytes).hexdigest()
 
-    for output in outputs:
-        output.parent.mkdir(parents=True, exist_ok=True)
-    staging = [
-        Path(
-            tempfile.mkdtemp(
-                prefix=f".{output.name}.staging-",
-                dir=output.parent,
-            )
-        )
-        for output in outputs
-    ]
+    staging: list[Path] = []
     published_first = False
     try:
+        for output in outputs:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            staging.append(
+                Path(
+                    tempfile.mkdtemp(
+                        prefix=f".{output.name}.staging-",
+                        dir=output.parent,
+                    )
+                )
+            )
         subtask_result = export_variant(
             source,
             staging[0],
@@ -811,6 +978,7 @@ def export_both(
             annotations,
             "subtasks",
             source_manifest_sha256=before_manifest,
+            workbook_sha256=workbook_sha256,
         )
         validate_variant(
             source,
@@ -818,7 +986,16 @@ def export_both(
             annotations,
             "full_prompt",
             source_manifest_sha256=before_manifest,
+            workbook_sha256=workbook_sha256,
         )
+        try:
+            current_workbook_sha256 = file_sha256(workbook)
+        except OSError as error:
+            raise DatasetValidationError(
+                f"annotation workbook changed or became unreadable during export: {error}"
+            ) from error
+        if current_workbook_sha256 != workbook_sha256:
+            raise DatasetValidationError("annotation workbook changed during export")
         after_manifest = dataset_manifest_sha256(source)
         if before_manifest != after_manifest:
             raise DatasetValidationError("source manifest changed during export")
@@ -1053,6 +1230,20 @@ def _validate_and_select_rows(
     return sorted(annotations, key=lambda annotation: annotation.episode)
 
 
+def load_annotations_bytes(
+    data: bytes,
+    expected_episodes: set[int] | None = None,
+) -> list[EpisodeAnnotation]:
+    """Parse one immutable XLSX byte snapshot and return its valid rows."""
+
+    try:
+        with ZipFile(BytesIO(data)) as archive:
+            worksheet_rows = _read_first_worksheet(archive)
+    except (BadZipFile, KeyError, ElementTree.ParseError) as error:
+        raise AnnotationError(f"cannot read XLSX workbook bytes: {error}") from error
+    return _validate_and_select_rows(worksheet_rows, expected_episodes)
+
+
 def load_annotations(
     path: Path,
     expected_episodes: set[int] | None = None,
@@ -1060,8 +1251,7 @@ def load_annotations(
     """Load, validate, and return rows whose ``valid`` value is one."""
 
     try:
-        with ZipFile(path) as archive:
-            worksheet_rows = _read_first_worksheet(archive)
-    except (BadZipFile, KeyError, ElementTree.ParseError) as error:
+        data = path.read_bytes()
+    except OSError as error:
         raise AnnotationError(f"cannot read XLSX workbook {path}: {error}") from error
-    return _validate_and_select_rows(worksheet_rows, expected_episodes)
+    return load_annotations_bytes(data, expected_episodes)

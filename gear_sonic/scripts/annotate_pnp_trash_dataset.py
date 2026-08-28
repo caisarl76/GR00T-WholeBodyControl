@@ -8,6 +8,7 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import tyro
 from gear_sonic.utils.data_collection.lerobot_xlsx_annotations import (
     dataset_manifest_sha256,
     export_both,
-    load_annotations,
+    load_annotations_bytes,
     validate_variant,
 )
 
@@ -64,11 +65,13 @@ def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, o
     if not config.validate_only:
         export_both(source, workbook, subtasks, full_prompt)
 
-    annotations = load_annotations(
-        workbook,
+    workbook_bytes = workbook.read_bytes()
+    annotations = load_annotations_bytes(
+        workbook_bytes,
         expected_episodes=_source_episode_indices(source),
     )
     source_manifest = dataset_manifest_sha256(source)
+    workbook_sha256 = hashlib.sha256(workbook_bytes).hexdigest()
     reports = (
         validate_variant(
             source,
@@ -76,6 +79,7 @@ def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, o
             annotations,
             "subtasks",
             source_manifest_sha256=source_manifest,
+            workbook_sha256=workbook_sha256,
         ),
         validate_variant(
             source,
@@ -83,6 +87,7 @@ def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, o
             annotations,
             "full_prompt",
             source_manifest_sha256=source_manifest,
+            workbook_sha256=workbook_sha256,
         ),
     )
     print(json.dumps({"outputs": reports}, indent=2))

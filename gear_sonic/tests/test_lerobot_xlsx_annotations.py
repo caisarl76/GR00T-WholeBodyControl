@@ -308,7 +308,10 @@ def _make_source_dataset(root: Path) -> Path:
         },
     }
     (root / "meta/info.json").write_text(json.dumps(info), encoding="utf-8")
-    (root / "meta/modality.json").write_text('{"annotation":{}}', encoding="utf-8")
+    (root / "meta/modality.json").write_text(
+        json.dumps({"annotation": {"human.task_description": {"original_key": "task_index"}}}),
+        encoding="utf-8",
+    )
     _write_jsonl(
         root / "meta/episodes.jsonl",
         [{"episode_index": episode, "tasks": ["source task"], "length": episode_length} for episode in range(2)],
@@ -462,6 +465,45 @@ def test_export_variant_builds_self_contained_lerobot_datasets(tmp_path: Path) -
     ]
 
 
+@pytest.mark.parametrize("path_style", ["absolute", "traversal"])
+def test_export_variant_rejects_unsafe_source_controlled_paths_before_writing(
+    tmp_path: Path,
+    path_style: str,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    info_path = source / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    if path_style == "absolute":
+        info["data_path"] = str(
+            source.resolve() / "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+        )
+    else:
+        info["data_path"] = "../source/data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    source_parquet = source / "data/chunk-000/episode_000001.parquet"
+    source_bytes = source_parquet.read_bytes()
+    output = tmp_path / "output"
+
+    with pytest.raises(AnnotationError, match="safe relative"):
+        export_variant(
+            source,
+            output,
+            [
+                _annotation(
+                    1,
+                    ("approach", "pick", "turn and approach", "drop"),
+                    "approach, pick, turn and approach, drop",
+                )
+            ],
+            "subtasks",
+            source_manifest_sha256="a" * 64,
+            workbook_sha256="b" * 64,
+        )
+
+    assert source_parquet.read_bytes() == source_bytes
+    assert not output.exists()
+
+
 def _rewrite_column(path: Path, name: str, values: list[object]) -> None:
     table = pq.read_table(path)
     index = table.schema.get_field_index(name)
@@ -510,6 +552,9 @@ def test_validate_variant_accepts_complete_export(tmp_path: Path, variant: str) 
     ("corruption", "match"),
     [
         ("metadata", "total_frames"),
+        ("total_chunks", "total_chunks"),
+        ("modality_missing", "modality"),
+        ("modality_mapping", "task_index"),
         ("episode_index", "episode_index"),
         ("global_index", "global index"),
         ("task_resolution", "task_index"),
@@ -518,6 +563,9 @@ def test_validate_variant_accepts_complete_export(tmp_path: Path, variant: str) 
         ("video_hash", "video hash"),
         ("video_symlink", "regular non-symlink"),
         ("provenance_mapping", "provenance"),
+        ("provenance_schema", "provenance"),
+        ("provenance_dataset_path", "provenance"),
+        ("provenance_workbook_hash", "provenance"),
         ("source_hash", "source manifest"),
     ],
 )
@@ -550,6 +598,18 @@ def test_validate_variant_rejects_corruption(
         info = json.loads(info_path.read_text(encoding="utf-8"))
         info["total_frames"] += 1
         info_path.write_text(json.dumps(info), encoding="utf-8")
+    elif corruption == "total_chunks":
+        info_path = output / "meta/info.json"
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        info["total_chunks"] = 999
+        info_path.write_text(json.dumps(info), encoding="utf-8")
+    elif corruption == "modality_missing":
+        (output / "meta/modality.json").unlink()
+    elif corruption == "modality_mapping":
+        (output / "meta/modality.json").write_text(
+            json.dumps({"annotation": {"human.task_description": {"original_key": "wrong_column"}}}),
+            encoding="utf-8",
+        )
     elif corruption == "episode_index":
         _rewrite_column(parquet, "episode_index", [7] + [0] * 200)
     elif corruption == "global_index":
@@ -571,6 +631,18 @@ def test_validate_variant_rejects_corruption(
     elif corruption == "provenance_mapping":
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
         provenance["episodes"][0]["source_episode_index"] = 0
+        provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    elif corruption == "provenance_schema":
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance["schema_version"] = 999
+        provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    elif corruption == "provenance_dataset_path":
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance["source"]["dataset_path"] = "/wrong/source"
+        provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    elif corruption == "provenance_workbook_hash":
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance["annotations"]["workbook_sha256"] = "bad"
         provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
     elif corruption == "source_hash":
         provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
@@ -600,6 +672,42 @@ def test_export_both_refuses_preexisting_output(tmp_path: Path) -> None:
         export_both(source, workbook, subtasks, tmp_path / "full_prompt")
 
 
+def test_export_both_rejects_overlapping_output_paths_before_writing(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+    subtasks = tmp_path / "outputs"
+    full_prompt = subtasks / "full_prompt"
+
+    with pytest.raises(AnnotationError, match="must not overlap"):
+        export_both(source, workbook, subtasks, full_prompt)
+
+    assert not subtasks.exists()
+
+
+def test_export_both_cleans_first_staging_directory_if_second_creation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+    real_mkdtemp = annotations_module.tempfile.mkdtemp
+    calls = 0
+
+    def fail_second_mkdtemp(*args: object, **kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("forced second staging creation failure")
+        return real_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(annotations_module.tempfile, "mkdtemp", fail_second_mkdtemp)
+
+    with pytest.raises(OSError, match="forced second staging creation failure"):
+        export_both(source, workbook, tmp_path / "subtasks", tmp_path / "full_prompt")
+
+    assert not list(tmp_path.glob(".*.staging-*"))
+
+
 def test_export_both_publishes_neither_output_when_second_export_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -619,6 +727,66 @@ def test_export_both_publishes_neither_output_when_second_export_fails(
     monkeypatch.setattr(annotations_module, "export_variant", fail_full_prompt)
 
     with pytest.raises(AnnotationError, match="forced full prompt failure"):
+        export_both(source, workbook, subtasks, full_prompt)
+
+    assert not subtasks.exists()
+    assert not full_prompt.exists()
+    assert not list(tmp_path.glob(".*.staging-*"))
+
+
+def test_export_both_rolls_back_first_output_when_second_publish_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    real_replace = Path.replace
+
+    def fail_second_publish(path: Path, target: Path) -> Path:
+        if path.name.startswith(".full_prompt.staging-") and target == full_prompt:
+            raise OSError("forced second publish failure")
+        return real_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_second_publish)
+
+    with pytest.raises(OSError, match="forced second publish failure"):
+        export_both(source, workbook, subtasks, full_prompt)
+
+    assert not subtasks.exists()
+    assert not full_prompt.exists()
+    assert not list(tmp_path.glob(".*.staging-*"))
+
+
+def test_export_both_rejects_workbook_changed_during_export(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = write_xlsx(
+        tmp_path / "external_annotations.xlsx",
+        [HEADERS, [0, 0], valid_row(episode=1)],
+    )
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    real_export = annotations_module.export_variant
+
+    def mutate_workbook_after_first_export(*args: object, **kwargs: object):
+        result = real_export(*args, **kwargs)
+        if args[3] == "subtasks":
+            changed = valid_row(episode=1)
+            changed[-1] = InlineText("changed full prompt")
+            write_xlsx(workbook, [HEADERS, [0, 0], changed])
+        return result
+
+    monkeypatch.setattr(
+        annotations_module,
+        "export_variant",
+        mutate_workbook_after_first_export,
+    )
+
+    with pytest.raises(DatasetValidationError, match="workbook changed"):
         export_both(source, workbook, subtasks, full_prompt)
 
     assert not subtasks.exists()
