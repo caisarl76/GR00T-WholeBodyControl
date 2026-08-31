@@ -13,6 +13,7 @@ import pytest
 from safetensors.torch import save_file
 import torch
 
+from gear_sonic.scripts import verify_gr00t_n17_checkpoint as checkpoint_verifier
 from gear_sonic.scripts.verify_gr00t_n17_checkpoint import (
     COSMOS_MODEL_ID,
     COSMOS_REVISION,
@@ -102,6 +103,30 @@ def test_valid_sharded_checkpoint_passes_payload_verification(tmp_path: Path) ->
         "sha256": expected_digest,
         "size": (checkpoint / index_entry["path"]).stat().st_size,
     }
+
+
+def test_checkpoint_rejects_content_replaced_after_semantic_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    original_validate = checkpoint_verifier._validate_trainer_state
+
+    def validate_then_replace(path: Path, expected_step: int) -> None:
+        original_validate(path, expected_step)
+        _write_json(
+            path / "trainer_state.json",
+            {"global_step": expected_step, "replacement": True},
+        )
+
+    monkeypatch.setattr(
+        checkpoint_verifier,
+        "_validate_trainer_state",
+        validate_then_replace,
+    )
+
+    with pytest.raises(CheckpointError, match="content changed"):
+        verify_checkpoint_structure(checkpoint, expected_step=5)
 
 
 @pytest.mark.parametrize(

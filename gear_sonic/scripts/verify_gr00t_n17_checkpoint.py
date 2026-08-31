@@ -409,6 +409,7 @@ def verify_checkpoint_structure(checkpoint: Path, expected_step: int) -> dict[st
     checkpoint = Path(checkpoint)
     _checkpoint_step(checkpoint, expected_step)
     files = _scan_checkpoint_files(checkpoint)
+    pre_validation_manifest = _build_file_manifest(checkpoint, files)
 
     try:
         import torch
@@ -422,6 +423,8 @@ def verify_checkpoint_structure(checkpoint: Path, expected_step: int) -> dict[st
     _validate_trainer_state(checkpoint, expected_step)
     _validate_required_configuration_artifacts(checkpoint)
     file_manifest = _build_file_manifest(checkpoint, files)
+    if file_manifest != pre_validation_manifest:
+        raise CheckpointError("checkpoint content changed during semantic validation")
     return {
         "status": "pass",
         "expected_step": expected_step,
