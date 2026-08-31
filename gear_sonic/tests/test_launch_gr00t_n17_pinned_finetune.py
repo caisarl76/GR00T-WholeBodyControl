@@ -71,6 +71,10 @@ EXPECTED_RECIPE = {
 }
 
 
+def expected_cosmos_snapshot(cache_root: Path) -> Path:
+    return cache_root / "hub" / "models--nvidia--Cosmos-Reason2-2B" / "snapshots" / COSMOS_REVISION
+
+
 def fake_config(*, use_wandb: bool = True) -> SimpleNamespace:
     return SimpleNamespace(
         load_config_path="sentinel",
@@ -234,7 +238,7 @@ def test_pinned_constants_are_exact() -> None:
     assert COSMOS_MODEL_ID == "nvidia/Cosmos-Reason2-2B"
     assert COSMOS_REVISION == "9ce19a195e423419c349abfc86fd07178b230561"
     assert COSMOS_SNAPSHOT_RELATIVE == (
-        "hub/models--nvidia--Cosmos-Reason2-2B/snapshots/9ce19a195e423419c349abfc86fd07178b230561"
+        "models--nvidia--Cosmos-Reason2-2B/snapshots/9ce19a195e423419c349abfc86fd07178b230561"
     )
     assert REQUIRED_OFFLINE_ENV == {
         "HF_HUB_OFFLINE": "1",
@@ -251,7 +255,7 @@ def test_apply_runtime_pins_preserves_selector_name_and_sets_offline_fields(
     assert config.model.model_name == "nvidia/Cosmos-Reason2-2B"
     assert config.model.model_revision == "9ce19a195e423419c349abfc86fd07178b230561"
     assert config.training.transformers_local_files_only is True
-    assert config.training.transformers_cache_dir == str(tmp_path)
+    assert config.training.transformers_cache_dir == str(tmp_path / "hub")
 
 
 def test_assert_offline_environment_accepts_only_required_exact_values() -> None:
@@ -274,7 +278,7 @@ def test_assert_offline_environment_rejects_missing_or_nonexact_values(
 
 
 def test_resolve_snapshot_uses_exact_id_revision_cache_and_local_only(tmp_path: Path) -> None:
-    expected = tmp_path / COSMOS_SNAPSHOT_RELATIVE
+    expected = expected_cosmos_snapshot(tmp_path)
     expected.mkdir(parents=True)
     calls = []
 
@@ -289,14 +293,35 @@ def test_resolve_snapshot_uses_exact_id_revision_cache_and_local_only(tmp_path: 
         {
             "repo_id": COSMOS_MODEL_ID,
             "revision": COSMOS_REVISION,
-            "cache_dir": str(tmp_path),
+            "cache_dir": str(tmp_path / "hub"),
             "local_files_only": True,
         }
     ]
 
 
+def test_resolve_snapshot_matches_realistic_hub_cache_layout(tmp_path: Path) -> None:
+    expected = expected_cosmos_snapshot(tmp_path)
+    expected.mkdir(parents=True)
+
+    def realistic_snapshot_download(
+        *,
+        repo_id: str,
+        revision: str,
+        cache_dir: str,
+        local_files_only: bool,
+    ) -> str:
+        assert local_files_only is True
+        repo_folder_name = f"models--{repo_id.replace('/', '--')}"
+        cached_snapshot = Path(cache_dir) / repo_folder_name / "snapshots" / revision
+        if not cached_snapshot.is_dir():
+            raise FileNotFoundError(cached_snapshot)
+        return str(cached_snapshot)
+
+    assert resolve_snapshot(tmp_path, snapshot_download=realistic_snapshot_download) == expected.resolve()
+
+
 def test_resolve_snapshot_rejects_resolution_to_other_cached_revision(tmp_path: Path) -> None:
-    expected = tmp_path / COSMOS_SNAPSHOT_RELATIVE
+    expected = expected_cosmos_snapshot(tmp_path)
     expected.mkdir(parents=True)
     other = tmp_path / "hub" / "other"
     other.mkdir(parents=True)
@@ -313,7 +338,7 @@ def test_resolve_snapshot_rejects_missing_expected_snapshot(tmp_path: Path) -> N
 def test_resolve_snapshot_rejects_symlinked_snapshot_directory(tmp_path: Path) -> None:
     actual = tmp_path / "actual-snapshot"
     actual.mkdir()
-    expected = tmp_path / COSMOS_SNAPSHOT_RELATIVE
+    expected = expected_cosmos_snapshot(tmp_path)
     expected.parent.mkdir(parents=True)
     expected.symlink_to(actual, target_is_directory=True)
 
@@ -322,7 +347,7 @@ def test_resolve_snapshot_rejects_symlinked_snapshot_directory(tmp_path: Path) -
 
 
 def test_resolve_snapshot_rejects_alias_returned_for_exact_directory(tmp_path: Path) -> None:
-    expected = tmp_path / COSMOS_SNAPSHOT_RELATIVE
+    expected = expected_cosmos_snapshot(tmp_path)
     expected.mkdir(parents=True)
     alias = tmp_path / "snapshot-alias"
     alias.symlink_to(expected, target_is_directory=True)
@@ -733,7 +758,7 @@ def _fake_runtime_dependencies(
     config = fake_config(use_wandb=use_wandb)
     config.data.datasets = None
     ft_config = fake_finetune_config(tmp_path, use_wandb=use_wandb)
-    snapshot = tmp_path / COSMOS_SNAPSHOT_RELATIVE
+    snapshot = expected_cosmos_snapshot(tmp_path)
     snapshot.mkdir(parents=True)
 
     class DefaultConfig:

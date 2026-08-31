@@ -157,6 +157,11 @@ Use H100 source commit
 The tag `jihun/gr00t-n1.7:626af89` is descriptive only. Every container's
 effective `.Image` must equal the immutable ID.
 
+The read-only mount at `/root/.cache/huggingface` is the Hugging Face home
+root. Its effective Hub/Transformers cache is the existing
+`/root/.cache/huggingface/hub` directory. Calls that accept an explicit
+`cache_dir` use the latter; the container mount remains at the home root.
+
 Resolve the GR00T base model locally and offline to this exact snapshot:
 
 ```text
@@ -183,7 +188,7 @@ only these effective overrides before calling `run(config)`:
   filesystem path;
 - `config.model.model_revision` is the exact Cosmos revision above;
 - `config.training.transformers_local_files_only=true`; and
-- `config.training.transformers_cache_dir=/root/.cache/huggingface`.
+- `config.training.transformers_cache_dir=/root/.cache/huggingface/hub`.
 
 The shim and its source diff against pinned `launch_finetune.py` are hashed and
 stored with the resolved command. `HF_HUB_OFFLINE=1`,

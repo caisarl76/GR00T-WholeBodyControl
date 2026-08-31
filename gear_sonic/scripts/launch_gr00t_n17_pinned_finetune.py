@@ -13,9 +13,7 @@ from types import SimpleNamespace
 
 COSMOS_MODEL_ID = "nvidia/Cosmos-Reason2-2B"
 COSMOS_REVISION = "9ce19a195e423419c349abfc86fd07178b230561"
-COSMOS_SNAPSHOT_RELATIVE = (
-    "hub/models--nvidia--Cosmos-Reason2-2B/snapshots/9ce19a195e423419c349abfc86fd07178b230561"
-)
+COSMOS_SNAPSHOT_RELATIVE = "models--nvidia--Cosmos-Reason2-2B/snapshots/9ce19a195e423419c349abfc86fd07178b230561"
 REQUIRED_OFFLINE_ENV = {
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
@@ -97,10 +95,11 @@ TRAINING_ARGUMENT_AUDIT_FIELDS = (
 
 def apply_runtime_pins(config: object, *, cache_root: Path) -> None:
     """Apply the immutable Cosmos identity and offline Transformers settings."""
+    hub_cache = cache_root / "hub"
     config.model.model_name = COSMOS_MODEL_ID
     config.model.model_revision = COSMOS_REVISION
     config.training.transformers_local_files_only = True
-    config.training.transformers_cache_dir = str(cache_root)
+    config.training.transformers_cache_dir = str(hub_cache)
 
 
 def assert_offline_environment(environ: Mapping[str, str] | None = None) -> None:
@@ -126,14 +125,15 @@ def resolve_snapshot(
 
         snapshot_download = huggingface_snapshot_download
 
-    expected = cache_root / COSMOS_SNAPSHOT_RELATIVE
+    hub_cache = cache_root / "hub"
+    expected = hub_cache / COSMOS_SNAPSHOT_RELATIVE
     if expected.is_symlink() or not expected.is_dir():
         raise RuntimeError(f"exact Cosmos snapshot is missing or not a directory: {expected}")
 
     resolved_raw = snapshot_download(
         repo_id=COSMOS_MODEL_ID,
         revision=COSMOS_REVISION,
-        cache_dir=str(cache_root),
+        cache_dir=str(hub_cache),
         local_files_only=True,
     )
     returned_path = Path(os.path.abspath(resolved_raw))

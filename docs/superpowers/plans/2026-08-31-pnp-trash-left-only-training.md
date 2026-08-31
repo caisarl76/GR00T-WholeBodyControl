@@ -940,7 +940,31 @@ def test_apply_runtime_pins_preserves_selector_name_and_sets_offline_fields(tmp_
     assert config.model.model_name == "nvidia/Cosmos-Reason2-2B"
     assert config.model.model_revision == "9ce19a195e423419c349abfc86fd07178b230561"
     assert config.training.transformers_local_files_only is True
-    assert config.training.transformers_cache_dir == str(tmp_path)
+    assert config.training.transformers_cache_dir == str(tmp_path / "hub")
+
+
+def test_resolve_snapshot_matches_realistic_hub_cache_layout(tmp_path: Path) -> None:
+    expected = (
+        tmp_path
+        / "hub/models--nvidia--Cosmos-Reason2-2B/snapshots"
+        / COSMOS_REVISION
+    )
+    expected.mkdir(parents=True)
+
+    def realistic_snapshot_download(
+        *, repo_id: str, revision: str, cache_dir: str, local_files_only: bool
+    ) -> str:
+        assert local_files_only is True
+        repo_folder_name = f"models--{repo_id.replace('/', '--')}"
+        snapshot = Path(cache_dir) / repo_folder_name / "snapshots" / revision
+        if not snapshot.is_dir():
+            raise FileNotFoundError(snapshot)
+        return str(snapshot)
+
+    assert (
+        resolve_snapshot(tmp_path, snapshot_download=realistic_snapshot_download)
+        == expected.resolve()
+    )
 
 
 def test_assert_fresh_experiment_rejects_checkpoint(tmp_path: Path) -> None:
@@ -1064,6 +1088,14 @@ The module must not import GR00T at module import time. Define constants,
 created `ft_config`, build the config with the pinned launcher's complete
 mapping below; these assignments are the audited contract and none may be
 omitted:
+
+`cache_root` means the mounted Hugging Face home root. Both
+`apply_runtime_pins` and `resolve_snapshot` must derive
+`hub_cache = cache_root / "hub"`. Set the Transformers `cache_dir` to that
+Hub cache and pass the same Hub cache to `snapshot_download`; a Hub lookup
+constructs `hub_cache / repo_folder_name(...) / "snapshots" / revision`.
+For the production mount this distinguishes `/root/.cache/huggingface` from
+the effective `/root/.cache/huggingface/hub` cache without changing the mount.
 
 ```python
 dataset_paths = [path for path in ft_config.dataset_path.split(os.pathsep) if path]
@@ -1228,7 +1260,7 @@ Use these immutable constants:
 COSMOS_MODEL_ID = "nvidia/Cosmos-Reason2-2B"
 COSMOS_REVISION = "9ce19a195e423419c349abfc86fd07178b230561"
 COSMOS_SNAPSHOT_RELATIVE = (
-    "hub/models--nvidia--Cosmos-Reason2-2B/"
+    "models--nvidia--Cosmos-Reason2-2B/"
     "snapshots/9ce19a195e423419c349abfc86fd07178b230561"
 )
 REQUIRED_OFFLINE_ENV = {
