@@ -1773,6 +1773,44 @@ def test_export_both_rejects_symlink_publication_ancestor(tmp_path: Path) -> Non
     assert not (tmp_path / "release.json").exists()
 
 
+@pytest.mark.parametrize("protected_path", ["subtasks", "marker"])
+def test_export_both_rejects_symlink_component_before_parent_traversal(
+    tmp_path: Path,
+    protected_path: str,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    alternate_target = tmp_path / "alternate-parent" / "target"
+    alternate_target.mkdir(parents=True)
+    symlink = tmp_path / "namespace-link"
+    symlink.symlink_to(alternate_target, target_is_directory=True)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "pnp_trash_left_only.release.json"
+    if protected_path == "subtasks":
+        subtasks = symlink / ".." / "subtasks"
+    else:
+        marker = symlink / ".." / "pnp_trash_left_only.release.json"
+
+    with pytest.raises(AnnotationError, match="symlink"):
+        export_both(
+            source,
+            workbook,
+            subtasks,
+            full_prompt,
+            direction_filter="left",
+            expected_direction_counts=(1, 1),
+            release_marker_path=marker,
+        )
+
+    alternate_parent = alternate_target.parent
+    assert not (tmp_path / "subtasks").exists()
+    assert not (tmp_path / "full_prompt").exists()
+    assert not (tmp_path / "pnp_trash_left_only.release.json").exists()
+    assert not (alternate_parent / "subtasks").exists()
+    assert not (alternate_parent / "pnp_trash_left_only.release.json").exists()
+
+
 def test_export_both_all_preserves_legacy_schema_without_classification(tmp_path: Path) -> None:
     source = _make_source_dataset(tmp_path / "source")
     row = valid_row(episode=1)

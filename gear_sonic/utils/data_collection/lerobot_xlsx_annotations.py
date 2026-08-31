@@ -405,12 +405,32 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
     raise OSError(error_number, os.strerror(error_number), destination)
 
 
-def _absolute_without_resolving(path: Path) -> Path:
-    return Path(os.path.abspath(path))
+def _normalized_artifact_path(path: Path, *, allow_existing_leaf: bool) -> Path:
+    """Normalize an artifact path while rejecting symlinks in raw component order."""
+
+    raw_path = path.absolute()
+    components = raw_path.parts[1:]
+    current = Path(raw_path.anchor)
+    for index, component in enumerate(components):
+        if component == ".":
+            continue
+        if component == "..":
+            current = current.parent
+            continue
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise AnnotationError(f"cannot inspect artifact path {current}: {error}") from error
+        if stat.S_ISLNK(mode) and not (allow_existing_leaf and index == len(components) - 1):
+            raise AnnotationError(f"publication path has a symlink ancestor: {current}")
+    return current
 
 
 def _validate_directory_chain(path: Path, *, create: bool) -> Path:
-    absolute = _absolute_without_resolving(path)
+    absolute = path.absolute()
     current = Path(absolute.anchor)
     for component in absolute.parts[1:]:
         current /= component
@@ -1563,16 +1583,16 @@ def _validate_publication_paths(
     raw_outputs: Sequence[Path],
     raw_marker: Path | None,
 ) -> tuple[list[Path], Path | None]:
-    for output in raw_outputs:
+    outputs = [_normalized_artifact_path(output, allow_existing_leaf=True) for output in raw_outputs]
+    marker = _normalized_artifact_path(raw_marker, allow_existing_leaf=True) if raw_marker is not None else None
+    for raw_output, output in zip(raw_outputs, outputs, strict=True):
         if _path_lexists(output):
-            raise AnnotationError(f"output path already exists: {output}")
-    if raw_marker is not None and _path_lexists(raw_marker):
+            raise AnnotationError(f"output path already exists: {raw_output}")
+    if raw_marker is not None and marker is not None and _path_lexists(marker):
         raise AnnotationError(f"release marker already exists: {raw_marker}")
-    for path in [*raw_outputs, *(() if raw_marker is None else (raw_marker,))]:
+    for path in [*outputs, *(() if marker is None else (marker,))]:
         _validate_directory_chain(path.parent, create=False)
 
-    outputs = [output.resolve() for output in raw_outputs]
-    marker = raw_marker.resolve() if raw_marker is not None else None
     if outputs[0] == outputs[1]:
         raise AnnotationError("subtasks and full-prompt output paths must differ")
     if _path_is_within(outputs[0], outputs[1]) or _path_is_within(outputs[1], outputs[0]):
