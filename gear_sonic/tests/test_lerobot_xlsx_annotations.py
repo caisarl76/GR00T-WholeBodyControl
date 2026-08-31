@@ -1063,6 +1063,29 @@ def test_export_both_rejects_preexisting_release_marker(tmp_path: Path, kind: st
         )
 
 
+def test_export_both_rejects_release_marker_ancestor_of_output(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    marker = tmp_path / "release"
+    subtasks = marker / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+
+    with pytest.raises(AnnotationError, match="release marker.*overlap"):
+        export_both(
+            source,
+            workbook,
+            subtasks,
+            full_prompt,
+            direction_filter="left",
+            expected_direction_counts=(1, 1),
+            release_marker_path=marker,
+        )
+
+    assert not marker.exists()
+    assert not subtasks.exists()
+    assert not full_prompt.exists()
+
+
 def test_filtered_export_publishes_valid_release_marker(tmp_path: Path) -> None:
     _source, subtasks, full_prompt, marker = _publish_filtered_fixture(tmp_path)
     reports = validate_release_marker(marker, subtasks, full_prompt)
@@ -1110,6 +1133,285 @@ def test_release_marker_rejects_cross_variant_episode_mapping_mismatch(tmp_path:
 
     with pytest.raises(DatasetValidationError, match="mapping"):
         validate_release_marker(marker, subtasks, full_prompt)
+
+
+@pytest.mark.parametrize("variant", ["subtasks", "full_prompt"])
+def test_release_marker_rejects_dataset_root_symlink(tmp_path: Path, variant: str) -> None:
+    _source, subtasks, full_prompt, marker = _publish_filtered_fixture(tmp_path)
+    dataset = {"subtasks": subtasks, "full_prompt": full_prompt}[variant]
+    target = tmp_path / f"{variant}-target"
+    dataset.rename(target)
+    dataset.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(DatasetValidationError, match="dataset root.*symlink"):
+        validate_release_marker(marker, subtasks, full_prompt)
+
+
+def test_export_both_validates_temporary_marker_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "release.json"
+    validated_markers: list[Path] = []
+
+    def fail_precommit_validation(
+        candidate: Path,
+        _subtasks: Path,
+        _full_prompt: Path,
+    ) -> dict[str, object]:
+        validated_markers.append(candidate)
+        assert candidate != marker
+        assert not annotations_module._path_lexists(marker)
+        raise DatasetValidationError("forced precommit release validation failure")
+
+    monkeypatch.setattr(annotations_module, "validate_release_marker", fail_precommit_validation)
+
+    with pytest.raises(DatasetValidationError, match="forced precommit release validation failure"):
+        export_both(
+            source,
+            workbook,
+            subtasks,
+            full_prompt,
+            direction_filter="left",
+            expected_direction_counts=(1, 1),
+            release_marker_path=marker,
+        )
+
+    assert validated_markers
+    assert not subtasks.exists()
+    assert not full_prompt.exists()
+    assert not annotations_module._path_lexists(marker)
+
+
+def test_export_both_does_not_clobber_raced_release_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "release.json"
+    raced_value = b"raced marker\n"
+    real_link = annotations_module.os.link
+
+    def race_marker_before_link(
+        source_path: Path,
+        destination_path: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        assert Path(destination_path) == marker
+        marker.write_bytes(raced_value)
+        real_link(source_path, destination_path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(annotations_module.os, "link", race_marker_before_link)
+
+    with pytest.raises(AnnotationError, match="release marker"):
+        export_both(
+            source,
+            workbook,
+            subtasks,
+            full_prompt,
+            direction_filter="left",
+            expected_direction_counts=(1, 1),
+            release_marker_path=marker,
+        )
+
+    assert marker.read_bytes() == raced_value
+    assert not subtasks.exists()
+    assert not full_prompt.exists()
+
+
+def test_export_both_closes_marker_descriptor_and_preserves_primary_write_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "release.json"
+    marker_descriptors: list[int] = []
+    real_mkstemp = annotations_module.tempfile.mkstemp
+    real_unlink = Path.unlink
+
+    def record_marker_descriptor(*args: object, **kwargs: object) -> tuple[int, str]:
+        descriptor, temporary = real_mkstemp(*args, **kwargs)
+        if kwargs.get("prefix") == f".{marker.name}.":
+            marker_descriptors.append(descriptor)
+        return descriptor, temporary
+
+    def fail_fdopen(*_args: object, **_kwargs: object) -> None:
+        raise OSError("forced marker fdopen failure")
+
+    def fail_marker_temp_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+        if path.name.startswith(f".{marker.name}."):
+            raise OSError("forced marker temp cleanup failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(annotations_module.tempfile, "mkstemp", record_marker_descriptor)
+    monkeypatch.setattr(annotations_module.os, "fdopen", fail_fdopen)
+    monkeypatch.setattr(Path, "unlink", fail_marker_temp_cleanup)
+
+    with pytest.raises(OSError, match="forced marker fdopen failure"):
+        export_both(
+            source,
+            workbook,
+            subtasks,
+            full_prompt,
+            direction_filter="left",
+            expected_direction_counts=(1, 1),
+            release_marker_path=marker,
+        )
+
+    assert marker_descriptors
+    for descriptor in marker_descriptors:
+        with pytest.raises(OSError):
+            annotations_module.os.fstat(descriptor)
+    assert not subtasks.exists()
+    assert not full_prompt.exists()
+    assert not annotations_module._path_lexists(marker)
+
+
+@pytest.mark.parametrize("failure_phase", ["tree", "parent"])
+def test_export_both_does_not_commit_marker_before_dataset_durability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "release.json"
+    marker_commit_attempted = False
+    real_link = annotations_module.os.link
+
+    def record_marker_link(*args: object, **kwargs: object) -> None:
+        nonlocal marker_commit_attempted
+        marker_commit_attempted = True
+        real_link(*args, **kwargs)
+
+    if failure_phase == "tree":
+
+        def fail_tree_fsync(_path: Path) -> None:
+            raise OSError("forced tree durability failure")
+
+        monkeypatch.setattr(annotations_module, "_fsync_tree", fail_tree_fsync, raising=False)
+    else:
+        monkeypatch.setattr(annotations_module, "_fsync_tree", lambda _path: None, raising=False)
+        directory_fsync_calls = 0
+
+        def fail_first_parent_fsync(_path: Path) -> None:
+            nonlocal directory_fsync_calls
+            directory_fsync_calls += 1
+            if directory_fsync_calls == 1:
+                raise OSError("forced parent durability failure")
+
+        monkeypatch.setattr(
+            annotations_module,
+            "_fsync_directory",
+            fail_first_parent_fsync,
+            raising=False,
+        )
+    monkeypatch.setattr(annotations_module.os, "link", record_marker_link)
+
+    with pytest.raises(OSError, match=f"forced {failure_phase} durability failure"):
+        export_both(
+            source,
+            workbook,
+            subtasks,
+            full_prompt,
+            direction_filter="left",
+            expected_direction_counts=(1, 1),
+            release_marker_path=marker,
+        )
+
+    assert not marker_commit_attempted
+    assert not subtasks.exists()
+    assert not full_prompt.exists()
+    assert not annotations_module._path_lexists(marker)
+
+
+def test_export_both_rolls_back_outputs_when_marker_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "release.json"
+    real_fsync_directory = annotations_module._fsync_directory
+    marker_fsync_failed = False
+
+    def fail_marker_fsync_once(path: Path) -> None:
+        nonlocal marker_fsync_failed
+        if annotations_module._path_lexists(marker) and not marker_fsync_failed:
+            marker_fsync_failed = True
+            raise OSError("forced marker durability failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(annotations_module, "_fsync_directory", fail_marker_fsync_once)
+
+    with pytest.raises(OSError, match="forced marker durability failure"):
+        export_both(
+            source,
+            workbook,
+            subtasks,
+            full_prompt,
+            direction_filter="left",
+            expected_direction_counts=(1, 1),
+            release_marker_path=marker,
+        )
+
+    assert marker_fsync_failed
+    assert not subtasks.exists()
+    assert not full_prompt.exists()
+    assert not annotations_module._path_lexists(marker)
+
+
+def test_export_both_leaves_changed_outputs_and_reports_incomplete_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "release.json"
+    changed_file = subtasks / "changed-after-publication"
+
+    def mutate_output_before_failure(
+        _candidate: Path,
+        _subtasks: Path,
+        _full_prompt: Path,
+    ) -> dict[str, object]:
+        changed_file.write_text("external change", encoding="utf-8")
+        raise DatasetValidationError("forced precommit release validation failure")
+
+    monkeypatch.setattr(annotations_module, "validate_release_marker", mutate_output_before_failure)
+
+    with pytest.raises(DatasetValidationError, match="incomplete publication"):
+        export_both(
+            source,
+            workbook,
+            subtasks,
+            full_prompt,
+            direction_filter="left",
+            expected_direction_counts=(1, 1),
+            release_marker_path=marker,
+        )
+
+    assert changed_file.read_text(encoding="utf-8") == "external change"
+    assert subtasks.is_dir()
+    assert full_prompt.is_dir()
+    assert not annotations_module._path_lexists(marker)
 
 
 def test_export_both_all_preserves_legacy_schema_without_classification(tmp_path: Path) -> None:
