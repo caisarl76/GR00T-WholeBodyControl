@@ -4,19 +4,17 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable, Iterable, Mapping, Sequence
 import csv
+from datetime import datetime, timezone
 import json
 import math
 import os
+from pathlib import Path
 import re
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
-
 
 EXPECTED_TOTAL_MIB = 81559
 BASELINE_MAX_FRACTION = 0.25
@@ -55,9 +53,7 @@ def _is_int(value: object) -> bool:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
-        "+00:00", "Z"
-    )
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _normalize_processes(
@@ -66,10 +62,7 @@ def _normalize_processes(
     normalized: dict[str, list[dict[str, object]]] = {}
     for raw_gpu, processes in (processes_by_gpu or {}).items():
         gpu = str(raw_gpu)
-        values = [
-            {"pid": int(process["pid"]), "name": str(process["name"])}
-            for process in processes
-        ]
+        values = [{"pid": int(process["pid"]), "name": str(process["name"])} for process in processes]
         normalized[gpu] = sorted(values, key=lambda value: (value["pid"], value["name"]))
     return dict(sorted(normalized.items(), key=lambda item: int(item[0])))
 
@@ -127,6 +120,7 @@ def _validate_samples(samples: Sequence[Mapping[str, object]]) -> list[str]:
             or int(sample["gpu_index"]) < 0
             or int(sample["memory_used_mib"]) < 0
             or int(sample["memory_total_mib"]) <= 0
+            or int(sample["memory_total_mib"]) != EXPECTED_TOTAL_MIB
         ):
             reasons.append(f"sample schema: invalid scalar in sample {sample_index}")
             continue
@@ -137,10 +131,7 @@ def _validate_samples(samples: Sequence[Mapping[str, object]]) -> list[str]:
         seen_pids: set[int] = set()
         for process_index, process in enumerate(processes):
             if not isinstance(process, Mapping) or set(process) != _PROCESS_KEYS:
-                reasons.append(
-                    "sample schema: process "
-                    f"{sample_index}:{process_index} must use exact keys"
-                )
+                reasons.append(f"sample schema: process {sample_index}:{process_index} must use exact keys")
                 continue
             pid = process["pid"]
             memory = process["used_memory_mib"]
@@ -153,9 +144,7 @@ def _validate_samples(samples: Sequence[Mapping[str, object]]) -> list[str]:
                 or not _is_int(memory)
                 or int(memory) < 0
             ):
-                reasons.append(
-                    f"sample schema: invalid process {sample_index}:{process_index}"
-                )
+                reasons.append(f"sample schema: invalid process {sample_index}:{process_index}")
             elif int(pid) in seen_pids:
                 reasons.append(f"sample schema: duplicate PID {pid} in sample {sample_index}")
             else:
@@ -225,8 +214,7 @@ def evaluate_baseline(
     thresholds: dict[str, object] = {
         "expected_total_mib": EXPECTED_TOTAL_MIB,
         "maximum_memory_fraction": BASELINE_MAX_FRACTION,
-        "maximum_memory_used_mib_exclusive": EXPECTED_TOTAL_MIB
-        * BASELINE_MAX_FRACTION,
+        "maximum_memory_used_mib_exclusive": EXPECTED_TOTAL_MIB * BASELINE_MAX_FRACTION,
         "maximum_process_range_mib": PROCESS_RANGE_MAX_MIB,
         "maximum_aggregate_range_mib": AGGREGATE_RANGE_MAX_MIB,
     }
@@ -236,9 +224,7 @@ def evaluate_baseline(
     if valid_samples:
         for sample in valid_samples:
             if int(sample["memory_total_mib"]) != EXPECTED_TOTAL_MIB:
-                reasons.append(
-                    f"GPU {sample['gpu_index']} total memory is not {EXPECTED_TOTAL_MIB} MiB"
-                )
+                reasons.append(f"GPU {sample['gpu_index']} total memory is not {EXPECTED_TOTAL_MIB} MiB")
             if int(sample["memory_used_mib"]) >= EXPECTED_TOTAL_MIB * BASELINE_MAX_FRACTION:
                 reasons.append(f"GPU {sample['gpu_index']} exceeded baseline memory ceiling")
 
@@ -315,10 +301,7 @@ def evaluate_concurrent_gate(
     samples: Sequence[Mapping[str, object]],
     expected_pids: Mapping[str, Mapping[str, object]],
     total_mib: int = EXPECTED_TOTAL_MIB,
-    baseline_processes_by_gpu: Mapping[
-        str | int, Iterable[Mapping[str, object]]
-    ]
-    | None = None,
+    baseline_processes_by_gpu: Mapping[str | int, Iterable[Mapping[str, object]]] | None = None,
     exit_codes: Mapping[str, int] | None = None,
     health_before: Mapping[str, object] | None = None,
     health_after: Mapping[str, object] | None = None,
@@ -335,12 +318,9 @@ def evaluate_concurrent_gate(
     if timed_out:
         reasons.append("concurrent gate timeout")
     allowed: dict[int, set[tuple[int, str]]] = {
-        int(gpu): {(int(value["pid"]), str(value["name"])) for value in values}
-        for gpu, values in baseline.items()
+        int(gpu): {(int(value["pid"]), str(value["name"])) for value in values} for gpu, values in baseline.items()
     }
-    expected_by_pid = {
-        value["pid"]: (label, value["gpu_index"]) for label, value in expected.items()
-    }
+    expected_by_pid = {value["pid"]: (label, value["gpu_index"]) for label, value in expected.items()}
     timestamps: dict[str, set[int]] = {}
     peaks: dict[int, int] = {}
     for sample in valid_samples:
@@ -358,17 +338,13 @@ def evaluate_concurrent_gate(
             if pid in expected_by_pid:
                 label, expected_gpu = expected_by_pid[pid]
                 if gpu != expected_gpu:
-                    reasons.append(
-                        f"GPU mismatch for {label}: expected {expected_gpu}, observed {gpu}"
-                    )
+                    reasons.append(f"GPU mismatch for {label}: expected {expected_gpu}, observed {gpu}")
                 else:
                     live.add(pid)
             elif (pid, name) not in allowed.get(gpu, set()):
                 reasons.append(f"unexpected process PID {pid} on GPU {gpu}")
     expected_pid_set = set(expected_by_pid)
-    overlap = bool(expected_pid_set) and any(
-        expected_pid_set <= live for live in timestamps.values()
-    )
+    overlap = bool(expected_pid_set) and any(expected_pid_set <= live for live in timestamps.values())
     if not overlap:
         reasons.append("no sample proves overlap of all declared gate PIDs")
     if exit_codes is not None:
@@ -386,9 +362,7 @@ def evaluate_concurrent_gate(
         "expected_pids": expected,
         "baseline_processes_by_gpu": baseline,
         "final_processes_by_gpu": final_processes,
-        "peak_memory_used_mib_by_gpu": {
-            str(gpu): value for gpu, value in sorted(peaks.items())
-        },
+        "peak_memory_used_mib_by_gpu": {str(gpu): value for gpu, value in sorted(peaks.items())},
     }
     thresholds = {
         "expected_total_mib": EXPECTED_TOTAL_MIB,
@@ -444,9 +418,7 @@ def load_expected_pid_files(paths: Sequence[Path]) -> dict[str, dict[str, int]]:
     return result
 
 
-def parse_exit_file_specs(
-    specs: Sequence[str], *, expected_labels: set[str]
-) -> dict[str, Path]:
+def parse_exit_file_specs(specs: Sequence[str], *, expected_labels: set[str]) -> dict[str, Path]:
     result: dict[str, Path] = {}
     seen_paths: set[Path] = set()
     for spec in specs:
@@ -501,14 +473,15 @@ def collect_samples(
     start = monotonic()
     deadline = start
     samples: list[dict[str, object]] = []
-    for _ in range(duration_seconds):
+    for sample_index in range(duration_seconds):
         if monotonic() - start >= timeout_seconds:
             return samples, True
         samples.extend(snapshot(gpu_indices))
-        deadline += 1.0
-        delay = deadline - monotonic()
-        if delay > 0:
-            sleep(delay)
+        if sample_index + 1 < duration_seconds:
+            deadline += 1.0
+            delay = deadline - monotonic()
+            if delay > 0:
+                sleep(delay)
     return samples, False
 
 
@@ -635,9 +608,7 @@ def snapshot_gpus(gpu_indices: tuple[int, ...]) -> list[dict[str, object]]:
                 "memory_used_mib": _parse_int(row[2]),
                 "memory_total_mib": _parse_int(row[3]),
                 "utilization_gpu_percent": _parse_int(row[4]),
-                "processes": sorted(
-                    processes_by_uuid.get(row[1], []), key=lambda value: int(value["pid"])
-                ),
+                "processes": sorted(processes_by_uuid.get(row[1], []), key=lambda value: int(value["pid"])),
             }
         )
     if {int(sample["gpu_index"]) for sample in samples} != requested:
@@ -708,9 +679,7 @@ def _collect_concurrent(
         elif not expected and all(path.exists() for path in pid_paths):
             try:
                 expected = load_expected_pid_files(pid_paths)
-                exit_specs = parse_exit_file_specs(
-                    exit_specs_raw, expected_labels=set(expected)
-                )
+                exit_specs = parse_exit_file_specs(exit_specs_raw, expected_labels=set(expected))
             except GpuGateError as error:
                 errors.append(str(error))
                 return samples, prelaunch, expected, exit_codes, False, errors
@@ -814,9 +783,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.duration_seconds is not None:
                 raise GpuGateError("concurrent mode does not accept --duration-seconds")
             if args.prelaunch_seconds is None or args.post_exit_seconds is None:
-                raise GpuGateError(
-                    "concurrent mode requires --prelaunch-seconds and --post-exit-seconds"
-                )
+                raise GpuGateError("concurrent mode requires --prelaunch-seconds and --post-exit-seconds")
             if not args.expected_pid_file or not args.exit_file:
                 raise GpuGateError("concurrent mode requires PID and exit files")
             (
