@@ -14,7 +14,15 @@
 
 The approved design is [2026-08-18-pnp-trash-cosmos-curation-design.md](/home/jihun/work/GR00T-WholeBodyControl/docs/superpowers/specs/2026-08-18-pnp-trash-cosmos-curation-design.md). Its frozen prompt strings, Cosmos v2 request/response schema, state machines, artifact/provenance schemas, publication order, and acceptance gates are normative. If this plan abbreviates a field list, the approved design wins.
 
-Implementation changes belong in `/home/jihun/work/lerobot-dataset-visualizer` unless a step explicitly names the current GR00T-WholeBodyControl repository. Do not modify `/home/jihun/work/Isaac-GR00T`; it is a validation dependency at commit `626af89` or the exact commit recorded when export runs.
+Implementation changes belong in the clean feature worktree
+`/home/jihun/work/GR00T-WholeBodyControl/worktrees/lerobot-dataset-visualizer-pnp-trash`
+unless a step explicitly names the current GR00T-WholeBodyControl repository.
+Every executable command uses that value through `CURATION_REPO_ROOT`. Before
+execution, the operator supplies an independently reviewed full commit SHA;
+the runbook requires exact HEAD equality, baseline `60ef88c` ancestry, the
+canonical Git worktree root, and an empty porcelain status. Do not modify
+`/home/jihun/work/Isaac-GR00T`; it is a validation dependency at commit
+`626af89` or the exact commit recorded when export runs.
 
 The source dataset is immutable and currently has these verified properties:
 
@@ -35,18 +43,9 @@ The source dataset is immutable and currently has these verified properties:
 
 The final output is `/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_cleaned`; mutable state is `/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation`.
 
-The visualizer worktree is already dirty with user-owned changes in:
-
-```text
-src/app/[org]/[dataset]/[episode]/__tests__/fetch-data.test.ts
-src/app/[org]/[dataset]/[episode]/episode-viewer.tsx
-src/app/[org]/[dataset]/[episode]/fetch-data.ts
-src/utils/versionUtils.ts
-src/app/[org]/[dataset]/[episode]/__tests__/tab-url.test.ts
-src/app/[org]/[dataset]/[episode]/tab-url.ts
-```
-
-Never stash, reset, replace, or broadly format those changes away. Before each commit, stage explicit curation files and inspect the staged diff. This plan intentionally avoids edits to `fetch-data.ts` and `tab-url.ts`; it requires one narrow integration edit in `episode-viewer.tsx` and one destination-auth edit in `versionUtils.ts`, both after inspecting the user diff.
+The authenticated feature worktree must be clean before any runtime command.
+Never redirect this plan to the dirty primary visualizer checkout, and never
+stash, reset, or overwrite user-owned changes outside the feature worktree.
 
 ## File map
 
@@ -126,7 +125,7 @@ src/app/[org]/[dataset]/[episode]/episode-viewer.tsx
 - [ ] From the visualizer root, record the starting point without changing it:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 git status --short --branch
 git diff -- src/app/'[org]'/'[dataset]'/'[episode]'/episode-viewer.tsx \
   src/app/'[org]'/'[dataset]'/'[episode]'/fetch-data.ts \
@@ -191,8 +190,10 @@ git commit -m "test: freeze visualizer v3.1 annotation behavior"
 - [ ] Write failing tests that seed `lerobot-viz-oauth` with a sentinel token and cover the exact destination matrix:
 
 ```ts
-const protectedHf = "https://huggingface.co/datasets/acme/private/resolve/main/meta/info.json";
-const localAsset = "http://127.0.0.1:8000/api/local-datasets/local/pnp_trash/resolve/main/meta/info.json";
+const protectedHf =
+  "https://huggingface.co/datasets/acme/private/resolve/main/meta/info.json";
+const localAsset =
+  "http://127.0.0.1:8000/api/local-datasets/local/pnp_trash/resolve/main/meta/info.json";
 
 expect(authHeaders(protectedHf)).toEqual({
   Authorization: "Bearer sentinel-hf-token",
@@ -215,7 +216,9 @@ bun test src/utils/__tests__/auth.test.ts src/utils/__tests__/parquetUtils.test.
 - [ ] Implement one shared predicate and make every caller pass its concrete destination:
 
 ```ts
-export function isAuthenticatedHfDestination(destination: string | URL): boolean {
+export function isAuthenticatedHfDestination(
+  destination: string | URL,
+): boolean {
   try {
     const url = destination instanceof URL ? destination : new URL(destination);
     return url.protocol === "https:" && url.hostname === "huggingface.co";
@@ -328,7 +331,6 @@ git commit -m "feat: serve registered local LeRobot assets safely"
 - Create: `backend/tests/test_curation_db.py`
 
 - [ ] Write failing tests that open multiple independent connections and prove:
-
   - `journal_mode=WAL`, `foreign_keys=ON`, `synchronous=FULL`, and a 5,000 ms busy timeout;
   - migrations are transactional and idempotent through `PRAGMA user_version`;
   - two updates with the same `expected_revision` yield one commit and one optimistic conflict;
@@ -477,7 +479,6 @@ git commit -m "feat: freeze Cosmos trash annotation contract"
 - Create: `backend/tests/test_artifacts.py`
 
 - [ ] Build a synthetic 50 Hz parquet/video fixture and write failing sampling tests for the approved alignment proof:
-
   - `frame_index[i] == i`;
   - finite timestamps within `1/(2F)` of `i/F`;
   - video stream rate within `1e-6` of `F`;
@@ -495,13 +496,18 @@ For the real 50 Hz fixture, expected sampled indices begin `[0, 25, 50, 75]` and
 ```json
 {
   "model": "cosmos3-nano-test",
-  "messages": [{
-    "role": "user",
-    "content": [
-      {"type": "video_url", "video_url": {"url": "data:video/jpeg;base64,YWJjZA==,ZWZnaA=="}},
-      {"type": "text", "text": "the frozen Cosmos v2 prompt"}
-    ]
-  }],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "video_url",
+          "video_url": { "url": "data:video/jpeg;base64,YWJjZA==,ZWZnaA==" }
+        },
+        { "type": "text", "text": "the frozen Cosmos v2 prompt" }
+      ]
+    }
+  ],
   "temperature": 0,
   "seed": 0,
   "max_completion_tokens": 4096,
@@ -677,7 +683,6 @@ bun add --dev @testing-library/react @testing-library/user-event happy-dom
 Configure Bun to preload `src/test-setup.ts`; install Happy DOM globals and Testing Library cleanup there.
 
 - [ ] Write failing proxy tests that set `CURATION_BACKEND_URL` and `CURATION_BEARER_TOKEN`, invoke GET/POST/PATCH handlers, and assert:
-
   - only relative paths under `/api/curation/` are forwarded;
   - query strings, method, content type, body, status, and JSON are preserved;
   - client `Authorization` is discarded;
@@ -734,7 +739,6 @@ git commit -m "feat: add secure frontend curation transport"
 - [ ] Implement the timeline as six controlled integer transition handles over `[0, frameCount-1]`. Use `useTime().currentTime` and `seek(frameTimestamp)` from the existing shared player context. Pointer updates snap through the backend-provided source timestamps; keyboard nudges move exactly one source frame and cannot cross neighboring handles or create an empty span.
 
 - [ ] Implement the workspace with explicit modes and lock behavior:
-
   - `task_index` is the default annotation mode only when `repoId === "local/pnp_trash"` and `codebase_version === "v2.1"`;
   - the existing v3.1 atom editor remains the default and unchanged for every other dataset;
   - approved episodes render read-only until `Reopen` succeeds;
@@ -799,7 +803,6 @@ git commit -m "feat: add task-index curation workspace"
 - [ ] For each untouched column, assert schema-field equality, `pyarrow.ChunkedArray.combine_chunks().equals`, canonical Arrow IPC hash equality, row order, null positions, and list shapes. Do not reuse the legacy `_materialize_tree` hardlink path. Copy every carried asset as an independent regular file; require a different `(st_dev, st_ino)` and identical SHA-256, including MP4s. Reject source symlinks rather than reproducing them.
 
 - [ ] Write exact output metadata tests:
-
   - `info.json` totals, splits, paths, counts, and existing feature definitions;
   - `episodes.jsonl` with contiguous output indices, exact lengths, and seven expanded prompts in step order;
   - canonical `tasks.jsonl` with no unreferenced task;
@@ -899,7 +902,6 @@ No provenance field may reference a not-yet-existing report. The workspace-only 
 - [ ] Implement a small `ctypes` wrapper around Linux libc `renameat2` using `AT_FDCWD=-100` and `RENAME_NOREPLACE=1`. There is no `os.replace`, plain rename, check-then-rename, or copy fallback. Unsupported syscall/filesystem is fatal. `EEXIST` preserves staging and the competing destination and records `publish_destination_exists`.
 
 - [ ] Write process/barrier publication tests for:
-
   - successful atomic rename, absent staging afterward, then parent fsync before `published` commit;
   - another process creating an empty final directory immediately before rename;
   - another process creating a final directory plus sentinel bytes immediately before rename;
@@ -943,6 +945,7 @@ git commit -m "feat: validate and atomically publish curated datasets"
 - [ ] Document every runtime variable, its secrecy, validation, and owning process. Use this non-secret example mapping verbatim:
 
 ```bash
+export CURATION_REPO_ROOT=/home/jihun/work/GR00T-WholeBodyControl/worktrees/lerobot-dataset-visualizer-pnp-trash
 export CURATION_DATASET_ALIASES_JSON='{"local/pnp_trash":"/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash"}'
 export CURATION_WORKSPACE=/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation
 export CURATION_OUTPUT=/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_cleaned
@@ -954,15 +957,28 @@ export ISAAC_GROOT_ROOT=/home/jihun/work/Isaac-GR00T
 
 Document `CURATION_BEARER_TOKEN`, `COSMOS_BASE_URL`, `COSMOS_MODEL`, `COSMOS_API_KEY_ENV`, and `COSMOS_ENDPOINT_IDENTITY` by variable name only. Require their actual values to come from the operator's existing server/runtime configuration; do not commit them or expose them through `NEXT_PUBLIC_*`.
 
+Document and test the process-specific loaders: FastAPI uses full
+`CurationSettings`; the worker uses `WorkerSettings` without bearer, output,
+browser origin, or Isaac root; the exporter uses `ExportSettings` without
+bearer, Cosmos base/API-key name/target secret, browser origin, or output.
+Aliases and workspace remain canonical and separated in every loader.
+Document and test `env -i` launchers: the worker receives only its settings and
+the dynamic target credential, while the exporter receives neither the bearer
+nor Cosmos base/API-key name/dynamic target secret from the ambient shell.
+Reject dynamic key-target collisions with inherited process names,
+`CURATION_*`/`NEXT_PUBLIC_*`, or the named Cosmos/Isaac settings before a
+backend or worker reads or forwards the target; a distinct conventional target
+such as `COSMOS_API_KEY` remains valid.
+
 - [ ] Document exact startup commands:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 bun run dev --hostname 127.0.0.1 --port 3000
 ```
 
@@ -973,7 +989,7 @@ Use package-relative imports and keep this repository-root `backend.app:app` com
 - [ ] Run the complete backend gate:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/python -m pytest -q backend/tests
 ```
 
@@ -982,11 +998,13 @@ Expected: PASS, including the v3.1 regression module.
 - [ ] Run the complete frontend gate:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
-bun run format && bun run validate
+cd "$CURATION_REPO_ROOT"
+bun run format:check && bun run validate
 ```
 
-Expected: PASS.
+Expected: PASS without rewriting the checkout. Re-run exact approved HEAD and
+`git status --porcelain --untracked-files=all` authentication after install and
+static gates, before starting runtime.
 
 - [ ] Run a local-asset integration smoke with the backend bound to loopback. Verify `info.json`, a parquet footer range, an MP4 range, `HEAD`, traversal rejection, and authorization rejection. Then open:
 
@@ -1014,15 +1032,14 @@ git commit -m "docs: add trash curation operations runbook"
 - Write only under: `/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation`
 - Read only: `/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash`
 
-- [ ] Start the configured FastAPI and Next.js services and open the workspace. Confirm the displayed source fingerprint matches the user-approved 2026-08-28 190-file manifest, including immutable ancillary `pnp_trash.xlsx`, and the review summary is 92 `pending` on a fresh workspace.
+- [ ] Start the configured FastAPI and Next.js services and open the workspace. Configured FastAPI startup creates the canonical source manifest and initializes `curation.sqlite3` before serving. Confirm the displayed source fingerprint matches the user-approved 2026-08-28 190-file manifest, including immutable ancillary `pnp_trash.xlsx`, and the review summary is 92 `pending` on a fresh workspace. Task 14's temporary tests do not complete this real approved-source loopback/browser smoke; it remains pending until secure runtime configuration is loaded here.
 
-- [ ] Run Cosmos capability preflight and a single representative episode smoke. Inspect `request.json`, response text, parsed v2 result, sampled frame indices/timestamps, proposal contact sheet, and UI rendering. Confirm the source FPS in `media_io_kwargs` is 50 and the sample cadence is 2 fps.
+- [ ] Run Cosmos capability preflight and pin source episode 4 for the representative smoke. Before creating its batch, require the operator-provided lexical source path to equal the configured `local/pnp_trash` alias, resolve that path to its existing canonical directory (supporting the approved `outputs` ancestor symlink), and pass the canonical path to the registered-source validator; changed aliases, dangling targets, and non-directory targets fail before the POST. Authenticate its approved-source metadata, parquet, and video through the persisted manifest and production alignment proof: exactly 2,060 frames at 50 fps, 41.2 seconds, 83 samples, within 120 seconds/240 samples. Episode 0 is ineligible at 6,435 frames/128.7 seconds. The smoke passes only with job state `completed`, a status `job_id` exactly equal to the nonempty ID returned by that smoke POST, exactly one `succeeded` attempt, zero `manual_only`/`retryable`, and active-proposal coverage one. Capture the exact attempt ID; require regular non-symlink `request.json`, initial `response.txt`, optional `repair-response.txt`, `parsed.json`, proposal contact-sheet PNG, and receipt. Resolve the authoritative raw response through `parsed.raw_response_sha256`; enforce the exact closed request/parsed schemas, rerun `prove_alignment_and_select` over the authenticated full float parquet timeline, compare exact selected indices and actual `p[i]` timestamps, require the registered source-video hash, and bind the receipt to dataset/source/proposal/episode/transition frames/path/PNG hash and size. Inspect the authoritative raw response, parsed v2 result, sampling, contact sheet, and UI rendering. Enter the runbook's exact operator confirmation and freeze its canonical evidence authority bound to the smoke job and attempt IDs.
 
-- [ ] Create a batch for all 92 episodes through `POST /api/curation/batches`, copy the returned exact command, and run:
+- [ ] Only after the shell contains the exact evidence/UI confirmation and canonical authority bound to the successful smoke job and attempt IDs, refetch and revalidate that smoke and all frozen artifact hashes, again requiring its status `job_id` to equal the confirmed smoke POST ID. Then create a batch for all 92 episodes through `POST /api/curation/batches`; before launching its worker, require the full status to carry the exact nonempty job ID just returned by the POST and exactly 92 closed queued attempt rows, compare the fresh configuration's source/prompt/model/endpoint/transport/sampling/limits with the smoke authority, and require the exact episode set `0..91`. Run:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
-backend/.venv/bin/python backend/curation_worker.py \
+run_curation_worker \
   --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
   run --job-id "$JOB_ID"
 ```
@@ -1030,7 +1047,6 @@ backend/.venv/bin/python backend/curation_worker.py \
 Before executing, copy the API's returned job ID into `JOB_ID` and require `test -n "$JOB_ID"`. Monitor the persisted API status; use the documented cancel or retry route only for explicit operator decisions. Transport/schema failures become `manual_only`, never automatic rejection.
 
 - [ ] In the visualizer, manually review every source episode. For each episode:
-
   1. inspect the full video and proposal/contact sheet;
   2. reject corrupt, incomplete, unsuccessful, or out-of-order attempts, optionally recording a reason; or
   3. enter normalized object text, pickup hand, turn direction, and six frame starts;
@@ -1065,9 +1081,8 @@ invalid approved_keep = 0
 - [ ] Run the returned export command only after verifying its UUID variable is nonempty:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
 test -n "$EXPORT_ID"
-backend/.venv/bin/python backend/curation_export.py \
+run_curation_exporter \
   --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
   run --export-id "$EXPORT_ID"
 ```
@@ -1093,7 +1108,7 @@ Any failure must leave the source and final path unchanged and retain staging/re
 ```bash
 test -d /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_cleaned
 test ! -w /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_cleaned/meta/info.json
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/python -m pytest -q backend/tests
 bun run validate
 ```
@@ -1101,7 +1116,6 @@ bun run validate
 Then validate every line of `meta/curation_checksums.sha256`, confirm the source manifest is unchanged, and inspect structural, GR00T stats, loader, provenance, and final-consistency reports. The loader report must show all retained episodes and exactly seven prompt runs in order, frame-for-frame equal to parquet task indices.
 
 - [ ] Final handoff records:
-
   - source and final canonical paths;
   - source manifest SHA-256 and approval snapshot SHA-256;
   - kept/rejected counts and retained frame count;

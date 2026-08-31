@@ -11,8 +11,9 @@ training-ready dataset at `outputs/pnp_trash_cleaned`. The workflow must:
 
 1. remove unsuccessful episodes through explicit human decisions;
 2. use the H100-hosted Cosmos3-Nano Reasoner to propose subtask boundaries;
-3. let a curator correct and approve every proposal in
-   `/home/jihun/work/lerobot-dataset-visualizer`;
+3. let a curator correct and approve every proposal in the authenticated
+   feature worktree at
+   `/home/jihun/work/GR00T-WholeBodyControl/worktrees/lerobot-dataset-visualizer-pnp-trash`;
 4. assign exactly one approved subtask prompt to every retained frame through
    the existing `task_index` column; and
 5. verify the result with the GR00T N1.7 `LeRobotEpisodeLoader` used for
@@ -95,8 +96,8 @@ without separately editing segment end times.
 
 ### Visualizer frontend
 
-Extend the existing **Annotations** tab in
-`/home/jihun/work/lerobot-dataset-visualizer` with a `task_index` curation mode
+Extend the existing **Annotations** tab in the checkout selected by
+`CURATION_REPO_ROOT` with a `task_index` curation mode
 for configured v2.1 datasets. Reuse the existing episode sidebar,
 synchronized video player, playback bar, annotation timeline, and frame
 snapping.
@@ -115,8 +116,12 @@ The curation workspace contains:
 - validation and stale-approval warnings; and
 - `Save draft`, `Approve & next episode`, and `Reopen` actions.
 
-The current uncommitted visualizer changes are user-owned. Implementation must
-inspect and patch around them, never discard or overwrite them.
+Runtime commands authenticate the clean feature worktree at
+`/home/jihun/work/GR00T-WholeBodyControl/worktrees/lerobot-dataset-visualizer-pnp-trash`.
+The operator supplies an independently reviewed full commit SHA; preflight
+requires exact HEAD equality, baseline `60ef88c` ancestry, canonical worktree
+identity, and an empty porcelain status. The dirty primary checkout is never a
+runtime authority and remains untouched.
 
 ### Visualizer backend
 
@@ -143,6 +148,24 @@ Runtime configuration is explicit:
 - API-key environment-variable name;
 - request timeouts and retry limits; and
 - an allowlist containing only the visualizer browser origin.
+
+Runtime loading is process-specific. FastAPI uses full `CurationSettings` and
+alone receives the curation bearer, final output, browser origin, and backend
+host. The worker uses `WorkerSettings`: dataset aliases, workspace, Cosmos
+base/model/API-key environment-variable name/endpoint identity, and frozen
+worker limits. It reads the variable named by the API-key setting only when it
+builds a Cosmos attempt processor. The exporter uses `ExportSettings`: aliases,
+workspace, Isaac-GR00T root, Cosmos model, and endpoint identity. It receives
+no bearer, Cosmos base URL, API-key environment-variable name, or target
+secret. All three validate canonical alias/workspace separation.
+Operator worker and exporter launches use explicit `env -i` allowlists. The
+worker allowlist contains only its settings plus the dynamic target credential;
+the exporter allowlist excludes the bearer, Cosmos base URL, API-key variable
+name, and the dynamic target credential even when they exist in the parent
+shell. The API-key target name must be a syntactically valid, distinct
+environment name (for example `COSMOS_API_KEY`); both FastAPI and worker reject
+collisions with inherited process names, `CURATION_*`/`NEXT_PUBLIC_*`, or the
+named Cosmos and Isaac settings before reading or forwarding the target.
 
 Absolute source paths are never accepted from a browser request or embedded in
 a browser URL.
@@ -258,7 +281,7 @@ Cosmos artifacts use explicit JSON schemas rather than ad hoc dictionaries:
   count/duration, target FPS 2, selected frame indices and timestamps, decoder
   name/version, RGB/resize rules, and JPEG settings, plus the exact request
   body with the base64 payload replaced by `{ "redacted": "base64",
-  "sha256": "...", "bytes": N }`.
+"sha256": "...", "bytes": N }`.
 - `parsed.json` has `schema_version: 1`, `contract_version`, the schema-valid
   `model_response` object, exactly six integer-or-null
   `snapped_transition_frames` corresponding to steps 2 through 7, an array of
@@ -593,13 +616,76 @@ timing. For example, if leaning starts but the drop and recovery never occur:
   "schema_version": 2,
   "episode_complete": false,
   "segments": [
-    { "step": 1, "phase": "approach_brown_table", "status": "completed", "start_s": 0.0, "end_s": 8.6, "caption": "approach the brown table", "confidence": 0.93, "evidence": "the robot stops at the table" },
-    { "step": 2, "phase": "pick_up_object", "status": "completed", "start_s": 8.6, "end_s": 15.1, "caption": "pick up the object", "confidence": 0.91, "evidence": "the object is lifted" },
-    { "step": 3, "phase": "turn_to_find_black_trash_bin", "status": "completed", "start_s": 15.1, "end_s": 18.4, "caption": "turn to find the black trash bin", "confidence": 0.88, "evidence": "the bin becomes visible" },
-    { "step": 4, "phase": "approach_black_trash_bin", "status": "completed", "start_s": 18.4, "end_s": 28.2, "caption": "approach the black trash bin", "confidence": 0.94, "evidence": "the robot reaches the bin" },
-    { "step": 5, "phase": "lean_down_to_black_trash_bin", "status": "partial", "start_s": 28.2, "end_s": 31.0, "caption": "lean down to the black trash bin", "confidence": 0.62, "evidence": "the camera lowers but the motion is interrupted" },
-    { "step": 6, "phase": "drop_object_into_black_trash_bin", "status": "not_observed", "start_s": null, "end_s": null, "caption": "drop the object into the black trash bin", "confidence": null, "evidence": null },
-    { "step": 7, "phase": "stand_straight", "status": "not_observed", "start_s": null, "end_s": null, "caption": "go to a standing straight pose", "confidence": null, "evidence": null }
+    {
+      "step": 1,
+      "phase": "approach_brown_table",
+      "status": "completed",
+      "start_s": 0.0,
+      "end_s": 8.6,
+      "caption": "approach the brown table",
+      "confidence": 0.93,
+      "evidence": "the robot stops at the table"
+    },
+    {
+      "step": 2,
+      "phase": "pick_up_object",
+      "status": "completed",
+      "start_s": 8.6,
+      "end_s": 15.1,
+      "caption": "pick up the object",
+      "confidence": 0.91,
+      "evidence": "the object is lifted"
+    },
+    {
+      "step": 3,
+      "phase": "turn_to_find_black_trash_bin",
+      "status": "completed",
+      "start_s": 15.1,
+      "end_s": 18.4,
+      "caption": "turn to find the black trash bin",
+      "confidence": 0.88,
+      "evidence": "the bin becomes visible"
+    },
+    {
+      "step": 4,
+      "phase": "approach_black_trash_bin",
+      "status": "completed",
+      "start_s": 18.4,
+      "end_s": 28.2,
+      "caption": "approach the black trash bin",
+      "confidence": 0.94,
+      "evidence": "the robot reaches the bin"
+    },
+    {
+      "step": 5,
+      "phase": "lean_down_to_black_trash_bin",
+      "status": "partial",
+      "start_s": 28.2,
+      "end_s": 31.0,
+      "caption": "lean down to the black trash bin",
+      "confidence": 0.62,
+      "evidence": "the camera lowers but the motion is interrupted"
+    },
+    {
+      "step": 6,
+      "phase": "drop_object_into_black_trash_bin",
+      "status": "not_observed",
+      "start_s": null,
+      "end_s": null,
+      "caption": "drop the object into the black trash bin",
+      "confidence": null,
+      "evidence": null
+    },
+    {
+      "step": 7,
+      "phase": "stand_straight",
+      "status": "not_observed",
+      "start_s": null,
+      "end_s": null,
+      "caption": "go to a standing straight pose",
+      "confidence": null,
+      "evidence": null
+    }
   ],
   "missing_steps": [5, 6, 7],
   "uncertainties": ["the episode ends during the lean"]
@@ -838,8 +924,7 @@ never starts a background thread, task, or subprocess. `POST
 operator starts that job with exactly:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
-backend/.venv/bin/python backend/curation_worker.py \
+run_curation_worker \
   --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
   run --job-id <job-uuid>
 ```
@@ -854,8 +939,7 @@ exits. A second `run` never attaches to an existing job.
 After a process or workstation crash, resume the same persisted job with:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
-backend/.venv/bin/python backend/curation_worker.py \
+run_curation_worker \
   --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
   resume --job-id <job-uuid>
 ```
@@ -871,6 +955,38 @@ exit with the job still resumable. Exit status is `0` for a terminal nonfailed
 job, `1` for job `failed`, `2` for arguments/configuration/state errors, `3`
 for a live-lease conflict, and `130` for a handled interrupt. Retry endpoints
 return a new child-job ID, which is launched with the same `run` command.
+
+Before the full 92-episode batch, source episode 4 is the pinned representative
+and must pass a strict capability smoke. Its approved-source facts are 2,060
+parquet rows and video frames at 50 fps, duration 41.2 seconds, and 83
+deterministic 2 fps samples. A read-only preflight authenticates those facts
+against the persisted source manifest and reruns the production alignment
+proof before the smoke batch can be created. The operator-provided lexical
+source path must equal the configured `local/pnp_trash` alias value; after that
+binding succeeds, the runbook resolves the path to its existing canonical
+directory and passes that canonical authority to the representative validator.
+An ancestor symlink such as `outputs` is therefore supported without weakening
+the registered canonical-root check; a changed alias, dangling target, or
+non-directory target fails before batch creation. Episode 0 is not eligible because
+its 6,435 frames produce a 128.7-second duration above the 120-second model
+limit. The episode-4 smoke requires terminal state `completed`, exactly one
+`succeeded` attempt, zero `manual_only` or `retryable`, and active-proposal coverage one.
+The operator captures the exact attempt ID; verifies regular non-symlink
+request, raw response, parsed response, proposal contact-sheet PNG, and receipt
+artifacts; reruns `prove_alignment_and_select` over the authenticated full
+float parquet timeline and validates the exact selected indices and actual
+`p[i]` timestamps plus the registered source-video hash and redacted payload
+descriptor against the closed production request schema; and inspects the raw
+response, parsed proposal, contact sheet, and UI. The full-batch POST is gated
+on an explicit confirmation bound to that smoke job and attempt ID. Both the
+initial evidence validation and the pre-full-batch revalidation require the
+status `job_id` to equal the exact nonempty ID returned by the smoke POST. The gate
+freezes canonical JSON authority over the exact job/configuration and evidence
+hashes, then refetches and revalidates the completed smoke and evidence before
+the POST. Before launching the new worker it requires the refetched full status
+to identify the exact nonempty job ID just returned by the POST, contain
+exactly 92 closed queued attempt rows, and validates the fresh job's exact
+source/prompt/model/endpoint/transport/sampling/limits and episode set `0..91`.
 
 - **Start:** `POST /api/curation/batches` validates endpoint/model capability,
   freezes the source fingerprint, prompt/sampling/limit configuration, and the
@@ -1005,7 +1121,9 @@ need a schema-version increment:
     "dataset_alias": "local/pnp_trash",
     "manifest_sha256": "<64 lowercase hex>",
     "file_count": 190,
-    "original_tasks": [{ "task_index": 0, "task": "<original whole-task prompt>" }]
+    "original_tasks": [
+      { "task_index": 0, "task": "<original whole-task prompt>" }
+    ]
   },
   "approval": {
     "snapshot_sha256": "<64 lowercase hex>",
@@ -1015,56 +1133,82 @@ need a schema-version increment:
   },
   "software": {
     "exporter_version": "<version>",
-    "repositories": [{
-      "name": "lerobot-dataset-visualizer",
-      "commit": "<40 lowercase hex>",
-      "dirty": false,
-      "tracked_diff_sha256": null,
-      "untracked_files": []
-    }]
+    "repositories": [
+      {
+        "name": "lerobot-dataset-visualizer",
+        "commit": "<40 lowercase hex>",
+        "dirty": false,
+        "tracked_diff_sha256": null,
+        "untracked_files": []
+      }
+    ]
   },
   "cosmos": {
     "model": "<configured model id>",
     "endpoint_identity": "<non-secret configured label>",
     "contract_version": "pnp-trash-cosmos-v2",
-    "sampling": { "target_fps": 2, "resize_max_long_edge": 640, "jpeg_quality": 85 },
-    "limits": { "max_duration_s": 120, "max_frames": 240, "max_payload_bytes": 67108864 },
+    "sampling": {
+      "target_fps": 2,
+      "resize_max_long_edge": 640,
+      "jpeg_quality": 85
+    },
+    "limits": {
+      "max_duration_s": 120,
+      "max_frames": 240,
+      "max_payload_bytes": 67108864
+    },
     "job_ids": ["<uuid>"],
     "attempt_ids": ["<uuid>"],
-    "workspace_artifacts": [{ "artifact_id": "<uuid>", "sha256": "<64 lowercase hex>" }]
+    "workspace_artifacts": [
+      { "artifact_id": "<uuid>", "sha256": "<64 lowercase hex>" }
+    ]
   },
   "export": {
     "export_id": "<uuid>",
     "created_at_utc": "<RFC 3339 UTC>",
-    "source_to_output": [{ "source_episode_index": 3, "output_episode_index": 0 }]
+    "source_to_output": [
+      { "source_episode_index": 3, "output_episode_index": 0 }
+    ]
   },
   "episodes": {
-    "kept": [{
-      "source_episode_index": 3,
-      "output_episode_index": 0,
-      "object": "can",
-      "hand": "left",
-      "turn": "right",
-      "transition_frames": [400, 760, 910, 1400, 1660, 1810],
-      "reviewer": "<id>",
-      "revision": 4,
-      "approved_at": "<RFC 3339 UTC>"
-    }],
-    "rejected": [{
-      "source_episode_index": 4,
-      "reason": null,
-      "reviewer": "<id>",
-      "revision": 2,
-      "approved_at": "<RFC 3339 UTC>"
-    }]
+    "kept": [
+      {
+        "source_episode_index": 3,
+        "output_episode_index": 0,
+        "object": "can",
+        "hand": "left",
+        "turn": "right",
+        "transition_frames": [400, 760, 910, 1400, 1660, 1810],
+        "reviewer": "<id>",
+        "revision": 4,
+        "approved_at": "<RFC 3339 UTC>"
+      }
+    ],
+    "rejected": [
+      {
+        "source_episode_index": 4,
+        "reason": null,
+        "reviewer": "<id>",
+        "revision": 2,
+        "approved_at": "<RFC 3339 UTC>"
+      }
+    ]
   },
-  "tasks": [{ "task_index": 0, "ordering_step": 1, "prompt": "approach the brown table" }],
-  "artifacts": [{
-    "kind": "structural_report",
-    "path": "meta/curation_artifacts/structural-report.json",
-    "bytes": 1234,
-    "sha256": "<64 lowercase hex>"
-  }]
+  "tasks": [
+    {
+      "task_index": 0,
+      "ordering_step": 1,
+      "prompt": "approach the brown table"
+    }
+  ],
+  "artifacts": [
+    {
+      "kind": "structural_report",
+      "path": "meta/curation_artifacts/structural-report.json",
+      "bytes": 1234,
+      "sha256": "<64 lowercase hex>"
+    }
+  ]
 }
 ```
 
@@ -1223,7 +1367,7 @@ changes those responses or output schemas.
 The executable Python backend gate is:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/python -m pytest -q backend/tests
 ```
 
@@ -1238,12 +1382,14 @@ conflict reload, state transitions, approval locking/reopening, batch status,
 save/resume, and approve-and-next navigation. The full visualizer gate is:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
-bun run format && bun run validate
+cd "$CURATION_REPO_ROOT"
+bun run format:check && bun run validate
 ```
 
-Both commands are mandatory. The Python suite's v3.1 regression module is the
-explicit compatibility gate for the existing annotation workflow.
+Both non-mutating checks are mandatory, followed by a second exact HEAD and
+clean-worktree authentication before runtime starts. The Python suite's v3.1
+regression module is the explicit compatibility gate for the existing
+annotation workflow.
 
 ### Core structural staging gate
 
