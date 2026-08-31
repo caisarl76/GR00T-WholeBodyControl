@@ -520,6 +520,46 @@ python gear_sonic/scripts/annotate_pnp_trash_dataset.py \
   --validate-only
 ```
 
+### Publish the left-only PnP trash release
+
+The left-only release is a separately published, filtered pair. Before
+generation, all three final targets—the two output directories and the release
+marker—must be absent. Generate it with:
+
+```bash
+python gear_sonic/scripts/annotate_pnp_trash_dataset.py \
+  --dataset-path outputs/pnp_trash \
+  --annotations-path outputs/pnp_trash/pnp_trash.xlsx \
+  --direction-filter left \
+  --expected-left-episodes 44 \
+  --expected-right-episodes 28 \
+  --subtasks-output-path outputs/pnp_trash_subtasks_left_only \
+  --full-prompt-output-path outputs/pnp_trash_full_prompt_left_only \
+  --release-marker-path outputs/pnp_trash_left_only.release.json
+```
+
+Validate the already-published release without modifying it:
+
+```bash
+python gear_sonic/scripts/annotate_pnp_trash_dataset.py \
+  --dataset-path outputs/pnp_trash \
+  --annotations-path outputs/pnp_trash/pnp_trash.xlsx \
+  --direction-filter left \
+  --expected-left-episodes 44 \
+  --expected-right-episodes 28 \
+  --subtasks-output-path outputs/pnp_trash_subtasks_left_only \
+  --full-prompt-output-path outputs/pnp_trash_full_prompt_left_only \
+  --release-marker-path outputs/pnp_trash_left_only.release.json \
+  --validate-only
+```
+
+The pair is consumable only when its release marker is present and accepted as
+`complete`. Publication requires Linux filesystem support for
+`renameat2(RENAME_NOREPLACE)`, same-filesystem hard links, and directory
+`fsync`. Unmarked incomplete outputs are preserved for explicit operator
+recovery; they must not be auto-deleted or retried. There is no recovery
+command yet.
+
 ### Remove Stale SMPL Frames
 
 Teleop pauses or ZMQ frame drops create frames where `teleop.smpl_pose` is all

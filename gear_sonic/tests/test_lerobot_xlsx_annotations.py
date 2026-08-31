@@ -1995,3 +1995,81 @@ def test_cli_validate_only_reports_both_existing_outputs(
     assert '"episodes": 1' in printed
     assert '"expected_runs_per_episode": 4' in printed
     assert '"expected_runs_per_episode": 1' in printed
+
+
+def test_cli_validates_complete_left_release(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, subtasks, full_prompt, marker = _publish_filtered_fixture(tmp_path)
+
+    reports = annotation_cli_main(
+        AnnotatePnpTrashConfig(
+            dataset_path=source,
+            annotations_path=source / "pnp_trash.xlsx",
+            subtasks_output_path=subtasks,
+            full_prompt_output_path=full_prompt,
+            direction_filter="left",
+            expected_left_episodes=1,
+            expected_right_episodes=1,
+            release_marker_path=marker,
+            validate_only=True,
+        )
+    )
+
+    assert [report["episodes"] for report in reports] == [1, 1]
+    printed = capsys.readouterr().out
+    assert '"direction": "left"' in printed
+    assert '"state": "complete"' in printed
+
+
+def test_cli_left_export_rejects_broken_marker_symlink(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "pnp_trash_left_only.release.json"
+    marker.symlink_to(tmp_path / "missing-release.json")
+
+    with pytest.raises(AnnotationError, match="release marker already exists"):
+        annotation_cli_main(
+            AnnotatePnpTrashConfig(
+                dataset_path=source,
+                annotations_path=workbook,
+                subtasks_output_path=subtasks,
+                full_prompt_output_path=full_prompt,
+                direction_filter="left",
+                expected_left_episodes=1,
+                expected_right_episodes=1,
+                release_marker_path=marker,
+            )
+        )
+
+    assert not subtasks.exists()
+    assert not full_prompt.exists()
+
+
+def test_cli_all_export_ignores_release_marker_path(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "pnp_trash_left_only.release.json"
+    marker.symlink_to(tmp_path / "missing-release.json")
+
+    reports = annotation_cli_main(
+        AnnotatePnpTrashConfig(
+            dataset_path=source,
+            annotations_path=workbook,
+            subtasks_output_path=subtasks,
+            full_prompt_output_path=full_prompt,
+            release_marker_path=marker,
+        )
+    )
+
+    assert [report["variant"] for report in reports] == ["subtasks", "full_prompt"]
+    assert subtasks.is_dir()
+    assert full_prompt.is_dir()
+    for output in (subtasks, full_prompt):
+        provenance = json.loads((output / "meta/annotation_provenance.json").read_text(encoding="utf-8"))
+        assert provenance["schema_version"] == 1
