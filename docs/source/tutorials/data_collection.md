@@ -560,7 +560,8 @@ The pair is consumable only when its release marker is present and accepted as
 recovery; they must not be auto-deleted or retried. There is no recovery
 command yet. Validate-only canonicalizes output and marker paths, rejects
 symlink components, and requires the source dataset and workbook to remain
-stable throughout validation.
+stable throughout validation. Namespace components must remain non-mutating
+throughout the command.
 
 ### Remove Stale SMPL Frames
 

@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-import os
 from pathlib import Path
 import stat
 from typing import Literal
@@ -18,6 +17,7 @@ from typing import Literal
 import tyro
 
 from gear_sonic.utils.data_collection.lerobot_xlsx_annotations import (
+    AnnotationError,
     DatasetValidationError,
     dataset_manifest_sha256,
     export_both,
@@ -73,22 +73,34 @@ def _source_episode_indices(dataset_path: Path) -> set[int]:
     return episodes
 
 
-def _canonical_validation_path(path: Path) -> Path:
-    """Normalize a validation path after rejecting each existing symlink component."""
+def _normalized_artifact_path(
+    path: Path,
+    *,
+    validation: bool,
+    allow_existing_leaf: bool,
+) -> Path:
+    """Normalize an artifact path while rejecting symlink components in raw order."""
 
-    normalized = Path(os.path.abspath(path))
-    current = Path(normalized.anchor)
-    for component in normalized.parts[1:]:
+    raw_path = path.absolute()
+    components = raw_path.parts[1:]
+    current = Path(raw_path.anchor)
+    error_type = DatasetValidationError if validation else AnnotationError
+    for index, component in enumerate(components):
+        if component == ".":
+            continue
+        if component == "..":
+            current = current.parent
+            continue
         current /= component
         try:
             mode = current.lstat().st_mode
         except FileNotFoundError:
             continue
         except OSError as error:
-            raise DatasetValidationError(f"cannot inspect validation path {current}: {error}") from error
-        if stat.S_ISLNK(mode):
-            raise DatasetValidationError(f"validation path has a symlink component: {current}")
-    return normalized
+            raise error_type(f"cannot inspect artifact path {current}: {error}") from error
+        if stat.S_ISLNK(mode) and not (allow_existing_leaf and index == len(components) - 1):
+            raise error_type(f"artifact path has a symlink component: {current}")
+    return current
 
 
 def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, object]]:
@@ -107,6 +119,25 @@ def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, o
     marker_path = raw_marker if config.direction_filter == "left" else None
 
     if not config.validate_only:
+        _normalized_artifact_path(
+            raw_subtasks,
+            validation=False,
+            allow_existing_leaf=True,
+        )
+        _normalized_artifact_path(
+            raw_full_prompt,
+            validation=False,
+            allow_existing_leaf=True,
+        )
+        marker = (
+            _normalized_artifact_path(
+                marker_path,
+                validation=False,
+                allow_existing_leaf=True,
+            )
+            if marker_path is not None
+            else None
+        )
         results = export_both(
             source,
             workbook,
@@ -119,8 +150,25 @@ def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, o
         subtasks = results[0].output_path
         full_prompt = results[1].output_path
     else:
-        subtasks = _canonical_validation_path(raw_subtasks)
-        full_prompt = _canonical_validation_path(raw_full_prompt)
+        subtasks = _normalized_artifact_path(
+            raw_subtasks,
+            validation=True,
+            allow_existing_leaf=False,
+        )
+        full_prompt = _normalized_artifact_path(
+            raw_full_prompt,
+            validation=True,
+            allow_existing_leaf=False,
+        )
+        marker = (
+            _normalized_artifact_path(
+                marker_path,
+                validation=True,
+                allow_existing_leaf=False,
+            )
+            if marker_path is not None
+            else None
+        )
 
     workbook_bytes = workbook.read_bytes()
     all_annotations = load_annotations_bytes(
@@ -155,8 +203,7 @@ def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, o
         ),
     )
     payload: dict[str, object] = {"outputs": reports}
-    if marker_path is not None:
-        marker = _canonical_validation_path(marker_path)
+    if marker is not None:
         payload["release"] = validate_release_marker(marker, subtasks, full_prompt)
     try:
         current_workbook_sha256 = file_sha256(workbook)

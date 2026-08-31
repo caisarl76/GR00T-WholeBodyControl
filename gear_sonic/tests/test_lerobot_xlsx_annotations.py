@@ -2119,6 +2119,75 @@ def test_cli_validate_only_rejects_output_symlink_ancestor(tmp_path: Path) -> No
         )
 
 
+@pytest.mark.parametrize("protected_path", ["subtasks", "marker"])
+def test_cli_left_export_rejects_symlink_component_before_parent_traversal(
+    tmp_path: Path,
+    protected_path: str,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    symlink_target = tmp_path / "symlink-target"
+    symlink_target.mkdir()
+    symlink = tmp_path / "namespace-link"
+    symlink.symlink_to(symlink_target, target_is_directory=True)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "pnp_trash_left_only.release.json"
+    if protected_path == "subtasks":
+        subtasks = symlink / ".." / "subtasks"
+    else:
+        marker = symlink / ".." / "pnp_trash_left_only.release.json"
+
+    with pytest.raises(AnnotationError, match="symlink"):
+        annotation_cli_main(
+            AnnotatePnpTrashConfig(
+                dataset_path=source,
+                annotations_path=workbook,
+                subtasks_output_path=subtasks,
+                full_prompt_output_path=full_prompt,
+                direction_filter="left",
+                expected_left_episodes=1,
+                expected_right_episodes=1,
+                release_marker_path=marker,
+            )
+        )
+
+    assert not (tmp_path / "subtasks").exists()
+    assert not (tmp_path / "full_prompt").exists()
+    assert not (tmp_path / "pnp_trash_left_only.release.json").exists()
+
+
+@pytest.mark.parametrize("protected_path", ["subtasks", "marker"])
+def test_cli_validate_only_rejects_symlink_component_before_parent_traversal(
+    tmp_path: Path,
+    protected_path: str,
+) -> None:
+    source, subtasks, full_prompt, marker = _publish_filtered_fixture(tmp_path)
+    symlink_target = tmp_path / "symlink-target"
+    symlink_target.mkdir()
+    symlink = tmp_path / "namespace-link"
+    symlink.symlink_to(symlink_target, target_is_directory=True)
+    if protected_path == "subtasks":
+        subtasks = symlink / ".." / "subtasks"
+    else:
+        marker = symlink / ".." / "pnp_trash_left_only.release.json"
+
+    with pytest.raises(DatasetValidationError, match="symlink"):
+        annotation_cli_main(
+            AnnotatePnpTrashConfig(
+                dataset_path=source,
+                annotations_path=source / "pnp_trash.xlsx",
+                subtasks_output_path=subtasks,
+                full_prompt_output_path=full_prompt,
+                validate_only=True,
+                direction_filter="left",
+                expected_left_episodes=1,
+                expected_right_episodes=1,
+                release_marker_path=marker,
+            )
+        )
+
+
 def test_cli_positional_config_preserves_validate_only_field(tmp_path: Path) -> None:
     source = tmp_path / "source"
     workbook = tmp_path / "annotations.xlsx"
