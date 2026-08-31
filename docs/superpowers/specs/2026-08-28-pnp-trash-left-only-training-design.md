@@ -51,13 +51,16 @@ retains its complete trajectory, video, and four subtasks.
 
 ### Outputs and consumable publication
 
-The two final dataset paths are:
+The three final local release artifacts are:
 
 - `outputs/pnp_trash_full_prompt_left_only`
 - `outputs/pnp_trash_subtasks_left_only`
+- `outputs/pnp_trash_left_only.release.json`
 
-Both paths must be nonexistent before publication. An existing path is an
-error even when it is an empty directory.
+All three must be nonexistent before publication. The precondition uses
+`lstat`, so an existing regular file, directory, symlink, or broken symlink at
+any of these paths is an error. The exporter never overwrites a prior release
+marker.
 
 Output episodes are ordered by source episode index and renumbered from 0
 through 43. The exporter regenerates global indices, task indices, episode
@@ -127,7 +130,8 @@ release passes only if:
 
 Tests cover direction normalization and rejection, the exact 44/28 split,
 preservation of schema-1 default exports, schema-2 filtered exports,
-provenance validation, cross-variant mapping, preexisting-path rejection,
+provenance validation, cross-variant mapping, preexisting dataset-path
+rejection, preexisting marker rejection for files/directories/symlinks,
 failure before publication, and the rule that an absent or mismatched release
 marker makes a sequentially exposed pair non-consumable.
 
@@ -153,16 +157,75 @@ Use H100 source commit
 The tag `jihun/gr00t-n1.7:626af89` is descriptive only. Every container's
 effective `.Image` must equal the immutable ID.
 
-Resolve the base model locally and offline to this mounted-cache snapshot:
+Resolve the GR00T base model locally and offline to this exact snapshot:
 
 ```text
-/root/.cache/huggingface/hub/models--nvidia--GR00T-N1.7-3B/
-snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495
+/root/.cache/huggingface/hub/models--nvidia--GR00T-N1.7-3B/snapshots/2fc962b973bccdd5d8ce4f67cc63b264d6886495
 ```
 
-The launcher receives that snapshot path, not the mutable Hub name. The cache
-must contain only the verified revision expected by this design. Do not
-install packages or modify software on the server host.
+The launcher receives that snapshot path, not the mutable Hub name. The
+secondary backbone/processor is also pinned to the locally cached Cosmos
+revision:
+
+```text
+revision: 9ce19a195e423419c349abfc86fd07178b230561
+snapshot: /root/.cache/huggingface/hub/models--nvidia--Cosmos-Reason2-2B/snapshots/9ce19a195e423419c349abfc86fd07178b230561
+```
+
+The pinned upstream fine-tune CLI does not expose its model-revision and
+local-only training fields. Therefore execution uses a small reviewed launcher
+shim stored under each output root. It imports the pinned GR00T configuration
+and `run` implementation, preserves the official argument mapping, and adds
+only these effective overrides before calling `run(config)`:
+
+- `config.model.model_name` is the exact local Cosmos snapshot path;
+- `config.model.model_revision` is the exact Cosmos revision above;
+- `config.training.transformers_local_files_only=true`; and
+- `config.training.transformers_cache_dir=/root/.cache/huggingface`.
+
+The shim and its source diff against pinned `launch_finetune.py` are hashed and
+stored with the resolved command. `HF_HUB_OFFLINE=1`,
+`TRANSFORMERS_OFFLINE=1`, and `HF_DATASETS_OFFLINE=1` are mandatory for every
+probe and training process. Both model and processor must load with local-only
+settings before a smoke is allowed.
+
+The Hugging Face cache is mounted read-only. Scoped validation requires the
+two selected snapshot directories and their model-specific blobs, resolves
+every symlink, and writes a relative-path/size/SHA-256 manifest for every
+resolved file. Other cached models or revisions are permitted and are neither
+validated nor deleted. The selected manifests must be unchanged at handoff.
+Do not install packages or modify software on the server host.
+
+## Fresh-Run Namespace Invariants
+
+Fresh training is enforced structurally because the pinned experiment runner
+always calls `trainer.train(resume_from_checkpoint=True)` and the trainer
+selects the last checkpoint under its output directory when one exists.
+
+Before workflow initialization, both host output roots and both exact
+container names in the next section must be absent. Presence of a file,
+directory, symlink, stopped container, or running container at any exact name
+blocks the workflow; nothing is removed or reused automatically.
+
+After creating the new run roots, every independent smoke and concurrent-gate
+attempt receives a never-before-used directory and experiment name containing
+a UTC timestamp plus random nonce. Failed attempts remain preserved; retries
+use new names.
+
+Immediately before each production launch, the exact experiment directory
+must be absent:
+
+- `/outputs/train/pnp-trash-full-prompt-left-only-gpu7-20260828`
+- `/outputs/train/pnp-trash-subtasks-left-only-gpu6-20260828`
+
+The parent `/outputs/train` may exist, but the exact experiment directory must
+not. The launch gate verifies no `checkpoint-*` exists beneath the exact path
+and records that pinned Transformers
+`get_last_checkpoint(experiment_directory)` returns `None`. The same check is
+repeated after the wrapper starts but before the trainer call. The initial log
+must contain no `Resuming from checkpoint` message, and the first emitted step
+must be step 1. Any contrary evidence terminates acceptance and requires user
+direction; it is never treated as a fresh run.
 
 ## Containers and Writable Dataset Views
 
@@ -175,7 +238,7 @@ Create isolated containers and output roots:
 
 Each container receives only its assigned physical GPU and mounts its
 left-only dataset read-only at `/dataset`, its output root read-write at
-`/outputs`, `/mnt/data01/huggingface` read-write at
+`/outputs`, `/mnt/data01/huggingface` read-only at
 `/root/.cache/huggingface`, and the existing W&B key as a read-only file. The
 runtime uses `--init`, host IPC, unlimited memlock, a 67,108,864-byte stack
 limit, no restart policy, and `sleep infinity`.
@@ -201,8 +264,10 @@ are also revalidated before production launch.
 
 ## Exact Fresh Training Recipe
 
-Both variants use the official pinned `examples/finetune.sh` launcher and the
-same recipe except for dataset, GPU, output, and experiment name:
+Both variants use the parameter contract from the pinned
+`examples/finetune.sh`, executed through the reviewed local-only launcher shim
+described above. Their recipes differ only by dataset, GPU, output, and
+experiment name:
 
 - embodiment `UNITREE_G1_SONIC`;
 - modality configuration `gr00t/configs/data/embodiment_configs.py`;
@@ -210,8 +275,11 @@ same recipe except for dataset, GPU, output, and experiment name:
 - global batch size 32, gradient accumulation 1, and four loader workers;
 - AdamW Torch, learning rate `1e-4`, cosine schedule, warmup ratio `0.05`,
   weight decay `1e-5`, and maximum gradient norm `1.0`;
-- BF16 and TF32 enabled, FP16 disabled, DeepSpeed stage 2, and gradient
-  checkpointing disabled;
+- BF16 and TF32 enabled, FP16 disabled, and gradient checkpointing disabled;
+- single-GPU execution with effective Hugging Face
+  `TrainingArguments.deepspeed=None`; the serialized GR00T configuration may
+  retain its unused `deepspeed_stage: 2` default, which is not runtime
+  evidence that DeepSpeed is active;
 - seed 42, shuffling enabled, episode sampling rate `0.1`, shard size 1,024,
   and 100,000 shards per epoch;
 - color jitter brightness `0.3`, contrast `0.4`, saturation `0.5`, and hue
@@ -233,7 +301,9 @@ entrypoint hashes, redacted environment, image/container inspection, base
 snapshot revision, and expected recipe. Each run must preserve the resolved
 `config.yaml`, `conf.yaml`, dataset statistics, processor/model configuration,
 and training arguments emitted by the trainer. A post-start comparison must
-show that the resolved configuration equals this contract.
+show that the resolved configuration equals this contract. It separately
+records the effective `TrainingArguments` and requires `deepspeed is None`, no
+DeepSpeed engine, and no DeepSpeed worker process for both jobs.
 
 ## Resource Authority and Baseline Gate
 
@@ -306,9 +376,18 @@ both baselines remain below 25%.
 A checkpoint named `checkpoint-N` is complete only when all conditions hold:
 
 - no `.part`, `.tmp`, `.incomplete`, or zero-length file exists;
-- `model.safetensors.index.json` parses, every referenced shard exists and is
-  nonempty, the referenced shard set exactly equals the present
-  `model-*-of-*.safetensors` set, and all tensor keys map to present shards;
+- these jobs use sharded Safetensors as an invariant: exactly one
+  `model.safetensors.index.json` and one or more
+  `model-*-of-*.safetensors` files exist, while unsharded
+  `model.safetensors`, PyTorch `.bin` model payloads, and unreferenced shards
+  are absent;
+- the index parses, every referenced shard exists and is nonempty, and the
+  referenced shard set exactly equals the present shard set;
+- every shard opens through pinned `safetensors.safe_open` on CPU; the verifier
+  enumerates every actual tensor key, reads every tensor payload, rejects
+  duplicate or unexpected keys, and proves that the actual key-to-shard map
+  exactly equals the index weight map and that indexed total size agrees with
+  tensor metadata;
 - nonempty `optimizer.pt`, `scheduler.pt`, and `rng_state.pth` load without
   error; optimizer state and parameter groups are present, scheduler
   `last_epoch` matches N, and RNG state contains the expected Python, NumPy,
@@ -320,8 +399,16 @@ A checkpoint named `checkpoint-N` is complete only when all conditions hold:
   `dataset_statistics.json`, `final_model_config.json`, and
   `final_processor_config.json`.
 
-The checkpoint verifier writes a hash-and-size manifest and a structured
-verdict. Directory existence alone is never checkpoint evidence.
+After structural checks, a separate CPU-only process with CUDA hidden,
+read-only model cache, the exact Cosmos snapshot/revision, and all offline
+environment flags performs pinned local-only GR00T model and processor loads
+from `checkpoint-N`. The load must complete without missing/unexpected-weight,
+configuration, processor, or network-resolution errors. Objects are released
+before the verdict is finalized.
+
+The checkpoint verifier writes the file hash-and-size manifest, actual tensor
+key manifest, local model/processor load log, and structured verdict.
+Directory existence or nonempty shards alone are never checkpoint evidence.
 
 ## Production Status Model
 
