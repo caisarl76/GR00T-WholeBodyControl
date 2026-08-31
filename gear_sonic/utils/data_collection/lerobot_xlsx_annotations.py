@@ -116,6 +116,44 @@ def select_annotations_by_direction(
     )
 
 
+def _selection_provenance(
+    selection: AnnotationSelection,
+    annotations: Sequence[EpisodeAnnotation],
+) -> dict[str, object]:
+    if type(selection.direction) is not str or selection.direction != "left":
+        raise AnnotationError("selection direction must be built-in str 'left'")
+
+    counts = {
+        "candidate_episodes": selection.candidate_episodes,
+        "selected_episodes": selection.selected_episodes,
+        "excluded_episodes": selection.excluded_episodes,
+    }
+    for field, value in counts.items():
+        if type(value) is not int:
+            raise AnnotationError(f"selection {field} must be a built-in int")
+        if value < 0:
+            raise AnnotationError(f"selection {field} must be nonnegative")
+    if selection.candidate_episodes != selection.selected_episodes + selection.excluded_episodes:
+        raise AnnotationError("selection candidate_episodes must equal selected_episodes + excluded_episodes")
+    if selection.selected_episodes != len(annotations):
+        raise AnnotationError(
+            "selection selected_episodes must match the retained annotation count: "
+            f"selected={selection.selected_episodes}, retained={len(annotations)}"
+        )
+
+    for annotation in annotations:
+        try:
+            direction = _turn_direction(annotation.subtasks[2])
+        except AnnotationError as error:
+            raise AnnotationError(
+                f"selection retained episode {annotation.episode} is not strictly left: {error}"
+            ) from error
+        if direction != "left":
+            raise AnnotationError(f"selection retained episode {annotation.episode} is {direction}, expected left")
+
+    return {"direction": selection.direction, **counts}
+
+
 AnnotationVariant = Literal["subtasks", "full_prompt"]
 
 
@@ -422,6 +460,7 @@ def export_variant(
         raise AnnotationError(f"unknown annotation variant: {variant!r}")
     if not annotations:
         raise AnnotationError("cannot export an empty annotation set")
+    selection_payload = _selection_provenance(selection, annotations) if selection is not None else None
 
     source_info = _read_json(source / "meta/info.json")
     if source_info.get("codebase_version") != "v2.1":
@@ -614,13 +653,8 @@ def export_variant(
         "tasks": task_rows,
         "episodes": provenance_episodes,
     }
-    if selection is not None:
-        provenance["selection"] = {
-            "direction": selection.direction,
-            "candidate_episodes": selection.candidate_episodes,
-            "selected_episodes": selection.selected_episodes,
-            "excluded_episodes": selection.excluded_episodes,
-        }
+    if selection_payload is not None:
+        provenance["selection"] = selection_payload
 
     _write_json(destination / "meta/info.json", output_info)
     _write_jsonl(destination / "meta/episodes.jsonl", output_episodes)
@@ -805,18 +839,10 @@ def validate_variant(
         if "selection" in provenance:
             raise DatasetValidationError("provenance selection must be absent for a complete export")
     else:
-        expected_selection = {
-            "direction": selection.direction,
-            "candidate_episodes": selection.candidate_episodes,
-            "selected_episodes": selection.selected_episodes,
-            "excluded_episodes": selection.excluded_episodes,
-        }
-        expected_selection_types = {
-            "direction": str,
-            "candidate_episodes": int,
-            "selected_episodes": int,
-            "excluded_episodes": int,
-        }
+        try:
+            expected_selection = _selection_provenance(selection, ordered_annotations)
+        except AnnotationError as error:
+            raise DatasetValidationError(str(error)) from error
         recorded_selection = provenance.get("selection")
         if type(recorded_selection) is not dict or recorded_selection.keys() != expected_selection.keys():
             raise DatasetValidationError(
@@ -825,12 +851,7 @@ def validate_variant(
             )
         for field, expected_value in expected_selection.items():
             recorded_value = recorded_selection[field]
-            expected_type = expected_selection_types[field]
-            if (
-                type(expected_value) is not expected_type
-                or type(recorded_value) is not expected_type
-                or recorded_value != expected_value
-            ):
+            if type(recorded_value) is not type(expected_value) or recorded_value != expected_value:
                 raise DatasetValidationError(
                     "provenance selection does not match the expected selection: "
                     f"field={field!r}, expected={expected_value!r}, actual={recorded_value!r}"

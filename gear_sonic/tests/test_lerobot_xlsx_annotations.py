@@ -656,6 +656,94 @@ def test_filtered_provenance_uses_schema_two_selection(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("selection", "turn_prompt"),
+    [
+        (AnnotationSelection("left", 99, 99, 0), "turn left and approach"),
+        (AnnotationSelection("left", 2, 1, 0), "turn left and approach"),
+        (AnnotationSelection("left", 0, 1, -1), "turn left and approach"),
+        (
+            AnnotationSelection("right", 1, 1, 0),  # type: ignore[arg-type]
+            "turn left and approach",
+        ),
+        (AnnotationSelection("left", 1, 1, 0), "turn right and approach"),
+    ],
+    ids=[
+        "false-selected-count",
+        "inconsistent-count-algebra",
+        "negative-count",
+        "invalid-direction",
+        "retained-right-annotation",
+    ],
+)
+def test_filtered_export_rejects_selection_inconsistent_with_annotations(
+    tmp_path: Path,
+    selection: AnnotationSelection,
+    turn_prompt: str,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    output = tmp_path / "subtasks"
+    annotation = _annotation(
+        0,
+        ("approach", "pick", turn_prompt, "put"),
+        "approach, pick, turn and approach, put",
+    )
+
+    with pytest.raises(AnnotationError, match="selection"):
+        export_variant(
+            source,
+            output,
+            [annotation],
+            "subtasks",
+            source_manifest_sha256="a" * 64,
+            workbook_sha256="b" * 64,
+            selection=selection,
+        )
+
+    assert not output.exists()
+
+
+def test_filtered_validation_rejects_self_consistent_forged_selection(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    output = tmp_path / "subtasks"
+    annotation = _annotation(
+        0,
+        ("approach", "pick", "turn left and approach", "put"),
+        "approach, pick, turn left and approach, put",
+    )
+    valid_selection = AnnotationSelection("left", 1, 1, 0)
+    export_variant(
+        source,
+        output,
+        [annotation],
+        "subtasks",
+        source_manifest_sha256="a" * 64,
+        workbook_sha256="b" * 64,
+        selection=valid_selection,
+    )
+    forged_selection = AnnotationSelection("left", 99, 99, 0)
+    provenance_path = output / "meta/annotation_provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["selection"] = {
+        "direction": forged_selection.direction,
+        "candidate_episodes": forged_selection.candidate_episodes,
+        "selected_episodes": forged_selection.selected_episodes,
+        "excluded_episodes": forged_selection.excluded_episodes,
+    }
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(DatasetValidationError, match="selection"):
+        validate_variant(
+            source,
+            output,
+            [annotation],
+            "subtasks",
+            workbook_sha256="b" * 64,
+            source_manifest_sha256="a" * 64,
+            selection=forged_selection,
+        )
+
+
+@pytest.mark.parametrize(
     ("field", "corrupt_value"),
     [
         ("direction", "right"),
