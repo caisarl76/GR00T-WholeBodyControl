@@ -797,25 +797,44 @@ def validate_variant(
         raise DatasetValidationError("episodes_stats.jsonl row count does not match retained episodes")
 
     current_manifest = source_manifest_sha256 or dataset_manifest_sha256(source)
+    expected_schema_version = 2 if selection is not None else 1
+    recorded_schema_version = provenance.get("schema_version")
+    if type(recorded_schema_version) is not int or recorded_schema_version != expected_schema_version:
+        raise DatasetValidationError(f"provenance schema_version must be integer {expected_schema_version}")
     if selection is None:
-        if provenance.get("schema_version") != 1:
-            raise DatasetValidationError("provenance schema_version must be 1")
         if "selection" in provenance:
             raise DatasetValidationError("provenance selection must be absent for a complete export")
     else:
-        if provenance.get("schema_version") != 2:
-            raise DatasetValidationError("filtered selection provenance schema_version must be 2")
         expected_selection = {
             "direction": selection.direction,
             "candidate_episodes": selection.candidate_episodes,
             "selected_episodes": selection.selected_episodes,
             "excluded_episodes": selection.excluded_episodes,
         }
-        if provenance.get("selection") != expected_selection:
+        expected_selection_types = {
+            "direction": str,
+            "candidate_episodes": int,
+            "selected_episodes": int,
+            "excluded_episodes": int,
+        }
+        recorded_selection = provenance.get("selection")
+        if type(recorded_selection) is not dict or recorded_selection.keys() != expected_selection.keys():
             raise DatasetValidationError(
                 "provenance selection does not match the expected selection: "
-                f"expected={expected_selection!r}, actual={provenance.get('selection')!r}"
+                f"expected={expected_selection!r}, actual={recorded_selection!r}"
             )
+        for field, expected_value in expected_selection.items():
+            recorded_value = recorded_selection[field]
+            expected_type = expected_selection_types[field]
+            if (
+                type(expected_value) is not expected_type
+                or type(recorded_value) is not expected_type
+                or recorded_value != expected_value
+            ):
+                raise DatasetValidationError(
+                    "provenance selection does not match the expected selection: "
+                    f"field={field!r}, expected={expected_value!r}, actual={recorded_value!r}"
+                )
     provenance_source = provenance.get("source")
     if not isinstance(provenance_source, dict):
         raise DatasetValidationError("provenance source must be an object")

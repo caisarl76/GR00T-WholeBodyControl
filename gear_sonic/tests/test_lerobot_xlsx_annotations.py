@@ -660,7 +660,9 @@ def test_filtered_provenance_uses_schema_two_selection(tmp_path: Path) -> None:
     [
         ("direction", "right"),
         ("candidate_episodes", 3),
+        ("candidate_episodes", 2.0),
         ("selected_episodes", 2),
+        ("selected_episodes", True),
         ("excluded_episodes", 0),
     ],
 )
@@ -692,6 +694,51 @@ def test_filtered_provenance_rejects_corrupt_selection(
     provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
 
     with pytest.raises(DatasetValidationError, match="selection"):
+        validate_variant(
+            source,
+            output,
+            [annotation],
+            "subtasks",
+            workbook_sha256="b" * 64,
+            source_manifest_sha256="a" * 64,
+            selection=selection,
+        )
+
+
+@pytest.mark.parametrize(
+    ("corrupt_value", "selection"),
+    [
+        (2.0, AnnotationSelection("left", 2, 1, 1)),
+        (True, None),
+    ],
+)
+def test_provenance_rejects_type_confused_schema_version(
+    tmp_path: Path,
+    corrupt_value: object,
+    selection: AnnotationSelection | None,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    output = tmp_path / "subtasks"
+    annotation = _annotation(
+        0,
+        ("approach", "pick", "turn left and approach", "put"),
+        "approach, pick, turn left and approach, put",
+    )
+    export_variant(
+        source,
+        output,
+        [annotation],
+        "subtasks",
+        source_manifest_sha256="a" * 64,
+        workbook_sha256="b" * 64,
+        selection=selection,
+    )
+    provenance_path = output / "meta/annotation_provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["schema_version"] = corrupt_value
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(DatasetValidationError, match="schema_version"):
         validate_variant(
             source,
             output,
