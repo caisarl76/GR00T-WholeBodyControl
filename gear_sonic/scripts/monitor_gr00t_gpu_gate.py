@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -435,14 +436,34 @@ def evaluate_concurrent_gate(
 
 
 def _load_json_regular(path: Path) -> object:
+    try:
+        return json.loads(_read_regular_text_no_follow(path))
+    except json.JSONDecodeError as error:
+        raise GpuGateError(f"cannot parse JSON file {path}: {error}") from error
+
+
+def _read_regular_text_no_follow(path: Path) -> str:
+    """Open a control file once and read only the verified regular-file descriptor."""
+    path = Path(path)
     if not path.is_absolute():
         raise GpuGateError(f"path must be absolute: {path}")
-    if path.is_symlink() or not path.is_file():
-        raise GpuGateError(f"expected a regular file: {path}")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise GpuGateError(f"cannot parse JSON file {path}: {error}") from error
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise GpuGateError(f"cannot open regular file without following links: {path}") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise GpuGateError(f"expected a regular file: {path}")
+        try:
+            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                descriptor = -1
+                return stream.read()
+        except (OSError, UnicodeError) as error:
+            raise GpuGateError(f"cannot read regular file: {path}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def load_expected_pid_files(paths: Sequence[Path]) -> dict[str, dict[str, int]]:
@@ -501,12 +522,7 @@ def parse_exit_file_specs(specs: Sequence[str], *, expected_labels: set[str]) ->
 def read_exit_codes(specs: Mapping[str, Path]) -> dict[str, int]:
     result: dict[str, int] = {}
     for label, path in specs.items():
-        if path.is_symlink() or not path.is_file():
-            raise GpuGateError(f"exit file is not a regular file: {path}")
-        try:
-            value = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            raise GpuGateError(f"cannot read exit file {path}: {error}") from error
+        value = _read_regular_text_no_follow(path)
         if not _INTEGER_RE.fullmatch(value):
             raise GpuGateError(f"exit file {path} must contain exactly one integer")
         result[label] = int(value)
@@ -532,6 +548,8 @@ def collect_samples(
         if monotonic() - start >= timeout_seconds:
             return samples, True
         samples.extend(snapshot(gpu_indices))
+        if monotonic() - start >= timeout_seconds:
+            return samples, True
         if sample_index + 1 < duration_seconds:
             deadline += 1.0
             delay = deadline - monotonic()
@@ -542,6 +560,8 @@ def collect_samples(
 
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if os.path.lexists(path):
+        raise GpuGateError(f"artifact destination already exists: {path}")
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary_path = Path(temporary)
     try:
@@ -549,10 +569,12 @@ def _atomic_write_text(path: Path, content: str) -> None:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
-    except BaseException:
+        try:
+            os.link(temporary_path, path, follow_symlinks=False)
+        except FileExistsError as error:
+            raise GpuGateError(f"artifact destination already exists: {path}") from error
+    finally:
         temporary_path.unlink(missing_ok=True)
-        raise
 
 
 def write_artifacts(
@@ -564,6 +586,12 @@ def write_artifacts(
 ) -> None:
     if set(result) != _RESULT_KEYS:
         raise GpuGateError("result artifact must use the exact field set")
+    destinations = [Path(csv_path), Path(jsonl_path), Path(result_path)]
+    if len(set(destinations)) != len(destinations):
+        raise GpuGateError("artifact destinations must be distinct")
+    for destination in destinations:
+        if os.path.lexists(destination):
+            raise GpuGateError(f"artifact destination already exists: {destination}")
     csv_fields = [
         "timestamp_utc",
         "gpu_index",
@@ -605,9 +633,7 @@ def write_artifacts(
 
 def _parse_int(value: str) -> int:
     value = value.strip()
-    if value in {"N/A", "[N/A]", ""}:
-        return 0
-    match = re.search(r"-?[0-9]+", value)
+    match = re.fullmatch(r"-?[0-9]+", value)
     if match is None:
         raise GpuGateError(f"nvidia-smi returned a noninteger value: {value!r}")
     return int(match.group())
@@ -732,6 +758,9 @@ def _collect_concurrent(
         current = snapshot_gpus(gpu_indices)
         samples.extend(current)
         sample_cycles.append(current)
+        if time.monotonic() - start >= timeout_seconds:
+            errors.append("timeout while waiting for PID or exit files")
+            return samples, prelaunch, sample_cycles, expected, exit_codes, True, errors
         if tick < prelaunch_seconds:
             prelaunch.extend(current)
         elif not expected and all(path.exists() for path in pid_paths):
@@ -750,6 +779,17 @@ def _collect_concurrent(
                     return samples, prelaunch, sample_cycles, expected, exit_codes, False, errors
                 exit_seen_at = now
             if now - exit_seen_at >= post_exit_seconds:
+                if time.monotonic() - start >= timeout_seconds:
+                    errors.append("timeout while waiting for PID or exit files")
+                    return (
+                        samples,
+                        prelaunch,
+                        sample_cycles,
+                        expected,
+                        exit_codes,
+                        True,
+                        errors,
+                    )
                 return samples, prelaunch, sample_cycles, expected, exit_codes, False, errors
         tick += 1
         next_deadline += 1.0

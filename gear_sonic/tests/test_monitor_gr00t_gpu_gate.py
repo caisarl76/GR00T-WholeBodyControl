@@ -4,6 +4,7 @@ import csv
 import json
 import os
 from pathlib import Path
+import stat
 
 import pytest
 
@@ -407,6 +408,248 @@ def test_collect_samples_times_out_fail_closed_without_signaling() -> None:
     assert "terminate(" not in source
 
 
+def test_collect_samples_checks_timeout_after_slow_final_snapshot() -> None:
+    now = [0.0]
+
+    def snapshot(_: tuple[int, ...]) -> list[dict[str, object]]:
+        now[0] = 2.0
+        return [_sample(1000, [])]
+
+    samples, timed_out = collect_samples(
+        gpu_indices=(7,),
+        duration_seconds=1,
+        timeout_seconds=1,
+        snapshot=snapshot,
+        monotonic=lambda: now[0],
+        sleep=lambda _: None,
+    )
+
+    assert len(samples) == 1
+    assert timed_out
+
+
+def test_concurrent_collector_checks_timeout_after_slow_success_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_path = tmp_path / "full.pid.json"
+    exit_path = tmp_path / "full.exit"
+    pid_path.write_text(
+        json.dumps({"label": "full", "gpu_index": 7, "pid": 101}),
+        encoding="utf-8",
+    )
+    exit_path.write_text("0\n", encoding="utf-8")
+    now = [0.0]
+    snapshots = [0]
+
+    def snapshot(_: tuple[int, ...]) -> list[dict[str, object]]:
+        snapshots[0] += 1
+        if snapshots[0] == 3:
+            now[0] = 6.0
+        return [_sample(1000, [(101, "full", 500)])]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    monkeypatch.setattr(gpu_gate, "snapshot_gpus", snapshot)
+    monkeypatch.setattr(gpu_gate.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(gpu_gate.time, "sleep", sleep)
+
+    result = gpu_gate._collect_concurrent(
+        gpu_indices=(7,),
+        prelaunch_seconds=1,
+        post_exit_seconds=1,
+        timeout_seconds=5,
+        pid_paths=[pid_path],
+        exit_specs_raw=[f"full={exit_path}"],
+    )
+
+    assert result[-2] is True
+    assert any("timeout" in reason for reason in result[-1])
+
+
+@pytest.mark.parametrize("value", ["N/A", "[N/A]", "", "12 MiB", "x12", "12x", "1.0"])
+def test_parse_int_rejects_missing_or_partial_values(value: str) -> None:
+    with pytest.raises(GpuGateError, match="integer"):
+        gpu_gate._parse_int(value)
+
+
+@pytest.mark.parametrize("query", ["process", "health"])
+def test_snapshot_rejects_unavailable_process_and_health_values(
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+) -> None:
+    if query == "process":
+        responses = iter(
+            [
+                [["7", "GPU-7", "1000", "81559", "0"]],
+                [["GPU-7", "101", "full", "N/A"]],
+            ]
+        )
+        monkeypatch.setattr(gpu_gate, "_run_nvidia_smi", lambda _: next(responses))
+    else:
+        monkeypatch.setattr(
+            gpu_gate,
+            "_run_nvidia_smi",
+            lambda _: [["7", "GPU-7", "N/A", "0", "0", "0"]],
+        )
+
+    with pytest.raises(GpuGateError, match="integer"):
+        if query == "process":
+            gpu_gate.snapshot_gpus((7,))
+        else:
+            gpu_gate.snapshot_health((7,))
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink"])
+@pytest.mark.parametrize("destination_index", [0, 1, 2])
+def test_write_artifacts_rejects_every_preexisting_destination_type(
+    tmp_path: Path,
+    kind: str,
+    destination_index: int,
+) -> None:
+    paths = [tmp_path / "samples.csv", tmp_path / "processes.jsonl", tmp_path / "result.json"]
+    destination = paths[destination_index]
+    if kind == "file":
+        destination.write_text("accepted", encoding="utf-8")
+    elif kind == "directory":
+        destination.mkdir()
+    else:
+        destination.symlink_to(tmp_path / "missing-target")
+
+    with pytest.raises(GpuGateError, match="already exists"):
+        write_artifacts(
+            [_sample(13000, [(101, "eval", 6500)])],
+            {
+                "status": "pass",
+                "reasons": [],
+                "mode": "baseline",
+                "thresholds": {},
+                "summary": {},
+                "health_before": {},
+                "health_after": {},
+            },
+            *paths,
+        )
+
+    assert os.path.lexists(destination)
+    for index, path in enumerate(paths):
+        if index != destination_index:
+            assert not os.path.lexists(path)
+
+
+@pytest.mark.parametrize("destination_index", [0, 1, 2])
+def test_write_artifacts_does_not_overwrite_racing_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    destination_index: int,
+) -> None:
+    paths = [tmp_path / "samples.csv", tmp_path / "processes.jsonl", tmp_path / "result.json"]
+    raced_path = paths[destination_index]
+    real_link = os.link
+
+    def racing_link(
+        source: str | Path,
+        destination: str | Path,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ) -> None:
+        if Path(destination) == raced_path:
+            raced_path.write_text("racer", encoding="utf-8")
+        real_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(gpu_gate.os, "link", racing_link)
+    with pytest.raises(GpuGateError, match="already exists"):
+        write_artifacts(
+            [_sample(13000, [(101, "eval", 6500)])],
+            {
+                "status": "pass",
+                "reasons": [],
+                "mode": "baseline",
+                "thresholds": {},
+                "summary": {},
+                "health_before": {},
+                "health_after": {},
+            },
+            *paths,
+        )
+
+    assert raced_path.read_text(encoding="utf-8") == "racer"
+    if destination_index < 2:
+        assert not os.path.lexists(paths[2])
+
+
+@pytest.mark.parametrize("reader", ["pid", "exit"])
+def test_control_files_reject_initial_symlinks(
+    tmp_path: Path,
+    reader: str,
+) -> None:
+    target = tmp_path / "target"
+    path = tmp_path / ("control.json" if reader == "pid" else "exit")
+    target.write_text(
+        json.dumps({"label": "full", "gpu_index": 7, "pid": 101}) if reader == "pid" else "0\n",
+        encoding="utf-8",
+    )
+    path.symlink_to(target)
+
+    with pytest.raises(GpuGateError, match="without following links"):
+        if reader == "pid":
+            load_expected_pid_files([path])
+        else:
+            read_exit_codes({"full": path})
+
+
+@pytest.mark.parametrize("reader", ["pid", "exit"])
+def test_control_files_are_read_once_from_no_follow_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+) -> None:
+    path = tmp_path / ("control.json" if reader == "pid" else "exit")
+    replacement = tmp_path / "replacement"
+    if reader == "pid":
+        path.write_text(
+            json.dumps({"label": "full", "gpu_index": 7, "pid": 101}),
+            encoding="utf-8",
+        )
+        replacement.write_text(
+            json.dumps({"label": "attacker", "gpu_index": 0, "pid": 999}),
+            encoding="utf-8",
+        )
+    else:
+        path.write_text("0\n", encoding="utf-8")
+        replacement.write_text("1\n", encoding="utf-8")
+    real_open = os.open
+    calls: list[int] = []
+
+    def replacing_open(raw_path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = real_open(raw_path, flags, mode, dir_fd=dir_fd)
+        if Path(raw_path) == path:
+            calls.append(flags)
+            path.unlink()
+            path.symlink_to(replacement)
+        return descriptor
+
+    monkeypatch.setattr(gpu_gate.os, "open", replacing_open)
+    if reader == "pid":
+        assert load_expected_pid_files([path]) == {"full": {"gpu_index": 7, "pid": 101}}
+    else:
+        assert read_exit_codes({"full": path}) == {"full": 0}
+
+    assert len(calls) == 1
+    assert calls[0] & os.O_NOFOLLOW
+    assert calls[0] & os.O_NONBLOCK
+    assert stat.S_ISLNK(path.lstat().st_mode)
+
+
 def test_write_artifacts_uses_exact_field_sets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -424,14 +667,14 @@ def test_write_artifacts_uses_exact_field_sets(
     csv_path = tmp_path / "samples.csv"
     jsonl_path = tmp_path / "processes.jsonl"
     result_path = tmp_path / "result.json"
-    replaced: list[tuple[Path, Path]] = []
-    real_replace = os.replace
+    linked: list[tuple[Path, Path]] = []
+    real_link = os.link
 
-    def recording_replace(source: str | Path, destination: str | Path) -> None:
-        replaced.append((Path(source), Path(destination)))
-        real_replace(source, destination)
+    def recording_link(source: str | Path, destination: str | Path, **kwargs) -> None:
+        linked.append((Path(source), Path(destination)))
+        real_link(source, destination, **kwargs)
 
-    monkeypatch.setattr(gpu_gate.os, "replace", recording_replace)
+    monkeypatch.setattr(gpu_gate.os, "link", recording_link)
     write_artifacts(samples, result, csv_path, jsonl_path, result_path)
 
     with csv_path.open(newline="", encoding="utf-8") as stream:
@@ -463,6 +706,6 @@ def test_write_artifacts_uses_exact_field_sets(
         "health_before",
         "health_after",
     }
-    assert replaced[-1][1] == result_path
-    assert replaced[-1][0].parent == result_path.parent
+    assert linked[-1][1] == result_path
+    assert linked[-1][0].parent == result_path.parent
     assert not list(tmp_path.glob("*.tmp"))
