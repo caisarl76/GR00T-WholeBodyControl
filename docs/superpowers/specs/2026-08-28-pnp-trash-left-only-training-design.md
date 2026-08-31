@@ -178,7 +178,9 @@ shim stored under each output root. It imports the pinned GR00T configuration
 and `run` implementation, preserves the official argument mapping, and adds
 only these effective overrides before calling `run(config)`:
 
-- `config.model.model_name` is the exact local Cosmos snapshot path;
+- `config.model.model_name="nvidia/Cosmos-Reason2-2B"` remains the canonical
+  identifier required by pinned `get_backbone_cls`; it is never replaced by a
+  filesystem path;
 - `config.model.model_revision` is the exact Cosmos revision above;
 - `config.training.transformers_local_files_only=true`; and
 - `config.training.transformers_cache_dir=/root/.cache/huggingface`.
@@ -186,15 +188,22 @@ only these effective overrides before calling `run(config)`:
 The shim and its source diff against pinned `launch_finetune.py` are hashed and
 stored with the resolved command. `HF_HUB_OFFLINE=1`,
 `TRANSFORMERS_OFFLINE=1`, and `HF_DATASETS_OFFLINE=1` are mandatory for every
-probe and training process. Both model and processor must load with local-only
-settings before a smoke is allowed.
+probe and training process. Before the offline model/processor load, a shim
+test constructs the effective config, asserts the canonical model name and
+exact revision, calls pinned `get_backbone_cls(config.model)`, and requires it
+to return `Qwen3Backbone`. Both model and processor must then load with
+local-only settings before a smoke is allowed.
 
 The Hugging Face cache is mounted read-only. Scoped validation requires the
 two selected snapshot directories and their model-specific blobs, resolves
 every symlink, and writes a relative-path/size/SHA-256 manifest for every
-resolved file. Other cached models or revisions are permitted and are neither
-validated nor deleted. The selected manifests must be unchanged at handoff.
-Do not install packages or modify software on the server host.
+resolved file. It independently asserts that canonical
+`nvidia/Cosmos-Reason2-2B` plus revision
+`9ce19a195e423419c349abfc86fd07178b230561` resolves to the specified snapshot
+directory while offline; the snapshot path is evidence and a hash target, not
+`config.model.model_name`. Other cached models or revisions are permitted and
+are neither validated nor deleted. The selected manifests must be unchanged
+at handoff. Do not install packages or modify software on the server host.
 
 ## Fresh-Run Namespace Invariants
 
@@ -400,11 +409,13 @@ A checkpoint named `checkpoint-N` is complete only when all conditions hold:
   `final_processor_config.json`.
 
 After structural checks, a separate CPU-only process with CUDA hidden,
-read-only model cache, the exact Cosmos snapshot/revision, and all offline
-environment flags performs pinned local-only GR00T model and processor loads
-from `checkpoint-N`. The load must complete without missing/unexpected-weight,
-configuration, processor, or network-resolution errors. Objects are released
-before the verdict is finalized.
+read-only model cache, canonical Cosmos model ID, exact Cosmos revision and
+resolved snapshot, and all offline environment flags first passes the pinned
+`get_backbone_cls` selector test and then performs pinned local-only GR00T
+model and processor loads from `checkpoint-N`. The load must complete without
+missing/unexpected-weight, configuration, processor, selector, or
+network-resolution errors. Objects are released before the verdict is
+finalized.
 
 The checkpoint verifier writes the file hash-and-size manifest, actual tensor
 key manifest, local model/processor load log, and structured verdict.
