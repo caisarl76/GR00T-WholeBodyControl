@@ -62,6 +62,8 @@ DirectionFilter = Literal["all", "left"]
 
 @dataclass(frozen=True)
 class AnnotationSelection:
+    """Summary of a validated left-only annotation selection."""
+
     direction: Literal["left"]
     candidate_episodes: int
     selected_episodes: int
@@ -83,6 +85,12 @@ def select_annotations_by_direction(
     *,
     expected_counts: tuple[int, int] | None = None,
 ) -> tuple[list[EpisodeAnnotation], AnnotationSelection | None]:
+    """Select annotations with the supported ``all`` or ``left`` filter.
+
+    Left selection classifies subtask 3 (``subtasks[2]``) and interprets
+    ``expected_counts`` in ``(left, right)`` order.
+    """
+
     if direction_filter == "all":
         return list(annotations), None
     if direction_filter != "left":

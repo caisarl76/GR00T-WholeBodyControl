@@ -229,23 +229,31 @@ def _annotation(
 
 
 def test_select_annotations_by_direction_keeps_complete_left_episodes() -> None:
-    left = _annotation(4, ("approach", "pick", "  TURN   LEFT toward bin ", "put"), "full left")
+    first_left = _annotation(
+        4,
+        ("approach", "pick", "  TURN   LEFT toward bin ", "put"),
+        "full left first",
+    )
+    second_left = _annotation(
+        7,
+        ("approach other", "pick other", "turn left toward other bin", "put other"),
+        "full left second",
+    )
     right = _annotation(9, ("approach", "pick", "turn right toward bin", "put"), "full right")
 
     selected, selection = select_annotations_by_direction(
-        [right, left],
+        [second_left, right, first_left],
         "left",
-        expected_counts=(1, 1),
+        expected_counts=(2, 1),
     )
 
-    assert [row.episode for row in selected] == [4]
+    assert selected == [first_left, second_left]
     assert selection == AnnotationSelection(
         direction="left",
-        candidate_episodes=2,
-        selected_episodes=1,
+        candidate_episodes=3,
+        selected_episodes=2,
         excluded_episodes=1,
     )
-    assert selected[0].subtasks[0:4] == left.subtasks
 
 
 @pytest.mark.parametrize(
@@ -264,6 +272,13 @@ def test_select_annotations_by_direction_requires_exact_counts() -> None:
 
     with pytest.raises(AnnotationError, match="expected left=44 right=28"):
         select_annotations_by_direction([left], "left", expected_counts=(44, 28))
+
+
+def test_select_annotations_by_direction_requires_expected_counts() -> None:
+    left = _annotation(1, ("approach", "pick", "turn left", "put"), "full")
+
+    with pytest.raises(AnnotationError, match="requires expected direction counts"):
+        select_annotations_by_direction([left], "left")
 
 
 def test_select_annotations_by_direction_all_preserves_legacy_order() -> None:
