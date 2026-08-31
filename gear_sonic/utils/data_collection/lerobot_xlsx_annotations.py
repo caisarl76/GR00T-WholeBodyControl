@@ -8,6 +8,7 @@ import hashlib
 from io import BytesIO
 import json
 import math
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -282,6 +283,31 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as stream:
         json.dump(value, stream, ensure_ascii=False, indent=4)
         stream.write("\n")
+
+
+def _path_lexists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if _path_lexists(temporary_path):
+            temporary_path.unlink()
 
 
 def _write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
@@ -707,6 +733,188 @@ def dataset_manifest_sha256(dataset_path: Path) -> str:
     return digest.hexdigest()
 
 
+def _release_sha256(value: object, field: str) -> str:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise DatasetValidationError(f"release marker {field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _release_selection(value: object, context: str) -> dict[str, str | int]:
+    fields = {
+        "direction",
+        "candidate_episodes",
+        "selected_episodes",
+        "excluded_episodes",
+    }
+    if type(value) is not dict or value.keys() != fields:
+        raise DatasetValidationError(f"{context} selection must contain exactly {sorted(fields)!r}")
+    direction = value["direction"]
+    if type(direction) is not str or direction != "left":
+        raise DatasetValidationError(f"{context} selection direction must be built-in str 'left'")
+    counts: dict[str, int] = {}
+    for field in ("candidate_episodes", "selected_episodes", "excluded_episodes"):
+        count = value[field]
+        if type(count) is not int or count < 0:
+            raise DatasetValidationError(f"{context} selection {field} must be a nonnegative built-in int")
+        counts[field] = count
+    if counts["candidate_episodes"] != counts["selected_episodes"] + counts["excluded_episodes"]:
+        raise DatasetValidationError(
+            f"{context} selection candidate_episodes must equal selected_episodes + excluded_episodes"
+        )
+    return {"direction": direction, **counts}
+
+
+def _release_episode_mapping(provenance: dict[str, Any], variant: str) -> list[tuple[int, int, int]]:
+    episodes = provenance.get("episodes")
+    if type(episodes) is not list:
+        raise DatasetValidationError(f"{variant} provenance episode mapping must be a list")
+    mapping: list[tuple[int, int, int]] = []
+    for row_number, row in enumerate(episodes):
+        if type(row) is not dict:
+            raise DatasetValidationError(
+                f"{variant} provenance episode mapping row {row_number} must be an object"
+            )
+        values: list[int] = []
+        for field in ("source_episode_index", "output_episode_index", "length"):
+            item = row.get(field)
+            if type(item) is not int or item < 0:
+                raise DatasetValidationError(
+                    f"{variant} provenance episode mapping {field} must be a nonnegative built-in int"
+                )
+            values.append(item)
+        mapping.append((values[0], values[1], values[2]))
+    return mapping
+
+
+def validate_release_marker(
+    marker: Path,
+    subtasks: Path,
+    full_prompt: Path,
+) -> dict[str, object]:
+    """Validate that a filtered dataset pair is a complete consumable release."""
+
+    if not _path_lexists(marker):
+        raise DatasetValidationError(f"release marker does not exist: {marker}")
+    if marker.is_symlink() or not marker.is_file():
+        raise DatasetValidationError(f"release marker must be a regular non-symlink file: {marker}")
+    try:
+        value = _read_json(marker)
+    except AnnotationError as error:
+        raise DatasetValidationError(f"cannot read release marker: {error}") from error
+
+    marker_fields = {
+        "format_version",
+        "state",
+        "direction",
+        "candidate_episodes",
+        "selected_episodes",
+        "excluded_episodes",
+        "source_manifest_sha256",
+        "workbook_sha256",
+        "datasets",
+    }
+    if value.keys() != marker_fields:
+        raise DatasetValidationError(
+            f"release marker fields must match exactly: expected={sorted(marker_fields)!r}"
+        )
+    format_version = value["format_version"]
+    if type(format_version) is not int or format_version != 1:
+        raise DatasetValidationError("release marker format_version must be integer 1")
+    state = value["state"]
+    if type(state) is not str or state != "complete":
+        raise DatasetValidationError("release marker state must be built-in str 'complete'")
+    marker_selection = _release_selection(
+        {
+            "direction": value["direction"],
+            "candidate_episodes": value["candidate_episodes"],
+            "selected_episodes": value["selected_episodes"],
+            "excluded_episodes": value["excluded_episodes"],
+        },
+        "release marker",
+    )
+    source_manifest_sha256 = _release_sha256(
+        value["source_manifest_sha256"],
+        "source_manifest_sha256",
+    )
+    workbook_sha256 = _release_sha256(value["workbook_sha256"], "workbook_sha256")
+
+    datasets = value["datasets"]
+    if type(datasets) is not dict or datasets.keys() != {"subtasks", "full_prompt"}:
+        raise DatasetValidationError("release marker datasets must contain exactly 'subtasks' and 'full_prompt'")
+    dataset_paths = {"subtasks": subtasks, "full_prompt": full_prompt}
+    for variant, dataset_path in dataset_paths.items():
+        dataset = datasets[variant]
+        if type(dataset) is not dict or dataset.keys() != {"path", "manifest_sha256"}:
+            raise DatasetValidationError(
+                f"release marker dataset {variant} must contain exactly path and manifest_sha256"
+            )
+        recorded_path = dataset["path"]
+        if type(recorded_path) is not str or recorded_path != dataset_path.name:
+            raise DatasetValidationError(
+                f"release marker dataset {variant} path must equal basename {dataset_path.name!r}"
+            )
+        recorded_manifest = _release_sha256(
+            dataset["manifest_sha256"],
+            f"datasets.{variant}.manifest_sha256",
+        )
+        try:
+            actual_manifest = dataset_manifest_sha256(dataset_path)
+        except (AnnotationError, OSError) as error:
+            raise DatasetValidationError(
+                f"release marker cannot compute {variant} dataset manifest: {error}"
+            ) from error
+        if recorded_manifest != actual_manifest:
+            raise DatasetValidationError(f"release marker {variant} dataset manifest does not match")
+
+    mappings: dict[str, list[tuple[int, int, int]]] = {}
+    for variant, dataset_path in dataset_paths.items():
+        provenance_path = dataset_path / "meta/annotation_provenance.json"
+        try:
+            provenance = _read_json(provenance_path)
+        except AnnotationError as error:
+            raise DatasetValidationError(f"release marker cannot read {variant} provenance: {error}") from error
+        schema_version = provenance.get("schema_version")
+        if type(schema_version) is not int or schema_version != 2:
+            raise DatasetValidationError(f"{variant} provenance selection requires schema_version integer 2")
+        if provenance.get("variant") != variant:
+            raise DatasetValidationError(f"{variant} provenance variant does not match its dataset")
+        provenance_source = provenance.get("source")
+        if type(provenance_source) is not dict:
+            raise DatasetValidationError(f"{variant} provenance source must be an object")
+        recorded_source_manifest = _release_sha256(
+            provenance_source.get("manifest_sha256"),
+            f"{variant} provenance source manifest",
+        )
+        if recorded_source_manifest != source_manifest_sha256:
+            raise DatasetValidationError(f"{variant} provenance source manifest does not match the release marker")
+        provenance_annotations = provenance.get("annotations")
+        if type(provenance_annotations) is not dict:
+            raise DatasetValidationError(f"{variant} provenance annotations must be an object")
+        recorded_workbook = _release_sha256(
+            provenance_annotations.get("workbook_sha256"),
+            f"{variant} provenance workbook_sha256",
+        )
+        if recorded_workbook != workbook_sha256:
+            raise DatasetValidationError(f"{variant} provenance workbook hash does not match the release marker")
+        provenance_selection = _release_selection(
+            provenance.get("selection"),
+            f"{variant} provenance",
+        )
+        if provenance_selection != marker_selection:
+            raise DatasetValidationError(
+                f"{variant} provenance selection does not match the release marker selection"
+            )
+        mappings[variant] = _release_episode_mapping(provenance, variant)
+
+    if mappings["subtasks"] != mappings["full_prompt"]:
+        raise DatasetValidationError("cross-variant provenance episode mapping does not match")
+    if len(mappings["subtasks"]) != marker_selection["selected_episodes"]:
+        raise DatasetValidationError(
+            "release marker selection selected_episodes does not match the provenance episode mapping"
+        )
+    return {"state": state, **marker_selection}
+
+
 def _expected_task_rows(task_map: dict[str, int]) -> list[dict[str, Any]]:
     return [
         {"task_index": task_index, "task": prompt}
@@ -1039,28 +1247,65 @@ def export_both(
     annotations_path: Path,
     subtasks_output_path: Path,
     full_prompt_output_path: Path,
+    *,
+    direction_filter: DirectionFilter = "all",
+    expected_direction_counts: tuple[int, int] | None = None,
+    release_marker_path: Path | None = None,
 ) -> tuple[ExportResult, ExportResult]:
     """Stage, validate, and publish both requested dataset variants."""
 
+    raw_outputs = [subtasks_output_path, full_prompt_output_path]
+    for output in raw_outputs:
+        if _path_lexists(output):
+            raise AnnotationError(f"output path already exists: {output}")
+    if release_marker_path is not None and _path_lexists(release_marker_path):
+        raise AnnotationError(f"release marker already exists: {release_marker_path}")
+    if direction_filter == "all":
+        if release_marker_path is not None:
+            raise AnnotationError("release marker path must be omitted for direction_filter='all'")
+    elif direction_filter == "left":
+        if release_marker_path is None:
+            raise AnnotationError("left direction filter requires a release marker path")
+    else:
+        raise AnnotationError(f"unknown direction filter: {direction_filter!r}")
+
     source = dataset_path.resolve()
     workbook = annotations_path.resolve()
-    outputs = [subtasks_output_path.resolve(), full_prompt_output_path.resolve()]
+    outputs = [output.resolve() for output in raw_outputs]
+    marker = release_marker_path.resolve() if release_marker_path is not None else None
     if outputs[0] == outputs[1]:
         raise AnnotationError("subtasks and full-prompt output paths must differ")
     if _path_is_within(outputs[0], outputs[1]) or _path_is_within(outputs[1], outputs[0]):
         raise AnnotationError("subtasks and full-prompt output paths must not overlap")
     for output in outputs:
-        if output.exists():
+        if _path_lexists(output):
             raise AnnotationError(f"output path already exists: {output}")
         if _path_is_within(output, source):
             raise AnnotationError(f"output path must be outside the source dataset: {output}")
+    if marker is not None:
+        if _path_lexists(marker):
+            raise AnnotationError(f"release marker already exists: {marker}")
+        if any(_path_is_within(marker, output) for output in outputs):
+            raise AnnotationError("release marker path must be outside both output datasets")
+        if _path_is_within(marker, source):
+            raise AnnotationError("release marker path must be outside the source dataset")
     source_episode_rows = _read_jsonl(source / "meta/episodes.jsonl")
     expected_episodes = {_integer_cell(row.get("episode_index"), "episode_index") for row in source_episode_rows}
     try:
         workbook_bytes = workbook.read_bytes()
     except OSError as error:
         raise AnnotationError(f"cannot read XLSX workbook {workbook}: {error}") from error
-    annotations = load_annotations_bytes(workbook_bytes, expected_episodes=expected_episodes)
+    complete_annotations = load_annotations_bytes(workbook_bytes, expected_episodes=expected_episodes)
+    annotations = complete_annotations
+    selection: AnnotationSelection | None = None
+    if direction_filter == "left":
+        annotations, selection = select_annotations_by_direction(
+            complete_annotations,
+            direction_filter,
+            expected_counts=expected_direction_counts,
+        )
+        if selection is None:
+            raise AnnotationError("left direction filter did not produce a selection")
     before_manifest = dataset_manifest_sha256(source)
     workbook_sha256 = hashlib.sha256(workbook_bytes).hexdigest()
 
@@ -1077,6 +1322,7 @@ def export_both(
                     )
                 )
             )
+        selection_kwargs = {} if selection is None else {"selection": selection}
         subtask_result = export_variant(
             source,
             staging[0],
@@ -1084,6 +1330,7 @@ def export_both(
             "subtasks",
             before_manifest,
             workbook_sha256,
+            **selection_kwargs,
         )
         full_result = export_variant(
             source,
@@ -1092,6 +1339,7 @@ def export_both(
             "full_prompt",
             before_manifest,
             workbook_sha256,
+            **selection_kwargs,
         )
         validate_variant(
             source,
@@ -1100,6 +1348,7 @@ def export_both(
             "subtasks",
             source_manifest_sha256=before_manifest,
             workbook_sha256=workbook_sha256,
+            **selection_kwargs,
         )
         validate_variant(
             source,
@@ -1108,6 +1357,7 @@ def export_both(
             "full_prompt",
             source_manifest_sha256=before_manifest,
             workbook_sha256=workbook_sha256,
+            **selection_kwargs,
         )
         try:
             current_workbook_sha256 = file_sha256(workbook)
@@ -1129,7 +1379,7 @@ def export_both(
             outputs[0].replace(staging[0])
             published_first = False
             raise
-        return (
+        results = (
             ExportResult(
                 output_path=outputs[0],
                 variant=subtask_result.variant,
@@ -1145,6 +1395,34 @@ def export_both(
                 tasks=full_result.tasks,
             ),
         )
+        if marker is not None:
+            if _path_lexists(marker):
+                raise AnnotationError(f"release marker already exists: {marker}")
+            if selection is None:
+                raise AnnotationError("release marker requires a filtered annotation selection")
+            marker_value = {
+                "format_version": 1,
+                "state": "complete",
+                "direction": "left",
+                "candidate_episodes": selection.candidate_episodes,
+                "selected_episodes": selection.selected_episodes,
+                "excluded_episodes": selection.excluded_episodes,
+                "source_manifest_sha256": before_manifest,
+                "workbook_sha256": workbook_sha256,
+                "datasets": {
+                    "subtasks": {
+                        "path": outputs[0].name,
+                        "manifest_sha256": dataset_manifest_sha256(outputs[0]),
+                    },
+                    "full_prompt": {
+                        "path": outputs[1].name,
+                        "manifest_sha256": dataset_manifest_sha256(outputs[1]),
+                    },
+                },
+            }
+            _atomic_write_json(marker, marker_value)
+            validate_release_marker(marker, outputs[0], outputs[1])
+        return results
     finally:
         for path in staging:
             if path.exists():

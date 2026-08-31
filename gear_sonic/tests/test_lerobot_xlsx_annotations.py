@@ -29,6 +29,7 @@ from gear_sonic.utils.data_collection.lerobot_xlsx_annotations import (
     load_annotations,
     select_annotations_by_direction,
     snap_boundary_frames,
+    validate_release_marker,
     validate_variant,
 )
 
@@ -999,6 +1000,153 @@ def _write_fixture_annotations(source: Path) -> Path:
         source / "pnp_trash.xlsx",
         [HEADERS, [0, 0], valid_row(episode=1)],
     )
+
+
+def _write_two_direction_fixture_annotations(source: Path) -> Path:
+    left = valid_row(episode=0)
+    left[-1] = InlineText("approach, pick, turn left, put")
+    right = valid_row(episode=1)
+    right[6] = "turn right and approach the trash bin"
+    right[-1] = InlineText("approach, pick, turn right, put")
+    return write_xlsx(source / "pnp_trash.xlsx", [HEADERS, left, right])
+
+
+def _make_existing_path(path: Path, kind: str) -> None:
+    if kind == "file":
+        path.write_text("occupied", encoding="utf-8")
+    elif kind == "directory":
+        path.mkdir()
+    elif kind == "symlink":
+        target = path.parent / "marker-target"
+        target.write_text("target", encoding="utf-8")
+        path.symlink_to(target)
+    elif kind == "broken_symlink":
+        path.symlink_to(path.parent / "missing-marker-target")
+    else:
+        raise AssertionError(f"unknown existing path kind: {kind}")
+
+
+def _publish_filtered_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+    marker = tmp_path / "pnp_trash_left_only.release.json"
+    export_both(
+        source,
+        workbook,
+        subtasks,
+        full_prompt,
+        direction_filter="left",
+        expected_direction_counts=(1, 1),
+        release_marker_path=marker,
+    )
+    return source, subtasks, full_prompt, marker
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink", "broken_symlink"])
+def test_export_both_rejects_preexisting_release_marker(tmp_path: Path, kind: str) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_two_direction_fixture_annotations(source)
+    marker = tmp_path / "pnp_trash_left_only.release.json"
+    _make_existing_path(marker, kind)
+
+    with pytest.raises(AnnotationError, match="release marker already exists"):
+        export_both(
+            source,
+            workbook,
+            tmp_path / "subtasks",
+            tmp_path / "full_prompt",
+            direction_filter="left",
+            expected_direction_counts=(1, 1),
+            release_marker_path=marker,
+        )
+
+
+def test_filtered_export_publishes_valid_release_marker(tmp_path: Path) -> None:
+    _source, subtasks, full_prompt, marker = _publish_filtered_fixture(tmp_path)
+    reports = validate_release_marker(marker, subtasks, full_prompt)
+    assert reports["state"] == "complete"
+    assert reports["selected_episodes"] == 1
+
+
+def test_release_without_marker_is_not_consumable(tmp_path: Path) -> None:
+    _source, subtasks, full_prompt, marker = _publish_filtered_fixture(tmp_path)
+    marker.unlink()
+    with pytest.raises(DatasetValidationError, match="release marker"):
+        validate_release_marker(marker, subtasks, full_prompt)
+
+
+def test_release_marker_rejects_mismatched_manifest_and_mapping(tmp_path: Path) -> None:
+    _source, subtasks, full_prompt, marker = _publish_filtered_fixture(tmp_path)
+    sub_provenance = json.loads((subtasks / "meta/annotation_provenance.json").read_text(encoding="utf-8"))
+    full_provenance = json.loads((full_prompt / "meta/annotation_provenance.json").read_text(encoding="utf-8"))
+
+    def mapping(value: dict[str, list[dict[str, int]]]) -> list[tuple[int, int, int]]:
+        return [
+            (row["source_episode_index"], row["output_episode_index"], row["length"]) for row in value["episodes"]
+        ]
+
+    assert mapping(sub_provenance) == mapping(full_provenance)
+
+    value = json.loads(marker.read_text(encoding="utf-8"))
+    value["datasets"]["subtasks"]["manifest_sha256"] = "0" * 64
+    marker.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(DatasetValidationError, match="manifest"):
+        validate_release_marker(marker, subtasks, full_prompt)
+
+
+def test_release_marker_rejects_cross_variant_episode_mapping_mismatch(tmp_path: Path) -> None:
+    _source, subtasks, full_prompt, marker = _publish_filtered_fixture(tmp_path)
+    provenance_path = full_prompt / "meta/annotation_provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["episodes"][0]["source_episode_index"] = 1
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    value = json.loads(marker.read_text(encoding="utf-8"))
+    value["datasets"]["subtasks"]["manifest_sha256"] = dataset_manifest_sha256(subtasks)
+    value["datasets"]["full_prompt"]["manifest_sha256"] = dataset_manifest_sha256(full_prompt)
+    marker.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(DatasetValidationError, match="mapping"):
+        validate_release_marker(marker, subtasks, full_prompt)
+
+
+def test_export_both_all_preserves_legacy_schema_without_classification(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    row = valid_row(episode=1)
+    row[6] = "move toward the trash bin"
+    workbook = write_xlsx(source / "pnp_trash.xlsx", [HEADERS, [0, 0], row])
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+
+    export_both(
+        source,
+        workbook,
+        subtasks,
+        full_prompt,
+        direction_filter="all",
+    )
+
+    for output in (subtasks, full_prompt):
+        provenance = json.loads((output / "meta/annotation_provenance.json").read_text(encoding="utf-8"))
+        assert provenance["schema_version"] == 1
+        assert "selection" not in provenance
+
+
+def test_export_both_all_rejects_release_marker_argument(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+
+    with pytest.raises(AnnotationError, match="release marker"):
+        export_both(
+            source,
+            workbook,
+            tmp_path / "subtasks",
+            tmp_path / "full_prompt",
+            direction_filter="all",
+            release_marker_path=tmp_path / "release.json",
+        )
 
 
 def test_export_both_refuses_preexisting_output(tmp_path: Path) -> None:
