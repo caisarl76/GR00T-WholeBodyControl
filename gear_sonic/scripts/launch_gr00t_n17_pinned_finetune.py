@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
+from contextlib import contextmanager
 import gc
 import json
 import os
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
+from types import SimpleNamespace, TracebackType
 
 COSMOS_MODEL_ID = "nvidia/Cosmos-Reason2-2B"
 COSMOS_REVISION = "9ce19a195e423419c349abfc86fd07178b230561"
@@ -21,6 +22,8 @@ REQUIRED_OFFLINE_ENV = {
 }
 
 DEFAULT_CACHE_ROOT = Path("/root/.cache/huggingface")
+ALBUMENTATIONS_UPDATE_ENV = "NO_ALBUMENTATIONS_UPDATE"
+ALBUMENTATIONS_UPDATE_VALUE = "1"
 FRESHNESS_AUDIT_ENV = "GR00T_FRESHNESS_AUDIT_PATH"
 PREFLIGHT_ONLY_ENV = "GR00T_PINNED_PREFLIGHT_ONLY"
 TRAINING_ARGS_AUDIT_ENV = "GR00T_TRAINING_ARGS_AUDIT_PATH"
@@ -45,6 +48,7 @@ PINNED_RECIPE: dict[str, object] = {
     "training.bf16": True,
     "training.gradient_checkpointing": False,
     "training.save_only_model": False,
+    "training.skip_weight_loading": False,
     "training.save_total_limit": 5,
     "training.wandb_project": "gr00t-n1.7-pnp-trash",
     "data.shard_size": 1024,
@@ -112,6 +116,38 @@ def assert_offline_environment(environ: Mapping[str, str] | None = None) -> None
     }
     if mismatches:
         raise RuntimeError("required offline environment is not active: " + json.dumps(mismatches, sort_keys=True))
+
+
+@contextmanager
+def _albumentations_import_environment(
+    environ: MutableMapping[str, str],
+) -> Iterator[None]:
+    """Suppress Albumentations update checks before importing GR00T."""
+    injected_is_process = environ is os.environ
+    injected_previous = environ.get(ALBUMENTATIONS_UPDATE_ENV)
+    process_previous = os.environ.get(ALBUMENTATIONS_UPDATE_ENV)
+    values = [injected_previous]
+    if not injected_is_process:
+        values.append(process_previous)
+    if any(value is not None and value != ALBUMENTATIONS_UPDATE_VALUE for value in values):
+        raise RuntimeError(
+            f"{ALBUMENTATIONS_UPDATE_ENV} must be exactly {ALBUMENTATIONS_UPDATE_VALUE!r} when preconfigured"
+        )
+
+    environ[ALBUMENTATIONS_UPDATE_ENV] = ALBUMENTATIONS_UPDATE_VALUE
+    os.environ[ALBUMENTATIONS_UPDATE_ENV] = ALBUMENTATIONS_UPDATE_VALUE
+    try:
+        yield
+    finally:
+        if not injected_is_process:
+            if injected_previous is None:
+                environ.pop(ALBUMENTATIONS_UPDATE_ENV, None)
+            else:
+                environ[ALBUMENTATIONS_UPDATE_ENV] = injected_previous
+            if process_previous is None:
+                os.environ.pop(ALBUMENTATIONS_UPDATE_ENV, None)
+            else:
+                os.environ[ALBUMENTATIONS_UPDATE_ENV] = process_previous
 
 
 def resolve_snapshot(
@@ -373,6 +409,13 @@ def _class_name(value: object | None) -> str | None:
     return None if value is None else type(value).__name__
 
 
+def _cleanup_failure_summary(
+    failures: list[tuple[BaseException, TracebackType | None]],
+) -> RuntimeError:
+    details = "; ".join(f"{type(error).__name__}: {error}" for error, _traceback in failures)
+    return RuntimeError(f"offline preflight cleanup failures: {details}")
+
+
 def run_offline_preflight(
     config: object,
     pipeline_class: Callable[[object, Path], object],
@@ -386,6 +429,8 @@ def run_offline_preflight(
         raise RuntimeError("offline preflight requires W&B to be disabled")
     save_cfg_dir.mkdir(parents=True, exist_ok=False)
     pipeline = pipeline_class(config, save_cfg_dir)
+    record = None
+    setup_failure: tuple[BaseException, TracebackType | None] | None = None
     try:
         pipeline.setup()
         record = {
@@ -395,25 +440,53 @@ def run_offline_preflight(
             "eval_dataset_class": _class_name(getattr(pipeline, "eval_dataset", None)),
             "data_collator_class": _class_name(getattr(pipeline, "data_collator", None)),
         }
-    finally:
-        for dataset_name in ("train_dataset", "eval_dataset"):
-            dataset = getattr(pipeline, dataset_name, None)
-            close = getattr(dataset, "close", None)
-            if callable(close):
+    except BaseException as error:
+        setup_failure = (error, error.__traceback__)
+
+    cleanup_failures: list[tuple[BaseException, TracebackType | None]] = []
+    for dataset_name in ("train_dataset", "eval_dataset"):
+        dataset = getattr(pipeline, dataset_name, None)
+        close = getattr(dataset, "close", None)
+        if callable(close):
+            try:
                 close()
-        del close, dataset
-        for attribute in (
-            "model",
-            "processor",
-            "train_dataset",
-            "eval_dataset",
-            "data_collator",
-        ):
-            if hasattr(pipeline, attribute):
+            except BaseException as error:
+                cleanup_failures.append((error, error.__traceback__))
+    del close, dataset
+    for attribute in (
+        "model",
+        "processor",
+        "train_dataset",
+        "eval_dataset",
+        "data_collator",
+    ):
+        if hasattr(pipeline, attribute):
+            try:
                 setattr(pipeline, attribute, None)
-        del pipeline
+            except BaseException as error:
+                cleanup_failures.append((error, error.__traceback__))
+    del pipeline
+    try:
         gc_collect()
+    except BaseException as error:
+        cleanup_failures.append((error, error.__traceback__))
+    try:
         torch_module.cuda.empty_cache()
+    except BaseException as error:
+        cleanup_failures.append((error, error.__traceback__))
+
+    if setup_failure is not None:
+        error, traceback = setup_failure
+        if cleanup_failures:
+            raise error.with_traceback(traceback) from _cleanup_failure_summary(cleanup_failures)
+        raise error.with_traceback(traceback)
+    if cleanup_failures:
+        error, traceback = cleanup_failures[0]
+        if len(cleanup_failures) > 1:
+            raise error.with_traceback(traceback) from _cleanup_failure_summary(cleanup_failures[1:])
+        raise error.with_traceback(traceback)
+    if record is None:
+        raise RuntimeError("offline preflight setup returned without a class record")
     return record
 
 
@@ -463,12 +536,15 @@ def main(
     *,
     environ: MutableMapping[str, str] | None = None,
     dependencies: object | None = None,
+    dependency_loader: Callable[[], object] | None = None,
 ) -> None:
     """Validate the immutable runtime contract and run preflight or training."""
     environment = os.environ if environ is None else environ
     assert_offline_environment(environment)
     preflight_only = parse_preflight_only(environment.get(PREFLIGHT_ONLY_ENV))
-    runtime = _load_runtime_dependencies() if dependencies is None else dependencies
+    load_dependencies = _load_runtime_dependencies if dependency_loader is None else dependency_loader
+    with _albumentations_import_environment(environment):
+        runtime = load_dependencies() if dependencies is None else dependencies
 
     environment.setdefault("LOGURU_LEVEL", "INFO")
     ft_config = runtime.tyro.cli(runtime.FinetuneConfig, description=__doc__)

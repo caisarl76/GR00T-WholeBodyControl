@@ -46,6 +46,7 @@ EXPECTED_RECIPE = {
     "training.bf16": True,
     "training.gradient_checkpointing": False,
     "training.save_only_model": False,
+    "training.skip_weight_loading": False,
     "training.save_total_limit": 5,
     "training.wandb_project": "gr00t-n1.7-pnp-trash",
     "data.shard_size": 1024,
@@ -479,6 +480,14 @@ def test_assert_recipe_contract_accepts_complete_exact_recipe() -> None:
     assert_recipe_contract(fake_config())
 
 
+def test_assert_recipe_contract_rejects_skip_weight_loading() -> None:
+    config = fake_config()
+    config.training.skip_weight_loading = True
+
+    with pytest.raises(RuntimeError, match="training.skip_weight_loading"):
+        assert_recipe_contract(config)
+
+
 def test_assert_recipe_contract_reports_every_mismatched_field() -> None:
     config = fake_config()
     config.training.optim = "adamw_hf"
@@ -740,6 +749,117 @@ def test_run_offline_preflight_releases_loaded_objects_before_collection(
     )
 
 
+def test_run_offline_preflight_preserves_setup_error_and_completes_cleanup(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    instances = []
+
+    class SetupFailure(RuntimeError):
+        pass
+
+    class TrainCloseFailure(RuntimeError):
+        pass
+
+    class EvalCloseFailure(RuntimeError):
+        pass
+
+    class Dataset:
+        def __init__(self, name: str, error: BaseException) -> None:
+            self.name = name
+            self.error = error
+
+        def close(self) -> None:
+            events.append(f"{self.name}-close")
+            raise self.error
+
+    class Pipeline:
+        def __init__(self, _config: object, _save_cfg_dir: Path) -> None:
+            instances.append(self)
+
+        def setup(self) -> None:
+            self.model = object()
+            self.processor = object()
+            self.train_dataset = Dataset("train", TrainCloseFailure("train close failed"))
+            self.eval_dataset = Dataset("eval", EvalCloseFailure("eval close failed"))
+            self.data_collator = object()
+            events.append("setup")
+            raise SetupFailure("setup failed")
+
+    with pytest.raises(SetupFailure, match="setup failed") as exc_info:
+        run_offline_preflight(
+            fake_config(use_wandb=False),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: events.append("empty-cache"))),
+            gc_collect=lambda: events.append("gc-collect"),
+        )
+
+    assert events == ["setup", "train-close", "eval-close", "gc-collect", "empty-cache"]
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "train close failed" in str(exc_info.value.__cause__)
+    assert "eval close failed" in str(exc_info.value.__cause__)
+    pipeline = instances[0]
+    assert pipeline.model is None
+    assert pipeline.processor is None
+    assert pipeline.train_dataset is None
+    assert pipeline.eval_dataset is None
+    assert pipeline.data_collator is None
+
+
+def test_run_offline_preflight_raises_first_cleanup_error_after_all_cleanup(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    instances = []
+
+    class TrainCloseFailure(RuntimeError):
+        pass
+
+    class EvalCloseFailure(RuntimeError):
+        pass
+
+    class Dataset:
+        def __init__(self, name: str, error: BaseException) -> None:
+            self.name = name
+            self.error = error
+
+        def close(self) -> None:
+            events.append(f"{self.name}-close")
+            raise self.error
+
+    class Pipeline:
+        def __init__(self, _config: object, _save_cfg_dir: Path) -> None:
+            instances.append(self)
+
+        def setup(self) -> None:
+            self.model = object()
+            self.processor = object()
+            self.train_dataset = Dataset("train", TrainCloseFailure("train close failed"))
+            self.eval_dataset = Dataset("eval", EvalCloseFailure("eval close failed"))
+            self.data_collator = object()
+            events.append("setup")
+
+    with pytest.raises(TrainCloseFailure, match="train close failed") as exc_info:
+        run_offline_preflight(
+            fake_config(use_wandb=False),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: events.append("empty-cache"))),
+            gc_collect=lambda: events.append("gc-collect"),
+        )
+
+    assert events == ["setup", "train-close", "eval-close", "gc-collect", "empty-cache"]
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "eval close failed" in str(exc_info.value.__cause__)
+    pipeline = instances[0]
+    assert pipeline.model is None
+    assert pipeline.processor is None
+    assert pipeline.train_dataset is None
+    assert pipeline.eval_dataset is None
+    assert pipeline.data_collator is None
+
+
 def test_main_validates_offline_environment_before_runtime_dependencies() -> None:
     class Dependencies:
         def __getattribute__(self, name: str) -> object:
@@ -821,6 +941,90 @@ def _fake_runtime_dependencies(
         torch=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: events.append("empty-cache"))),
         gc_collect=lambda: events.append("gc-collect"),
     )
+
+
+@pytest.mark.parametrize("injected_value", [None, "1"])
+def test_main_sets_albumentations_no_update_before_dependency_loader_and_restores_injected_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    injected_value: str | None,
+) -> None:
+    variable = "NO_ALBUMENTATIONS_UPDATE"
+    monkeypatch.delenv(variable, raising=False)
+    events: list[object] = []
+    dependencies = _fake_runtime_dependencies(tmp_path, use_wandb=False, events=events)
+    environment = {
+        **REQUIRED_OFFLINE_ENV,
+        "GR00T_PINNED_PREFLIGHT_ONLY": "1",
+        "GR00T_FRESHNESS_AUDIT_PATH": str((tmp_path / "freshness.json").resolve()),
+    }
+    if injected_value is not None:
+        environment[variable] = injected_value
+    observed = []
+
+    def dependency_loader() -> SimpleNamespace:
+        observed.append(os.environ.get(variable))
+        return dependencies
+
+    main(environ=environment, dependency_loader=dependency_loader)
+
+    assert observed == ["1"]
+    assert os.environ.get(variable) is None
+    if injected_value is None:
+        assert variable not in environment
+    else:
+        assert environment[variable] == injected_value
+
+
+@pytest.mark.parametrize("conflict_source", ["injected", "process"])
+def test_main_rejects_conflicting_albumentations_update_value_before_dependency_loader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict_source: str,
+) -> None:
+    variable = "NO_ALBUMENTATIONS_UPDATE"
+    monkeypatch.delenv(variable, raising=False)
+    environment = {**REQUIRED_OFFLINE_ENV}
+    if conflict_source == "injected":
+        environment[variable] = "0"
+    else:
+        monkeypatch.setenv(variable, "0")
+    loader_called = False
+
+    def dependency_loader() -> SimpleNamespace:
+        nonlocal loader_called
+        loader_called = True
+        raise AssertionError("dependency loader must not run")
+
+    with pytest.raises(RuntimeError, match="NO_ALBUMENTATIONS_UPDATE"):
+        main(environ=environment, dependency_loader=dependency_loader)
+
+    assert loader_called is False
+
+
+def test_main_rejects_skip_weight_loading_before_snapshot_freshness_or_run(
+    tmp_path: Path,
+) -> None:
+    events: list[object] = []
+    dependencies = _fake_runtime_dependencies(tmp_path, use_wandb=True, events=events)
+    dependencies.tyro.cli().skip_weight_loading = True
+    freshness_audit = (tmp_path / "freshness.json").resolve()
+    environment = {
+        **REQUIRED_OFFLINE_ENV,
+        "GR00T_PINNED_PREFLIGHT_ONLY": "0",
+        "GR00T_FRESHNESS_AUDIT_PATH": str(freshness_audit),
+        "GR00T_TRAINING_ARGS_AUDIT_PATH": str((tmp_path / "training-arguments.json").resolve()),
+    }
+
+    with pytest.raises(RuntimeError, match="training.skip_weight_loading"):
+        main(environ=environment, dependencies=dependencies)
+
+    assert not any(
+        isinstance(event, tuple) and event[0] in {"snapshot-download", "checkpoint-probe", "run"}
+        for event in events
+    )
+    assert not freshness_audit.exists()
+    assert not (tmp_path / "outputs" / "experiment").exists()
 
 
 def test_main_preflight_runs_setup_and_never_calls_training(tmp_path: Path, capsys) -> None:

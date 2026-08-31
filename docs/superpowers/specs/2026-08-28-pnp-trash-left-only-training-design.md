@@ -193,11 +193,16 @@ only these effective overrides before calling `run(config)`:
 The shim and its source diff against pinned `launch_finetune.py` are hashed and
 stored with the resolved command. `HF_HUB_OFFLINE=1`,
 `TRANSFORMERS_OFFLINE=1`, and `HF_DATASETS_OFFLINE=1` are mandatory for every
-probe and training process. Before the offline model/processor load, a shim
-test constructs the effective config, asserts the canonical model name and
-exact revision, calls pinned `get_backbone_cls(config.model)`, and requires it
-to return `Qwen3Backbone`. Both model and processor must then load with
-local-only settings before a smoke is allowed.
+probe and training process. Independently, the launcher sets
+`NO_ALBUMENTATIONS_UPDATE=1` in the real process environment before importing
+GR00T or Albumentations so that the pinned import chain cannot request
+`pypi.org`. A preexisting exact value of `1` is accepted; any other preexisting
+value fails closed instead of being overwritten. Before the offline
+model/processor load, a shim test constructs the effective config, asserts the
+canonical model name and exact revision, calls pinned
+`get_backbone_cls(config.model)`, and requires it to return `Qwen3Backbone`.
+Both model and processor must then load with local-only settings before a smoke
+is allowed.
 
 The Hugging Face cache is mounted read-only. Scoped validation requires the
 two selected snapshot directories and their model-specific blobs, resolves
@@ -302,7 +307,9 @@ experiment name:
 - projector, diffusion model, and VLLN trainable; LLM and visual backbone
   frozen, with zero top LLM layers tuned;
 - checkpoint interval 1,000 and retention limit five;
-- `save_only_model=false`, producing complete resumable trainer state; and
+- `save_only_model=false`, producing complete resumable trainer state;
+- `skip_weight_loading=false`; architecture-only construction is forbidden;
+  and
 - W&B online under project `gr00t-n1.7-pnp-trash`.
 
 The distinct production experiment names are:

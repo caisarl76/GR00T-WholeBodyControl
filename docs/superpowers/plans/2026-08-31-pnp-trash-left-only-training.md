@@ -1014,6 +1014,13 @@ def test_parse_preflight_only_rejects_other_values() -> None:
         parse_preflight_only("true")
 
 
+def test_assert_recipe_contract_rejects_skip_weight_loading() -> None:
+    config = fake_config()
+    config.training.skip_weight_loading = True
+    with pytest.raises(RuntimeError, match="training.skip_weight_loading"):
+        assert_recipe_contract(config)
+
+
 def _training_arguments_payload(deepspeed: object) -> dict[str, object]:
     return {
         "deepspeed": deepspeed,
@@ -1183,6 +1190,7 @@ expected = {
     "training.bf16": True,
     "training.gradient_checkpointing": False,
     "training.save_only_model": False,
+    "training.skip_weight_loading": False,
     "training.save_total_limit": 5,
     "training.wandb_project": "gr00t-n1.7-pnp-trash",
     "data.shard_size": 1024,
@@ -1210,10 +1218,18 @@ expected = {
 
 `main` imports pinned `FinetuneConfig`, `get_default_config`, modality loader,
 `EmbodimentTag`, `get_backbone_cls`, `get_last_checkpoint`, and `run` only after
-the offline environment has passed validation. It resolves the embodiment,
-loads the modality module, applies the mapping above, asserts the Cosmos
-snapshot, calls `verify_backbone_selector(config.model, get_backbone_cls)`,
-and calls `assert_fresh_experiment` on
+the offline environment has passed validation. Immediately before any such
+import, it sets `NO_ALBUMENTATIONS_UPDATE=1` in the real process environment so
+the pinned Albumentations import chain cannot request `pypi.org`. Accept an
+existing exact value of `1`, but fail closed on any other preexisting value
+rather than overwriting it. When a separate environment mapping is injected
+for pure tests, restore both that mapping and the real process environment to
+their prior state after dependency loading; normal production use mutates
+`os.environ` and retains `1`. `REQUIRED_OFFLINE_ENV` remains the strict three
+Hugging Face offline flags below. Main then resolves the embodiment, loads the
+modality module, applies the mapping above, asserts the Cosmos snapshot, calls
+`verify_backbone_selector(config.model, get_backbone_cls)`, and calls
+`assert_fresh_experiment` on
 `Path(config.training.output_dir) / config.training.experiment_name` before
 `run(config)`. It also calls `assert_recipe_contract(config)`. The single-GPU
 post-start gate separately reads the effective Hugging Face
@@ -1241,6 +1257,12 @@ objects, run `gc.collect()` and `torch.cuda.empty_cache()`, then exit without
 calling `run(config)`. With value `0` or unset, require
 `config.training.use_wandb is True` and call `run(config)`.
 
+Preflight cleanup attempts both dataset closes even when either fails, clears
+all pipeline-held model, processor, dataset, and collator references, and calls
+`gc.collect()` and `torch.cuda.empty_cache()` exactly once. A setup exception
+remains primary and chains any cleanup failures; without a setup exception,
+the first cleanup failure is primary and chains later cleanup failures.
+
 Before the normal `run(config)` branch, require an absolute nonexistent path
 from `GR00T_TRAINING_ARGS_AUDIT_PATH`. `install_training_arguments_audit`
 wraps the pinned `gr00t.experiment.experiment.TrainingArguments` constructor,
@@ -1263,6 +1285,8 @@ COSMOS_SNAPSHOT_RELATIVE = (
     "models--nvidia--Cosmos-Reason2-2B/"
     "snapshots/9ce19a195e423419c349abfc86fd07178b230561"
 )
+ALBUMENTATIONS_UPDATE_ENV = "NO_ALBUMENTATIONS_UPDATE"
+ALBUMENTATIONS_UPDATE_VALUE = "1"
 REQUIRED_OFFLINE_ENV = {
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
