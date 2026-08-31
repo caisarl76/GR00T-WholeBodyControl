@@ -153,6 +153,32 @@ def test_concurrent_gate_requires_overlap_and_exact_processes() -> None:
     assert any("unexpected process" in item for item in result["reasons"])
 
 
+def test_concurrent_gate_does_not_union_distinct_cycles_with_duplicate_timestamps() -> None:
+    first_cycle = [
+        _sample(30000, [(202, "subtasks", 10000)], gpu_index=6),
+        _sample(30000, [], gpu_index=7),
+    ]
+    second_cycle = [
+        _sample(30000, [], gpu_index=6),
+        _sample(30000, [(101, "full", 10000)], gpu_index=7),
+    ]
+
+    result = evaluate_concurrent_gate(
+        samples=[*first_cycle, *second_cycle],
+        sample_cycles=[first_cycle, second_cycle],
+        expected_pids={
+            "full": {"gpu_index": 7, "pid": 101},
+            "subtasks": {"gpu_index": 6, "pid": 202},
+        },
+        total_mib=81559,
+    )
+
+    assert result["status"] == "fail"
+    assert result["summary"]["sample_cycle_count"] == 2
+    assert result["summary"]["overlap_cycle_indices"] == []
+    assert any("overlap" in reason for reason in result["reasons"])
+
+
 def test_concurrent_gate_accepts_baseline_processes_and_normalizes_summaries() -> None:
     baseline = {
         "7": [{"pid": 9, "name": "eval"}],

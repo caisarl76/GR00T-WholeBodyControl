@@ -296,9 +296,53 @@ def _expected_pid_contract(
     return normalized, reasons
 
 
+def _partition_sample_cycles(
+    samples: Sequence[Mapping[str, object]],
+) -> list[list[Mapping[str, object]]]:
+    """Recover contiguous snapshot batches without trusting timestamp precision."""
+    cycles: list[list[Mapping[str, object]]] = []
+    current: list[Mapping[str, object]] = []
+    current_gpus: set[int] = set()
+    for sample in samples:
+        gpu = int(sample["gpu_index"])
+        if gpu in current_gpus:
+            cycles.append(current)
+            current = []
+            current_gpus = set()
+        current.append(sample)
+        current_gpus.add(gpu)
+    if current:
+        cycles.append(current)
+    return cycles
+
+
+def _sample_cycle_contract(
+    samples: Sequence[Mapping[str, object]],
+    sample_cycles: Sequence[Sequence[Mapping[str, object]]] | None,
+) -> tuple[list[list[Mapping[str, object]]], list[str]]:
+    cycles = (
+        _partition_sample_cycles(samples) if sample_cycles is None else [list(cycle) for cycle in sample_cycles]
+    )
+    reasons: list[str] = []
+    if not cycles or any(not cycle for cycle in cycles):
+        return [], ["sample cycle contract requires nonempty cycles"]
+    flattened: list[Mapping[str, object]] = []
+    for cycle_index, cycle in enumerate(cycles):
+        gpu_indices = [int(sample["gpu_index"]) for sample in cycle]
+        if len(gpu_indices) != len(set(gpu_indices)):
+            reasons.append(f"sample cycle {cycle_index} repeats a GPU")
+        if len({str(sample["timestamp_utc"]) for sample in cycle}) != 1:
+            reasons.append(f"sample cycle {cycle_index} has inconsistent timestamps")
+        flattened.extend(cycle)
+    if flattened != list(samples):
+        reasons.append("sample cycles do not exactly partition the ordered samples")
+    return ([] if reasons else cycles), reasons
+
+
 def evaluate_concurrent_gate(
     *,
     samples: Sequence[Mapping[str, object]],
+    sample_cycles: Sequence[Sequence[Mapping[str, object]]] | None = None,
     expected_pids: Mapping[str, Mapping[str, object]],
     total_mib: int = EXPECTED_TOTAL_MIB,
     baseline_processes_by_gpu: Mapping[str | int, Iterable[Mapping[str, object]]] | None = None,
@@ -313,6 +357,8 @@ def evaluate_concurrent_gate(
     reasons.extend(expected_reasons)
     baseline = _normalize_processes(baseline_processes_by_gpu)
     valid_samples = [] if _validate_samples(samples) else list(samples)
+    cycles, cycle_reasons = _sample_cycle_contract(valid_samples, sample_cycles)
+    reasons.extend(cycle_reasons)
     if not _is_int(total_mib) or total_mib != EXPECTED_TOTAL_MIB:
         reasons.append(f"expected H100 total memory is {EXPECTED_TOTAL_MIB} MiB")
     if timed_out:
@@ -321,7 +367,6 @@ def evaluate_concurrent_gate(
         int(gpu): {(int(value["pid"]), str(value["name"])) for value in values} for gpu, values in baseline.items()
     }
     expected_by_pid = {value["pid"]: (label, value["gpu_index"]) for label, value in expected.items()}
-    timestamps: dict[str, set[int]] = {}
     peaks: dict[int, int] = {}
     for sample in valid_samples:
         gpu = int(sample["gpu_index"])
@@ -331,7 +376,6 @@ def evaluate_concurrent_gate(
             reasons.append(f"GPU {gpu} total memory is not {EXPECTED_TOTAL_MIB} MiB")
         if used >= EXPECTED_TOTAL_MIB * GATE_MAX_FRACTION:
             reasons.append(f"GPU {gpu} reached the concurrent memory ceiling")
-        live = timestamps.setdefault(str(sample["timestamp_utc"]), set())
         for process in sample["processes"]:  # type: ignore[union-attr]
             pid = int(process["pid"])
             name = str(process["name"])
@@ -339,12 +383,21 @@ def evaluate_concurrent_gate(
                 label, expected_gpu = expected_by_pid[pid]
                 if gpu != expected_gpu:
                     reasons.append(f"GPU mismatch for {label}: expected {expected_gpu}, observed {gpu}")
-                else:
-                    live.add(pid)
             elif (pid, name) not in allowed.get(gpu, set()):
                 reasons.append(f"unexpected process PID {pid} on GPU {gpu}")
     expected_pid_set = set(expected_by_pid)
-    overlap = bool(expected_pid_set) and any(expected_pid_set <= live for live in timestamps.values())
+    overlap_cycle_indices: list[int] = []
+    for cycle_index, cycle in enumerate(cycles):
+        live = {
+            int(process["pid"])
+            for sample in cycle
+            for process in sample["processes"]  # type: ignore[union-attr]
+            if int(process["pid"]) in expected_by_pid
+            and int(sample["gpu_index"]) == expected_by_pid[int(process["pid"])][1]
+        }
+        if expected_pid_set and expected_pid_set <= live:
+            overlap_cycle_indices.append(cycle_index)
+    overlap = bool(overlap_cycle_indices)
     if not overlap:
         reasons.append("no sample proves overlap of all declared gate PIDs")
     if exit_codes is not None:
@@ -358,7 +411,9 @@ def evaluate_concurrent_gate(
     final_processes = _processes_from_last_samples(valid_samples)
     summary: dict[str, object] = {
         "sample_count": len(samples),
+        "sample_cycle_count": len(cycles),
         "overlap_observed": overlap,
+        "overlap_cycle_indices": overlap_cycle_indices,
         "expected_pids": expected,
         "baseline_processes_by_gpu": baseline,
         "final_processes_by_gpu": final_processes,
@@ -652,6 +707,7 @@ def _collect_concurrent(
 ) -> tuple[
     list[dict[str, object]],
     list[dict[str, object]],
+    list[list[dict[str, object]]],
     dict[str, dict[str, int]],
     dict[str, int] | None,
     bool,
@@ -661,6 +717,7 @@ def _collect_concurrent(
     next_deadline = start
     samples: list[dict[str, object]] = []
     prelaunch: list[dict[str, object]] = []
+    sample_cycles: list[list[dict[str, object]]] = []
     expected: dict[str, dict[str, int]] = {}
     exit_specs: dict[str, Path] | None = None
     exit_codes: dict[str, int] | None = None
@@ -671,9 +728,10 @@ def _collect_concurrent(
         now = time.monotonic()
         if now - start >= timeout_seconds:
             errors.append("timeout while waiting for PID or exit files")
-            return samples, prelaunch, expected, exit_codes, True, errors
+            return samples, prelaunch, sample_cycles, expected, exit_codes, True, errors
         current = snapshot_gpus(gpu_indices)
         samples.extend(current)
+        sample_cycles.append(current)
         if tick < prelaunch_seconds:
             prelaunch.extend(current)
         elif not expected and all(path.exists() for path in pid_paths):
@@ -682,17 +740,17 @@ def _collect_concurrent(
                 exit_specs = parse_exit_file_specs(exit_specs_raw, expected_labels=set(expected))
             except GpuGateError as error:
                 errors.append(str(error))
-                return samples, prelaunch, expected, exit_codes, False, errors
+                return samples, prelaunch, sample_cycles, expected, exit_codes, False, errors
         if expected and exit_specs is not None and all(path.exists() for path in exit_specs.values()):
             if exit_seen_at is None:
                 try:
                     exit_codes = read_exit_codes(exit_specs)
                 except GpuGateError as error:
                     errors.append(str(error))
-                    return samples, prelaunch, expected, exit_codes, False, errors
+                    return samples, prelaunch, sample_cycles, expected, exit_codes, False, errors
                 exit_seen_at = now
             if now - exit_seen_at >= post_exit_seconds:
-                return samples, prelaunch, expected, exit_codes, False, errors
+                return samples, prelaunch, sample_cycles, expected, exit_codes, False, errors
         tick += 1
         next_deadline += 1.0
         delay = next_deadline - time.monotonic()
@@ -789,6 +847,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             (
                 samples,
                 prelaunch,
+                sample_cycles,
                 expected,
                 exit_codes,
                 timed_out,
@@ -810,6 +869,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             result = evaluate_concurrent_gate(
                 samples=samples,
+                sample_cycles=sample_cycles,
                 expected_pids=expected,
                 baseline_processes_by_gpu=baseline_result["summary"][  # type: ignore[index]
                     "baseline_processes_by_gpu"
