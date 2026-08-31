@@ -17,6 +17,7 @@ from gear_sonic.scripts.verify_gr00t_n17_checkpoint import (
     COSMOS_MODEL_ID,
     COSMOS_REVISION,
     CheckpointError,
+    _cache_is_read_only,
     _verify_offline_load_worker,
     main,
     verify_checkpoint_structure,
@@ -334,6 +335,36 @@ def _offline_dependencies(
         gc_collect=lambda: events.append("gc"),
         empty_cache=lambda: events.append("empty-cache"),
     )
+
+
+def test_cache_read_only_rejects_mode_0555_on_writable_filesystem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_path = SimpleNamespace(stat=lambda: SimpleNamespace(st_mode=0o40555))
+    monkeypatch.setattr(os, "statvfs", lambda _path: SimpleNamespace(f_flag=0))
+
+    assert _cache_is_read_only(fake_path) is False
+
+
+def test_cache_read_only_accepts_genuine_read_only_filesystem_for_root_and_hub(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_root = tmp_path / "cache"
+    hub_cache = cache_root / "hub"
+    hub_cache.mkdir(parents=True)
+    inspected: list[Path] = []
+    read_only_flag = getattr(os, "ST_RDONLY", 1)
+
+    def statvfs(path: Path) -> SimpleNamespace:
+        inspected.append(path)
+        return SimpleNamespace(f_flag=read_only_flag)
+
+    monkeypatch.setattr(os, "statvfs", statvfs)
+
+    assert _cache_is_read_only(cache_root) is True
+    assert _cache_is_read_only(hub_cache) is True
+    assert inspected == [cache_root, hub_cache]
 
 
 def _set_exact_offline_environment(monkeypatch: pytest.MonkeyPatch) -> None:

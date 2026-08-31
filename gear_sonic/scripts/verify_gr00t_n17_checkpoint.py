@@ -442,11 +442,9 @@ def _assert_offline_child_environment() -> None:
 
 def _cache_is_read_only(path: Path) -> bool:
     try:
-        read_only_mount = bool(os.statvfs(path).f_flag & getattr(os, "ST_RDONLY", 1))
-        no_write_bits = stat.S_IMODE(path.stat().st_mode) & 0o222 == 0
-    except OSError:
+        return bool(os.statvfs(path).f_flag & getattr(os, "ST_RDONLY", 1))
+    except (AttributeError, OSError, TypeError):
         return False
-    return read_only_mount or no_write_bits
 
 
 def _load_offline_dependencies() -> SimpleNamespace:
