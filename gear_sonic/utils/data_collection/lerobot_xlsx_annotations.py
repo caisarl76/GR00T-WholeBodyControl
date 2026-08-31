@@ -57,6 +57,57 @@ class EpisodeAnnotation:
     full_prompt: str
 
 
+DirectionFilter = Literal["all", "left"]
+
+
+@dataclass(frozen=True)
+class AnnotationSelection:
+    direction: Literal["left"]
+    candidate_episodes: int
+    selected_episodes: int
+    excluded_episodes: int
+
+
+def _turn_direction(prompt: str) -> Literal["left", "right"]:
+    normalized = " ".join(prompt.casefold().split())
+    has_left = re.search(r"\bturn left\b", normalized) is not None
+    has_right = re.search(r"\bturn right\b", normalized) is not None
+    if has_left == has_right:
+        raise AnnotationError(f"subtask3 must contain exactly one turn direction, got {prompt!r}")
+    return "left" if has_left else "right"
+
+
+def select_annotations_by_direction(
+    annotations: Sequence[EpisodeAnnotation],
+    direction_filter: DirectionFilter,
+    *,
+    expected_counts: tuple[int, int] | None = None,
+) -> tuple[list[EpisodeAnnotation], AnnotationSelection | None]:
+    if direction_filter == "all":
+        return list(annotations), None
+    if direction_filter != "left":
+        raise AnnotationError(f"unknown direction filter: {direction_filter!r}")
+    classified = [(row, _turn_direction(row.subtasks[2])) for row in annotations]
+    left = sorted(
+        (row for row, direction in classified if direction == "left"),
+        key=lambda row: row.episode,
+    )
+    right_count = sum(direction == "right" for _row, direction in classified)
+    if expected_counts is None:
+        raise AnnotationError("left direction filter requires expected direction counts")
+    if (len(left), right_count) != expected_counts:
+        raise AnnotationError(
+            f"direction counts differ: expected left={expected_counts[0]} right={expected_counts[1]}, "
+            f"actual left={len(left)} right={right_count}"
+        )
+    return left, AnnotationSelection(
+        direction="left",
+        candidate_episodes=len(classified),
+        selected_episodes=len(left),
+        excluded_episodes=right_count,
+    )
+
+
 AnnotationVariant = Literal["subtasks", "full_prompt"]
 
 

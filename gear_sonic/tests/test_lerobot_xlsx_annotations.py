@@ -18,6 +18,7 @@ from gear_sonic.scripts.annotate_pnp_trash_dataset import (
 import gear_sonic.utils.data_collection.lerobot_xlsx_annotations as annotations_module
 from gear_sonic.utils.data_collection.lerobot_xlsx_annotations import (
     AnnotationError,
+    AnnotationSelection,
     DatasetValidationError,
     EpisodeAnnotation,
     build_run_steps,
@@ -26,6 +27,7 @@ from gear_sonic.utils.data_collection.lerobot_xlsx_annotations import (
     export_both,
     export_variant,
     load_annotations,
+    select_annotations_by_direction,
     snap_boundary_frames,
     validate_variant,
 )
@@ -224,6 +226,56 @@ def _annotation(
         boundaries_s=(1.0, 2.0, 3.0),
         full_prompt=full_prompt,
     )
+
+
+def test_select_annotations_by_direction_keeps_complete_left_episodes() -> None:
+    left = _annotation(4, ("approach", "pick", "  TURN   LEFT toward bin ", "put"), "full left")
+    right = _annotation(9, ("approach", "pick", "turn right toward bin", "put"), "full right")
+
+    selected, selection = select_annotations_by_direction(
+        [right, left],
+        "left",
+        expected_counts=(1, 1),
+    )
+
+    assert [row.episode for row in selected] == [4]
+    assert selection == AnnotationSelection(
+        direction="left",
+        candidate_episodes=2,
+        selected_episodes=1,
+        excluded_episodes=1,
+    )
+    assert selected[0].subtasks[0:4] == left.subtasks
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["approach the trash bin", "turn left then turn right"],
+)
+def test_select_annotations_by_direction_rejects_ambiguous_turn_prompt(prompt: str) -> None:
+    row = _annotation(1, ("approach", "pick", prompt, "put"), "full")
+
+    with pytest.raises(AnnotationError, match="exactly one turn direction"):
+        select_annotations_by_direction([row], "left", expected_counts=(1, 0))
+
+
+def test_select_annotations_by_direction_requires_exact_counts() -> None:
+    left = _annotation(1, ("approach", "pick", "turn left", "put"), "full")
+
+    with pytest.raises(AnnotationError, match="expected left=44 right=28"):
+        select_annotations_by_direction([left], "left", expected_counts=(44, 28))
+
+
+def test_select_annotations_by_direction_all_preserves_legacy_order() -> None:
+    rows = [
+        _annotation(2, ("a", "b", "unclassified", "d"), "two"),
+        _annotation(1, ("a", "b", "unclassified", "d"), "one"),
+    ]
+
+    selected, selection = select_annotations_by_direction(rows, "all")
+
+    assert selected == rows
+    assert selection is None
 
 
 def test_build_task_map_is_stable_under_annotation_order() -> None:
