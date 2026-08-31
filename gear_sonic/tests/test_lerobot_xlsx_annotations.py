@@ -616,6 +616,115 @@ def test_validate_variant_accepts_complete_export(tmp_path: Path, variant: str) 
     }
 
 
+def test_filtered_provenance_uses_schema_two_selection(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    output = tmp_path / "subtasks"
+    annotation = _annotation(
+        0,
+        ("approach", "pick", "turn left and approach", "put"),
+        "approach, pick, turn left and approach, put",
+    )
+    selection = AnnotationSelection("left", 2, 1, 1)
+    export_variant(
+        source,
+        output,
+        [annotation],
+        "subtasks",
+        source_manifest_sha256="a" * 64,
+        workbook_sha256="b" * 64,
+        selection=selection,
+    )
+    provenance = json.loads((output / "meta/annotation_provenance.json").read_text(encoding="utf-8"))
+
+    validate_variant(
+        source,
+        output,
+        [annotation],
+        "subtasks",
+        workbook_sha256="b" * 64,
+        source_manifest_sha256="a" * 64,
+        selection=selection,
+    )
+
+    assert provenance["schema_version"] == 2
+    assert provenance["selection"] == {
+        "direction": "left",
+        "candidate_episodes": 2,
+        "selected_episodes": 1,
+        "excluded_episodes": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "corrupt_value"),
+    [
+        ("direction", "right"),
+        ("candidate_episodes", 3),
+        ("selected_episodes", 2),
+        ("excluded_episodes", 0),
+    ],
+)
+def test_filtered_provenance_rejects_corrupt_selection(
+    tmp_path: Path,
+    field: str,
+    corrupt_value: object,
+) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    output = tmp_path / "subtasks"
+    annotation = _annotation(
+        0,
+        ("approach", "pick", "turn left and approach", "put"),
+        "approach, pick, turn left and approach, put",
+    )
+    selection = AnnotationSelection("left", 2, 1, 1)
+    export_variant(
+        source,
+        output,
+        [annotation],
+        "subtasks",
+        source_manifest_sha256="a" * 64,
+        workbook_sha256="b" * 64,
+        selection=selection,
+    )
+    provenance_path = output / "meta/annotation_provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["selection"][field] = corrupt_value
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(DatasetValidationError, match="selection"):
+        validate_variant(
+            source,
+            output,
+            [annotation],
+            "subtasks",
+            workbook_sha256="b" * 64,
+            source_manifest_sha256="a" * 64,
+            selection=selection,
+        )
+
+
+def test_complete_export_provenance_remains_schema_one(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    output = tmp_path / "subtasks"
+    annotation = _annotation(
+        0,
+        ("approach", "pick", "turn left and approach", "put"),
+        "approach, pick, turn left and approach, put",
+    )
+    export_variant(
+        source,
+        output,
+        [annotation],
+        "subtasks",
+        source_manifest_sha256="a" * 64,
+        workbook_sha256="b" * 64,
+    )
+    provenance = json.loads((output / "meta/annotation_provenance.json").read_text(encoding="utf-8"))
+
+    assert provenance["schema_version"] == 1
+    assert "selection" not in provenance
+
+
 def test_validate_variant_requires_exact_workbook_digest(tmp_path: Path) -> None:
     source = _make_source_dataset(tmp_path / "source")
     annotation = _annotation(

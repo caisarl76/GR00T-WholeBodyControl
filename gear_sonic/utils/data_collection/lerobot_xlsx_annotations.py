@@ -413,6 +413,8 @@ def export_variant(
     variant: AnnotationVariant,
     source_manifest_sha256: str,
     workbook_sha256: str,
+    *,
+    selection: AnnotationSelection | None = None,
 ) -> ExportResult:
     """Materialize one self-contained LeRobot annotation variant."""
 
@@ -597,34 +599,35 @@ def export_variant(
             "splits": {"train": f"0:{len(ordered_annotations)}"},
         }
     )
+    task_rows = [
+        {"task_index": task_index, "task": prompt}
+        for prompt, task_index in sorted(task_map.items(), key=lambda item: item[1])
+    ]
+    provenance = {
+        "schema_version": 2 if selection is not None else 1,
+        "variant": variant,
+        "source": {
+            "dataset_path": str(source.resolve()),
+            "manifest_sha256": source_manifest_sha256,
+        },
+        "annotations": {"workbook_sha256": workbook_sha256},
+        "tasks": task_rows,
+        "episodes": provenance_episodes,
+    }
+    if selection is not None:
+        provenance["selection"] = {
+            "direction": selection.direction,
+            "candidate_episodes": selection.candidate_episodes,
+            "selected_episodes": selection.selected_episodes,
+            "excluded_episodes": selection.excluded_episodes,
+        }
+
     _write_json(destination / "meta/info.json", output_info)
     _write_jsonl(destination / "meta/episodes.jsonl", output_episodes)
-    _write_jsonl(
-        destination / "meta/tasks.jsonl",
-        [
-            {"task_index": task_index, "task": prompt}
-            for prompt, task_index in sorted(task_map.items(), key=lambda item: item[1])
-        ],
-    )
+    _write_jsonl(destination / "meta/tasks.jsonl", task_rows)
     _write_jsonl(destination / "meta/episodes_stats.jsonl", output_stats)
     shutil.copy2(source_modality, destination / "meta/modality.json")
-    _write_json(
-        destination / "meta/annotation_provenance.json",
-        {
-            "schema_version": 1,
-            "variant": variant,
-            "source": {
-                "dataset_path": str(source.resolve()),
-                "manifest_sha256": source_manifest_sha256,
-            },
-            "annotations": {"workbook_sha256": workbook_sha256},
-            "tasks": [
-                {"task_index": task_index, "task": prompt}
-                for prompt, task_index in sorted(task_map.items(), key=lambda item: item[1])
-            ],
-            "episodes": provenance_episodes,
-        },
-    )
+    _write_json(destination / "meta/annotation_provenance.json", provenance)
     return ExportResult(
         output_path=destination,
         variant=variant,
@@ -702,6 +705,8 @@ def validate_variant(
     variant: AnnotationVariant,
     workbook_sha256: str,
     source_manifest_sha256: str | None = None,
+    *,
+    selection: AnnotationSelection | None = None,
 ) -> dict[str, object]:
     """Validate an output against its source and annotation contract."""
 
@@ -792,8 +797,25 @@ def validate_variant(
         raise DatasetValidationError("episodes_stats.jsonl row count does not match retained episodes")
 
     current_manifest = source_manifest_sha256 or dataset_manifest_sha256(source)
-    if provenance.get("schema_version") != 1:
-        raise DatasetValidationError("provenance schema_version must be 1")
+    if selection is None:
+        if provenance.get("schema_version") != 1:
+            raise DatasetValidationError("provenance schema_version must be 1")
+        if "selection" in provenance:
+            raise DatasetValidationError("provenance selection must be absent for a complete export")
+    else:
+        if provenance.get("schema_version") != 2:
+            raise DatasetValidationError("filtered selection provenance schema_version must be 2")
+        expected_selection = {
+            "direction": selection.direction,
+            "candidate_episodes": selection.candidate_episodes,
+            "selected_episodes": selection.selected_episodes,
+            "excluded_episodes": selection.excluded_episodes,
+        }
+        if provenance.get("selection") != expected_selection:
+            raise DatasetValidationError(
+                "provenance selection does not match the expected selection: "
+                f"expected={expected_selection!r}, actual={provenance.get('selection')!r}"
+            )
     provenance_source = provenance.get("source")
     if not isinstance(provenance_source, dict):
         raise DatasetValidationError("provenance source must be an object")
