@@ -10,7 +10,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import tyro
 
+import gear_sonic.scripts.annotate_pnp_trash_dataset as annotation_cli_module
 from gear_sonic.scripts.annotate_pnp_trash_dataset import (
     AnnotatePnpTrashConfig,
     main as annotation_cli_main,
@@ -2018,9 +2020,9 @@ def test_cli_validates_complete_left_release(
     )
 
     assert [report["episodes"] for report in reports] == [1, 1]
-    printed = capsys.readouterr().out
-    assert '"direction": "left"' in printed
-    assert '"state": "complete"' in printed
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["release"]["direction"] == "left"
+    assert payload["release"]["state"] == "complete"
 
 
 def test_cli_left_export_rejects_broken_marker_symlink(tmp_path: Path) -> None:
@@ -2073,3 +2075,131 @@ def test_cli_all_export_ignores_release_marker_path(tmp_path: Path) -> None:
     for output in (subtasks, full_prompt):
         provenance = json.loads((output / "meta/annotation_provenance.json").read_text(encoding="utf-8"))
         assert provenance["schema_version"] == 1
+
+
+def test_cli_export_validates_canonical_published_output_paths(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+    subtasks = tmp_path / "missing" / ".." / "subtasks"
+    full_prompt = tmp_path / "other-missing" / ".." / "full_prompt"
+
+    reports = annotation_cli_main(
+        AnnotatePnpTrashConfig(
+            dataset_path=source,
+            annotations_path=workbook,
+            subtasks_output_path=subtasks,
+            full_prompt_output_path=full_prompt,
+        )
+    )
+
+    assert [report["variant"] for report in reports] == ["subtasks", "full_prompt"]
+    assert (tmp_path / "subtasks").is_dir()
+    assert (tmp_path / "full_prompt").is_dir()
+
+
+def test_cli_validate_only_rejects_output_symlink_ancestor(tmp_path: Path) -> None:
+    source = _make_source_dataset(tmp_path / "source")
+    workbook = _write_fixture_annotations(source)
+    published = tmp_path / "published"
+    subtasks = published / "subtasks"
+    full_prompt = published / "full_prompt"
+    export_both(source, workbook, subtasks, full_prompt)
+    alias = tmp_path / "published-alias"
+    alias.symlink_to(published, target_is_directory=True)
+
+    with pytest.raises(DatasetValidationError, match="symlink"):
+        annotation_cli_main(
+            AnnotatePnpTrashConfig(
+                dataset_path=source,
+                annotations_path=workbook,
+                subtasks_output_path=alias / "subtasks",
+                full_prompt_output_path=full_prompt,
+                validate_only=True,
+            )
+        )
+
+
+def test_cli_positional_config_preserves_validate_only_field(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    workbook = tmp_path / "annotations.xlsx"
+    subtasks = tmp_path / "subtasks"
+    full_prompt = tmp_path / "full_prompt"
+
+    config = AnnotatePnpTrashConfig(source, workbook, subtasks, full_prompt, True)
+
+    assert config.validate_only is True
+    assert config.direction_filter == "all"
+
+
+def test_cli_parses_left_only_flags(tmp_path: Path) -> None:
+    marker = tmp_path / "left.release.json"
+
+    config = tyro.cli(
+        AnnotatePnpTrashConfig,
+        args=[
+            "--direction-filter",
+            "left",
+            "--expected-left-episodes",
+            "1",
+            "--expected-right-episodes",
+            "2",
+            "--release-marker-path",
+            str(marker),
+        ],
+    )
+
+    assert config.direction_filter == "left"
+    assert config.expected_left_episodes == 1
+    assert config.expected_right_episodes == 2
+    assert config.release_marker_path == marker
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("workbook", "workbook changed during validation"),
+        ("source", "source changed during validation"),
+    ],
+)
+def test_cli_rejects_inputs_changed_after_left_validation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    message: str,
+) -> None:
+    source, subtasks, full_prompt, marker = _publish_filtered_fixture(tmp_path)
+    workbook = source / "pnp_trash.xlsx"
+    original_validate_release_marker = annotation_cli_module.validate_release_marker
+
+    def mutate_after_marker_validation(
+        release_marker: Path,
+        subtasks_output: Path,
+        full_prompt_output: Path,
+    ) -> dict[str, object]:
+        report = original_validate_release_marker(release_marker, subtasks_output, full_prompt_output)
+        if mutation == "workbook":
+            workbook.write_bytes(workbook.read_bytes() + b"\n")
+        elif mutation == "source":
+            info = source / "meta/info.json"
+            info.write_bytes(info.read_bytes() + b"\n")
+        return report
+
+    monkeypatch.setattr(annotation_cli_module, "validate_release_marker", mutate_after_marker_validation)
+
+    with pytest.raises(DatasetValidationError, match=message):
+        annotation_cli_main(
+            AnnotatePnpTrashConfig(
+                dataset_path=source,
+                annotations_path=workbook,
+                subtasks_output_path=subtasks,
+                full_prompt_output_path=full_prompt,
+                validate_only=True,
+                direction_filter="left",
+                expected_left_episodes=1,
+                expected_right_episodes=1,
+                release_marker_path=marker,
+            )
+        )
+
+    assert capsys.readouterr().out == ""

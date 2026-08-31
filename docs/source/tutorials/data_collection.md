@@ -558,7 +558,9 @@ The pair is consumable only when its release marker is present and accepted as
 `renameat2(RENAME_NOREPLACE)`, same-filesystem hard links, and directory
 `fsync`. Unmarked incomplete outputs are preserved for explicit operator
 recovery; they must not be auto-deleted or retried. There is no recovery
-command yet.
+command yet. Validate-only canonicalizes output and marker paths, rejects
+symlink components, and requires the source dataset and workbook to remain
+stable throughout validation.
 
 ### Remove Stale SMPL Frames
 

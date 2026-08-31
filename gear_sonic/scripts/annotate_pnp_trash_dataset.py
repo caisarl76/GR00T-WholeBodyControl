@@ -10,14 +10,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 from typing import Literal
 
 import tyro
 
 from gear_sonic.utils.data_collection.lerobot_xlsx_annotations import (
+    DatasetValidationError,
     dataset_manifest_sha256,
     export_both,
+    file_sha256,
     load_annotations_bytes,
     select_annotations_by_direction,
     validate_release_marker,
@@ -41,6 +45,9 @@ class AnnotatePnpTrashConfig:
     full_prompt_output_path: Path = Path("outputs/pnp_trash_full_prompt")
     """Output containing one episode-wide prompt per valid episode."""
 
+    validate_only: bool = False
+    """Validate existing outputs instead of creating them."""
+
     direction_filter: Literal["all", "left"] = "all"
     """Export all valid episodes or only the left-turn subset."""
 
@@ -53,9 +60,6 @@ class AnnotatePnpTrashConfig:
     release_marker_path: Path = Path("outputs/pnp_trash_left_only.release.json")
     """Completion marker published with the left-only release."""
 
-    validate_only: bool = False
-    """Validate existing outputs instead of creating them."""
-
 
 def _source_episode_indices(dataset_path: Path) -> set[int]:
     episodes_path = dataset_path / "meta/episodes.jsonl"
@@ -67,6 +71,24 @@ def _source_episode_indices(dataset_path: Path) -> set[int]:
             row = json.loads(line)
             episodes.add(int(row["episode_index"]))
     return episodes
+
+
+def _canonical_validation_path(path: Path) -> Path:
+    """Normalize a validation path after rejecting each existing symlink component."""
+
+    normalized = Path(os.path.abspath(path))
+    current = Path(normalized.anchor)
+    for component in normalized.parts[1:]:
+        current /= component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise DatasetValidationError(f"cannot inspect validation path {current}: {error}") from error
+        if stat.S_ISLNK(mode):
+            raise DatasetValidationError(f"validation path has a symlink component: {current}")
+    return normalized
 
 
 def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, object]]:
@@ -85,7 +107,7 @@ def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, o
     marker_path = raw_marker if config.direction_filter == "left" else None
 
     if not config.validate_only:
-        export_both(
+        results = export_both(
             source,
             workbook,
             raw_subtasks,
@@ -94,6 +116,11 @@ def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, o
             expected_direction_counts=expected_counts,
             release_marker_path=marker_path,
         )
+        subtasks = results[0].output_path
+        full_prompt = results[1].output_path
+    else:
+        subtasks = _canonical_validation_path(raw_subtasks)
+        full_prompt = _canonical_validation_path(raw_full_prompt)
 
     workbook_bytes = workbook.read_bytes()
     all_annotations = load_annotations_bytes(
@@ -107,8 +134,6 @@ def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, o
     )
     source_manifest = dataset_manifest_sha256(source)
     workbook_sha256 = hashlib.sha256(workbook_bytes).hexdigest()
-    subtasks = raw_subtasks.absolute()
-    full_prompt = raw_full_prompt.absolute()
     reports = (
         validate_variant(
             source,
@@ -131,7 +156,16 @@ def main(config: AnnotatePnpTrashConfig) -> tuple[dict[str, object], dict[str, o
     )
     payload: dict[str, object] = {"outputs": reports}
     if marker_path is not None:
-        payload["release"] = validate_release_marker(marker_path.absolute(), subtasks, full_prompt)
+        marker = _canonical_validation_path(marker_path)
+        payload["release"] = validate_release_marker(marker, subtasks, full_prompt)
+    try:
+        current_workbook_sha256 = file_sha256(workbook)
+    except OSError as error:
+        raise DatasetValidationError(f"workbook changed during validation: {error}") from error
+    if current_workbook_sha256 != workbook_sha256:
+        raise DatasetValidationError("workbook changed during validation")
+    if dataset_manifest_sha256(source) != source_manifest:
+        raise DatasetValidationError("source changed during validation")
     print(json.dumps(payload, indent=2))
     return reports
 
