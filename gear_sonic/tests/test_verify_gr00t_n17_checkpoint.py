@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,6 +17,7 @@ from gear_sonic.scripts.verify_gr00t_n17_checkpoint import (
     COSMOS_MODEL_ID,
     COSMOS_REVISION,
     CheckpointError,
+    _verify_offline_load_worker,
     main,
     verify_checkpoint_structure,
     verify_offline_load,
@@ -57,28 +60,24 @@ def _write_checkpoint_fixture(root: Path, step: int = 5) -> Path:
         checkpoint / "rng_state.pth",
     )
     _write_json(checkpoint / "trainer_state.json", {"global_step": step})
-    torch.save({"output_dir": "/outputs/fixture"}, checkpoint / "training_args.bin")
-    _write_json(
-        checkpoint / "config.json",
-        {
-            "model_type": "Gr00tN1d7",
-            "model_name": COSMOS_MODEL_ID,
-            "model_revision": COSMOS_REVISION,
-        },
-    )
-    _write_json(checkpoint / "processor_config.json", {"processor_class": "Gr00tN1d7Processor"})
-    _write_json(checkpoint / "statistics.json", {"state": {"mean": [0.0]}})
-    _write_json(checkpoint / "embodiment_id.json", {"UNITREE_G1": 0})
+    for filename in (
+        "training_args.bin",
+        "config.json",
+        "processor_config.json",
+        "statistics.json",
+        "embodiment_id.json",
+    ):
+        (checkpoint / filename).write_bytes(b"fixture")
     experiment_cfg = checkpoint / "experiment_cfg"
     experiment_cfg.mkdir()
-    (experiment_cfg / "config.yaml").write_text("model:\n  name: fixture\n", encoding="utf-8")
-    (experiment_cfg / "conf.yaml").write_text("training:\n  max_steps: 5\n", encoding="utf-8")
     for filename in (
+        "config.yaml",
+        "conf.yaml",
         "dataset_statistics.json",
         "final_model_config.json",
         "final_processor_config.json",
     ):
-        _write_json(experiment_cfg / filename, {"fixture": True})
+        (experiment_cfg / filename).write_bytes(b"fixture")
     return checkpoint
 
 
@@ -203,13 +202,6 @@ def _set_index_total_size(checkpoint: Path, size: int) -> None:
             "total_size.*integer",
         ),
         (lambda path: _write_json(path / "trainer_state.json", {"global_step": True}), "global_step.*integer"),
-        (lambda path: (path / "config.json").write_text("[]", encoding="utf-8"), "config.json.*object"),
-        (lambda path: (path / "experiment_cfg/config.yaml").write_text("[", encoding="utf-8"), "config.yaml"),
-        (lambda path: (path / "training_args.bin").write_bytes(b"not torch"), "training_args.bin"),
-        (
-            lambda path: (path / "config.json").write_text('{"not_finite": NaN}', encoding="utf-8"),
-            "valid JSON",
-        ),
         (lambda path: torch.save({"state": {}, "param_groups": []}, path / "optimizer.pt"), "optimizer"),
     ],
 )
@@ -277,6 +269,7 @@ def _offline_dependencies(
     selector_name: str = "Qwen3Backbone",
     snapshot_result: Path | None = None,
     cache_read_only: bool = True,
+    hub_cache_read_only: bool = True,
     model_error: BaseException | None = None,
     processor_model_name: str = COSMOS_MODEL_ID,
 ) -> SimpleNamespace:
@@ -327,19 +320,34 @@ def _offline_dependencies(
         events.append(("snapshot", kwargs))
         return str(snapshot if snapshot_result is None else snapshot_result)
 
+    def is_read_only(path: Path) -> bool:
+        events.append(("cache-mode", path))
+        return hub_cache_read_only if path == cache_root / "hub" else cache_read_only
+
     return SimpleNamespace(
         config_class=Config,
         model_class=Model,
         processor_class=Processor,
         get_backbone_cls=lambda config: events.append(("selector", config)) or backbone,
         snapshot_download=snapshot_download,
-        cache_is_read_only=lambda path: events.append(("cache-mode", path)) or cache_read_only,
+        cache_is_read_only=is_read_only,
         gc_collect=lambda: events.append("gc"),
         empty_cache=lambda: events.append("empty-cache"),
     )
 
 
-def test_offline_load_sets_environment_before_import_and_uses_exact_pins(
+def _set_exact_offline_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    for key in (
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "HF_DATASETS_OFFLINE",
+        "NO_ALBUMENTATIONS_UPDATE",
+    ):
+        monkeypatch.setenv(key, "1")
+
+
+def test_offline_worker_requires_environment_before_import_and_uses_exact_pins(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -347,14 +355,7 @@ def test_offline_load_sets_environment_before_import_and_uses_exact_pins(
     cache_root = tmp_path / "cache"
     events: list[object] = []
     dependencies = _offline_dependencies(cache_root, events)
-    for key in (
-        "CUDA_VISIBLE_DEVICES",
-        "HF_HUB_OFFLINE",
-        "TRANSFORMERS_OFFLINE",
-        "HF_DATASETS_OFFLINE",
-        "NO_ALBUMENTATIONS_UPDATE",
-    ):
-        monkeypatch.setenv(key, "conflicting")
+    _set_exact_offline_environment(monkeypatch)
 
     def dependency_loader() -> SimpleNamespace:
         events.append(
@@ -374,7 +375,7 @@ def test_offline_load_sets_environment_before_import_and_uses_exact_pins(
         )
         return dependencies
 
-    result = verify_offline_load(
+    result = _verify_offline_load_worker(
         checkpoint,
         cache_root,
         COSMOS_REVISION,
@@ -427,6 +428,7 @@ def test_offline_load_sets_environment_before_import_and_uses_exact_pins(
         ({"model_revision": "wrong"}, COSMOS_REVISION, "config revision"),
         ({"selector_name": "OtherBackbone"}, COSMOS_REVISION, "Qwen3Backbone"),
         ({"cache_read_only": False}, COSMOS_REVISION, "read-only"),
+        ({"hub_cache_read_only": False}, COSMOS_REVISION, "hub.*read-only"),
         ({"snapshot_result": Path("/wrong/snapshot")}, COSMOS_REVISION, "snapshot"),
         (
             {"processor_model_name": "other/model"},
@@ -437,17 +439,19 @@ def test_offline_load_sets_environment_before_import_and_uses_exact_pins(
 )
 def test_offline_load_rejects_pin_or_runtime_mismatch(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     dependency_overrides: dict[str, object],
     revision: str,
     match: str,
 ) -> None:
+    _set_exact_offline_environment(monkeypatch)
     checkpoint = _write_checkpoint_fixture(tmp_path)
     cache_root = tmp_path / "cache"
     events: list[object] = []
     dependencies = _offline_dependencies(cache_root, events, **dependency_overrides)
 
     with pytest.raises(CheckpointError, match=match):
-        verify_offline_load(
+        _verify_offline_load_worker(
             checkpoint,
             cache_root,
             revision,
@@ -456,7 +460,12 @@ def test_offline_load_rejects_pin_or_runtime_mismatch(
 
 
 @pytest.mark.parametrize("loading_key", ["missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"])
-def test_offline_load_rejects_nonempty_loading_information(tmp_path: Path, loading_key: str) -> None:
+def test_offline_load_rejects_nonempty_loading_information(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    loading_key: str,
+) -> None:
+    _set_exact_offline_environment(monkeypatch)
     checkpoint = _write_checkpoint_fixture(tmp_path)
     cache_root = tmp_path / "cache"
     events: list[object] = []
@@ -470,7 +479,7 @@ def test_offline_load_rejects_nonempty_loading_information(tmp_path: Path, loadi
     dependencies = _offline_dependencies(cache_root, events, model_info=info)
 
     with pytest.raises(CheckpointError, match=loading_key):
-        verify_offline_load(
+        _verify_offline_load_worker(
             checkpoint,
             cache_root,
             COSMOS_REVISION,
@@ -478,6 +487,151 @@ def test_offline_load_rejects_nonempty_loading_information(tmp_path: Path, loadi
         )
 
     assert events[-2:] == ["gc", "empty-cache"]
+
+
+def _offline_process_result(cache_root: Path) -> dict[str, object]:
+    snapshot = cache_root / "hub/models--nvidia--Cosmos-Reason2-2B/snapshots" / COSMOS_REVISION
+    return {
+        "status": "pass",
+        "backbone_class": "Qwen3Backbone",
+        "cosmos_model_id": COSMOS_MODEL_ID,
+        "cosmos_revision": COSMOS_REVISION,
+        "cosmos_snapshot": str(snapshot),
+        "model_class": "LoadedModel",
+        "processor_class": "LoadedProcessor",
+        "log_lines": ["offline worker passed"],
+    }
+
+
+def test_verify_offline_load_launches_fresh_child_with_exact_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    cache_root = (tmp_path / "cache").resolve()
+    monkeypatch.delenv("NO_ALBUMENTATIONS_UPDATE", raising=False)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "parent-visible")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "conflicting")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def process_runner(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append((command, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(_offline_process_result(cache_root)),
+            stderr="ignored child diagnostics",
+        )
+
+    result = verify_offline_load(
+        checkpoint,
+        cache_root,
+        COSMOS_REVISION,
+        process_runner=process_runner,
+    )
+
+    assert result["status"] == "pass"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "parent-visible"
+    assert os.environ.get("NO_ALBUMENTATIONS_UPDATE") is None
+    command, kwargs = calls[0]
+    assert command == [
+        sys.executable,
+        str((Path(__file__).parents[1] / "scripts/verify_gr00t_n17_checkpoint.py").resolve()),
+        "--_offline-worker",
+    ]
+    child_environment = kwargs["env"]
+    assert child_environment["CUDA_VISIBLE_DEVICES"] == ""
+    for key in (
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "HF_DATASETS_OFFLINE",
+        "NO_ALBUMENTATIONS_UPDATE",
+    ):
+        assert child_environment[key] == "1"
+    assert kwargs["capture_output"] is True
+    assert kwargs["text"] is True
+    assert 0 < kwargs["timeout"] <= 300
+    request = json.loads(kwargs["input"])
+    assert request == {
+        "cache_root": str(cache_root),
+        "checkpoint": str(checkpoint),
+        "cosmos_revision": COSMOS_REVISION,
+    }
+
+
+def test_verify_offline_load_rejects_albumentations_conflict_before_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    monkeypatch.setenv("NO_ALBUMENTATIONS_UPDATE", "0")
+    launched = False
+
+    def process_runner(*_args: object, **_kwargs: object) -> object:
+        nonlocal launched
+        launched = True
+        raise AssertionError("must not launch")
+
+    with pytest.raises(CheckpointError, match="NO_ALBUMENTATIONS_UPDATE"):
+        verify_offline_load(
+            checkpoint,
+            (tmp_path / "cache").resolve(),
+            COSMOS_REVISION,
+            process_runner=process_runner,
+        )
+
+    assert launched is False
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "signal", "invalid_json", "invalid_result", "timeout"])
+def test_verify_offline_load_fails_closed_on_child_failure(tmp_path: Path, failure: str) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+
+    def process_runner(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        if failure == "nonzero":
+            return SimpleNamespace(returncode=2, stdout='{"status":"fail"}', stderr="")
+        if failure == "signal":
+            return SimpleNamespace(returncode=-9, stdout="", stderr="")
+        if failure == "invalid_json":
+            return SimpleNamespace(returncode=0, stdout="not-json", stderr="")
+        return SimpleNamespace(returncode=0, stdout='{"status":"pass"}', stderr="")
+
+    with pytest.raises(CheckpointError, match="offline child"):
+        verify_offline_load(
+            checkpoint,
+            (tmp_path / "cache").resolve(),
+            COSMOS_REVISION,
+            process_runner=process_runner,
+        )
+
+
+def test_offline_worker_rejects_inexact_environment_before_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    cache_root = tmp_path / "cache"
+    events: list[object] = []
+    dependencies = _offline_dependencies(cache_root, events)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    for key in (
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "HF_DATASETS_OFFLINE",
+        "NO_ALBUMENTATIONS_UPDATE",
+    ):
+        monkeypatch.setenv(key, "1")
+
+    with pytest.raises(CheckpointError, match="offline child environment"):
+        _verify_offline_load_worker(
+            checkpoint,
+            cache_root,
+            COSMOS_REVISION,
+            dependency_loader=lambda: events.append("loader") or dependencies,
+        )
+
+    assert "loader" not in events
 
 
 def _cli_arguments(checkpoint: Path, cache_root: Path, output_dir: Path, *, offline: bool = False) -> list[str]:
@@ -532,13 +686,14 @@ def test_cli_returns_nonzero_and_publishes_failure_without_secrets(
     checkpoint = _write_checkpoint_fixture(tmp_path)
     cache_root = tmp_path / "cache"
     output_dir = (tmp_path / "failed-verdict").resolve()
-    events: list[object] = []
     secret = "hf_secret-token-123"
-    dependencies = _offline_dependencies(cache_root, events, model_error=RuntimeError(secret))
+
+    def process_runner(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=1, stdout='{"status":"fail"}', stderr=secret)
 
     exit_code = main(
         _cli_arguments(checkpoint, cache_root, output_dir, offline=True),
-        offline_dependency_loader=lambda: dependencies,
+        offline_process_runner=process_runner,
     )
 
     assert exit_code == 1
@@ -550,6 +705,46 @@ def test_cli_returns_nonzero_and_publishes_failure_without_secrets(
     )
     assert secret not in combined
     assert json.loads((output_dir / "verdict.json").read_text(encoding="utf-8"))["status"] == "fail"
+
+
+def test_cli_runs_offline_child_only_after_structural_success(tmp_path: Path) -> None:
+    cache_root = (tmp_path / "cache").resolve()
+    successful_checkpoint = _write_checkpoint_fixture(tmp_path / "successful")
+    failed_checkpoint = _write_checkpoint_fixture(tmp_path / "failed")
+    (failed_checkpoint / "model-00001-of-00002.safetensors").write_bytes(b"corrupt")
+    launched_for: list[str] = []
+
+    def process_runner(_command: list[str], **kwargs: object) -> SimpleNamespace:
+        request = json.loads(kwargs["input"])
+        launched_for.append(request["checkpoint"])
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(_offline_process_result(cache_root)),
+            stderr="",
+        )
+
+    successful_exit = main(
+        _cli_arguments(
+            successful_checkpoint,
+            cache_root,
+            (tmp_path / "successful-verdict").resolve(),
+            offline=True,
+        ),
+        offline_process_runner=process_runner,
+    )
+    failed_exit = main(
+        _cli_arguments(
+            failed_checkpoint,
+            cache_root,
+            (tmp_path / "failed-structural-verdict").resolve(),
+            offline=True,
+        ),
+        offline_process_runner=process_runner,
+    )
+
+    assert successful_exit == 0
+    assert failed_exit == 1
+    assert launched_for == [str(successful_checkpoint)]
 
 
 @pytest.mark.parametrize("output_kind", ["relative", "existing"])

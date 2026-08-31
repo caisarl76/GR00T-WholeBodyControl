@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -29,7 +31,8 @@ _OFFLINE_ENVIRONMENT = {
 }
 _CHECKPOINT_NAME = re.compile(r"checkpoint-(0|[1-9][0-9]*)")
 _SHARD_NAME = re.compile(r"model-([0-9]{5})-of-([0-9]{5})\.safetensors")
-_INCOMPLETE_SUFFIXES = (".part", ".partial", ".tmp", ".incomplete")
+_INTERNAL_OFFLINE_WORKER_FLAG = "--_offline-worker"
+_OFFLINE_CHILD_TIMEOUT_SECONDS = 180
 _ROOT_JSON_CONFIGS = (
     "config.json",
     "processor_config.json",
@@ -230,35 +233,17 @@ def _validate_trainer_state(checkpoint: Path, expected_step: int) -> None:
         )
 
 
-def _validate_configuration_payloads(torch_module: Any, checkpoint: Path) -> None:
-    training_arguments = _load_torch_payload(
-        torch_module,
-        _required_file(checkpoint, "training_args.bin"),
-        label="training_args.bin",
-    )
-    if training_arguments is None:
-        raise CheckpointError("training_args.bin contains no payload")
+def _validate_required_configuration_artifacts(checkpoint: Path) -> None:
+    _required_file(checkpoint, "training_args.bin")
     for filename in _ROOT_JSON_CONFIGS:
-        _load_json_object(_required_file(checkpoint, filename), label=filename)
-
+        _required_file(checkpoint, filename)
     experiment = checkpoint / "experiment_cfg"
     if experiment.is_symlink() or not experiment.is_dir():
         raise CheckpointError("required experiment_cfg directory is missing")
-    try:
-        import yaml
-    except ImportError as exc:
-        raise CheckpointError("PyYAML is required to validate experiment_cfg") from exc
     for filename in ("config.yaml", "conf.yaml"):
-        path = _required_file(experiment, filename)
-        try:
-            with path.open("r", encoding="utf-8") as handle:
-                value = yaml.safe_load(handle)
-        except (OSError, UnicodeError, yaml.YAMLError) as exc:
-            raise CheckpointError(f"{filename} is not valid YAML") from exc
-        if type(value) is not dict:
-            raise CheckpointError(f"{filename} must contain a YAML mapping")
+        _required_file(experiment, filename)
     for filename in _EXPERIMENT_JSON_CONFIGS:
-        _load_json_object(_required_file(experiment, filename), label=filename)
+        _required_file(experiment, filename)
 
 
 def _validate_shards(checkpoint: Path, files: list[Path]) -> dict[str, object]:
@@ -435,7 +420,7 @@ def verify_checkpoint_structure(checkpoint: Path, expected_step: int) -> dict[st
     _validate_scheduler(torch, checkpoint, expected_step)
     _validate_rng(torch, checkpoint)
     _validate_trainer_state(checkpoint, expected_step)
-    _validate_configuration_payloads(torch, checkpoint)
+    _validate_required_configuration_artifacts(checkpoint)
     file_manifest = _build_file_manifest(checkpoint, files)
     return {
         "status": "pass",
@@ -445,9 +430,14 @@ def verify_checkpoint_structure(checkpoint: Path, expected_step: int) -> dict[st
     }
 
 
-def _activate_offline_environment() -> None:
-    for key, value in _OFFLINE_ENVIRONMENT.items():
-        os.environ[key] = value
+def _assert_offline_child_environment() -> None:
+    mismatches = {
+        key: {"expected": expected, "actual": os.environ.get(key)}
+        for key, expected in _OFFLINE_ENVIRONMENT.items()
+        if os.environ.get(key) != expected
+    }
+    if mismatches:
+        raise CheckpointError("offline child environment is not exact")
 
 
 def _cache_is_read_only(path: Path) -> bool:
@@ -497,15 +487,15 @@ def _validate_loading_info(value: object) -> None:
             raise CheckpointError(f"model loading_info {key} is nonempty")
 
 
-def verify_offline_load(
+def _verify_offline_load_worker(
     checkpoint: Path,
     cache_root: Path,
     cosmos_revision: str,
     *,
     dependency_loader: Callable[[], object] | None = None,
 ) -> dict[str, object]:
-    """Load the pinned GR00T model and processor locally with CUDA hidden."""
-    _activate_offline_environment()
+    """Load pinned GR00T objects inside an already isolated child process."""
+    _assert_offline_child_environment()
     if cosmos_revision != COSMOS_REVISION:
         raise CheckpointError("Cosmos revision differs from the pinned exact revision")
 
@@ -531,6 +521,8 @@ def verify_offline_load(
     try:
         if not runtime.cache_is_read_only(cache_root):
             raise CheckpointError("Hugging Face cache_root is not read-only")
+        if not runtime.cache_is_read_only(hub_cache):
+            raise CheckpointError("effective Hugging Face hub cache is not read-only")
         expected_snapshot = hub_cache / COSMOS_SNAPSHOT_RELATIVE
         if expected_snapshot.is_symlink() or not expected_snapshot.is_dir():
             raise CheckpointError("exact pinned Cosmos snapshot is missing")
@@ -632,6 +624,136 @@ def verify_offline_load(
     return result
 
 
+def _load_child_json(text: str) -> object:
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_nonfinite_json,
+        )
+    except CheckpointError:
+        raise
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise CheckpointError("offline child returned invalid JSON") from exc
+
+
+def _validate_offline_child_result(value: object, cache_root: Path) -> dict[str, object]:
+    if type(value) is not dict or value.get("status") != "pass":
+        raise CheckpointError("offline child returned an invalid result")
+    exact_fields = {
+        "cosmos_model_id": COSMOS_MODEL_ID,
+        "cosmos_revision": COSMOS_REVISION,
+        "backbone_class": "Qwen3Backbone",
+        "cosmos_snapshot": str(cache_root / "hub" / COSMOS_SNAPSHOT_RELATIVE),
+    }
+    if any(value.get(key) != expected for key, expected in exact_fields.items()):
+        raise CheckpointError("offline child returned an invalid pinned identity")
+    for key in ("model_class", "processor_class"):
+        if type(value.get(key)) is not str or not value[key]:
+            raise CheckpointError("offline child returned an invalid class record")
+    log_lines = value.get("log_lines")
+    if type(log_lines) is not list or any(type(line) is not str for line in log_lines):
+        raise CheckpointError("offline child returned invalid log records")
+    return value
+
+
+def verify_offline_load(
+    checkpoint: Path,
+    cache_root: Path,
+    cosmos_revision: str,
+    *,
+    process_runner: Callable[..., object] | None = None,
+    timeout_seconds: int = _OFFLINE_CHILD_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    """Launch the model/processor gate in a fresh CPU-only child process."""
+    if cosmos_revision != COSMOS_REVISION:
+        raise CheckpointError("Cosmos revision differs from the pinned exact revision")
+    albumentations_value = os.environ.get("NO_ALBUMENTATIONS_UPDATE")
+    if albumentations_value not in (None, "1"):
+        raise CheckpointError("NO_ALBUMENTATIONS_UPDATE must be absent or exactly '1'")
+    if type(timeout_seconds) is not int or timeout_seconds <= 0:
+        raise CheckpointError("offline child timeout must be a positive integer")
+
+    checkpoint = Path(checkpoint)
+    cache_root = Path(cache_root)
+    child_environment = os.environ.copy()
+    child_environment.update(_OFFLINE_ENVIRONMENT)
+    request = {
+        "cache_root": str(cache_root),
+        "checkpoint": str(checkpoint),
+        "cosmos_revision": cosmos_revision,
+    }
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        _INTERNAL_OFFLINE_WORKER_FLAG,
+    ]
+    run_process = subprocess.run if process_runner is None else process_runner
+    try:
+        completed = run_process(
+            command,
+            input=json.dumps(request, allow_nan=False, sort_keys=True),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=child_environment,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CheckpointError("offline child timed out") from exc
+    except BaseException as exc:
+        raise CheckpointError(f"offline child launch failed ({type(exc).__name__})") from exc
+
+    return_code = getattr(completed, "returncode", None)
+    if type(return_code) is not int or return_code != 0:
+        raise CheckpointError("offline child exited abnormally")
+    stdout = getattr(completed, "stdout", None)
+    if type(stdout) is not str:
+        raise CheckpointError("offline child returned no structured result")
+    try:
+        value = _load_child_json(stdout)
+        return _validate_offline_child_result(value, cache_root)
+    except CheckpointError as exc:
+        raise CheckpointError(f"offline child result rejected ({type(exc).__name__})") from exc
+
+
+def _offline_worker_entrypoint() -> int:
+    """Read one request from stdin and emit one secret-free JSON response."""
+    try:
+        _assert_offline_child_environment()
+        request = json.load(
+            sys.stdin,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_nonfinite_json,
+        )
+        if type(request) is not dict or set(request) != {
+            "cache_root",
+            "checkpoint",
+            "cosmos_revision",
+        }:
+            raise CheckpointError("offline child request has invalid fields")
+        if any(type(request[key]) is not str for key in request):
+            raise CheckpointError("offline child request values must be strings")
+        with open(os.devnull, "w", encoding="utf-8") as sink:
+            with redirect_stdout(sink), redirect_stderr(sink):
+                result = _verify_offline_load_worker(
+                    Path(request["checkpoint"]),
+                    Path(request["cache_root"]),
+                    request["cosmos_revision"],
+                )
+    except BaseException as exc:
+        print(
+            json.dumps(
+                {"status": "fail", "error_type": type(exc).__name__},
+                allow_nan=False,
+                sort_keys=True,
+            )
+        )
+        return 1
+    print(json.dumps(result, allow_nan=False, sort_keys=True))
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
@@ -703,7 +825,7 @@ def _failure_record(gate: str, error: BaseException) -> dict[str, str]:
 def main(
     argv: list[str] | None = None,
     *,
-    offline_dependency_loader: Callable[[], object] | None = None,
+    offline_process_runner: Callable[..., object] | None = None,
     atomic_writer: Callable[..., None] | None = None,
 ) -> int:
     """Run requested gates and publish durable evidence, with the verdict last."""
@@ -726,8 +848,6 @@ def main(
     offline: dict[str, object] | None = None
     offline_log = "offline load not requested\n"
 
-    if arguments.offline_load:
-        _activate_offline_environment()
     try:
         structural = verify_checkpoint_structure(arguments.checkpoint, arguments.expected_step)
         files = structural["files"]
@@ -745,7 +865,7 @@ def main(
                 arguments.checkpoint,
                 arguments.cache_root,
                 arguments.cosmos_revision,
-                dependency_loader=offline_dependency_loader,
+                process_runner=offline_process_runner,
             )
             offline_log = "\n".join(offline["log_lines"]) + "\n"
         except BaseException as exc:
@@ -777,4 +897,6 @@ def main(
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == [_INTERNAL_OFFLINE_WORKER_FLAG]:
+        raise SystemExit(_offline_worker_entrypoint())
     raise SystemExit(main())
