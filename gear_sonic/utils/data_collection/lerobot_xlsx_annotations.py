@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import ctypes
 from dataclasses import dataclass
+import errno
 import hashlib
 from io import BytesIO
 import json
@@ -367,6 +369,77 @@ def _fsync_tree(root: Path) -> None:
         key=lambda item: (-len(item.relative_to(root).parts), item.as_posix().encode("utf-8")),
     ):
         _fsync_directory(path)
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable; refusing non-atomic output publication") from error
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise AnnotationError(f"output path already exists: {destination}")
+    if error_number in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}:
+        raise OSError(
+            error_number,
+            "renameat2 RENAME_NOREPLACE is unsupported; refusing non-atomic output publication",
+            destination,
+        )
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _absolute_without_resolving(path: Path) -> Path:
+    return Path(os.path.abspath(path))
+
+
+def _validate_directory_chain(path: Path, *, create: bool) -> Path:
+    absolute = _absolute_without_resolving(path)
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        if _path_lexists(current):
+            try:
+                current_stat = current.lstat()
+            except OSError as error:
+                raise AnnotationError(f"cannot inspect publication directory {current}: {error}") from error
+            if stat.S_ISLNK(current_stat.st_mode):
+                raise AnnotationError(f"publication path has a symlink ancestor: {current}")
+            if not stat.S_ISDIR(current_stat.st_mode):
+                raise AnnotationError(f"publication path ancestor is not a directory: {current}")
+            continue
+        if not create:
+            continue
+        try:
+            current.mkdir()
+        except FileExistsError:
+            current_stat = current.lstat()
+            if stat.S_ISLNK(current_stat.st_mode):
+                raise AnnotationError(f"publication path has a symlink ancestor: {current}")
+            if not stat.S_ISDIR(current_stat.st_mode):
+                raise AnnotationError(f"publication path ancestor is not a directory: {current}")
+        _fsync_directory(current.parent)
+    return absolute
+
+
+def _ensure_durable_directory(path: Path) -> Path:
+    return _validate_directory_chain(path, create=True)
 
 
 def _write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
@@ -979,16 +1052,15 @@ def validate_release_marker(
 
 
 class _IncompletePublicationError(DatasetValidationError):
-    """Raised when rollback cannot prove or restore publication ownership."""
+    """Raised when visible or foreign publication state requires operator recovery."""
 
 
-@dataclass(frozen=True)
-class _OwnedOutput:
-    output: Path
-    staging: Path
+@dataclass
+class _StagingRoot:
+    path: Path
     device: int
     inode: int
-    manifest_sha256: str
+    published: bool = False
 
 
 def _build_release_marker(
@@ -1023,7 +1095,7 @@ def _build_release_marker(
 def _remove_owned_marker_link(marker: Path, identity: tuple[int, int]) -> None:
     try:
         marker_stat = marker.lstat()
-    except OSError as error:
+    except BaseException as error:
         raise _IncompletePublicationError(
             "incomplete publication: cannot inspect the non-durable release marker"
         ) from error
@@ -1034,7 +1106,7 @@ def _remove_owned_marker_link(marker: Path, identity: tuple[int, int]) -> None:
     try:
         marker.unlink()
         _fsync_directory(marker.parent)
-    except OSError as error:
+    except BaseException as error:
         raise _IncompletePublicationError(
             "incomplete publication: could not durably remove the non-durable release marker"
         ) from error
@@ -1048,6 +1120,7 @@ def _publish_prevalidated_marker(
     if _path_lexists(marker):
         raise AnnotationError(f"release marker already exists: {marker}")
     temporary = _write_temporary_json(marker, value)
+    temporary_identity: tuple[int, int] | None = None
     linked_identity: tuple[int, int] | None = None
     try:
         validate_release_marker(temporary, outputs[0], outputs[1])
@@ -1062,7 +1135,23 @@ def _publish_prevalidated_marker(
         linked_identity = temporary_identity
         temporary.unlink()
         _fsync_directory(marker.parent)
-    except Exception as error:
+    except BaseException as error:
+        if linked_identity is None and temporary_identity is not None and _path_lexists(marker):
+            try:
+                marker_stat = marker.lstat()
+            except BaseException as inspection_error:
+                raise _IncompletePublicationError(
+                    "incomplete publication: cannot inspect a possibly linked release marker"
+                ) from inspection_error
+            if (
+                stat.S_ISREG(marker_stat.st_mode)
+                and (
+                    marker_stat.st_dev,
+                    marker_stat.st_ino,
+                )
+                == temporary_identity
+            ):
+                linked_identity = temporary_identity
         if linked_identity is not None:
             try:
                 _remove_owned_marker_link(marker, linked_identity)
@@ -1071,76 +1160,75 @@ def _publish_prevalidated_marker(
         if _path_lexists(temporary):
             try:
                 temporary.unlink()
-            except OSError:
+            except BaseException:
                 pass
         raise
 
 
-def _record_owned_output(
-    output: Path,
-    staging: Path,
-    manifest_sha256: str,
-) -> _OwnedOutput:
+def _create_staging_root(output: Path) -> _StagingRoot:
+    path = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output.name}.staging-",
+            dir=output.parent,
+        )
+    )
     try:
-        output_stat = output.lstat()
+        path_stat = path.lstat()
     except OSError as error:
         raise _IncompletePublicationError(
-            f"incomplete publication: cannot inspect newly published output {output}"
+            f"incomplete publication: cannot inspect newly created staging root {path}"
         ) from error
-    if not stat.S_ISDIR(output_stat.st_mode) or output.is_symlink():
+    if not stat.S_ISDIR(path_stat.st_mode) or path.is_symlink():
         raise _IncompletePublicationError(
-            f"incomplete publication: newly published output is not a regular directory: {output}"
+            f"incomplete publication: staging root is not a regular directory: {path}"
         )
-    return _OwnedOutput(
-        output=output,
-        staging=staging,
-        device=output_stat.st_dev,
-        inode=output_stat.st_ino,
-        manifest_sha256=manifest_sha256,
+    return _StagingRoot(
+        path=path,
+        device=path_stat.st_dev,
+        inode=path_stat.st_ino,
     )
 
 
-def _rollback_owned_outputs(owned_outputs: Sequence[_OwnedOutput]) -> None:
+def _cleanup_staging_roots(staging_roots: Sequence[_StagingRoot]) -> list[str]:
     problems: list[str] = []
-    for owned in owned_outputs:
-        if _path_lexists(owned.staging):
-            problems.append(f"staging path was unexpectedly recreated: {owned.staging}")
+    for staging in staging_roots:
+        if staging.published:
+            continue
+        if not _path_lexists(staging.path):
             continue
         try:
-            output_stat = owned.output.lstat()
+            current_stat = staging.path.lstat()
         except OSError as error:
-            problems.append(f"cannot inspect {owned.output}: {error}")
+            problems.append(f"cannot inspect staging path {staging.path}: {error}")
             continue
-        if (
-            not stat.S_ISDIR(output_stat.st_mode)
-            or owned.output.is_symlink()
-            or (output_stat.st_dev, output_stat.st_ino) != (owned.device, owned.inode)
-        ):
-            problems.append(f"output root identity changed: {owned.output}")
+        if (current_stat.st_dev, current_stat.st_ino) != (staging.device, staging.inode):
+            problems.append(f"staging path identity changed; preserved foreign path {staging.path}")
             continue
         try:
-            current_manifest = dataset_manifest_sha256(owned.output)
-        except (AnnotationError, OSError) as error:
-            problems.append(f"cannot verify output manifest {owned.output}: {error}")
-            continue
-        if current_manifest != owned.manifest_sha256:
-            problems.append(f"output manifest changed: {owned.output}")
-    if problems:
-        raise _IncompletePublicationError(
-            "incomplete publication: refusing to roll back outputs whose ownership changed: " + "; ".join(problems)
-        )
+            shutil.rmtree(staging.path)
+        except OSError as error:
+            problems.append(f"cannot clean staging path {staging.path}: {error}")
+    return problems
 
-    rollback_errors: list[str] = []
-    for owned in reversed(owned_outputs):
-        try:
-            owned.output.replace(owned.staging)
-            _fsync_directory(owned.output.parent)
-        except OSError as error:
-            rollback_errors.append(f"cannot roll back {owned.output}: {error}")
-    if rollback_errors:
-        raise _IncompletePublicationError(
-            "incomplete publication: failed to durably roll back call-owned outputs: " + "; ".join(rollback_errors)
-        )
+
+def _incomplete_publication_error(visible_outputs: Sequence[Path]) -> _IncompletePublicationError:
+    rendered = ", ".join(str(path) for path in visible_outputs)
+    return _IncompletePublicationError(
+        f"incomplete publication: visible outputs preserved without a complete release marker: {rendered}"
+    )
+
+
+def _published_output_paths(
+    outputs: Sequence[Path],
+    staging_roots: Sequence[_StagingRoot],
+) -> list[Path]:
+    published: list[Path] = []
+    for output, staging in zip(outputs, staging_roots, strict=True):
+        if not staging.published and not _path_lexists(staging.path) and _path_lexists(output):
+            staging.published = True
+        if staging.published:
+            published.append(output)
+    return published
 
 
 def _expected_task_rows(task_map: dict[str, int]) -> list[dict[str, Any]]:
@@ -1480,6 +1568,8 @@ def _validate_publication_paths(
             raise AnnotationError(f"output path already exists: {output}")
     if raw_marker is not None and _path_lexists(raw_marker):
         raise AnnotationError(f"release marker already exists: {raw_marker}")
+    for path in [*raw_outputs, *(() if raw_marker is None else (raw_marker,))]:
+        _validate_directory_chain(path.parent, create=False)
 
     outputs = [output.resolve() for output in raw_outputs]
     marker = raw_marker.resolve() if raw_marker is not None else None
@@ -1547,23 +1637,22 @@ def export_both(
     before_manifest = dataset_manifest_sha256(source)
     workbook_sha256 = hashlib.sha256(workbook_bytes).hexdigest()
 
-    staging: list[Path] = []
+    staging: list[_StagingRoot] = []
+    visible_outputs: list[Path] = []
     primary_error: BaseException | None = None
     try:
+        publication_parents = [output.parent for output in outputs]
+        if marker is not None:
+            publication_parents.append(marker.parent)
+        for parent in dict.fromkeys(publication_parents):
+            _ensure_durable_directory(parent)
         for output in outputs:
-            output.parent.mkdir(parents=True, exist_ok=True)
-            staging.append(
-                Path(
-                    tempfile.mkdtemp(
-                        prefix=f".{output.name}.staging-",
-                        dir=output.parent,
-                    )
-                )
-            )
+            staging.append(_create_staging_root(output))
+        staging_paths = [item.path for item in staging]
         selection_kwargs = {} if selection is None else {"selection": selection}
         subtask_result = export_variant(
             source,
-            staging[0],
+            staging_paths[0],
             annotations,
             "subtasks",
             before_manifest,
@@ -1572,7 +1661,7 @@ def export_both(
         )
         full_result = export_variant(
             source,
-            staging[1],
+            staging_paths[1],
             annotations,
             "full_prompt",
             before_manifest,
@@ -1581,7 +1670,7 @@ def export_both(
         )
         validate_variant(
             source,
-            staging[0],
+            staging_paths[0],
             annotations,
             "subtasks",
             source_manifest_sha256=before_manifest,
@@ -1590,7 +1679,7 @@ def export_both(
         )
         validate_variant(
             source,
-            staging[1],
+            staging_paths[1],
             annotations,
             "full_prompt",
             source_manifest_sha256=before_manifest,
@@ -1609,7 +1698,7 @@ def export_both(
         if before_manifest != after_manifest:
             raise DatasetValidationError("source manifest changed during export")
 
-        output_manifests = [dataset_manifest_sha256(path) for path in staging]
+        output_manifests = [dataset_manifest_sha256(path) for path in staging_paths]
         marker_value: dict[str, Any] | None = None
         if marker is not None:
             if selection is None:
@@ -1621,24 +1710,21 @@ def export_both(
                 before_manifest,
                 workbook_sha256,
             )
-        for path in staging:
+        for path in staging_paths:
             _fsync_tree(path)
 
-        owned_outputs: list[_OwnedOutput] = []
         try:
-            for output, staged, manifest in zip(outputs, staging, output_manifests, strict=True):
+            for output, staged in zip(outputs, staging, strict=True):
                 if _path_lexists(output):
                     raise AnnotationError(f"output path already exists: {output}")
-                staged.replace(output)
-                owned_outputs.append(_record_owned_output(output, staged, manifest))
+                _rename_noreplace(staged.path, output)
+                staged.published = True
+                visible_outputs.append(output)
                 _fsync_directory(output.parent)
-        except _IncompletePublicationError:
-            raise
-        except Exception as error:
-            try:
-                _rollback_owned_outputs(owned_outputs)
-            except _IncompletePublicationError as rollback_error:
-                raise rollback_error from error
+        except BaseException as error:
+            visible_outputs = _published_output_paths(outputs, staging)
+            if visible_outputs:
+                raise _incomplete_publication_error(visible_outputs) from error
             raise
 
         results = (
@@ -1660,31 +1746,22 @@ def export_both(
         if marker is not None and marker_value is not None:
             try:
                 _publish_prevalidated_marker(marker, marker_value, outputs)
-            except _IncompletePublicationError:
-                raise
-            except Exception as error:
-                try:
-                    _rollback_owned_outputs(owned_outputs)
-                except _IncompletePublicationError as rollback_error:
-                    raise rollback_error from error
-                raise
+            except BaseException as error:
+                raise _incomplete_publication_error(visible_outputs) from error
         return results
     except BaseException as error:
         primary_error = error
         raise
     finally:
-        cleanup_errors: list[str] = []
-        for path in staging:
-            if _path_lexists(path):
-                try:
-                    if path.is_symlink() or not path.is_dir():
-                        path.unlink()
-                    else:
-                        shutil.rmtree(path)
-                except OSError as error:
-                    cleanup_errors.append(f"cannot clean staging path {path}: {error}")
-        if cleanup_errors and primary_error is None:
-            raise DatasetValidationError("; ".join(cleanup_errors))
+        cleanup_errors = _cleanup_staging_roots(staging)
+        if cleanup_errors:
+            cleanup_error = _IncompletePublicationError(
+                "incomplete cleanup/publication: " + "; ".join(cleanup_errors)
+            )
+            if primary_error is not None:
+                primary_error.args = (f"{primary_error}; {cleanup_error}",)
+            else:
+                raise cleanup_error
 
 
 def _column_index(cell_reference: str) -> int:
