@@ -920,8 +920,11 @@ three model calls: two bounded initial transport attempts and one repair.
 
 The repair request uses the same model, `temperature: 0`, `seed: 0`, and wire
 response rules, but contains no video or `media_io_kwargs`. Its sole user text
-is `Return only one corrected JSON object matching pnp-trash-cosmos-v2.\n`
-followed by a canonical minified JSON object with
+starts with `Return only one corrected JSON object matching
+pnp-trash-cosmos-v2.\n`, requires exactly seven ordered phase objects, lists
+all eight required segment keys, forbids omitting null-valued keys, and embeds
+the canonical minified v2 response schema. That prefix is followed by a
+canonical minified JSON object with
 `validation_errors: string[]` and `invalid_response: string`. The invalid
 response is capped at 64 KiB before building the request; a larger value skips
 repair and becomes `manual_only`.

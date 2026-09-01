@@ -531,7 +531,7 @@ For the real 50 Hz fixture, expected sampled indices begin `[0, 25, 50, 75]` and
 }
 ```
 
-The values are fixture-derived; `fps` is source fps, not 2. Exercise stop success, length failure, missing choices, connection retry, retryable 408/429/5xx, non-retryable 4xx, timeout, one schema-repair request, and repair failure.
+The values are fixture-derived; `fps` is source fps, not 2. Exercise stop success, length failure, missing choices, connection retry, retryable 408/429/5xx, non-retryable 4xx, timeout, one schema-repair request, and repair failure. The standalone repair request must embed the canonical minified v2 response schema, require all seven ordered phases and all eight segment keys, and forbid omission of required null-valued keys.
 
 - [ ] Implement artifact writes as `temporary file -> flush -> file fsync -> atomic rename -> parent fsync -> SHA-256 -> database reference`. `request.json` contains the redacted base64 descriptor and full sampling metadata; response text is exact UTF-8 model content; `parsed.json` is written only after validation; repair text exists only after a repair response.
 
