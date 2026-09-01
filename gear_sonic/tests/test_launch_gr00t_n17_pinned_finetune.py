@@ -88,6 +88,25 @@ def write_cosmos_snapshot_config(snapshot: Path, **overrides: object) -> Path:
     return snapshot
 
 
+def write_cosmos_snapshot_config_blob_link(snapshot: Path) -> Path:
+    snapshot.mkdir(parents=True, exist_ok=True)
+    blobs = snapshot.parent.parent / "blobs"
+    blobs.mkdir()
+    blob = blobs / "pinned-config-blob"
+    blob.write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_vl",
+                "architectures": ["Qwen3VLForConditionalGeneration"],
+                "transformers_version": "4.57.0.dev0",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "config.json").symlink_to(Path("../../blobs") / blob.name)
+    return snapshot
+
+
 def offline_hub(events: list[object] | None = None) -> tuple[SimpleNamespace, object]:
     def network_model_info(*args: object, **kwargs: object) -> object:
         if events is not None:
@@ -758,6 +777,78 @@ def test_run_offline_preflight_rejects_inexact_cosmos_snapshot_before_setup(
     hub, original_model_info = offline_hub()
 
     with pytest.raises(RuntimeError, match=match):
+        run_offline_preflight(
+            fake_config(use_wandb=False),
+            lambda *_args: pytest.fail("pipeline must not be constructed"),
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+        )
+
+    assert hub.model_info is original_model_info
+
+
+def test_run_offline_preflight_accepts_config_symlink_to_canonical_blob(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config_blob_link(expected_cosmos_snapshot(tmp_path))
+    hub, original_model_info = offline_hub()
+
+    class Pipeline:
+        def __init__(self, _config: object, _save_cfg_dir: Path) -> None:
+            pass
+
+        def setup(self) -> None:
+            assert hub.model_info(COSMOS_MODEL_ID).tags == ["qwen3_vl"]
+
+    record = run_offline_preflight(
+        fake_config(use_wandb=False),
+        Pipeline,
+        tmp_path / "experiment_cfg",
+        torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+        cosmos_snapshot=snapshot,
+        huggingface_hub_module=hub,
+    )
+
+    assert record == {
+        "model_class": None,
+        "processor_class": None,
+        "train_dataset_class": None,
+        "eval_dataset_class": None,
+        "data_collator_class": None,
+    }
+    assert hub.model_info is original_model_info
+
+
+@pytest.mark.parametrize("link_kind", ["dangling", "escaping"])
+def test_run_offline_preflight_rejects_invalid_config_symlink_before_setup(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    snapshot = expected_cosmos_snapshot(tmp_path)
+    snapshot.mkdir(parents=True)
+    blobs = snapshot.parent.parent / "blobs"
+    blobs.mkdir()
+    config_link = snapshot / "config.json"
+    if link_kind == "dangling":
+        config_link.symlink_to(Path("../../blobs/missing-config-blob"))
+    else:
+        outside = tmp_path / "outside-config.json"
+        outside.write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_vl",
+                    "architectures": ["Qwen3VLForConditionalGeneration"],
+                    "transformers_version": "4.57.0.dev0",
+                }
+            ),
+            encoding="utf-8",
+        )
+        config_link.symlink_to(outside)
+    hub, original_model_info = offline_hub()
+
+    with pytest.raises(RuntimeError, match="config.json"):
         run_offline_preflight(
             fake_config(use_wandb=False),
             lambda *_args: pytest.fail("pipeline must not be constructed"),

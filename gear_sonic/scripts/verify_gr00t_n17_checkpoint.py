@@ -460,8 +460,23 @@ def _validate_cosmos_snapshot_config(snapshot: Path) -> None:
     if snapshot.is_symlink() or not snapshot.is_dir():
         raise CheckpointError("exact resolved Cosmos snapshot must be a real directory")
     config_path = snapshot / "config.json"
-    if config_path.is_symlink() or not config_path.is_file():
-        raise CheckpointError("exact resolved Cosmos snapshot config.json must be a real file")
+    if config_path.is_symlink():
+        blobs_path = snapshot.parent.parent / "blobs"
+        if blobs_path.is_symlink() or not blobs_path.is_dir():
+            raise CheckpointError("Cosmos snapshot config.json symlink requires a real canonical blobs directory")
+        try:
+            resolved_config_path = config_path.resolve(strict=True)
+            resolved_blobs_path = blobs_path.resolve(strict=True)
+            resolved_config_path.relative_to(resolved_blobs_path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise CheckpointError(
+                "Cosmos snapshot config.json symlink must resolve inside the canonical blobs directory"
+            ) from exc
+        if not resolved_config_path.is_file():
+            raise CheckpointError("Cosmos snapshot config.json symlink must resolve to a regular file")
+        config_path = resolved_config_path
+    elif not config_path.is_file():
+        raise CheckpointError("exact resolved Cosmos snapshot config.json must be a regular file")
     payload = _load_json_object(config_path, label="Cosmos snapshot config.json")
     for field, expected in COSMOS_SNAPSHOT_CONFIG_IDENTITY.items():
         actual = payload.get(field)

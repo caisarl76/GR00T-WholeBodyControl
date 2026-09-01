@@ -300,6 +300,7 @@ def _offline_dependencies(
     processor_model_name: str = COSMOS_MODEL_ID,
     model_info_repo: str = COSMOS_MODEL_ID,
     snapshot_config: dict[str, object] | None = None,
+    snapshot_config_link: str | None = None,
 ) -> SimpleNamespace:
     snapshot = cache_root / "hub/models--nvidia--Cosmos-Reason2-2B/snapshots" / COSMOS_REVISION
     snapshot.mkdir(parents=True, exist_ok=True)
@@ -310,7 +311,24 @@ def _offline_dependencies(
     }
     if snapshot_config is not None:
         config_payload.update(snapshot_config)
-    (snapshot / "config.json").write_text(json.dumps(config_payload), encoding="utf-8")
+    config_path = snapshot / "config.json"
+    if snapshot_config_link is None:
+        config_path.write_text(json.dumps(config_payload), encoding="utf-8")
+    elif snapshot_config_link == "contained":
+        blobs = snapshot.parent.parent / "blobs"
+        blobs.mkdir()
+        blob = blobs / "pinned-config-blob"
+        blob.write_text(json.dumps(config_payload), encoding="utf-8")
+        config_path.symlink_to(Path("../../blobs") / blob.name)
+    elif snapshot_config_link == "dangling":
+        (snapshot.parent.parent / "blobs").mkdir()
+        config_path.symlink_to(Path("../../blobs/missing-config-blob"))
+    elif snapshot_config_link == "escaping":
+        outside = cache_root / "outside-config.json"
+        outside.write_text(json.dumps(config_payload), encoding="utf-8")
+        config_path.symlink_to(outside)
+    else:
+        raise AssertionError(f"unsupported snapshot_config_link: {snapshot_config_link}")
 
     def network_model_info(*args: object, **kwargs: object) -> object:
         events.append(("network-model-info", args, kwargs))
@@ -526,6 +544,59 @@ def test_offline_worker_rejects_inexact_cosmos_snapshot_identity_before_load(
     )
 
     with pytest.raises(CheckpointError, match=match):
+        _verify_offline_load_worker(
+            checkpoint,
+            cache_root,
+            COSMOS_REVISION,
+            dependency_loader=lambda: dependencies,
+        )
+
+    assert not any(isinstance(event, tuple) and event[0] == "model" for event in events)
+    assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
+
+
+def test_offline_worker_accepts_config_symlink_to_canonical_blob(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_exact_offline_environment(monkeypatch)
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    cache_root = tmp_path / "cache"
+    events: list[object] = []
+    dependencies = _offline_dependencies(
+        cache_root,
+        events,
+        snapshot_config_link="contained",
+    )
+
+    result = _verify_offline_load_worker(
+        checkpoint,
+        cache_root,
+        COSMOS_REVISION,
+        dependency_loader=lambda: dependencies,
+    )
+
+    assert result["status"] == "pass"
+    assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
+
+
+@pytest.mark.parametrize("link_kind", ["dangling", "escaping"])
+def test_offline_worker_rejects_invalid_config_symlink_before_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    link_kind: str,
+) -> None:
+    _set_exact_offline_environment(monkeypatch)
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    cache_root = tmp_path / "cache"
+    events: list[object] = []
+    dependencies = _offline_dependencies(
+        cache_root,
+        events,
+        snapshot_config_link=link_kind,
+    )
+
+    with pytest.raises(CheckpointError, match="config.json"):
         _verify_offline_load_worker(
             checkpoint,
             cache_root,
