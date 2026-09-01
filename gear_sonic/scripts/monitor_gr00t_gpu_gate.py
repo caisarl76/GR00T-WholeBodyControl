@@ -729,10 +729,11 @@ def _retired_page_counts(
         if cause not in causes:
             raise GpuGateError(f"retired-page health returned unexpected cause: {cause}")
         entry = entries[uuid][cause]
-        address_is_placeholder = address == "N/A"
-        timestamp_is_placeholder = timestamp == "N/A"
+        placeholder_forms = {"N/A", "[N/A]"}
+        address_is_placeholder = address in placeholder_forms
+        timestamp_is_placeholder = timestamp in placeholder_forms
         if address_is_placeholder or timestamp_is_placeholder:
-            if not address_is_placeholder or not timestamp_is_placeholder:
+            if not address_is_placeholder or not timestamp_is_placeholder or address != timestamp:
                 raise GpuGateError("retired-page health returned a partial N/A placeholder")
             entry["placeholder_count"] += 1
             continue

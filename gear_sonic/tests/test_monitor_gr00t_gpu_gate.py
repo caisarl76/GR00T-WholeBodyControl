@@ -509,10 +509,10 @@ def test_snapshot_health_uses_three_selective_h100_query_interfaces(
         "--query-gpu=": "6, GPU-six, 0\n7, GPU-seven, 0\n",
         "--query-remapped-rows=": ("GPU-six, 0, 0, 0, 0\nGPU-seven, 0, 0, 0, 0\n"),
         "--query-retired-pages=": (
-            "GPU-six, N/A, N/A, Single Bit ECC\n"
-            "GPU-six, N/A, N/A, Double Bit ECC\n"
-            "GPU-seven, N/A, N/A, Single Bit ECC\n"
-            "GPU-seven, N/A, N/A, Double Bit ECC\n"
+            "GPU-six, [N/A], [N/A], Single Bit ECC\n"
+            "GPU-six, [N/A], [N/A], Double Bit ECC\n"
+            "GPU-seven, [N/A], [N/A], Single Bit ECC\n"
+            "GPU-seven, [N/A], [N/A], Double Bit ECC\n"
         ),
     }
     commands: list[list[str]] = []
@@ -610,6 +610,15 @@ def test_snapshot_health_counts_real_retired_page_addresses(
             [
                 ["GPU-seven", "N/A", "2026/09/01 00:00:00.000", "Single Bit ECC"],
                 ["GPU-seven", "N/A", "N/A", "Double Bit ECC"],
+            ],
+        ),
+        (
+            "mixed placeholder forms",
+            [["7", "GPU-seven", "0"]],
+            [["GPU-seven", "0", "0", "0", "0"]],
+            [
+                ["GPU-seven", "N/A", "[N/A]", "Single Bit ECC"],
+                ["GPU-seven", "[N/A]", "[N/A]", "Double Bit ECC"],
             ],
         ),
         (
