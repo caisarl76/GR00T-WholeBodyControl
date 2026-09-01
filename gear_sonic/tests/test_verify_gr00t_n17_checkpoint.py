@@ -64,11 +64,14 @@ def _write_checkpoint_fixture(root: Path, step: int = 5) -> Path:
     _write_json(checkpoint / "trainer_state.json", {"global_step": step})
     for filename in (
         "training_args.bin",
-        "config.json",
         "statistics.json",
         "embodiment_id.json",
     ):
         (checkpoint / filename).write_bytes(b"fixture")
+    _write_json(
+        checkpoint / "config.json",
+        {"model_name": COSMOS_MODEL_ID, "model_revision": COSMOS_REVISION},
+    )
     _write_json(
         checkpoint / "processor_config.json",
         {"processor_kwargs": {"model_name": COSMOS_MODEL_ID}},
@@ -79,10 +82,13 @@ def _write_checkpoint_fixture(root: Path, step: int = 5) -> Path:
         "config.yaml",
         "conf.yaml",
         "dataset_statistics.json",
-        "final_model_config.json",
         "final_processor_config.json",
     ):
         (experiment_cfg / filename).write_bytes(b"fixture")
+    _write_json(
+        experiment_cfg / "final_model_config.json",
+        {"model_name": COSMOS_MODEL_ID, "model_revision": COSMOS_REVISION},
+    )
     return checkpoint
 
 
@@ -149,6 +155,32 @@ def test_checkpoint_rejects_missing_or_wrong_raw_processor_model_name(
     _write_json(checkpoint / "processor_config.json", processor_config)
 
     with pytest.raises(CheckpointError, match="processor.*model_name"):
+        verify_checkpoint_structure(checkpoint, expected_step=5)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["config.json", "experiment_cfg/final_model_config.json"],
+)
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        {},
+        {"model_name": "other/model", "model_revision": COSMOS_REVISION},
+        {"model_name": COSMOS_MODEL_ID},
+        {"model_name": COSMOS_MODEL_ID, "model_revision": None},
+        {"model_name": COSMOS_MODEL_ID, "model_revision": "wrong-revision"},
+    ],
+)
+def test_checkpoint_rejects_missing_or_wrong_raw_model_identity(
+    tmp_path: Path,
+    relative_path: str,
+    model_config: dict[str, object],
+) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    _write_json(checkpoint / relative_path, model_config)
+
+    with pytest.raises(CheckpointError, match="model_(?:name|revision)"):
         verify_checkpoint_structure(checkpoint, expected_step=5)
 
 

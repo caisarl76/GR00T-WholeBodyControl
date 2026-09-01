@@ -312,24 +312,33 @@ def _parse_pipeline_json_object(value: object, *, label: str) -> dict[str, objec
     return payload
 
 
+_MISSING_IDENTITY_FIELD = object()
+
+
 def _assert_model_identity(
     payload: object,
     *,
     label: str,
-    allow_missing_revision: bool,
+    allow_none_revision: bool,
 ) -> None:
     model_name = (
-        getattr(payload, "model_name", None) if not isinstance(payload, Mapping) else payload.get("model_name")
+        getattr(payload, "model_name", _MISSING_IDENTITY_FIELD)
+        if not isinstance(payload, Mapping)
+        else payload.get("model_name", _MISSING_IDENTITY_FIELD)
     )
     model_revision = (
-        getattr(payload, "model_revision", None)
+        getattr(payload, "model_revision", _MISSING_IDENTITY_FIELD)
         if not isinstance(payload, Mapping)
-        else payload.get("model_revision")
+        else payload.get("model_revision", _MISSING_IDENTITY_FIELD)
     )
+    if model_name is _MISSING_IDENTITY_FIELD:
+        raise RuntimeError(f"{label} model_name is missing")
+    if model_revision is _MISSING_IDENTITY_FIELD:
+        raise RuntimeError(f"{label} model_revision is missing")
     if model_name != COSMOS_MODEL_ID:
         raise RuntimeError(f"{label} model_name is not the exact canonical Cosmos ID")
     allowed_revisions = {COSMOS_REVISION}
-    if allow_missing_revision:
+    if allow_none_revision:
         allowed_revisions.add(None)
     if model_revision not in allowed_revisions:
         raise RuntimeError(f"{label} model_revision is neither None nor the exact Cosmos revision")
@@ -369,7 +378,7 @@ def _repair_created_model_identity(pipeline: object, model: object) -> object:
     _assert_model_identity(
         model_config,
         label="returned model config",
-        allow_missing_revision=True,
+        allow_none_revision=True,
     )
 
     save_cfg_dir = getattr(pipeline, "save_cfg_dir", None)
@@ -383,7 +392,7 @@ def _repair_created_model_identity(pipeline: object, model: object) -> object:
     _assert_model_identity(
         persisted_before,
         label="final_model_config.json before repair",
-        allow_missing_revision=True,
+        allow_none_revision=True,
     )
 
     try:
@@ -394,7 +403,7 @@ def _repair_created_model_identity(pipeline: object, model: object) -> object:
     _assert_model_identity(
         model_config,
         label="repaired model config",
-        allow_missing_revision=False,
+        allow_none_revision=False,
     )
 
     to_filtered_json = getattr(model_config, "to_filtered_json", None)
@@ -411,7 +420,7 @@ def _repair_created_model_identity(pipeline: object, model: object) -> object:
     _assert_model_identity(
         serialized_payload,
         label="repaired model config serialization",
-        allow_missing_revision=False,
+        allow_none_revision=False,
     )
     _atomic_rewrite_final_model_config(final_model_config, serialized)
     persisted_after = _load_pipeline_json_object(
@@ -421,7 +430,7 @@ def _repair_created_model_identity(pipeline: object, model: object) -> object:
     _assert_model_identity(
         persisted_after,
         label="final_model_config.json after repair",
-        allow_missing_revision=False,
+        allow_none_revision=False,
     )
     return model
 
@@ -432,7 +441,7 @@ def _validate_pipeline_creation_inputs(pipeline: object, expected_hub_cache: Pat
     _assert_model_identity(
         outer_model_config,
         label="outer pipeline model config",
-        allow_missing_revision=False,
+        allow_none_revision=False,
     )
     loading_kwargs = getattr(pipeline, "transformers_loading_kwargs", None)
     if type(loading_kwargs) is not dict:
@@ -461,6 +470,15 @@ def _pinned_pipeline_model_identity(
     restored = False
     invoked = False
 
+    def add_restoration_note(error: BaseException, note: str) -> None:
+        add_note = getattr(error, "add_note", None)
+        if not callable(add_note):
+            return
+        try:
+            add_note(note)
+        except BaseException:
+            return
+
     def restore(primary: BaseException | None = None) -> None:
         nonlocal restored
         if restored:
@@ -472,7 +490,7 @@ def _pinned_pipeline_model_identity(
             restored = True
         except BaseException as restoration_error:
             if primary is not None:
-                primary.add_note(f"_create_model restoration failed: {restoration_error}")
+                add_restoration_note(primary, f"_create_model restoration failed: {restoration_error}")
                 raise primary.with_traceback(primary.__traceback__) from restoration_error
             raise RuntimeError("could not restore original _create_model descriptor") from restoration_error
 
@@ -511,7 +529,10 @@ def _pinned_pipeline_model_identity(
             except BaseException as restoration_error:
                 if primary_failure is None:
                     raise
-                primary_failure.add_note(f"_create_model restoration failed: {restoration_error}")
+                add_restoration_note(
+                    primary_failure,
+                    f"_create_model restoration failed: {restoration_error}",
+                )
     if not invoked:
         raise RuntimeError("official GR00T pipeline _create_model hook must run exactly once")
 

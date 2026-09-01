@@ -238,10 +238,22 @@ def _validate_trainer_state(checkpoint: Path, expected_step: int) -> None:
         )
 
 
+def _validate_raw_model_identity(path: Path, *, label: str) -> None:
+    model_config = _load_json_object(path, label=label)
+    if model_config.get("model_name") != COSMOS_MODEL_ID:
+        raise CheckpointError(f"{label} model_name is not canonical")
+    if model_config.get("model_revision") != COSMOS_REVISION:
+        raise CheckpointError(f"{label} model_revision is not the exact pinned revision")
+
+
 def _validate_required_configuration_artifacts(checkpoint: Path) -> None:
     _required_file(checkpoint, "training_args.bin")
     for filename in _ROOT_JSON_CONFIGS:
         _required_file(checkpoint, filename)
+    _validate_raw_model_identity(
+        checkpoint / "config.json",
+        label="config.json",
+    )
     processor_config = _load_json_object(
         checkpoint / "processor_config.json",
         label="processor_config.json",
@@ -256,6 +268,10 @@ def _validate_required_configuration_artifacts(checkpoint: Path) -> None:
         _required_file(experiment, filename)
     for filename in _EXPERIMENT_JSON_CONFIGS:
         _required_file(experiment, filename)
+    _validate_raw_model_identity(
+        experiment / "final_model_config.json",
+        label="experiment_cfg/final_model_config.json",
+    )
 
 
 def _validate_shards(checkpoint: Path, files: list[Path]) -> dict[str, object]:

@@ -989,6 +989,61 @@ def test_run_offline_preflight_accepts_already_pinned_returned_identity(
     assert vars(Pipeline)["_create_model"] is original_create_model
 
 
+@pytest.mark.parametrize("missing_from", ["returned-config", "persisted-config"])
+def test_run_offline_preflight_distinguishes_missing_revision_from_explicit_none(
+    tmp_path: Path,
+    missing_from: str,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+
+    class MissingRevisionConfig:
+        model_name = COSMOS_MODEL_ID
+
+        def to_filtered_json(self) -> str:
+            return json.dumps(vars(self))
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = (
+                MissingRevisionConfig()
+                if missing_from == "returned-config"
+                else FakeModelConfig(model_revision=None)
+            )
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            payload = {"model_name": COSMOS_MODEL_ID}
+            if missing_from != "persisted-config":
+                payload["model_revision"] = None
+            self.save_cfg_dir.joinpath("final_model_config.json").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            return model
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    with pytest.raises(RuntimeError, match="model_revision.*missing"):
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
 @pytest.mark.parametrize(
     ("model_name", "model_revision", "match"),
     [
@@ -1254,6 +1309,53 @@ def test_run_offline_preflight_preserves_original_model_creation_failure(
         )
 
     assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_run_offline_preflight_preserves_primary_when_restoration_fails_on_python310(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+
+    class OriginalLoadFailure(RuntimeError):
+        pass
+
+    class RestorationBlockingMeta(type):
+        def __setattr__(cls, name: str, value: object) -> None:
+            current = vars(cls).get(name)
+            if (
+                name == "_create_model"
+                and getattr(current, "_groot_pinned_identity_hook", False)
+                and not getattr(value, "_groot_pinned_identity_hook", False)
+            ):
+                raise RuntimeError("restoration blocked")
+            super().__setattr__(name, value)
+
+    class Pipeline(metaclass=RestorationBlockingMeta):
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> object:
+            raise OriginalLoadFailure("original load failed")
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    with pytest.raises(OriginalLoadFailure, match="^original load failed$") as exc_info:
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert str(exc_info.value) == "original load failed"
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "restoration blocked" in str(exc_info.value.__cause__)
 
 
 def test_run_offline_preflight_rejects_unexpected_create_model_descriptor(

@@ -28,6 +28,8 @@
 - Create `gear_sonic/tests/test_launch_gr00t_n17_pinned_finetune.py`: shim configuration, selector, snapshot, and freshness tests without importing GR00T locally.
 - Create `gear_sonic/scripts/verify_gr00t_n17_checkpoint.py`: structural, tensor-payload, trainer-state, and offline load verification.
 - Create `gear_sonic/tests/test_verify_gr00t_n17_checkpoint.py`: synthetic sharded-checkpoint and corruption tests.
+- Create `gear_sonic/scripts/verify_gr00t_training_attempt.py`: real-log, Trainer-argument, W&B-identity, and immutable verdict verification for bounded attempts.
+- Create `gear_sonic/tests/test_verify_gr00t_training_attempt.py`: fixture-driven terminal-metric, anchor-order, W&B, loss, and no-clobber tests.
 - Create `gear_sonic/scripts/monitor_gr00t_gpu_gate.py`: 1 Hz baseline/gate sampling and structured pass/fail artifacts.
 - Create `gear_sonic/tests/test_monitor_gr00t_gpu_gate.py`: threshold, stability, overlap, process-set, timeout, and artifact tests.
 - Create after launch `docs/superpowers/progress/2026-08-31-pnp-trash-left-only-training.md`: secret-free execution evidence and current health state.
@@ -1826,8 +1828,9 @@ git commit -m "feat: gate concurrent gr00t gpu usage"
 - Verify: `gear_sonic/scripts/annotate_pnp_trash_dataset.py`
 - Verify: `gear_sonic/scripts/launch_gr00t_n17_pinned_finetune.py`
 - Verify: `gear_sonic/scripts/verify_gr00t_n17_checkpoint.py`
+- Verify: `gear_sonic/scripts/verify_gr00t_training_attempt.py`
 - Verify: `gear_sonic/scripts/monitor_gr00t_gpu_gate.py`
-- Verify: the four corresponding test modules listed in the file map.
+- Verify: the five corresponding test modules listed in the file map.
 
 - [ ] **Step 1: Run the complete focused suite**
 
@@ -1838,6 +1841,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   .venv_teleop/bin/python -m pytest -q -p no:cacheprovider \
   gear_sonic/tests/test_launch_gr00t_n17_pinned_finetune.py \
+  gear_sonic/tests/test_verify_gr00t_training_attempt.py \
   gear_sonic/tests/test_monitor_gr00t_gpu_gate.py
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   .venv_inference/bin/python -m pytest -q -p no:cacheprovider \
@@ -1854,24 +1858,29 @@ ruff check --no-cache \
   gear_sonic/scripts/annotate_pnp_trash_dataset.py \
   gear_sonic/scripts/launch_gr00t_n17_pinned_finetune.py \
   gear_sonic/scripts/verify_gr00t_n17_checkpoint.py \
+  gear_sonic/scripts/verify_gr00t_training_attempt.py \
   gear_sonic/scripts/monitor_gr00t_gpu_gate.py \
   gear_sonic/tests/test_lerobot_xlsx_annotations.py \
   gear_sonic/tests/test_launch_gr00t_n17_pinned_finetune.py \
   gear_sonic/tests/test_verify_gr00t_n17_checkpoint.py \
+  gear_sonic/tests/test_verify_gr00t_training_attempt.py \
   gear_sonic/tests/test_monitor_gr00t_gpu_gate.py
 ruff format --check --no-cache \
   gear_sonic/utils/data_collection/lerobot_xlsx_annotations.py \
   gear_sonic/scripts/annotate_pnp_trash_dataset.py \
   gear_sonic/scripts/launch_gr00t_n17_pinned_finetune.py \
   gear_sonic/scripts/verify_gr00t_n17_checkpoint.py \
+  gear_sonic/scripts/verify_gr00t_training_attempt.py \
   gear_sonic/scripts/monitor_gr00t_gpu_gate.py \
   gear_sonic/tests/test_lerobot_xlsx_annotations.py \
   gear_sonic/tests/test_launch_gr00t_n17_pinned_finetune.py \
   gear_sonic/tests/test_verify_gr00t_n17_checkpoint.py \
+  gear_sonic/tests/test_verify_gr00t_training_attempt.py \
   gear_sonic/tests/test_monitor_gr00t_gpu_gate.py
 PYTHONDONTWRITEBYTECODE=1 .venv_teleop/bin/python -m py_compile \
   gear_sonic/scripts/launch_gr00t_n17_pinned_finetune.py \
   gear_sonic/scripts/verify_gr00t_n17_checkpoint.py \
+  gear_sonic/scripts/verify_gr00t_training_attempt.py \
   gear_sonic/scripts/monitor_gr00t_gpu_gate.py
 ```
 
@@ -2165,6 +2174,7 @@ do
   rsync -a --protect-args \
     gear_sonic/scripts/launch_gr00t_n17_pinned_finetune.py \
     gear_sonic/scripts/verify_gr00t_n17_checkpoint.py \
+    gear_sonic/scripts/verify_gr00t_training_attempt.py \
     gear_sonic/scripts/monitor_gr00t_gpu_gate.py \
     outputs/pnp_trash_left_only.release.json \
     /tmp/pnp-trash-left-local-hashes.txt \
@@ -2180,6 +2190,7 @@ done
 for SCRIPT in \
   launch_gr00t_n17_pinned_finetune.py \
   verify_gr00t_n17_checkpoint.py \
+  verify_gr00t_training_attempt.py \
   monitor_gr00t_gpu_gate.py
 do
   LOCAL_SHA=$(sha256sum "gear_sonic/scripts/$SCRIPT" | cut -d " " -f 1)
@@ -2596,12 +2607,19 @@ done
 The exact production recipe keeps `logging_steps=10`, so one-step and five-step
 attempts are expected to have no per-step loss row in `trainer_state.json`.
 Validate their loss from the single official terminal Trainer metrics dictionary
-instead. Do not modify, reuse, or delete the completed failed smoke; allocate new
-attempt IDs after the persistence fix is installed.
+instead. The observed pinned runtime emits exactly the four required keys
+`train_runtime`, `train_samples_per_second`, `train_steps_per_second`, and
+`train_loss`; `epoch` is optional. Its buffered output order is exactly one
+`Model saved` anchor, exactly one `Training completed` anchor, then the terminal
+dictionary. The audited source verifier also correlates the W&B setup ID, unique
+online run URL, and local run path, hashes `train.log`, and publishes the result
+as a no-clobber final marker. Do not modify, reuse, or delete the completed failed
+smoke; allocate new attempt IDs after the persistence fix is installed.
 
 - [ ] **Step 1: Allocate unique attempt names**
 
-Install one audited wrapper in both containers and allocate two unique IDs:
+Install one audited wrapper in both containers, compile-check the already
+hash-verified source verifier, and allocate two unique IDs:
 
 ```bash
 for CONTAINER in \
@@ -2703,132 +2721,8 @@ exit "$STATUS"
 BASH
   ssh h100 "docker exec '$CONTAINER' chmod 700 /outputs/evidence/run_training_attempt.sh"
   ssh h100 "docker exec '$CONTAINER' bash -lc 'sha256sum /outputs/evidence/run_training_attempt.sh > /outputs/evidence/run_training_attempt.sha256'"
-  ssh h100 "docker exec -i '$CONTAINER' tee /outputs/evidence/verify_training_attempt.py >/dev/null" <<'PY'
-#!/usr/bin/env python3
-import ast
-from hashlib import sha256
-import json
-import math
-import os
-from pathlib import Path
-import re
-import sys
-import tempfile
-
-import torch
-
-if len(sys.argv) != 5:
-    raise SystemExit(
-        "usage: verify_training_attempt.py ATTEMPT_ROOT CHECKPOINT "
-        "EXPECTED_STEPS EXPECTED_SAVE_STEPS"
-    )
-root = Path(sys.argv[1])
-checkpoint = Path(sys.argv[2])
-expected_steps = int(sys.argv[3])
-expected_save_steps = int(sys.argv[4])
-assert root.joinpath("exit").read_text().strip() == "0"
-freshness = json.loads(root.joinpath("freshness-runtime.json").read_text())
-assert freshness["get_last_checkpoint"] is None
-
-log_bytes = root.joinpath("train.log").read_bytes()
-log = log_bytes.decode("utf-8", errors="replace").replace("\r", "\n")
-ansi = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-clean_log = ansi.sub("", log)
-lowered = clean_log.casefold()
-for indicator in ("resuming from checkpoint", "traceback", "out of memory"):
-    assert indicator not in lowered, indicator
-assert re.search(
-    r"(?<![a-z0-9_])(?:nan|[+-]?inf(?:inity)?)(?![a-z0-9_])",
-    lowered,
-) is None
-
-required_metrics = {
-    "train_runtime",
-    "train_samples_per_second",
-    "train_steps_per_second",
-    "train_loss",
-    "epoch",
-}
-terminal_metrics = []
-for line in clean_log.splitlines():
-    candidate_text = line.strip()
-    if not (candidate_text.startswith("{") and candidate_text.endswith("}")):
-        continue
-    try:
-        candidate = ast.literal_eval(candidate_text)
-    except (SyntaxError, ValueError):
-        continue
-    if type(candidate) is dict and required_metrics <= set(candidate):
-        terminal_metrics.append(candidate)
-assert len(terminal_metrics) == 1, terminal_metrics
-metrics = terminal_metrics[0]
-for field in required_metrics:
-    value = metrics[field]
-    assert type(value) in (int, float), (field, value)
-    assert math.isfinite(float(value)), (field, value)
-    assert float(metrics[field]) > 0.0, (field, metrics[field])
-
-state = json.loads((checkpoint / "trainer_state.json").read_text())
-assert state["global_step"] == expected_steps
-arguments = torch.load(
-    checkpoint / "training_args.bin",
-    map_location="cpu",
-    weights_only=False,
-)
-assert arguments.max_steps == expected_steps
-assert arguments.save_steps == expected_save_steps
-assert arguments.logging_steps == 10
-assert arguments.deepspeed is None
-assert arguments.report_to == ["wandb"]
-audit = json.loads(root.joinpath("training-arguments.json").read_text())
-assert audit["save_steps"] == expected_save_steps
-assert audit["logging_steps"] == 10
-assert audit["deepspeed"] is None
-assert audit["report_to"] == ["wandb"]
-
-evidence = {
-    "status": "pass",
-    "checkpoint": str(checkpoint),
-    "global_step": expected_steps,
-    "terminal_metrics": metrics,
-    "training_arguments": {
-        "max_steps": arguments.max_steps,
-        "save_steps": arguments.save_steps,
-        "logging_steps": arguments.logging_steps,
-        "deepspeed": arguments.deepspeed,
-        "report_to": arguments.report_to,
-    },
-    "train_log": {
-        "path": str(root / "train.log"),
-        "bytes": len(log_bytes),
-        "sha256": sha256(log_bytes).hexdigest(),
-    },
-}
-destination = root / "training-attempt-verdict.json"
-assert not os.path.lexists(destination), destination
-descriptor, temporary_name = tempfile.mkstemp(
-    dir=root,
-    prefix=f".{destination.name}.",
-    suffix=".tmp",
-)
-temporary = Path(temporary_name)
-try:
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(evidence, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.link(temporary, destination)
-    directory_descriptor = os.open(root, os.O_RDONLY)
-    try:
-        os.fsync(directory_descriptor)
-    finally:
-        os.close(directory_descriptor)
-finally:
-    temporary.unlink(missing_ok=True)
-PY
-  ssh h100 "docker exec '$CONTAINER' chmod 500 /outputs/evidence/verify_training_attempt.py"
-  ssh h100 "docker exec '$CONTAINER' bash -lc 'sha256sum /outputs/evidence/verify_training_attempt.py > /outputs/evidence/verify_training_attempt.sha256'"
+  ssh h100 "docker exec '$CONTAINER' test -f /outputs/evidence/verify_gr00t_training_attempt.py"
+  ssh h100 "docker exec '$CONTAINER' python -m py_compile /outputs/evidence/verify_gr00t_training_attempt.py"
 done
 FULL_SMOKE_ID=$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import secrets; print(secrets.token_hex(4))')
 SUBTASK_SMOKE_ID=$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import secrets; print(secrets.token_hex(4))')
@@ -2868,7 +2762,7 @@ FULL_SMOKE_EXPERIMENT="pnp-trash-full-prompt-left-smoke-$FULL_SMOKE_ID"
 FULL_SMOKE_ROOT="/outputs/smoke/$FULL_SMOKE_ID"
 FULL_SMOKE_CHECKPOINT="$FULL_SMOKE_ROOT/$FULL_SMOKE_EXPERIMENT/checkpoint-1"
 ssh h100 "docker exec jihun_gr00t_n17_pnp_trash_full_prompt_left_gpu7_20260828 \
-  python /outputs/evidence/verify_training_attempt.py \
+  python /outputs/evidence/verify_gr00t_training_attempt.py \
   '$FULL_SMOKE_ROOT' '$FULL_SMOKE_CHECKPOINT' 1 1"
 ssh h100 "docker exec jihun_gr00t_n17_pnp_trash_full_prompt_left_gpu7_20260828 \
   python /outputs/evidence/verify_input_manifests.py"
@@ -2909,7 +2803,7 @@ SUBTASK_SMOKE_EXPERIMENT="pnp-trash-subtasks-left-smoke-$SUBTASK_SMOKE_ID"
 SUBTASK_SMOKE_ROOT="/outputs/smoke/$SUBTASK_SMOKE_ID"
 SUBTASK_SMOKE_CHECKPOINT="$SUBTASK_SMOKE_ROOT/$SUBTASK_SMOKE_EXPERIMENT/checkpoint-1"
 ssh h100 "docker exec jihun_gr00t_n17_pnp_trash_subtasks_left_gpu6_20260828 \
-  python /outputs/evidence/verify_training_attempt.py \
+  python /outputs/evidence/verify_gr00t_training_attempt.py \
   '$SUBTASK_SMOKE_ROOT' '$SUBTASK_SMOKE_CHECKPOINT' 1 1"
 ssh h100 "docker exec jihun_gr00t_n17_pnp_trash_subtasks_left_gpu6_20260828 \
   python /outputs/evidence/verify_input_manifests.py"
@@ -2920,6 +2814,17 @@ ssh h100 "docker exec -e CUDA_VISIBLE_DEVICES= \
   --cache-root /root/.cache/huggingface \
   --cosmos-revision 9ce19a195e423419c349abfc86fd07178b230561 \
   --output-dir '$SUBTASK_SMOKE_ROOT/checkpoint-verdict' --offline-load"
+FULL_SMOKE_ID=$(cat /tmp/pnp-trash-full-left-smoke-id.txt)
+FULL_VERDICT="/mnt/data01/jhkim/gr00t_runs/pnp_trash_full_prompt_left_only_n17_20260828/smoke/$FULL_SMOKE_ID/training-attempt-verdict.json"
+SUBTASK_VERDICT="/mnt/data01/jhkim/gr00t_runs/pnp_trash_subtasks_left_only_n17_20260828/smoke/$SUBTASK_SMOKE_ID/training-attempt-verdict.json"
+ssh h100 "python3 - '$FULL_VERDICT' '$SUBTASK_VERDICT'" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+ids = [json.loads(Path(path).read_text())["wandb"]["run_id"] for path in sys.argv[1:]]
+assert len(ids) == len(set(ids)) == 2, ids
+PY
 ```
 
 Expected: both independent smokes pass. Preserve all artifacts.
@@ -3025,7 +2930,7 @@ do
   EXPERIMENT=${REMAINDER#*:}
   CHECKPOINT="$ATTEMPT_ROOT/$EXPERIMENT/checkpoint-5"
   ssh h100 "docker exec '$CONTAINER' \
-    python /outputs/evidence/verify_training_attempt.py \
+    python /outputs/evidence/verify_gr00t_training_attempt.py \
     '$ATTEMPT_ROOT' '$CHECKPOINT' 5 5"
   ssh h100 "docker exec '$CONTAINER' python /outputs/evidence/verify_input_manifests.py"
   ssh h100 "docker exec -e CUDA_VISIBLE_DEVICES= '$CONTAINER' \
@@ -3034,6 +2939,20 @@ do
     --cosmos-revision 9ce19a195e423419c349abfc86fd07178b230561 \
     --output-dir '$ATTEMPT_ROOT/checkpoint-verdict' --offline-load"
 done
+FULL_SMOKE_ID=$(cat /tmp/pnp-trash-full-left-smoke-id.txt)
+SUBTASK_SMOKE_ID=$(cat /tmp/pnp-trash-subtasks-left-smoke-id.txt)
+FULL_SMOKE_VERDICT="/mnt/data01/jhkim/gr00t_runs/pnp_trash_full_prompt_left_only_n17_20260828/smoke/$FULL_SMOKE_ID/training-attempt-verdict.json"
+SUBTASK_SMOKE_VERDICT="/mnt/data01/jhkim/gr00t_runs/pnp_trash_subtasks_left_only_n17_20260828/smoke/$SUBTASK_SMOKE_ID/training-attempt-verdict.json"
+FULL_GATE_VERDICT="/mnt/data01/jhkim/gr00t_runs/pnp_trash_full_prompt_left_only_n17_20260828/gate/$GATE_ID/training-attempt-verdict.json"
+SUBTASK_GATE_VERDICT="/mnt/data01/jhkim/gr00t_runs/pnp_trash_subtasks_left_only_n17_20260828/gate/$GATE_ID/training-attempt-verdict.json"
+ssh h100 "python3 - '$FULL_SMOKE_VERDICT' '$SUBTASK_SMOKE_VERDICT' '$FULL_GATE_VERDICT' '$SUBTASK_GATE_VERDICT'" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+ids = [json.loads(Path(path).read_text())["wandb"]["run_id"] for path in sys.argv[1:]]
+assert len(ids) == len(set(ids)) == 4, ids
+PY
 ```
 
 - [ ] **Step 4: Handle capacity failure without reclaiming resources**
