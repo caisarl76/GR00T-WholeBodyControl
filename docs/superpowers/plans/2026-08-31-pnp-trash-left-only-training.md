@@ -2593,6 +2593,12 @@ done
 **Files:**
 - Create per run: unique `smoke/YYYYmmddTHHMMSSZ-randomhex/` directories, logs, exit files, W&B identities, checkpoint verdicts.
 
+The exact production recipe keeps `logging_steps=10`, so one-step and five-step
+attempts are expected to have no per-step loss row in `trainer_state.json`.
+Validate their loss from the single official terminal Trainer metrics dictionary
+instead. Do not modify, reuse, or delete the completed failed smoke; allocate new
+attempt IDs after the persistence fix is installed.
+
 - [ ] **Step 1: Allocate unique attempt names**
 
 Install one audited wrapper in both containers and allocate two unique IDs:
@@ -2697,6 +2703,132 @@ exit "$STATUS"
 BASH
   ssh h100 "docker exec '$CONTAINER' chmod 700 /outputs/evidence/run_training_attempt.sh"
   ssh h100 "docker exec '$CONTAINER' bash -lc 'sha256sum /outputs/evidence/run_training_attempt.sh > /outputs/evidence/run_training_attempt.sha256'"
+  ssh h100 "docker exec -i '$CONTAINER' tee /outputs/evidence/verify_training_attempt.py >/dev/null" <<'PY'
+#!/usr/bin/env python3
+import ast
+from hashlib import sha256
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+
+import torch
+
+if len(sys.argv) != 5:
+    raise SystemExit(
+        "usage: verify_training_attempt.py ATTEMPT_ROOT CHECKPOINT "
+        "EXPECTED_STEPS EXPECTED_SAVE_STEPS"
+    )
+root = Path(sys.argv[1])
+checkpoint = Path(sys.argv[2])
+expected_steps = int(sys.argv[3])
+expected_save_steps = int(sys.argv[4])
+assert root.joinpath("exit").read_text().strip() == "0"
+freshness = json.loads(root.joinpath("freshness-runtime.json").read_text())
+assert freshness["get_last_checkpoint"] is None
+
+log_bytes = root.joinpath("train.log").read_bytes()
+log = log_bytes.decode("utf-8", errors="replace").replace("\r", "\n")
+ansi = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+clean_log = ansi.sub("", log)
+lowered = clean_log.casefold()
+for indicator in ("resuming from checkpoint", "traceback", "out of memory"):
+    assert indicator not in lowered, indicator
+assert re.search(
+    r"(?<![a-z0-9_])(?:nan|[+-]?inf(?:inity)?)(?![a-z0-9_])",
+    lowered,
+) is None
+
+required_metrics = {
+    "train_runtime",
+    "train_samples_per_second",
+    "train_steps_per_second",
+    "train_loss",
+    "epoch",
+}
+terminal_metrics = []
+for line in clean_log.splitlines():
+    candidate_text = line.strip()
+    if not (candidate_text.startswith("{") and candidate_text.endswith("}")):
+        continue
+    try:
+        candidate = ast.literal_eval(candidate_text)
+    except (SyntaxError, ValueError):
+        continue
+    if type(candidate) is dict and required_metrics <= set(candidate):
+        terminal_metrics.append(candidate)
+assert len(terminal_metrics) == 1, terminal_metrics
+metrics = terminal_metrics[0]
+for field in required_metrics:
+    value = metrics[field]
+    assert type(value) in (int, float), (field, value)
+    assert math.isfinite(float(value)), (field, value)
+    assert float(metrics[field]) > 0.0, (field, metrics[field])
+
+state = json.loads((checkpoint / "trainer_state.json").read_text())
+assert state["global_step"] == expected_steps
+arguments = torch.load(
+    checkpoint / "training_args.bin",
+    map_location="cpu",
+    weights_only=False,
+)
+assert arguments.max_steps == expected_steps
+assert arguments.save_steps == expected_save_steps
+assert arguments.logging_steps == 10
+assert arguments.deepspeed is None
+assert arguments.report_to == ["wandb"]
+audit = json.loads(root.joinpath("training-arguments.json").read_text())
+assert audit["save_steps"] == expected_save_steps
+assert audit["logging_steps"] == 10
+assert audit["deepspeed"] is None
+assert audit["report_to"] == ["wandb"]
+
+evidence = {
+    "status": "pass",
+    "checkpoint": str(checkpoint),
+    "global_step": expected_steps,
+    "terminal_metrics": metrics,
+    "training_arguments": {
+        "max_steps": arguments.max_steps,
+        "save_steps": arguments.save_steps,
+        "logging_steps": arguments.logging_steps,
+        "deepspeed": arguments.deepspeed,
+        "report_to": arguments.report_to,
+    },
+    "train_log": {
+        "path": str(root / "train.log"),
+        "bytes": len(log_bytes),
+        "sha256": sha256(log_bytes).hexdigest(),
+    },
+}
+destination = root / "training-attempt-verdict.json"
+assert not os.path.lexists(destination), destination
+descriptor, temporary_name = tempfile.mkstemp(
+    dir=root,
+    prefix=f".{destination.name}.",
+    suffix=".tmp",
+)
+temporary = Path(temporary_name)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(evidence, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.link(temporary, destination)
+    directory_descriptor = os.open(root, os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+  ssh h100 "docker exec '$CONTAINER' chmod 500 /outputs/evidence/verify_training_attempt.py"
+  ssh h100 "docker exec '$CONTAINER' bash -lc 'sha256sum /outputs/evidence/verify_training_attempt.py > /outputs/evidence/verify_training_attempt.sha256'"
 done
 FULL_SMOKE_ID=$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import secrets; print(secrets.token_hex(4))')
 SUBTASK_SMOKE_ID=$(date -u +%Y%m%dT%H%M%SZ)-$(python3 -c 'import secrets; print(secrets.token_hex(4))')
@@ -2735,34 +2867,11 @@ FULL_SMOKE_ID=$(cat /tmp/pnp-trash-full-left-smoke-id.txt)
 FULL_SMOKE_EXPERIMENT="pnp-trash-full-prompt-left-smoke-$FULL_SMOKE_ID"
 FULL_SMOKE_ROOT="/outputs/smoke/$FULL_SMOKE_ID"
 FULL_SMOKE_CHECKPOINT="$FULL_SMOKE_ROOT/$FULL_SMOKE_EXPERIMENT/checkpoint-1"
-ssh h100 "docker exec -i jihun_gr00t_n17_pnp_trash_full_prompt_left_gpu7_20260828 \
-  python - '$FULL_SMOKE_ROOT'" <<'PY'
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1])
-assert root.joinpath("exit").read_text().strip() == "0"
-assert "Resuming from checkpoint" not in root.joinpath("train.log").read_text(errors="replace")
-assert json.loads(root.joinpath("freshness-runtime.json").read_text())["get_last_checkpoint"] is None
-PY
+ssh h100 "docker exec jihun_gr00t_n17_pnp_trash_full_prompt_left_gpu7_20260828 \
+  python /outputs/evidence/verify_training_attempt.py \
+  '$FULL_SMOKE_ROOT' '$FULL_SMOKE_CHECKPOINT' 1 1"
 ssh h100 "docker exec jihun_gr00t_n17_pnp_trash_full_prompt_left_gpu7_20260828 \
   python /outputs/evidence/verify_input_manifests.py"
-ssh h100 "docker exec -i jihun_gr00t_n17_pnp_trash_full_prompt_left_gpu7_20260828 \
-  python - '$FULL_SMOKE_CHECKPOINT'" <<'PY'
-import json
-import math
-from pathlib import Path
-import sys
-import torch
-
-checkpoint = Path(sys.argv[1])
-state = json.loads((checkpoint / "trainer_state.json").read_text())
-assert state["global_step"] == 1
-losses = [row["loss"] for row in state["log_history"] if "loss" in row]
-assert losses and all(math.isfinite(float(value)) for value in losses)
-arguments = torch.load(checkpoint / "training_args.bin", map_location="cpu", weights_only=False)
-assert arguments.deepspeed is None
-PY
 ssh h100 "docker exec -e CUDA_VISIBLE_DEVICES= \
   jihun_gr00t_n17_pnp_trash_full_prompt_left_gpu7_20260828 \
   python /outputs/evidence/verify_gr00t_n17_checkpoint.py \
@@ -2799,34 +2908,11 @@ SUBTASK_SMOKE_ID=$(cat /tmp/pnp-trash-subtasks-left-smoke-id.txt)
 SUBTASK_SMOKE_EXPERIMENT="pnp-trash-subtasks-left-smoke-$SUBTASK_SMOKE_ID"
 SUBTASK_SMOKE_ROOT="/outputs/smoke/$SUBTASK_SMOKE_ID"
 SUBTASK_SMOKE_CHECKPOINT="$SUBTASK_SMOKE_ROOT/$SUBTASK_SMOKE_EXPERIMENT/checkpoint-1"
-ssh h100 "docker exec -i jihun_gr00t_n17_pnp_trash_subtasks_left_gpu6_20260828 \
-  python - '$SUBTASK_SMOKE_ROOT'" <<'PY'
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1])
-assert root.joinpath("exit").read_text().strip() == "0"
-assert "Resuming from checkpoint" not in root.joinpath("train.log").read_text(errors="replace")
-assert json.loads(root.joinpath("freshness-runtime.json").read_text())["get_last_checkpoint"] is None
-PY
+ssh h100 "docker exec jihun_gr00t_n17_pnp_trash_subtasks_left_gpu6_20260828 \
+  python /outputs/evidence/verify_training_attempt.py \
+  '$SUBTASK_SMOKE_ROOT' '$SUBTASK_SMOKE_CHECKPOINT' 1 1"
 ssh h100 "docker exec jihun_gr00t_n17_pnp_trash_subtasks_left_gpu6_20260828 \
   python /outputs/evidence/verify_input_manifests.py"
-ssh h100 "docker exec -i jihun_gr00t_n17_pnp_trash_subtasks_left_gpu6_20260828 \
-  python - '$SUBTASK_SMOKE_CHECKPOINT'" <<'PY'
-import json
-import math
-from pathlib import Path
-import sys
-import torch
-
-checkpoint = Path(sys.argv[1])
-state = json.loads((checkpoint / "trainer_state.json").read_text())
-assert state["global_step"] == 1
-losses = [row["loss"] for row in state["log_history"] if "loss" in row]
-assert losses and all(math.isfinite(float(value)) for value in losses)
-arguments = torch.load(checkpoint / "training_args.bin", map_location="cpu", weights_only=False)
-assert arguments.deepspeed is None
-PY
 ssh h100 "docker exec -e CUDA_VISIBLE_DEVICES= \
   jihun_gr00t_n17_pnp_trash_subtasks_left_gpu6_20260828 \
   python /outputs/evidence/verify_gr00t_n17_checkpoint.py \
@@ -2938,30 +3024,9 @@ do
   ATTEMPT_ROOT=${REMAINDER%%:*}
   EXPERIMENT=${REMAINDER#*:}
   CHECKPOINT="$ATTEMPT_ROOT/$EXPERIMENT/checkpoint-5"
-  ssh h100 "docker exec -i '$CONTAINER' python - '$ATTEMPT_ROOT' '$CHECKPOINT'" <<'PY'
-import json
-import math
-from pathlib import Path
-import re
-import sys
-import torch
-
-root = Path(sys.argv[1])
-checkpoint = Path(sys.argv[2])
-assert root.joinpath("exit").read_text().strip() == "0"
-log = root.joinpath("train.log").read_text(errors="replace")
-assert "Resuming from checkpoint" not in log
-assert json.loads(root.joinpath("freshness-runtime.json").read_text())["get_last_checkpoint"] is None
-lowered = log.casefold()
-assert "out of memory" not in lowered and "traceback" not in lowered
-assert re.search(r"\b(?:nan|inf)\b", lowered) is None
-state = json.loads((checkpoint / "trainer_state.json").read_text())
-assert state["global_step"] == 5
-losses = [row["loss"] for row in state["log_history"] if "loss" in row]
-assert losses and all(math.isfinite(float(value)) for value in losses)
-arguments = torch.load(checkpoint / "training_args.bin", map_location="cpu", weights_only=False)
-assert arguments.deepspeed is None
-PY
+  ssh h100 "docker exec '$CONTAINER' \
+    python /outputs/evidence/verify_training_attempt.py \
+    '$ATTEMPT_ROOT' '$CHECKPOINT' 5 5"
   ssh h100 "docker exec '$CONTAINER' python /outputs/evidence/verify_input_manifests.py"
   ssh h100 "docker exec -e CUDA_VISIBLE_DEVICES= '$CONTAINER' \
     python /outputs/evidence/verify_gr00t_n17_checkpoint.py '$CHECKPOINT' \

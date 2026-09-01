@@ -275,6 +275,247 @@ def _offline_cosmos_model_info_shim(
         setattr(huggingface_hub_module, "model_info", original_model_info)
 
 
+def _load_pipeline_json_object(path: Path, *, label: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"{label} must be a regular non-symlink file")
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(
+                handle,
+                object_pairs_hook=_reject_duplicate_snapshot_config_pairs,
+                parse_constant=_reject_nonfinite_snapshot_config,
+            )
+    except RuntimeError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{label} is not valid JSON") from exc
+    if type(payload) is not dict:
+        raise RuntimeError(f"{label} must contain a JSON object")
+    return payload
+
+
+def _parse_pipeline_json_object(value: object, *, label: str) -> dict[str, object]:
+    if type(value) is not str:
+        raise RuntimeError(f"{label} must be a JSON string")
+    try:
+        payload = json.loads(
+            value,
+            object_pairs_hook=_reject_duplicate_snapshot_config_pairs,
+            parse_constant=_reject_nonfinite_snapshot_config,
+        )
+    except RuntimeError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{label} is not valid JSON") from exc
+    if type(payload) is not dict:
+        raise RuntimeError(f"{label} must contain a JSON object")
+    return payload
+
+
+def _assert_model_identity(
+    payload: object,
+    *,
+    label: str,
+    allow_missing_revision: bool,
+) -> None:
+    model_name = (
+        getattr(payload, "model_name", None) if not isinstance(payload, Mapping) else payload.get("model_name")
+    )
+    model_revision = (
+        getattr(payload, "model_revision", None)
+        if not isinstance(payload, Mapping)
+        else payload.get("model_revision")
+    )
+    if model_name != COSMOS_MODEL_ID:
+        raise RuntimeError(f"{label} model_name is not the exact canonical Cosmos ID")
+    allowed_revisions = {COSMOS_REVISION}
+    if allow_missing_revision:
+        allowed_revisions.add(None)
+    if model_revision not in allowed_revisions:
+        raise RuntimeError(f"{label} model_revision is neither None nor the exact Cosmos revision")
+
+
+def _atomic_rewrite_final_model_config(path: Path, serialized: str) -> None:
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("final_model_config.json changed before atomic rewrite")
+        try:
+            os.replace(temporary_path, path)
+        except OSError as exc:
+            raise RuntimeError("could not atomically rewrite final_model_config.json") from exc
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _repair_created_model_identity(pipeline: object, model: object) -> object:
+    model_config = getattr(model, "config", None)
+    if model_config is None:
+        raise RuntimeError("official GR00T pipeline returned a model without config")
+    _assert_model_identity(
+        model_config,
+        label="returned model config",
+        allow_missing_revision=True,
+    )
+
+    save_cfg_dir = getattr(pipeline, "save_cfg_dir", None)
+    if not isinstance(save_cfg_dir, (str, os.PathLike)):
+        raise RuntimeError("official GR00T pipeline save_cfg_dir is invalid")
+    final_model_config = Path(save_cfg_dir) / "final_model_config.json"
+    persisted_before = _load_pipeline_json_object(
+        final_model_config,
+        label="final_model_config.json before repair",
+    )
+    _assert_model_identity(
+        persisted_before,
+        label="final_model_config.json before repair",
+        allow_missing_revision=True,
+    )
+
+    try:
+        setattr(model_config, "model_name", COSMOS_MODEL_ID)
+        setattr(model_config, "model_revision", COSMOS_REVISION)
+    except BaseException as exc:
+        raise RuntimeError("could not persist the exact Cosmos identity on model config") from exc
+    _assert_model_identity(
+        model_config,
+        label="repaired model config",
+        allow_missing_revision=False,
+    )
+
+    to_filtered_json = getattr(model_config, "to_filtered_json", None)
+    if not callable(to_filtered_json):
+        raise RuntimeError("repaired model config must provide to_filtered_json()")
+    try:
+        serialized = to_filtered_json()
+    except BaseException as exc:
+        raise RuntimeError("model config serialization failed") from exc
+    serialized_payload = _parse_pipeline_json_object(
+        serialized,
+        label="repaired model config serialization",
+    )
+    _assert_model_identity(
+        serialized_payload,
+        label="repaired model config serialization",
+        allow_missing_revision=False,
+    )
+    _atomic_rewrite_final_model_config(final_model_config, serialized)
+    persisted_after = _load_pipeline_json_object(
+        final_model_config,
+        label="final_model_config.json after repair",
+    )
+    _assert_model_identity(
+        persisted_after,
+        label="final_model_config.json after repair",
+        allow_missing_revision=False,
+    )
+    return model
+
+
+def _validate_pipeline_creation_inputs(pipeline: object, expected_hub_cache: Path) -> None:
+    config = getattr(pipeline, "config", None)
+    outer_model_config = getattr(config, "model", None)
+    _assert_model_identity(
+        outer_model_config,
+        label="outer pipeline model config",
+        allow_missing_revision=False,
+    )
+    loading_kwargs = getattr(pipeline, "transformers_loading_kwargs", None)
+    if type(loading_kwargs) is not dict:
+        raise RuntimeError("pipeline transformers_loading_kwargs must be a dictionary")
+    if loading_kwargs.get("revision") != COSMOS_REVISION:
+        raise RuntimeError("pipeline transformers revision is not the exact Cosmos revision")
+    if loading_kwargs.get("local_files_only") is not True:
+        raise RuntimeError("pipeline transformers local_files_only must be exactly True")
+    if loading_kwargs.get("cache_dir") != str(expected_hub_cache):
+        raise RuntimeError("pipeline transformers cache_dir is not the exact pinned Hub cache")
+
+
+@contextmanager
+def _pinned_pipeline_model_identity(
+    pipeline_class: type[object],
+    expected_create_model: object,
+    expected_hub_cache: Path,
+) -> Iterator[None]:
+    """One-shot repair of official GR00T model serialization identity."""
+    original_create_model = vars(pipeline_class).get("_create_model")
+    if original_create_model is not expected_create_model or not callable(original_create_model):
+        raise RuntimeError("official GR00T pipeline _create_model descriptor is unexpected")
+    if getattr(original_create_model, "_groot_pinned_identity_hook", False):
+        raise RuntimeError("official GR00T pipeline _create_model is already patched")
+
+    restored = False
+    invoked = False
+
+    def restore(primary: BaseException | None = None) -> None:
+        nonlocal restored
+        if restored:
+            return
+        try:
+            setattr(pipeline_class, "_create_model", original_create_model)
+            if vars(pipeline_class).get("_create_model") is not original_create_model:
+                raise RuntimeError("original _create_model descriptor was not restored")
+            restored = True
+        except BaseException as restoration_error:
+            if primary is not None:
+                primary.add_note(f"_create_model restoration failed: {restoration_error}")
+                raise primary.with_traceback(primary.__traceback__) from restoration_error
+            raise RuntimeError("could not restore original _create_model descriptor") from restoration_error
+
+    def create_model_with_pinned_identity(self: object, *args: object, **kwargs: object) -> object:
+        nonlocal invoked
+        if invoked:
+            raise RuntimeError("official GR00T pipeline _create_model hook may run only once")
+        invoked = True
+        try:
+            if args or kwargs:
+                raise RuntimeError("official GR00T pipeline _create_model received unexpected arguments")
+            _validate_pipeline_creation_inputs(self, expected_hub_cache)
+            model = original_create_model(self)
+        except BaseException as primary:
+            restore(primary)
+            raise
+        restore()
+        return _repair_created_model_identity(self, model)
+
+    create_model_with_pinned_identity._groot_pinned_identity_hook = True
+    setattr(pipeline_class, "_create_model", create_model_with_pinned_identity)
+    if vars(pipeline_class).get("_create_model") is not create_model_with_pinned_identity:
+        restore()
+        raise RuntimeError("could not install official GR00T pipeline _create_model hook")
+
+    primary_failure: BaseException | None = None
+    try:
+        yield
+    except BaseException as error:
+        primary_failure = error
+        raise
+    finally:
+        if not restored:
+            try:
+                restore()
+            except BaseException as restoration_error:
+                if primary_failure is None:
+                    raise
+                primary_failure.add_note(f"_create_model restoration failed: {restoration_error}")
+    if not invoked:
+        raise RuntimeError("official GR00T pipeline _create_model hook must run exactly once")
+
+
 def _validate_new_absolute_path(path: Path, *, label: str) -> None:
     if not path.is_absolute():
         raise RuntimeError(f"{label} audit path must be absolute: {path}")
@@ -509,6 +750,7 @@ def run_offline_preflight(
     torch_module: object,
     cosmos_snapshot: Path,
     huggingface_hub_module: object,
+    pipeline_create_model_descriptor: object,
     gc_collect: Callable[[], object] = gc.collect,
 ) -> dict[str, str | None]:
     """Run official pipeline setup, record loaded classes, and release resources."""
@@ -521,7 +763,12 @@ def run_offline_preflight(
     setup_failure: tuple[BaseException, TracebackType | None] | None = None
     try:
         with _offline_cosmos_model_info_shim(cosmos_snapshot, huggingface_hub_module):
-            pipeline.setup()
+            with _pinned_pipeline_model_identity(
+                pipeline_class,
+                pipeline_create_model_descriptor,
+                cosmos_snapshot.parents[2],
+            ):
+                pipeline.setup()
         record = {
             "model_class": _class_name(getattr(pipeline, "model", None)),
             "processor_class": _class_name(getattr(pipeline, "processor", None)),
@@ -594,6 +841,10 @@ def _load_runtime_dependencies() -> SimpleNamespace:
     from transformers.trainer_utils import get_last_checkpoint
     import tyro
 
+    pipeline_create_model_descriptor = vars(Gr00tN1d7Pipeline).get("_create_model")
+    if not callable(pipeline_create_model_descriptor):
+        raise RuntimeError("official GR00T pipeline _create_model descriptor is unavailable")
+
     return SimpleNamespace(
         cache_root=DEFAULT_CACHE_ROOT,
         torch=torch,
@@ -606,6 +857,7 @@ def _load_runtime_dependencies() -> SimpleNamespace:
         run=run,
         get_backbone_cls=get_backbone_cls,
         Gr00tN1d7Pipeline=Gr00tN1d7Pipeline,
+        Gr00tN1d7Pipeline_create_model=pipeline_create_model_descriptor,
         snapshot_download=huggingface_hub.snapshot_download,
         huggingface_hub=huggingface_hub,
         get_last_checkpoint=get_last_checkpoint,
@@ -698,6 +950,7 @@ def main(
             torch_module=runtime.torch,
             cosmos_snapshot=snapshot,
             huggingface_hub_module=runtime.huggingface_hub,
+            pipeline_create_model_descriptor=runtime.Gr00tN1d7Pipeline_create_model,
             gc_collect=getattr(runtime, "gc_collect", gc.collect),
         )
         print(json.dumps({"offline_preflight": preflight_record}, sort_keys=True))
@@ -708,7 +961,12 @@ def main(
         training_arguments_audit,
     )
     with _offline_cosmos_model_info_shim(snapshot, runtime.huggingface_hub):
-        runtime.run(config)
+        with _pinned_pipeline_model_identity(
+            runtime.Gr00tN1d7Pipeline,
+            runtime.Gr00tN1d7Pipeline_create_model,
+            snapshot.parents[2],
+        ):
+            runtime.run(config)
 
 
 if __name__ == "__main__":

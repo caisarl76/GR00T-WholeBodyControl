@@ -242,6 +242,13 @@ def _validate_required_configuration_artifacts(checkpoint: Path) -> None:
     _required_file(checkpoint, "training_args.bin")
     for filename in _ROOT_JSON_CONFIGS:
         _required_file(checkpoint, filename)
+    processor_config = _load_json_object(
+        checkpoint / "processor_config.json",
+        label="processor_config.json",
+    )
+    processor_kwargs = processor_config.get("processor_kwargs")
+    if type(processor_kwargs) is not dict or processor_kwargs.get("model_name") != COSMOS_MODEL_ID:
+        raise CheckpointError("processor_config.json processor_kwargs.model_name is not canonical")
     experiment = checkpoint / "experiment_cfg"
     if experiment.is_symlink() or not experiment.is_dir():
         raise CheckpointError("required experiment_cfg directory is missing")

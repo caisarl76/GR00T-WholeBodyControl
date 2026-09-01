@@ -65,11 +65,14 @@ def _write_checkpoint_fixture(root: Path, step: int = 5) -> Path:
     for filename in (
         "training_args.bin",
         "config.json",
-        "processor_config.json",
         "statistics.json",
         "embodiment_id.json",
     ):
         (checkpoint / filename).write_bytes(b"fixture")
+    _write_json(
+        checkpoint / "processor_config.json",
+        {"processor_kwargs": {"model_name": COSMOS_MODEL_ID}},
+    )
     experiment_cfg = checkpoint / "experiment_cfg"
     experiment_cfg.mkdir()
     for filename in (
@@ -126,6 +129,26 @@ def test_checkpoint_rejects_content_replaced_after_semantic_validation(
     )
 
     with pytest.raises(CheckpointError, match="content changed"):
+        verify_checkpoint_structure(checkpoint, expected_step=5)
+
+
+@pytest.mark.parametrize(
+    "processor_config",
+    [
+        {},
+        {"processor_kwargs": None},
+        {"processor_kwargs": {}},
+        {"processor_kwargs": {"model_name": "other/model"}},
+    ],
+)
+def test_checkpoint_rejects_missing_or_wrong_raw_processor_model_name(
+    tmp_path: Path,
+    processor_config: dict[str, object],
+) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    _write_json(checkpoint / "processor_config.json", processor_config)
+
+    with pytest.raises(CheckpointError, match="processor.*model_name"):
         verify_checkpoint_structure(checkpoint, expected_step=5)
 
 

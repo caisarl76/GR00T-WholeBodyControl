@@ -8,6 +8,7 @@ import weakref
 
 import pytest
 
+from gear_sonic.scripts import launch_gr00t_n17_pinned_finetune as launcher
 from gear_sonic.scripts.launch_gr00t_n17_pinned_finetune import (
     COSMOS_MODEL_ID,
     COSMOS_REVISION,
@@ -183,6 +184,57 @@ def fake_config(*, use_wandb: bool = True) -> SimpleNamespace:
             shuffle=True,
             seed=42,
         ),
+    )
+
+
+class FakeModelConfig:
+    def __init__(
+        self,
+        *,
+        model_name: str = COSMOS_MODEL_ID,
+        model_revision: str | None = None,
+        serialization_error: BaseException | None = None,
+    ) -> None:
+        self.model_name = model_name
+        self.model_revision = model_revision
+        self.serialization_error = serialization_error
+
+    def to_filtered_json(self) -> str:
+        if self.serialization_error is not None:
+            raise self.serialization_error
+        return json.dumps(
+            {
+                "model_name": self.model_name,
+                "model_revision": self.model_revision,
+            }
+        )
+
+
+def pinned_preflight_config(tmp_path: Path, *, use_wandb: bool = False) -> SimpleNamespace:
+    config = fake_config(use_wandb=use_wandb)
+    apply_runtime_pins(config, cache_root=tmp_path)
+    return config
+
+
+def initialize_fake_pipeline(
+    pipeline: object,
+    config: object,
+    save_cfg_dir: Path,
+) -> None:
+    pipeline.config = config
+    pipeline.save_cfg_dir = save_cfg_dir
+    pipeline.transformers_loading_kwargs = {
+        "revision": config.model.model_revision,
+        "local_files_only": config.training.transformers_local_files_only,
+        "cache_dir": config.training.transformers_cache_dir,
+    }
+
+
+def write_pre_repair_model_artifact(save_cfg_dir: Path, model_config: FakeModelConfig) -> None:
+    save_cfg_dir.mkdir(parents=True, exist_ok=True)
+    (save_cfg_dir / "final_model_config.json").write_text(
+        model_config.to_filtered_json(),
+        encoding="utf-8",
     )
 
 
@@ -683,7 +735,8 @@ def test_run_offline_preflight_runs_official_setup_records_classes_and_cleans_up
     hub, original_model_info = offline_hub(events)
 
     class Model:
-        pass
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
 
     class Processor:
         pass
@@ -702,19 +755,25 @@ def test_run_offline_preflight_runs_official_setup_records_classes_and_cleans_up
     class Pipeline:
         def __init__(self, config: object, save_cfg_dir: Path) -> None:
             events.append(("init", config, save_cfg_dir))
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
 
         def setup(self) -> None:
             events.append("setup")
             model_info = hub.model_info(COSMOS_MODEL_ID)
             assert model_info.tags == ["qwen3_vl"]
-            self.model = Model()
+            self.model = self._create_model()
             self.processor = Processor()
             self.train_dataset = TrainDataset()
             self.eval_dataset = EvalDataset()
             self.data_collator = Collator()
 
     torch_module = SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: events.append("empty-cache")))
-    config = fake_config(use_wandb=False)
+    config = pinned_preflight_config(tmp_path)
     save_cfg_dir = tmp_path / "experiment" / "experiment_cfg"
 
     record = run_offline_preflight(
@@ -724,6 +783,7 @@ def test_run_offline_preflight_runs_official_setup_records_classes_and_cleans_up
         torch_module=torch_module,
         cosmos_snapshot=snapshot,
         huggingface_hub_module=hub,
+        pipeline_create_model_descriptor=vars(Pipeline)["_create_model"],
         gc_collect=lambda: events.append("gc-collect"),
     )
 
@@ -746,6 +806,518 @@ def test_run_offline_preflight_runs_official_setup_records_classes_and_cleans_up
     ]
 
 
+def test_run_offline_preflight_persists_exact_identity_on_created_model(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+    created_models = []
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            created_models.append(model)
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+            self.processor = None
+            self.train_dataset = None
+            self.eval_dataset = None
+            self.data_collator = None
+
+    original_create_model = vars(Pipeline)["_create_model"]
+
+    config = pinned_preflight_config(tmp_path)
+    run_offline_preflight(
+        config,
+        Pipeline,
+        tmp_path / "experiment_cfg",
+        torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+        cosmos_snapshot=snapshot,
+        huggingface_hub_module=hub,
+        pipeline_create_model_descriptor=original_create_model,
+    )
+
+    assert created_models[0].config.model_name == COSMOS_MODEL_ID
+    assert created_models[0].config.model_revision == COSMOS_REVISION
+    persisted = json.loads((tmp_path / "experiment_cfg" / "final_model_config.json").read_text(encoding="utf-8"))
+    assert persisted == {
+        "model_name": COSMOS_MODEL_ID,
+        "model_revision": COSMOS_REVISION,
+    }
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_run_offline_preflight_model_identity_hook_restores_after_setup_failure(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+    created_models = []
+
+    class SetupFailure(RuntimeError):
+        pass
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            created_models.append(model)
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+            raise SetupFailure("setup failed after model creation")
+
+    original_create_model = vars(Pipeline)["_create_model"]
+
+    with pytest.raises(SetupFailure, match="setup failed after model creation"):
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert created_models[0].config.model_name == COSMOS_MODEL_ID
+    assert created_models[0].config.model_revision == COSMOS_REVISION
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_run_offline_preflight_rejects_model_config_that_does_not_persist_revision(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+
+    class Config(FakeModelConfig):
+        def __init__(self) -> None:
+            object.__setattr__(self, "model_name", COSMOS_MODEL_ID)
+            object.__setattr__(self, "model_revision", None)
+            object.__setattr__(self, "serialization_error", None)
+
+        def __setattr__(self, name: str, value: object) -> None:
+            if name != "model_revision":
+                object.__setattr__(self, name, value)
+
+    class Model:
+        config = Config()
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+
+    with pytest.raises(RuntimeError, match="model_revision"):
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_run_offline_preflight_accepts_already_pinned_returned_identity(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+    created_models = []
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=COSMOS_REVISION)
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            created_models.append(model)
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    run_offline_preflight(
+        pinned_preflight_config(tmp_path),
+        Pipeline,
+        tmp_path / "experiment_cfg",
+        torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+        cosmos_snapshot=snapshot,
+        huggingface_hub_module=hub,
+        pipeline_create_model_descriptor=original_create_model,
+    )
+
+    assert created_models[0].config.model_revision == COSMOS_REVISION
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+@pytest.mark.parametrize(
+    ("model_name", "model_revision", "match"),
+    [
+        ("other/model", None, "model_name"),
+        (COSMOS_MODEL_ID, "wrong-revision", "model_revision"),
+    ],
+)
+def test_run_offline_preflight_rejects_wrong_returned_model_identity(
+    tmp_path: Path,
+    model_name: str,
+    model_revision: str | None,
+    match: str,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+    created_models = []
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(
+                model_name=model_name,
+                model_revision=model_revision,
+            )
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            created_models.append(model)
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    with pytest.raises(RuntimeError, match=match):
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert created_models[0].config.model_name == model_name
+    assert created_models[0].config.model_revision == model_revision
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_run_offline_preflight_restores_hook_after_model_config_serialization_failure(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            model.config.serialization_error = RuntimeError("serialization failed")
+            return model
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    with pytest.raises(RuntimeError, match="serialization"):
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_run_offline_preflight_restores_hook_after_artifact_rewrite_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    monkeypatch.setattr(launcher.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("replace failed")))
+
+    with pytest.raises(RuntimeError, match="rewrite"):
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "match"),
+    [
+        ("outer-name", "outer.*model_name"),
+        ("outer-revision", "outer.*model_revision"),
+        ("loading-revision", "transformers revision"),
+        ("local-files", "local_files_only"),
+        ("cache", "cache_dir"),
+    ],
+)
+def test_run_offline_preflight_validates_outer_identity_before_original_model_call(
+    tmp_path: Path,
+    failure_kind: str,
+    match: str,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+    original_called = False
+    config = pinned_preflight_config(tmp_path)
+    if failure_kind == "outer-name":
+        config.model.model_name = "other/model"
+    elif failure_kind == "outer-revision":
+        config.model.model_revision = "wrong-revision"
+
+    class Pipeline:
+        def __init__(self, received_config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, received_config, save_cfg_dir)
+            if failure_kind == "loading-revision":
+                self.transformers_loading_kwargs["revision"] = "wrong-revision"
+            elif failure_kind == "local-files":
+                self.transformers_loading_kwargs["local_files_only"] = False
+            elif failure_kind == "cache":
+                self.transformers_loading_kwargs["cache_dir"] = "/wrong/cache"
+
+        def _create_model(self) -> object:
+            nonlocal original_called
+            original_called = True
+            raise AssertionError("original model creation must not run")
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    with pytest.raises(RuntimeError, match=match):
+        run_offline_preflight(
+            config,
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert original_called is False
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_run_offline_preflight_rejects_wrong_pre_repair_artifact_identity(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+    created_models = []
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            created_models.append(model)
+            self.save_cfg_dir.joinpath("final_model_config.json").write_text(
+                json.dumps({"model_name": "other/model", "model_revision": None}),
+                encoding="utf-8",
+            )
+            return model
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    with pytest.raises(RuntimeError, match="final_model_config.*model_name"):
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert created_models[0].config.model_revision is None
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_run_offline_preflight_preserves_original_model_creation_failure(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+
+    class OriginalLoadFailure(RuntimeError):
+        pass
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> object:
+            raise OriginalLoadFailure("original load failed")
+
+        def setup(self) -> None:
+            self.model = self._create_model()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    with pytest.raises(OriginalLoadFailure, match="original load failed"):
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_run_offline_preflight_rejects_unexpected_create_model_descriptor(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+
+    class Pipeline:
+        def __init__(self, _config: object, _save_cfg_dir: Path) -> None:
+            pass
+
+        def _create_model(self) -> object:
+            raise AssertionError("model creation must not run")
+
+        def setup(self) -> None:
+            raise AssertionError("setup must not run")
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    with pytest.raises(RuntimeError, match="descriptor is unexpected"):
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=lambda _self: None,
+        )
+
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_run_offline_preflight_requires_exactly_one_model_creation_call(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> object:
+            raise AssertionError("unused official model creation method")
+
+        def setup(self) -> None:
+            self.model = object()
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    with pytest.raises(RuntimeError, match="must run exactly once"):
+        run_offline_preflight(
+            pinned_preflight_config(tmp_path),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=original_create_model,
+        )
+
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
 def test_run_offline_preflight_requires_wandb_disabled(tmp_path: Path) -> None:
     snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
     hub, _original_model_info = offline_hub()
@@ -757,6 +1329,7 @@ def test_run_offline_preflight_requires_wandb_disabled(tmp_path: Path) -> None:
             torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
             cosmos_snapshot=snapshot,
             huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=None,
         )
 
 
@@ -784,6 +1357,7 @@ def test_run_offline_preflight_rejects_inexact_cosmos_snapshot_before_setup(
             torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
             cosmos_snapshot=snapshot,
             huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=None,
         )
 
     assert hub.model_info is original_model_info
@@ -796,23 +1370,30 @@ def test_run_offline_preflight_accepts_config_symlink_to_canonical_blob(
     hub, original_model_info = offline_hub()
 
     class Pipeline:
-        def __init__(self, _config: object, _save_cfg_dir: Path) -> None:
-            pass
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> object:
+            model = SimpleNamespace(config=FakeModelConfig(model_revision=None))
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
 
         def setup(self) -> None:
             assert hub.model_info(COSMOS_MODEL_ID).tags == ["qwen3_vl"]
+            self.model = self._create_model()
 
     record = run_offline_preflight(
-        fake_config(use_wandb=False),
+        pinned_preflight_config(tmp_path),
         Pipeline,
         tmp_path / "experiment_cfg",
         torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
         cosmos_snapshot=snapshot,
         huggingface_hub_module=hub,
+        pipeline_create_model_descriptor=vars(Pipeline)["_create_model"],
     )
 
     assert record == {
-        "model_class": None,
+        "model_class": "SimpleNamespace",
         "processor_class": None,
         "train_dataset_class": None,
         "eval_dataset_class": None,
@@ -856,6 +1437,7 @@ def test_run_offline_preflight_rejects_invalid_config_symlink_before_setup(
             torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
             cosmos_snapshot=snapshot,
             huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=None,
         )
 
     assert hub.model_info is original_model_info
@@ -871,6 +1453,9 @@ def test_run_offline_preflight_rejects_unexpected_model_info_repo_and_restores(
         def __init__(self, _config: object, _save_cfg_dir: Path) -> None:
             pass
 
+        def _create_model(self) -> object:
+            return SimpleNamespace(config=SimpleNamespace(model_name=COSMOS_MODEL_ID, model_revision=None))
+
         def setup(self) -> None:
             hub.model_info("other/model")
 
@@ -882,6 +1467,7 @@ def test_run_offline_preflight_rejects_unexpected_model_info_repo_and_restores(
             torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
             cosmos_snapshot=snapshot,
             huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=vars(Pipeline)["_create_model"],
         )
 
     assert hub.model_info is original_model_info
@@ -895,14 +1481,20 @@ def test_run_offline_preflight_releases_loaded_objects_before_collection(
     hub, _original_model_info = offline_hub()
 
     class LoadedObject:
-        pass
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
 
     class Pipeline:
-        def __init__(self, _config: object, _save_cfg_dir: Path) -> None:
-            pass
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> LoadedObject:
+            model = LoadedObject()
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
 
         def setup(self) -> None:
-            self.model = LoadedObject()
+            self.model = self._create_model()
             self.processor = LoadedObject()
             self.train_dataset = LoadedObject()
             self.eval_dataset = LoadedObject()
@@ -922,12 +1514,13 @@ def test_run_offline_preflight_releases_loaded_objects_before_collection(
         assert all(reference() is None for reference in references)
 
     run_offline_preflight(
-        fake_config(use_wandb=False),
+        pinned_preflight_config(tmp_path),
         Pipeline,
         tmp_path / "experiment_cfg",
         torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
         cosmos_snapshot=snapshot,
         huggingface_hub_module=hub,
+        pipeline_create_model_descriptor=vars(Pipeline)["_create_model"],
         gc_collect=assert_released,
     )
 
@@ -958,12 +1551,22 @@ def test_run_offline_preflight_preserves_setup_error_and_completes_cleanup(
             events.append(f"{self.name}-close")
             raise self.error
 
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
+
     class Pipeline:
-        def __init__(self, _config: object, _save_cfg_dir: Path) -> None:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
             instances.append(self)
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
 
         def setup(self) -> None:
-            self.model = object()
+            self.model = self._create_model()
             self.processor = object()
             self.train_dataset = Dataset("train", TrainCloseFailure("train close failed"))
             self.eval_dataset = Dataset("eval", EvalCloseFailure("eval close failed"))
@@ -973,12 +1576,13 @@ def test_run_offline_preflight_preserves_setup_error_and_completes_cleanup(
 
     with pytest.raises(SetupFailure, match="setup failed") as exc_info:
         run_offline_preflight(
-            fake_config(use_wandb=False),
+            pinned_preflight_config(tmp_path),
             Pipeline,
             tmp_path / "experiment_cfg",
             torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: events.append("empty-cache"))),
             cosmos_snapshot=snapshot,
             huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=vars(Pipeline)["_create_model"],
             gc_collect=lambda: events.append("gc-collect"),
         )
 
@@ -1018,12 +1622,22 @@ def test_run_offline_preflight_raises_first_cleanup_error_after_all_cleanup(
             events.append(f"{self.name}-close")
             raise self.error
 
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
+
     class Pipeline:
-        def __init__(self, _config: object, _save_cfg_dir: Path) -> None:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
             instances.append(self)
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
 
         def setup(self) -> None:
-            self.model = object()
+            self.model = self._create_model()
             self.processor = object()
             self.train_dataset = Dataset("train", TrainCloseFailure("train close failed"))
             self.eval_dataset = Dataset("eval", EvalCloseFailure("eval close failed"))
@@ -1032,12 +1646,13 @@ def test_run_offline_preflight_raises_first_cleanup_error_after_all_cleanup(
 
     with pytest.raises(TrainCloseFailure, match="train close failed") as exc_info:
         run_offline_preflight(
-            fake_config(use_wandb=False),
+            pinned_preflight_config(tmp_path),
             Pipeline,
             tmp_path / "experiment_cfg",
             torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: events.append("empty-cache"))),
             cosmos_snapshot=snapshot,
             huggingface_hub_module=hub,
+            pipeline_create_model_descriptor=vars(Pipeline)["_create_model"],
             gc_collect=lambda: events.append("gc-collect"),
         )
 
@@ -1086,7 +1701,8 @@ def _fake_runtime_dependencies(
             return SimpleNamespace(value=value)
 
     class Model:
-        pass
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
 
     class Processor:
         pass
@@ -1101,12 +1717,18 @@ def _fake_runtime_dependencies(
     class Pipeline:
         def __init__(self, received_config: object, save_cfg_dir: Path) -> None:
             events.append(("pipeline-init", received_config, save_cfg_dir))
+            initialize_fake_pipeline(self, received_config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
 
         def setup(self) -> None:
             events.append("pipeline-setup")
             model_info = hub.model_info(COSMOS_MODEL_ID)
             events.append(("pipeline-model-info-tags", model_info.tags))
-            self.model = Model()
+            self.model = self._create_model()
             self.processor = Processor()
             self.train_dataset = TrainDataset()
             self.eval_dataset = None
@@ -1132,6 +1754,7 @@ def _fake_runtime_dependencies(
         huggingface_hub=hub,
         original_model_info=original_model_info,
         Gr00tN1d7Pipeline=Pipeline,
+        Gr00tN1d7Pipeline_create_model=vars(Pipeline)["_create_model"],
         experiment_module=experiment_module,
         run=lambda received_config: (
             events.append(("training-model-info-tags", hub.model_info(COSMOS_MODEL_ID).tags)),
@@ -1274,6 +1897,7 @@ def test_main_production_installs_audit_then_calls_training(tmp_path: Path) -> N
         model_info = dependencies.huggingface_hub.model_info(COSMOS_MODEL_ID)
         events.append(("training-model-info-tags", model_info.tags))
         events.append(("run", config))
+        dependencies.Gr00tN1d7Pipeline(config, tmp_path / "training-config")._create_model()
         returned = dependencies.experiment_module.TrainingArguments(deepspeed=None)
         assert returned is training_arguments
 
@@ -1290,9 +1914,116 @@ def test_main_production_installs_audit_then_calls_training(tmp_path: Path) -> N
 
     assert any(isinstance(event, tuple) and event[0] == "run" for event in events)
     assert json.loads(training_audit.read_text(encoding="utf-8"))["deepspeed"] is None
-    assert not any(isinstance(event, tuple) and event[0] == "pipeline-init" for event in events)
+    assert sum(isinstance(event, tuple) and event[0] == "pipeline-init" for event in events) == 1
     assert ("training-model-info-tags", ["qwen3_vl"]) in events
     assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
+
+
+def test_main_production_persists_model_identity_and_restores_creation_hook(
+    tmp_path: Path,
+) -> None:
+    events: list[object] = []
+    dependencies = _fake_runtime_dependencies(tmp_path, use_wandb=True, events=events)
+    training_arguments = SimpleNamespace(
+        deepspeed=None,
+        to_dict=lambda: _training_arguments_payload(None),
+    )
+    dependencies.experiment_module.TrainingArguments = lambda **_kwargs: training_arguments
+    created_models = []
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            created_models.append(model)
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    dependencies.Gr00tN1d7Pipeline = Pipeline
+    dependencies.Gr00tN1d7Pipeline_create_model = original_create_model
+
+    def run(config: object) -> None:
+        dependencies.huggingface_hub.model_info(COSMOS_MODEL_ID)
+        pipeline = Pipeline(config, tmp_path / "training-config")
+        pipeline._create_model()
+
+    dependencies.run = run
+    environment = {
+        **REQUIRED_OFFLINE_ENV,
+        "GR00T_PINNED_PREFLIGHT_ONLY": "0",
+        "GR00T_FRESHNESS_AUDIT_PATH": str((tmp_path / "freshness.json").resolve()),
+        "GR00T_TRAINING_ARGS_AUDIT_PATH": str((tmp_path / "training-arguments.json").resolve()),
+    }
+
+    main(environ=environment, dependencies=dependencies)
+
+    assert created_models[0].config.model_name == COSMOS_MODEL_ID
+    assert created_models[0].config.model_revision == COSMOS_REVISION
+    assert (
+        json.loads((tmp_path / "training-config" / "final_model_config.json").read_text(encoding="utf-8"))[
+            "model_revision"
+        ]
+        == COSMOS_REVISION
+    )
+    assert vars(Pipeline)["_create_model"] is original_create_model
+
+
+def test_main_production_restores_creation_hook_after_artifact_rewrite_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    dependencies = _fake_runtime_dependencies(tmp_path, use_wandb=True, events=events)
+    training_arguments = SimpleNamespace(
+        deepspeed=None,
+        to_dict=lambda: _training_arguments_payload(None),
+    )
+    dependencies.experiment_module.TrainingArguments = lambda **_kwargs: training_arguments
+
+    class Model:
+        def __init__(self) -> None:
+            self.config = FakeModelConfig(model_revision=None)
+
+    class Pipeline:
+        def __init__(self, config: object, save_cfg_dir: Path) -> None:
+            initialize_fake_pipeline(self, config, save_cfg_dir)
+
+        def _create_model(self) -> Model:
+            model = Model()
+            write_pre_repair_model_artifact(self.save_cfg_dir, model.config)
+            return model
+
+    original_create_model = vars(Pipeline)["_create_model"]
+    dependencies.Gr00tN1d7Pipeline = Pipeline
+    dependencies.Gr00tN1d7Pipeline_create_model = original_create_model
+
+    def run(config: object) -> None:
+        Pipeline(config, tmp_path / "training-config")._create_model()
+
+    dependencies.run = run
+    monkeypatch.setattr(
+        launcher.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+    environment = {
+        **REQUIRED_OFFLINE_ENV,
+        "GR00T_PINNED_PREFLIGHT_ONLY": "0",
+        "GR00T_FRESHNESS_AUDIT_PATH": str((tmp_path / "freshness.json").resolve()),
+        "GR00T_TRAINING_ARGS_AUDIT_PATH": str((tmp_path / "training-arguments.json").resolve()),
+    }
+
+    with pytest.raises(RuntimeError, match="rewrite"):
+        main(environ=environment, dependencies=dependencies)
+
+    assert vars(Pipeline)["_create_model"] is original_create_model
 
 
 def test_main_production_restores_model_info_when_training_fails(tmp_path: Path) -> None:
@@ -1303,6 +2034,7 @@ def test_main_production_restores_model_info_when_training_fails(tmp_path: Path)
         to_dict=lambda: _training_arguments_payload(None),
     )
     dependencies.experiment_module.TrainingArguments = lambda **_kwargs: training_arguments
+    original_create_model = dependencies.Gr00tN1d7Pipeline_create_model
 
     def fail_training(_config: object) -> None:
         dependencies.huggingface_hub.model_info(COSMOS_MODEL_ID)
@@ -1320,6 +2052,7 @@ def test_main_production_restores_model_info_when_training_fails(tmp_path: Path)
         main(environ=environment, dependencies=dependencies)
 
     assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
+    assert vars(dependencies.Gr00tN1d7Pipeline)["_create_model"] is original_create_model
 
 
 @pytest.mark.parametrize(
