@@ -565,7 +565,7 @@ def test_snapshot_health_uses_three_selective_h100_query_interfaces(
         [
             "nvidia-smi",
             "--id=6,7",
-            "--query-retired-pages=gpu_uuid,address,timestamp,cause",
+            "--query-retired-pages=gpu_uuid,retired_pages.address,retired_pages.timestamp,retired_pages.cause",
             "--format=csv,noheader,nounits",
         ],
     ]

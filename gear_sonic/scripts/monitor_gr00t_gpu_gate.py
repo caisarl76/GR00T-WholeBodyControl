@@ -812,7 +812,7 @@ def snapshot_health(gpu_indices: tuple[int, ...]) -> dict[str, object]:
         raise GpuGateError("row-remap health did not return every requested GPU UUID")
 
     retired_rows = _run_nvidia_smi(
-        "retired-pages:gpu_uuid,address,timestamp,cause",
+        "retired-pages:gpu_uuid,retired_pages.address,retired_pages.timestamp,retired_pages.cause",
         gpu_indices=gpu_indices,
     )
     retired_by_uuid = _retired_page_counts(retired_rows, {uuid: gpu for gpu, uuid in uuid_by_index.items()})
