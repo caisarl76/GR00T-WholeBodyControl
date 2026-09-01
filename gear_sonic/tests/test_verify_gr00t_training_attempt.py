@@ -1,4 +1,5 @@
 from hashlib import sha256
+import io
 import json
 import math
 from pathlib import Path
@@ -18,6 +19,7 @@ from gear_sonic.scripts.verify_gr00t_training_attempt import (
 RUN_ID = "uiqz3f58"
 RUN_URL = f"https://wandb.ai/example/gr00t-n1.7-pnp-trash/runs/{RUN_ID}"
 LOCAL_RUN_PATH = f"/outputs/wandb/run-20260901_010203-{RUN_ID}"
+LOCAL_LOG_PATH = f"./wandb/run-20260901_010203-{RUN_ID}/logs"
 REQUIRED_METRICS = {
     "train_runtime": 12.5,
     "train_samples_per_second": 0.4,
@@ -106,14 +108,17 @@ def verify_fixture(
         log=log,
         log_history=log_history,
     )
+
+    def load_training_arguments(stream: io.BytesIO) -> object:
+        assert stream.read() == b"fixture"
+        return arguments
+
     return verify_training_attempt(
         root,
         checkpoint,
         expected_steps=1,
         expected_save_steps=1,
-        load_training_arguments=lambda path: (
-            arguments if path == checkpoint / "training_args.bin" else pytest.fail(f"unexpected load path: {path}")
-        ),
+        load_training_arguments=load_training_arguments,
     )
 
 
@@ -126,11 +131,24 @@ def test_accepts_real_terminal_metrics_without_epoch_and_zero_loss(tmp_path: Pat
     assert evidence["wandb"] == {
         "run_id": RUN_ID,
         "run_url": RUN_URL,
-        "local_run_path": LOCAL_RUN_PATH,
+        "local_run_paths": [LOCAL_RUN_PATH],
     }
     log_bytes = training_log(metrics).encode()
     assert evidence["train_log"]["bytes"] == len(log_bytes)
     assert evidence["train_log"]["sha256"] == sha256(log_bytes).hexdigest()
+    manifest = evidence["input_manifest"]
+    assert [entry["label"] for entry in manifest] == [
+        "exit status",
+        "freshness-runtime.json",
+        "train.log",
+        "trainer_state.json",
+        "training_args.bin",
+        "training-arguments.json",
+    ]
+    for entry in manifest:
+        assert entry["bytes"] >= 0
+        assert len(entry["sha256"]) == 64
+        assert set(entry["identity"]) == {"device", "inode", "mtime_ns", "ctime_ns"}
 
 
 def test_accepts_optional_zero_epoch(tmp_path: Path) -> None:
@@ -155,7 +173,6 @@ def test_accepts_zero_throughput_rates(tmp_path: Path) -> None:
     "metrics",
     [
         {**REQUIRED_METRICS, "train_runtime": 0.0},
-        {**REQUIRED_METRICS, "train_loss": -0.1},
         {**REQUIRED_METRICS, "train_loss": True},
         {**REQUIRED_METRICS, "train_steps_per_second": -0.1},
         {**REQUIRED_METRICS, "epoch": -0.1},
@@ -168,6 +185,12 @@ def test_rejects_invalid_terminal_metric_values(
 ) -> None:
     with pytest.raises(AttemptVerificationError, match="metric|nonfinite"):
         verify_fixture(tmp_path, log=training_log(metrics))
+
+
+def test_accepts_finite_negative_terminal_loss(tmp_path: Path) -> None:
+    metrics = {**REQUIRED_METRICS, "train_loss": -0.1}
+
+    assert verify_fixture(tmp_path, log=training_log(metrics))["terminal_metrics"] == metrics
 
 
 def test_rejects_nonfinite_terminal_loss_token(tmp_path: Path) -> None:
@@ -191,6 +214,24 @@ def test_rejects_duplicate_terminal_metrics_dicts(tmp_path: Path) -> None:
 
     with pytest.raises(AttemptVerificationError, match="exactly one terminal"):
         verify_fixture(tmp_path, log=log)
+
+
+@pytest.mark.parametrize(
+    "terminal_line",
+    [
+        (
+            "{'train_runtime': 1.0, 'train_samples_per_second': 0.1, "
+            "'train_steps_per_second': 0.1, 'train_loss': 0.2, 'train_loss': 0.3}"
+        ),
+        repr({**REQUIRED_METRICS, "unexpected": 1}),
+    ],
+)
+def test_rejects_duplicate_or_unexpected_terminal_metric_keys(
+    tmp_path: Path,
+    terminal_line: str,
+) -> None:
+    with pytest.raises(AttemptVerificationError, match="duplicate|exact key set"):
+        verify_fixture(tmp_path, log=training_log(terminal_line=terminal_line))
 
 
 def test_strips_ansi_and_carriage_returns_before_parsing(tmp_path: Path) -> None:
@@ -346,11 +387,28 @@ def test_rejects_missing_duplicate_or_mismatched_wandb_identity(
 
 
 def test_accepts_blank_final_wandb_url_and_repeated_same_online_url(tmp_path: Path) -> None:
-    log = training_log(suffix=f"wandb: View run at {RUN_URL}\nwandb: logs at {LOCAL_RUN_PATH}/logs\n")
+    log = training_log(suffix=f"wandb: View run at {RUN_URL}\nwandb: logs at {LOCAL_LOG_PATH}\n")
 
     evidence = verify_fixture(tmp_path, log=log)
 
     assert evidence["wandb"]["run_id"] == RUN_ID
+    assert evidence["wandb"]["local_run_paths"] == [LOCAL_RUN_PATH, LOCAL_LOG_PATH]
+
+
+@pytest.mark.parametrize(
+    "run_url",
+    [
+        f"http://wandb.ai/example/gr00t-n1.7-pnp-trash/runs/{RUN_ID}",
+        f"https://example.com/example/gr00t-n1.7-pnp-trash/runs/{RUN_ID}",
+        f"https://wandb.ai/example/wrong-project/runs/{RUN_ID}",
+        f"https://wandb.ai/example/gr00t-n1.7-pnp-trash/runs/{RUN_ID}?query=forbidden",
+    ],
+)
+def test_rejects_noncanonical_wandb_run_url(tmp_path: Path, run_url: str) -> None:
+    log = training_log().replace(RUN_URL, run_url)
+
+    with pytest.raises(AttemptVerificationError, match="canonical online run URL"):
+        verify_fixture(tmp_path, log=log)
 
 
 @pytest.mark.parametrize("kind", ["symlink", "directory"])
@@ -411,6 +469,40 @@ def test_publish_loses_race_without_overwriting_accepted_evidence(
     assert not list(tmp_path.glob(".*.tmp"))
 
 
+@pytest.mark.parametrize("mutation", ["symlink-swap", "content-change"])
+def test_verify_and_publish_rejects_post_validation_input_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    root, checkpoint, arguments = write_attempt(tmp_path)
+    original_revalidate = verifier._revalidate_captured_inputs
+
+    def mutate_then_revalidate(captured_inputs: object) -> None:
+        train_log = root / "train.log"
+        if mutation == "symlink-swap":
+            replacement = tmp_path / "replacement.log"
+            replacement.write_text(training_log(), encoding="utf-8")
+            train_log.unlink()
+            train_log.symlink_to(replacement)
+        else:
+            train_log.write_text(training_log(suffix="mutated\n"), encoding="utf-8")
+        original_revalidate(captured_inputs)
+
+    monkeypatch.setattr(verifier, "_revalidate_captured_inputs", mutate_then_revalidate)
+
+    with pytest.raises(AttemptVerificationError, match="changed|regular non-symlink"):
+        verifier.verify_and_publish_training_attempt(
+            root,
+            checkpoint,
+            expected_steps=1,
+            expected_save_steps=1,
+            load_training_arguments=lambda _stream: arguments,
+        )
+
+    assert not (root / "training-attempt-verdict.json").exists()
+
+
 def test_main_verifies_and_publishes_final_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -418,8 +510,8 @@ def test_main_verifies_and_publishes_final_marker(
     root, checkpoint, arguments = write_attempt(tmp_path)
     loads = []
 
-    def load(path: Path, *, map_location: str, weights_only: bool) -> object:
-        loads.append((path, map_location, weights_only))
+    def load(stream: io.BytesIO, *, map_location: str, weights_only: bool) -> object:
+        loads.append((stream.read(), map_location, weights_only))
         return arguments
 
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(load=load))
@@ -430,4 +522,4 @@ def test_main_verifies_and_publishes_final_marker(
     evidence = json.loads(destination.read_text(encoding="utf-8"))
     assert evidence["status"] == "pass"
     assert evidence["wandb"]["run_id"] == RUN_ID
-    assert loads == [(checkpoint / "training_args.bin", "cpu", False)]
+    assert loads == [(b"fixture", "cpu", False)]

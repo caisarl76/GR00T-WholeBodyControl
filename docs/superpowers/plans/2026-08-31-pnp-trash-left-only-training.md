@@ -2609,12 +2609,16 @@ attempts are expected to have no per-step loss row in `trainer_state.json`.
 Validate their loss from the single official terminal Trainer metrics dictionary
 instead. The observed pinned runtime emits exactly the four required keys
 `train_runtime`, `train_samples_per_second`, `train_steps_per_second`, and
-`train_loss`; `epoch` is optional. Its buffered output order is exactly one
+`train_loss`; `epoch` is optional, loss is finite without a sign restriction,
+runtime is positive, and throughput rates are nonnegative. Its buffered output order is exactly one
 `Model saved` anchor, exactly one `Training completed` anchor, then the terminal
-dictionary. The audited source verifier also correlates the W&B setup ID, unique
-online run URL, and local run path, hashes `train.log`, and publishes the result
-as a no-clobber final marker. Do not modify, reuse, or delete the completed failed
-smoke; allocate new attempt IDs after the persistence fix is installed.
+dictionary with no duplicate or unexpected keys. The audited source verifier
+also correlates the W&B setup ID, every rendered local path, and the exact unique
+`https://wandb.ai/<entity>/gr00t-n1.7-pnp-trash/runs/<id>` URL. It captures every
+input through a no-follow file descriptor, records identity and SHA-256 manifests,
+revalidates them immediately before publishing, and writes a no-clobber final
+marker. Do not modify, reuse, or delete the completed failed smoke; allocate new
+attempt IDs after the persistence fix is installed.
 
 - [ ] **Step 1: Allocate unique attempt names**
 
