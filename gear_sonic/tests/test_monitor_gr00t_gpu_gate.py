@@ -548,11 +548,27 @@ def test_snapshot_health_uses_three_selective_h100_query_interfaces(
             "row_remap_failure": 0,
         },
     }
-    assert len(commands) == 3
-    assert all("--id=6,7" in command for command in commands)
-    assert any(any(arg.startswith("--query-gpu=") for arg in command) for command in commands)
-    assert any(any(arg.startswith("--query-remapped-rows=") for arg in command) for command in commands)
-    assert any(any(arg.startswith("--query-retired-pages=") for arg in command) for command in commands)
+    assert commands == [
+        [
+            "nvidia-smi",
+            "--id=6,7",
+            "--query-gpu=index,uuid,ecc.errors.uncorrected.volatile.total",
+            "--format=csv,noheader,nounits",
+        ],
+        [
+            "nvidia-smi",
+            "--id=6,7",
+            "--query-remapped-rows=gpu_uuid,remapped_rows.correctable,"
+            "remapped_rows.uncorrectable,remapped_rows.pending,remapped_rows.failure",
+            "--format=csv,noheader,nounits",
+        ],
+        [
+            "nvidia-smi",
+            "--id=6,7",
+            "--query-retired-pages=gpu_uuid,address,timestamp,cause",
+            "--format=csv,noheader,nounits",
+        ],
+    ]
 
 
 def test_snapshot_health_counts_real_retired_page_addresses(

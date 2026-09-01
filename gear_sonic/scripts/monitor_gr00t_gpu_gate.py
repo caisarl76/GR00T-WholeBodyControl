@@ -789,7 +789,8 @@ def snapshot_health(gpu_indices: tuple[int, ...]) -> dict[str, object]:
         raise GpuGateError("nvidia-smi did not return health for every requested GPU")
 
     remap_rows = _run_nvidia_smi(
-        "remapped-rows:gpu_uuid,correctable,uncorrectable,pending,failure",
+        "remapped-rows:gpu_uuid,remapped_rows.correctable,"
+        "remapped_rows.uncorrectable,remapped_rows.pending,remapped_rows.failure",
         gpu_indices=gpu_indices,
     )
     remap_by_uuid: dict[str, dict[str, int]] = {}
