@@ -76,6 +76,28 @@ def expected_cosmos_snapshot(cache_root: Path) -> Path:
     return cache_root / "hub" / "models--nvidia--Cosmos-Reason2-2B" / "snapshots" / COSMOS_REVISION
 
 
+def write_cosmos_snapshot_config(snapshot: Path, **overrides: object) -> Path:
+    snapshot.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_type": "qwen3_vl",
+        "architectures": ["Qwen3VLForConditionalGeneration"],
+        "transformers_version": "4.57.0.dev0",
+        **overrides,
+    }
+    (snapshot / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+    return snapshot
+
+
+def offline_hub(events: list[object] | None = None) -> tuple[SimpleNamespace, object]:
+    def network_model_info(*args: object, **kwargs: object) -> object:
+        if events is not None:
+            events.append(("network-model-info", args, kwargs))
+        raise RuntimeError("HF_HUB_OFFLINE: model_info network access is forbidden")
+
+    hub = SimpleNamespace(model_info=network_model_info)
+    return hub, network_model_info
+
+
 def fake_config(*, use_wandb: bool = True) -> SimpleNamespace:
     return SimpleNamespace(
         load_config_path="sentinel",
@@ -638,6 +660,8 @@ def test_run_offline_preflight_runs_official_setup_records_classes_and_cleans_up
     tmp_path: Path,
 ) -> None:
     events = []
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, original_model_info = offline_hub(events)
 
     class Model:
         pass
@@ -662,6 +686,8 @@ def test_run_offline_preflight_runs_official_setup_records_classes_and_cleans_up
 
         def setup(self) -> None:
             events.append("setup")
+            model_info = hub.model_info(COSMOS_MODEL_ID)
+            assert model_info.tags == ["qwen3_vl"]
             self.model = Model()
             self.processor = Processor()
             self.train_dataset = TrainDataset()
@@ -677,6 +703,8 @@ def test_run_offline_preflight_runs_official_setup_records_classes_and_cleans_up
         Pipeline,
         save_cfg_dir,
         torch_module=torch_module,
+        cosmos_snapshot=snapshot,
+        huggingface_hub_module=hub,
         gc_collect=lambda: events.append("gc-collect"),
     )
 
@@ -688,6 +716,7 @@ def test_run_offline_preflight_runs_official_setup_records_classes_and_cleans_up
         "data_collator_class": "Collator",
     }
     assert save_cfg_dir.is_dir()
+    assert hub.model_info is original_model_info
     assert events == [
         ("init", config, save_cfg_dir),
         "setup",
@@ -699,19 +728,80 @@ def test_run_offline_preflight_runs_official_setup_records_classes_and_cleans_up
 
 
 def test_run_offline_preflight_requires_wandb_disabled(tmp_path: Path) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
     with pytest.raises(RuntimeError, match="W&B"):
         run_offline_preflight(
             fake_config(use_wandb=True),
             lambda *_args: pytest.fail("pipeline must not be constructed"),
             tmp_path / "experiment_cfg",
             torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
         )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"model_type": "mistral"}, "model_type"),
+        ({"architectures": ["MistralForCausalLM"]}, "architectures"),
+        ({"transformers_version": "4.57.1"}, "transformers_version"),
+    ],
+)
+def test_run_offline_preflight_rejects_inexact_cosmos_snapshot_before_setup(
+    tmp_path: Path,
+    overrides: dict[str, object],
+    match: str,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path), **overrides)
+    hub, original_model_info = offline_hub()
+
+    with pytest.raises(RuntimeError, match=match):
+        run_offline_preflight(
+            fake_config(use_wandb=False),
+            lambda *_args: pytest.fail("pipeline must not be constructed"),
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+        )
+
+    assert hub.model_info is original_model_info
+
+
+def test_run_offline_preflight_rejects_unexpected_model_info_repo_and_restores(
+    tmp_path: Path,
+) -> None:
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, original_model_info = offline_hub()
+
+    class Pipeline:
+        def __init__(self, _config: object, _save_cfg_dir: Path) -> None:
+            pass
+
+        def setup(self) -> None:
+            hub.model_info("other/model")
+
+    with pytest.raises(RuntimeError, match="only supports.*Cosmos"):
+        run_offline_preflight(
+            fake_config(use_wandb=False),
+            Pipeline,
+            tmp_path / "experiment_cfg",
+            torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
+        )
+
+    assert hub.model_info is original_model_info
 
 
 def test_run_offline_preflight_releases_loaded_objects_before_collection(
     tmp_path: Path,
 ) -> None:
     references: list[weakref.ReferenceType[object]] = []
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
 
     class LoadedObject:
         pass
@@ -745,6 +835,8 @@ def test_run_offline_preflight_releases_loaded_objects_before_collection(
         Pipeline,
         tmp_path / "experiment_cfg",
         torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: None)),
+        cosmos_snapshot=snapshot,
+        huggingface_hub_module=hub,
         gc_collect=assert_released,
     )
 
@@ -754,6 +846,8 @@ def test_run_offline_preflight_preserves_setup_error_and_completes_cleanup(
 ) -> None:
     events: list[str] = []
     instances = []
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, original_model_info = offline_hub()
 
     class SetupFailure(RuntimeError):
         pass
@@ -792,9 +886,12 @@ def test_run_offline_preflight_preserves_setup_error_and_completes_cleanup(
             Pipeline,
             tmp_path / "experiment_cfg",
             torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: events.append("empty-cache"))),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
             gc_collect=lambda: events.append("gc-collect"),
         )
 
+    assert hub.model_info is original_model_info
     assert events == ["setup", "train-close", "eval-close", "gc-collect", "empty-cache"]
     assert isinstance(exc_info.value.__cause__, RuntimeError)
     assert "train close failed" in str(exc_info.value.__cause__)
@@ -812,6 +909,8 @@ def test_run_offline_preflight_raises_first_cleanup_error_after_all_cleanup(
 ) -> None:
     events: list[str] = []
     instances = []
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, _original_model_info = offline_hub()
 
     class TrainCloseFailure(RuntimeError):
         pass
@@ -846,6 +945,8 @@ def test_run_offline_preflight_raises_first_cleanup_error_after_all_cleanup(
             Pipeline,
             tmp_path / "experiment_cfg",
             torch_module=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: events.append("empty-cache"))),
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=hub,
             gc_collect=lambda: events.append("gc-collect"),
         )
 
@@ -878,8 +979,8 @@ def _fake_runtime_dependencies(
     config = fake_config(use_wandb=use_wandb)
     config.data.datasets = None
     ft_config = fake_finetune_config(tmp_path, use_wandb=use_wandb)
-    snapshot = expected_cosmos_snapshot(tmp_path)
-    snapshot.mkdir(parents=True)
+    snapshot = write_cosmos_snapshot_config(expected_cosmos_snapshot(tmp_path))
+    hub, original_model_info = offline_hub(events)
 
     class DefaultConfig:
         def load_dict(self, payload: dict[str, object]) -> SimpleNamespace:
@@ -912,6 +1013,8 @@ def _fake_runtime_dependencies(
 
         def setup(self) -> None:
             events.append("pipeline-setup")
+            model_info = hub.model_info(COSMOS_MODEL_ID)
+            events.append(("pipeline-model-info-tags", model_info.tags))
             self.model = Model()
             self.processor = Processor()
             self.train_dataset = TrainDataset()
@@ -925,7 +1028,7 @@ def _fake_runtime_dependencies(
         events.append(("snapshot-download", kwargs))
         return str(snapshot)
 
-    return SimpleNamespace(
+    dependencies = SimpleNamespace(
         cache_root=tmp_path,
         tyro=SimpleNamespace(cli=lambda *_args, **_kwargs: ft_config),
         FinetuneConfig=object,
@@ -935,12 +1038,18 @@ def _fake_runtime_dependencies(
         get_backbone_cls=lambda _model: qwen3_backbone,
         get_last_checkpoint=lambda path: events.append(("checkpoint-probe", path)),
         snapshot_download=snapshot_download,
+        huggingface_hub=hub,
+        original_model_info=original_model_info,
         Gr00tN1d7Pipeline=Pipeline,
         experiment_module=experiment_module,
-        run=lambda received_config: events.append(("run", received_config)),
+        run=lambda received_config: (
+            events.append(("training-model-info-tags", hub.model_info(COSMOS_MODEL_ID).tags)),
+            events.append(("run", received_config)),
+        ),
         torch=SimpleNamespace(cuda=SimpleNamespace(empty_cache=lambda: events.append("empty-cache"))),
         gc_collect=lambda: events.append("gc-collect"),
     )
+    return dependencies
 
 
 @pytest.mark.parametrize("injected_value", [None, "1"])
@@ -1053,6 +1162,8 @@ def test_main_preflight_runs_setup_and_never_calls_training(tmp_path: Path, caps
     assert "Model" in output
     assert "Processor" in output
     assert "TrainDataset" in output
+    assert ("pipeline-model-info-tags", ["qwen3_vl"]) in events
+    assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
 
 
 def test_main_production_installs_audit_then_calls_training(tmp_path: Path) -> None:
@@ -1069,6 +1180,8 @@ def test_main_production_installs_audit_then_calls_training(tmp_path: Path) -> N
     dependencies.experiment_module.TrainingArguments = lambda **_kwargs: training_arguments
 
     def run(config: object) -> None:
+        model_info = dependencies.huggingface_hub.model_info(COSMOS_MODEL_ID)
+        events.append(("training-model-info-tags", model_info.tags))
         events.append(("run", config))
         returned = dependencies.experiment_module.TrainingArguments(deepspeed=None)
         assert returned is training_arguments
@@ -1087,6 +1200,35 @@ def test_main_production_installs_audit_then_calls_training(tmp_path: Path) -> N
     assert any(isinstance(event, tuple) and event[0] == "run" for event in events)
     assert json.loads(training_audit.read_text(encoding="utf-8"))["deepspeed"] is None
     assert not any(isinstance(event, tuple) and event[0] == "pipeline-init" for event in events)
+    assert ("training-model-info-tags", ["qwen3_vl"]) in events
+    assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
+
+
+def test_main_production_restores_model_info_when_training_fails(tmp_path: Path) -> None:
+    events: list[object] = []
+    dependencies = _fake_runtime_dependencies(tmp_path, use_wandb=True, events=events)
+    training_arguments = SimpleNamespace(
+        deepspeed=None,
+        to_dict=lambda: _training_arguments_payload(None),
+    )
+    dependencies.experiment_module.TrainingArguments = lambda **_kwargs: training_arguments
+
+    def fail_training(_config: object) -> None:
+        dependencies.huggingface_hub.model_info(COSMOS_MODEL_ID)
+        raise RuntimeError("training failed")
+
+    dependencies.run = fail_training
+    environment = {
+        **REQUIRED_OFFLINE_ENV,
+        "GR00T_PINNED_PREFLIGHT_ONLY": "0",
+        "GR00T_FRESHNESS_AUDIT_PATH": str((tmp_path / "freshness.json").resolve()),
+        "GR00T_TRAINING_ARGS_AUDIT_PATH": str((tmp_path / "training-arguments.json").resolve()),
+    }
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        main(environ=environment, dependencies=dependencies)
+
+    assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
 
 
 @pytest.mark.parametrize(

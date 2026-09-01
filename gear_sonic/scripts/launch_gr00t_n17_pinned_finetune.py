@@ -15,6 +15,11 @@ from types import SimpleNamespace, TracebackType
 COSMOS_MODEL_ID = "nvidia/Cosmos-Reason2-2B"
 COSMOS_REVISION = "9ce19a195e423419c349abfc86fd07178b230561"
 COSMOS_SNAPSHOT_RELATIVE = "models--nvidia--Cosmos-Reason2-2B/snapshots/9ce19a195e423419c349abfc86fd07178b230561"
+COSMOS_SNAPSHOT_CONFIG_IDENTITY: dict[str, object] = {
+    "model_type": "qwen3_vl",
+    "architectures": ["Qwen3VLForConditionalGeneration"],
+    "transformers_version": "4.57.0.dev0",
+}
 REQUIRED_OFFLINE_ENV = {
     "HF_HUB_OFFLINE": "1",
     "TRANSFORMERS_OFFLINE": "1",
@@ -188,6 +193,71 @@ def resolve_snapshot(
             f"exact Cosmos snapshot resolution mismatch: expected {expected_resolved}, resolved {resolved}"
         )
     return resolved
+
+
+def _reject_duplicate_snapshot_config_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RuntimeError(f"Cosmos snapshot config contains duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_snapshot_config(value: str) -> object:
+    raise RuntimeError(f"Cosmos snapshot config contains nonstandard numeric constant: {value}")
+
+
+def _validate_cosmos_snapshot_config(snapshot: Path) -> None:
+    """Fail closed unless the resolved snapshot declares the pinned Qwen3 VL identity."""
+    snapshot = Path(snapshot)
+    if snapshot.is_symlink() or not snapshot.is_dir():
+        raise RuntimeError("exact resolved Cosmos snapshot must be a real directory")
+    config_path = snapshot / "config.json"
+    if config_path.is_symlink() or not config_path.is_file():
+        raise RuntimeError("exact resolved Cosmos snapshot config.json must be a real file")
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(
+                handle,
+                object_pairs_hook=_reject_duplicate_snapshot_config_pairs,
+                parse_constant=_reject_nonfinite_snapshot_config,
+            )
+    except RuntimeError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("exact resolved Cosmos snapshot config.json is not valid JSON") from exc
+    if type(payload) is not dict:
+        raise RuntimeError("exact resolved Cosmos snapshot config.json must contain an object")
+    for field, expected in COSMOS_SNAPSHOT_CONFIG_IDENTITY.items():
+        actual = payload.get(field)
+        if actual != expected:
+            raise RuntimeError(f"Cosmos snapshot config {field} mismatch: expected {expected!r}, got {actual!r}")
+
+
+@contextmanager
+def _offline_cosmos_model_info_shim(
+    snapshot: Path,
+    huggingface_hub_module: object,
+) -> Iterator[None]:
+    """Classify only the pinned Cosmos repo locally during official GR00T loading."""
+    _validate_cosmos_snapshot_config(snapshot)
+    original_model_info = getattr(huggingface_hub_module, "model_info", None)
+    if not callable(original_model_info):
+        raise RuntimeError("huggingface_hub.model_info must be callable before installing offline shim")
+
+    def pinned_model_info(repo_id: str, *args: object, **kwargs: object) -> SimpleNamespace:
+        if repo_id != COSMOS_MODEL_ID:
+            raise RuntimeError("offline model_info shim only supports the exact canonical Cosmos model ID")
+        if args or kwargs:
+            raise RuntimeError("offline Cosmos model_info shim does not accept additional arguments")
+        return SimpleNamespace(tags=["qwen3_vl"])
+
+    setattr(huggingface_hub_module, "model_info", pinned_model_info)
+    try:
+        yield
+    finally:
+        setattr(huggingface_hub_module, "model_info", original_model_info)
 
 
 def _validate_new_absolute_path(path: Path, *, label: str) -> None:
@@ -422,17 +492,21 @@ def run_offline_preflight(
     save_cfg_dir: Path,
     *,
     torch_module: object,
+    cosmos_snapshot: Path,
+    huggingface_hub_module: object,
     gc_collect: Callable[[], object] = gc.collect,
 ) -> dict[str, str | None]:
     """Run official pipeline setup, record loaded classes, and release resources."""
     if config.training.use_wandb is not False:
         raise RuntimeError("offline preflight requires W&B to be disabled")
+    _validate_cosmos_snapshot_config(cosmos_snapshot)
     save_cfg_dir.mkdir(parents=True, exist_ok=False)
     pipeline = pipeline_class(config, save_cfg_dir)
     record = None
     setup_failure: tuple[BaseException, TracebackType | None] | None = None
     try:
-        pipeline.setup()
+        with _offline_cosmos_model_info_shim(cosmos_snapshot, huggingface_hub_module):
+            pipeline.setup()
         record = {
             "model_class": _class_name(getattr(pipeline, "model", None)),
             "processor_class": _class_name(getattr(pipeline, "processor", None)),
@@ -500,7 +574,7 @@ def _load_runtime_dependencies() -> SimpleNamespace:
     from gr00t.experiment.launch_finetune import load_modality_config
     from gr00t.model.gr00t_n1d7.gr00t_n1d7 import get_backbone_cls
     from gr00t.model.gr00t_n1d7.setup import Gr00tN1d7Pipeline
-    from huggingface_hub import snapshot_download
+    import huggingface_hub
     import torch
     from transformers.trainer_utils import get_last_checkpoint
     import tyro
@@ -517,7 +591,8 @@ def _load_runtime_dependencies() -> SimpleNamespace:
         run=run,
         get_backbone_cls=get_backbone_cls,
         Gr00tN1d7Pipeline=Gr00tN1d7Pipeline,
-        snapshot_download=snapshot_download,
+        snapshot_download=huggingface_hub.snapshot_download,
+        huggingface_hub=huggingface_hub,
         get_last_checkpoint=get_last_checkpoint,
         gc_collect=gc.collect,
     )
@@ -606,6 +681,8 @@ def main(
             runtime.Gr00tN1d7Pipeline,
             experiment / "experiment_cfg",
             torch_module=runtime.torch,
+            cosmos_snapshot=snapshot,
+            huggingface_hub_module=runtime.huggingface_hub,
             gc_collect=getattr(runtime, "gc_collect", gc.collect),
         )
         print(json.dumps({"offline_preflight": preflight_record}, sort_keys=True))
@@ -615,7 +692,8 @@ def main(
         runtime.experiment_module,
         training_arguments_audit,
     )
-    runtime.run(config)
+    with _offline_cosmos_model_info_shim(snapshot, runtime.huggingface_hub):
+        runtime.run(config)
 
 
 if __name__ == "__main__":

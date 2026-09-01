@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import hashlib
 import json
 import os
@@ -21,6 +21,11 @@ from typing import Any
 COSMOS_MODEL_ID = "nvidia/Cosmos-Reason2-2B"
 COSMOS_REVISION = "9ce19a195e423419c349abfc86fd07178b230561"
 COSMOS_SNAPSHOT_RELATIVE = Path("models--nvidia--Cosmos-Reason2-2B/snapshots") / COSMOS_REVISION
+COSMOS_SNAPSHOT_CONFIG_IDENTITY: dict[str, object] = {
+    "model_type": "qwen3_vl",
+    "architectures": ["Qwen3VLForConditionalGeneration"],
+    "transformers_version": "4.57.0.dev0",
+}
 
 _OFFLINE_ENVIRONMENT = {
     "CUDA_VISIBLE_DEVICES": "",
@@ -450,13 +455,54 @@ def _cache_is_read_only(path: Path) -> bool:
         return False
 
 
+def _validate_cosmos_snapshot_config(snapshot: Path) -> None:
+    """Fail closed unless the local snapshot declares the pinned Qwen3 VL identity."""
+    if snapshot.is_symlink() or not snapshot.is_dir():
+        raise CheckpointError("exact resolved Cosmos snapshot must be a real directory")
+    config_path = snapshot / "config.json"
+    if config_path.is_symlink() or not config_path.is_file():
+        raise CheckpointError("exact resolved Cosmos snapshot config.json must be a real file")
+    payload = _load_json_object(config_path, label="Cosmos snapshot config.json")
+    for field, expected in COSMOS_SNAPSHOT_CONFIG_IDENTITY.items():
+        actual = payload.get(field)
+        if actual != expected:
+            raise CheckpointError(
+                f"Cosmos snapshot config {field} mismatch: expected {expected!r}, got {actual!r}"
+            )
+
+
+@contextmanager
+def _offline_cosmos_model_info_shim(
+    snapshot: Path,
+    huggingface_hub_module: object,
+) -> Iterator[None]:
+    """Classify only the pinned Cosmos repo locally during official checkpoint loading."""
+    _validate_cosmos_snapshot_config(snapshot)
+    original_model_info = getattr(huggingface_hub_module, "model_info", None)
+    if not callable(original_model_info):
+        raise CheckpointError("huggingface_hub.model_info must be callable before installing offline shim")
+
+    def pinned_model_info(repo_id: str, *args: object, **kwargs: object) -> SimpleNamespace:
+        if repo_id != COSMOS_MODEL_ID:
+            raise CheckpointError("offline model_info shim only supports the exact canonical Cosmos model ID")
+        if args or kwargs:
+            raise CheckpointError("offline Cosmos model_info shim does not accept additional arguments")
+        return SimpleNamespace(tags=["qwen3_vl"])
+
+    setattr(huggingface_hub_module, "model_info", pinned_model_info)
+    try:
+        yield
+    finally:
+        setattr(huggingface_hub_module, "model_info", original_model_info)
+
+
 def _load_offline_dependencies() -> SimpleNamespace:
     import gc
 
     from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
     from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7, get_backbone_cls
     from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
-    from huggingface_hub import snapshot_download
+    import huggingface_hub
     import torch
 
     return SimpleNamespace(
@@ -464,7 +510,8 @@ def _load_offline_dependencies() -> SimpleNamespace:
         model_class=Gr00tN1d7,
         processor_class=Gr00tN1d7Processor,
         get_backbone_cls=get_backbone_cls,
-        snapshot_download=snapshot_download,
+        snapshot_download=huggingface_hub.snapshot_download,
+        huggingface_hub=huggingface_hub,
         cache_is_read_only=_cache_is_read_only,
         gc_collect=gc.collect,
         empty_cache=torch.cuda.empty_cache,
@@ -539,64 +586,65 @@ def _verify_offline_load_worker(
         ):
             raise CheckpointError("offline Cosmos snapshot resolution mismatch")
 
-        checkpoint_loading_kwargs = {
-            "local_files_only": True,
-            "cache_dir": str(hub_cache),
-        }
-        model_config = runtime.config_class.from_pretrained(
-            checkpoint,
-            **checkpoint_loading_kwargs,
-        )
-        if getattr(model_config, "model_name", None) != COSMOS_MODEL_ID:
-            raise CheckpointError("model config does not use the canonical Cosmos model ID")
-        if getattr(model_config, "model_revision", None) != COSMOS_REVISION:
-            raise CheckpointError("model config revision differs from the pinned Cosmos revision")
-        backbone_class = runtime.get_backbone_cls(model_config)
-        if getattr(backbone_class, "__name__", None) != "Qwen3Backbone":
-            raise CheckpointError("pinned selector did not return Qwen3Backbone")
+        with _offline_cosmos_model_info_shim(snapshot, runtime.huggingface_hub):
+            checkpoint_loading_kwargs = {
+                "local_files_only": True,
+                "cache_dir": str(hub_cache),
+            }
+            model_config = runtime.config_class.from_pretrained(
+                checkpoint,
+                **checkpoint_loading_kwargs,
+            )
+            if getattr(model_config, "model_name", None) != COSMOS_MODEL_ID:
+                raise CheckpointError("model config does not use the canonical Cosmos model ID")
+            if getattr(model_config, "model_revision", None) != COSMOS_REVISION:
+                raise CheckpointError("model config revision differs from the pinned Cosmos revision")
+            backbone_class = runtime.get_backbone_cls(model_config)
+            if getattr(backbone_class, "__name__", None) != "Qwen3Backbone":
+                raise CheckpointError("pinned selector did not return Qwen3Backbone")
 
-        transformers_loading_kwargs = {
-            "trust_remote_code": True,
-            "local_files_only": True,
-            "revision": COSMOS_REVISION,
-            "cache_dir": str(hub_cache),
-        }
-        loaded = runtime.model_class.from_pretrained(
-            checkpoint,
-            transformers_loading_kwargs=transformers_loading_kwargs,
-            output_loading_info=True,
-            **transformers_loading_kwargs,
-        )
-        if type(loaded) is not tuple or len(loaded) != 2:
-            raise CheckpointError("model load did not return loading_info")
-        model, loading_info = loaded
-        _validate_loading_info(loading_info)
-        processor = runtime.processor_class.from_pretrained(
-            checkpoint,
-            transformers_loading_kwargs=transformers_loading_kwargs,
-            **transformers_loading_kwargs,
-        )
-        if processor is None:
-            raise CheckpointError("processor load returned no object")
-        if getattr(processor, "model_name", None) != COSMOS_MODEL_ID:
-            raise CheckpointError("processor does not use the canonical Cosmos model ID")
-        result = {
-            "status": "pass",
-            "backbone_class": backbone_class.__name__,
-            "cosmos_model_id": COSMOS_MODEL_ID,
-            "cosmos_revision": COSMOS_REVISION,
-            "cosmos_snapshot": str(_absolute_without_resolving(expected_snapshot)),
-            "model_class": type(model).__name__,
-            "processor_class": type(processor).__name__,
-            "log_lines": [
-                "offline environment active",
-                "pinned Cosmos snapshot resolved locally",
-                "Qwen3Backbone selector verified",
-                f"GR00T model loaded: {type(model).__name__}",
-                f"GR00T processor loaded: {type(processor).__name__}",
-                "model loading_info is empty",
-            ],
-        }
+            transformers_loading_kwargs = {
+                "trust_remote_code": True,
+                "local_files_only": True,
+                "revision": COSMOS_REVISION,
+                "cache_dir": str(hub_cache),
+            }
+            loaded = runtime.model_class.from_pretrained(
+                checkpoint,
+                transformers_loading_kwargs=transformers_loading_kwargs,
+                output_loading_info=True,
+                **transformers_loading_kwargs,
+            )
+            if type(loaded) is not tuple or len(loaded) != 2:
+                raise CheckpointError("model load did not return loading_info")
+            model, loading_info = loaded
+            _validate_loading_info(loading_info)
+            processor = runtime.processor_class.from_pretrained(
+                checkpoint,
+                transformers_loading_kwargs=transformers_loading_kwargs,
+                **transformers_loading_kwargs,
+            )
+            if processor is None:
+                raise CheckpointError("processor load returned no object")
+            if getattr(processor, "model_name", None) != COSMOS_MODEL_ID:
+                raise CheckpointError("processor does not use the canonical Cosmos model ID")
+            result = {
+                "status": "pass",
+                "backbone_class": backbone_class.__name__,
+                "cosmos_model_id": COSMOS_MODEL_ID,
+                "cosmos_revision": COSMOS_REVISION,
+                "cosmos_snapshot": str(_absolute_without_resolving(expected_snapshot)),
+                "model_class": type(model).__name__,
+                "processor_class": type(processor).__name__,
+                "log_lines": [
+                    "offline environment active",
+                    "pinned Cosmos snapshot resolved locally",
+                    "Qwen3Backbone selector verified",
+                    f"GR00T model loaded: {type(model).__name__}",
+                    f"GR00T processor loaded: {type(processor).__name__}",
+                    "model loading_info is empty",
+                ],
+            }
     except BaseException as exc:
         if isinstance(exc, CheckpointError):
             failure = exc

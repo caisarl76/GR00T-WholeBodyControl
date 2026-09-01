@@ -298,9 +298,25 @@ def _offline_dependencies(
     hub_cache_read_only: bool = True,
     model_error: BaseException | None = None,
     processor_model_name: str = COSMOS_MODEL_ID,
+    model_info_repo: str = COSMOS_MODEL_ID,
+    snapshot_config: dict[str, object] | None = None,
 ) -> SimpleNamespace:
     snapshot = cache_root / "hub/models--nvidia--Cosmos-Reason2-2B/snapshots" / COSMOS_REVISION
     snapshot.mkdir(parents=True, exist_ok=True)
+    config_payload = {
+        "model_type": "qwen3_vl",
+        "architectures": ["Qwen3VLForConditionalGeneration"],
+        "transformers_version": "4.57.0.dev0",
+    }
+    if snapshot_config is not None:
+        config_payload.update(snapshot_config)
+    (snapshot / "config.json").write_text(json.dumps(config_payload), encoding="utf-8")
+
+    def network_model_info(*args: object, **kwargs: object) -> object:
+        events.append(("network-model-info", args, kwargs))
+        raise RuntimeError("HF_HUB_OFFLINE: model_info network access is forbidden")
+
+    huggingface_hub = SimpleNamespace(model_info=network_model_info)
 
     class Config:
         @classmethod
@@ -316,6 +332,8 @@ def _offline_dependencies(
         @classmethod
         def from_pretrained(cls, path: Path, **kwargs: object) -> tuple[object, dict[str, object]]:
             events.append(("model", path, kwargs))
+            info_response = huggingface_hub.model_info(model_info_repo)
+            events.append(("model-info-tags", info_response.tags))
             if model_error is not None:
                 raise model_error
             info = model_info
@@ -338,6 +356,8 @@ def _offline_dependencies(
         @classmethod
         def from_pretrained(cls, path: Path, **kwargs: object) -> object:
             events.append(("processor", path, kwargs))
+            info_response = huggingface_hub.model_info(COSMOS_MODEL_ID)
+            events.append(("processor-model-info-tags", info_response.tags))
             return LoadedProcessor()
 
     backbone = type(selector_name, (), {})
@@ -356,6 +376,8 @@ def _offline_dependencies(
         processor_class=Processor,
         get_backbone_cls=lambda config: events.append(("selector", config)) or backbone,
         snapshot_download=snapshot_download,
+        huggingface_hub=huggingface_hub,
+        original_model_info=network_model_info,
         cache_is_read_only=is_read_only,
         gc_collect=lambda: events.append("gc"),
         empty_cache=lambda: events.append("empty-cache"),
@@ -474,6 +496,70 @@ def test_offline_worker_requires_environment_before_import_and_uses_exact_pins(
     assert events[-2:] == ["gc", "empty-cache"]
     assert events.index("model-released") < events.index("gc")
     assert events.index("processor-released") < events.index("gc")
+    assert ("model-info-tags", ["qwen3_vl"]) in events
+    assert ("processor-model-info-tags", ["qwen3_vl"]) in events
+    assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
+
+
+@pytest.mark.parametrize(
+    ("snapshot_config", "match"),
+    [
+        ({"model_type": "mistral"}, "model_type"),
+        ({"architectures": ["MistralForCausalLM"]}, "architectures"),
+        ({"transformers_version": "4.57.1"}, "transformers_version"),
+    ],
+)
+def test_offline_worker_rejects_inexact_cosmos_snapshot_identity_before_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_config: dict[str, object],
+    match: str,
+) -> None:
+    _set_exact_offline_environment(monkeypatch)
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    cache_root = tmp_path / "cache"
+    events: list[object] = []
+    dependencies = _offline_dependencies(
+        cache_root,
+        events,
+        snapshot_config=snapshot_config,
+    )
+
+    with pytest.raises(CheckpointError, match=match):
+        _verify_offline_load_worker(
+            checkpoint,
+            cache_root,
+            COSMOS_REVISION,
+            dependency_loader=lambda: dependencies,
+        )
+
+    assert not any(isinstance(event, tuple) and event[0] == "model" for event in events)
+    assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
+
+
+def test_offline_worker_rejects_unexpected_model_info_repo_and_restores(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_exact_offline_environment(monkeypatch)
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    cache_root = tmp_path / "cache"
+    events: list[object] = []
+    dependencies = _offline_dependencies(
+        cache_root,
+        events,
+        model_info_repo="other/model",
+    )
+
+    with pytest.raises(CheckpointError, match="only supports.*Cosmos"):
+        _verify_offline_load_worker(
+            checkpoint,
+            cache_root,
+            COSMOS_REVISION,
+            dependency_loader=lambda: dependencies,
+        )
+
+    assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
 
 
 @pytest.mark.parametrize(
