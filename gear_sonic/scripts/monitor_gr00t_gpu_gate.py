@@ -639,12 +639,20 @@ def _parse_int(value: str) -> int:
     return int(match.group())
 
 
-def _run_nvidia_smi(query: str) -> list[list[str]]:
-    command = [
-        "nvidia-smi",
-        f"--query-{query.split(':', 1)[0]}={query.split(':', 1)[1]}",
-        "--format=csv,noheader,nounits",
-    ]
+def _run_nvidia_smi(
+    query: str,
+    *,
+    gpu_indices: tuple[int, ...] | None = None,
+) -> list[list[str]]:
+    command = ["nvidia-smi"]
+    if gpu_indices is not None:
+        command.append(f"--id={','.join(str(index) for index in gpu_indices)}")
+    command.extend(
+        [
+            f"--query-{query.split(':', 1)[0]}={query.split(':', 1)[1]}",
+            "--format=csv,noheader,nounits",
+        ]
+    )
     try:
         completed = subprocess.run(
             command,
@@ -697,29 +705,126 @@ def snapshot_gpus(gpu_indices: tuple[int, ...]) -> list[dict[str, object]]:
     return sorted(samples, key=lambda sample: int(sample["gpu_index"]))
 
 
-def snapshot_health(gpu_indices: tuple[int, ...]) -> dict[str, object]:
-    fields = (
-        "index,uuid,ecc.errors.uncorrected.volatile.total,"
-        "retired_pages.single_bit_ecc.count,retired_pages.double_bit.count,"
-        "remapped_rows.pending"
-    )
-    rows = _run_nvidia_smi(f"gpu:{fields}")
-    requested = set(gpu_indices)
-    result: dict[str, object] = {}
+def _health_nonnegative_int(value: str, label: str) -> int:
+    parsed = _parse_int(value)
+    if parsed < 0:
+        raise GpuGateError(f"nvidia-smi {label} must be nonnegative")
+    return parsed
+
+
+def _retired_page_counts(
+    rows: Sequence[Sequence[str]],
+    uuid_to_index: Mapping[str, int],
+) -> dict[str, int]:
+    causes = ("Single Bit ECC", "Double Bit ECC")
+    entries = {
+        uuid: {cause: {"placeholder_count": 0, "addresses": set()} for cause in causes} for uuid in uuid_to_index
+    }
     for row in rows:
-        if len(row) != 6:
-            raise GpuGateError("unexpected nvidia-smi GPU health schema")
-        gpu = _parse_int(row[0])
-        if gpu not in requested:
+        if len(row) != 4:
+            raise GpuGateError("unexpected nvidia-smi retired-page health schema")
+        uuid, address, timestamp, cause = row
+        if uuid not in entries:
+            raise GpuGateError(f"retired-page health returned unexpected GPU UUID: {uuid}")
+        if cause not in causes:
+            raise GpuGateError(f"retired-page health returned unexpected cause: {cause}")
+        entry = entries[uuid][cause]
+        address_is_placeholder = address == "N/A"
+        timestamp_is_placeholder = timestamp == "N/A"
+        if address_is_placeholder or timestamp_is_placeholder:
+            if not address_is_placeholder or not timestamp_is_placeholder:
+                raise GpuGateError("retired-page health returned a partial N/A placeholder")
+            entry["placeholder_count"] += 1
             continue
-        result[str(gpu)] = {
-            "ecc_uncorrected": _parse_int(row[2]),
-            "retired_pages": _parse_int(row[3]) + _parse_int(row[4]),
-            "row_remap_pending": _parse_int(row[5]),
-        }
-    if {int(key) for key in result} != requested:
+        if re.fullmatch(r"0x[0-9A-Fa-f]+", address) is None or not timestamp:
+            raise GpuGateError("retired-page health returned a malformed address row")
+        addresses = entry["addresses"]
+        if address in addresses:
+            raise GpuGateError("retired-page health returned a duplicate address")
+        addresses.add(address)
+
+    counts: dict[str, int] = {}
+    for uuid, by_cause in entries.items():
+        count = 0
+        for cause in causes:
+            placeholder_count = by_cause[cause]["placeholder_count"]
+            addresses = by_cause[cause]["addresses"]
+            exact_zero_placeholder = placeholder_count == 1 and not addresses
+            actual_rows = placeholder_count == 0 and bool(addresses)
+            if not exact_zero_placeholder and not actual_rows:
+                raise GpuGateError(f"retired-page health has an invalid placeholder contract for {uuid} {cause}")
+            count += len(addresses)
+        counts[uuid] = count
+    return counts
+
+
+def snapshot_health(gpu_indices: tuple[int, ...]) -> dict[str, object]:
+    if (
+        not gpu_indices
+        or len(set(gpu_indices)) != len(gpu_indices)
+        or any(not _is_int(index) or index < 0 for index in gpu_indices)
+    ):
+        raise GpuGateError("health GPU indices must be unique nonnegative integers")
+    requested = set(gpu_indices)
+    gpu_rows = _run_nvidia_smi(
+        "gpu:index,uuid,ecc.errors.uncorrected.volatile.total",
+        gpu_indices=gpu_indices,
+    )
+    uuid_by_index: dict[int, str] = {}
+    ecc_by_uuid: dict[str, int] = {}
+    for row in gpu_rows:
+        if len(row) != 3:
+            raise GpuGateError("unexpected nvidia-smi GPU health schema")
+        gpu = _health_nonnegative_int(row[0], "GPU index")
+        uuid = row[1]
+        if gpu not in requested:
+            raise GpuGateError(f"GPU health returned unexpected index: {gpu}")
+        if not uuid or uuid in {"N/A", "[N/A]"}:
+            raise GpuGateError("GPU health returned an unavailable UUID")
+        if gpu in uuid_by_index or uuid in ecc_by_uuid:
+            raise GpuGateError("GPU health returned duplicate index or UUID rows")
+        uuid_by_index[gpu] = uuid
+        ecc_by_uuid[uuid] = _health_nonnegative_int(row[2], "uncorrected ECC")
+    if set(uuid_by_index) != requested:
         raise GpuGateError("nvidia-smi did not return health for every requested GPU")
-    return dict(sorted(result.items(), key=lambda item: int(item[0])))
+
+    remap_rows = _run_nvidia_smi(
+        "remapped-rows:gpu_uuid,correctable,uncorrectable,pending,failure",
+        gpu_indices=gpu_indices,
+    )
+    remap_by_uuid: dict[str, dict[str, int]] = {}
+    for row in remap_rows:
+        if len(row) != 5:
+            raise GpuGateError("unexpected nvidia-smi row-remap health schema")
+        uuid = row[0]
+        if uuid not in ecc_by_uuid:
+            raise GpuGateError(f"row-remap health returned unexpected GPU UUID: {uuid}")
+        if uuid in remap_by_uuid:
+            raise GpuGateError(f"row-remap health returned duplicate GPU UUID: {uuid}")
+        remap_by_uuid[uuid] = {
+            "row_remap_correctable": _health_nonnegative_int(row[1], "correctable row remaps"),
+            "row_remap_uncorrectable": _health_nonnegative_int(row[2], "uncorrectable row remaps"),
+            "row_remap_pending": _health_nonnegative_int(row[3], "pending row remaps"),
+            "row_remap_failure": _health_nonnegative_int(row[4], "row-remap failures"),
+        }
+    if set(remap_by_uuid) != set(ecc_by_uuid):
+        raise GpuGateError("row-remap health did not return every requested GPU UUID")
+
+    retired_rows = _run_nvidia_smi(
+        "retired-pages:gpu_uuid,address,timestamp,cause",
+        gpu_indices=gpu_indices,
+    )
+    retired_by_uuid = _retired_page_counts(retired_rows, {uuid: gpu for gpu, uuid in uuid_by_index.items()})
+
+    result: dict[str, object] = {}
+    for gpu in sorted(requested):
+        uuid = uuid_by_index[gpu]
+        result[str(gpu)] = {
+            "ecc_uncorrected": ecc_by_uuid[uuid],
+            "retired_pages": retired_by_uuid[uuid],
+            **remap_by_uuid[uuid],
+        }
+    return result
 
 
 def _collect_concurrent(

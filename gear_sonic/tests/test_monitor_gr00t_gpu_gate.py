@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -491,7 +492,7 @@ def test_snapshot_rejects_unavailable_process_and_health_values(
         monkeypatch.setattr(
             gpu_gate,
             "_run_nvidia_smi",
-            lambda _: [["7", "GPU-7", "N/A", "0", "0", "0"]],
+            lambda *_args, **_kwargs: [["7", "GPU-7", "N/A"]],
         )
 
     with pytest.raises(GpuGateError, match="integer"):
@@ -499,6 +500,160 @@ def test_snapshot_rejects_unavailable_process_and_health_values(
             gpu_gate.snapshot_gpus((7,))
         else:
             gpu_gate.snapshot_health((7,))
+
+
+def test_snapshot_health_uses_three_selective_h100_query_interfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outputs = {
+        "--query-gpu=": "6, GPU-six, 0\n7, GPU-seven, 0\n",
+        "--query-remapped-rows=": ("GPU-six, 0, 0, 0, 0\nGPU-seven, 0, 0, 0, 0\n"),
+        "--query-retired-pages=": (
+            "GPU-six, N/A, N/A, Single Bit ECC\n"
+            "GPU-six, N/A, N/A, Double Bit ECC\n"
+            "GPU-seven, N/A, N/A, Single Bit ECC\n"
+            "GPU-seven, N/A, N/A, Double Bit ECC\n"
+        ),
+    }
+    commands: list[list[str]] = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        query_flag = next(key for key in outputs if any(arg.startswith(key) for arg in command))
+        assert kwargs == {
+            "check": True,
+            "capture_output": True,
+            "text": True,
+            "timeout": 30,
+        }
+        return SimpleNamespace(stdout=outputs[query_flag])
+
+    monkeypatch.setattr(gpu_gate.subprocess, "run", run)
+
+    assert gpu_gate.snapshot_health((6, 7)) == {
+        "6": {
+            "ecc_uncorrected": 0,
+            "retired_pages": 0,
+            "row_remap_correctable": 0,
+            "row_remap_uncorrectable": 0,
+            "row_remap_pending": 0,
+            "row_remap_failure": 0,
+        },
+        "7": {
+            "ecc_uncorrected": 0,
+            "retired_pages": 0,
+            "row_remap_correctable": 0,
+            "row_remap_uncorrectable": 0,
+            "row_remap_pending": 0,
+            "row_remap_failure": 0,
+        },
+    }
+    assert len(commands) == 3
+    assert all("--id=6,7" in command for command in commands)
+    assert any(any(arg.startswith("--query-gpu=") for arg in command) for command in commands)
+    assert any(any(arg.startswith("--query-remapped-rows=") for arg in command) for command in commands)
+    assert any(any(arg.startswith("--query-retired-pages=") for arg in command) for command in commands)
+
+
+def test_snapshot_health_counts_real_retired_page_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = {
+        "gpu": [["7", "GPU-seven", "0"]],
+        "remapped-rows": [["GPU-seven", "1", "2", "0", "0"]],
+        "retired-pages": [
+            [
+                "GPU-seven",
+                "0x0000000000000010",
+                "2026/09/01 00:00:00.000",
+                "Single Bit ECC",
+            ],
+            ["GPU-seven", "N/A", "N/A", "Double Bit ECC"],
+        ],
+    }
+    monkeypatch.setattr(
+        gpu_gate,
+        "_run_nvidia_smi",
+        lambda query, **_kwargs: responses[query.split(":", 1)[0]],
+    )
+
+    health = gpu_gate.snapshot_health((7,))
+
+    assert health["7"]["retired_pages"] == 1
+    assert health["7"]["row_remap_correctable"] == 1
+    assert health["7"]["row_remap_uncorrectable"] == 2
+
+
+@pytest.mark.parametrize(
+    ("case", "gpu_rows", "remap_rows", "retired_rows"),
+    [
+        (
+            "partial placeholder",
+            [["7", "GPU-seven", "0"]],
+            [["GPU-seven", "0", "0", "0", "0"]],
+            [
+                ["GPU-seven", "N/A", "2026/09/01 00:00:00.000", "Single Bit ECC"],
+                ["GPU-seven", "N/A", "N/A", "Double Bit ECC"],
+            ],
+        ),
+        (
+            "duplicate zero cause",
+            [["7", "GPU-seven", "0"]],
+            [["GPU-seven", "0", "0", "0", "0"]],
+            [
+                ["GPU-seven", "N/A", "N/A", "Single Bit ECC"],
+                ["GPU-seven", "N/A", "N/A", "Single Bit ECC"],
+            ],
+        ),
+        (
+            "unknown retired cause",
+            [["7", "GPU-seven", "0"]],
+            [["GPU-seven", "0", "0", "0", "0"]],
+            [
+                ["GPU-seven", "N/A", "N/A", "Unknown"],
+                ["GPU-seven", "N/A", "N/A", "Double Bit ECC"],
+            ],
+        ),
+        (
+            "unavailable remap",
+            [["7", "GPU-seven", "0"]],
+            [["GPU-seven", "N/A", "0", "0", "0"]],
+            [
+                ["GPU-seven", "N/A", "N/A", "Single Bit ECC"],
+                ["GPU-seven", "N/A", "N/A", "Double Bit ECC"],
+            ],
+        ),
+        (
+            "unexpected UUID",
+            [["7", "GPU-seven", "0"]],
+            [["GPU-attacker", "0", "0", "0", "0"]],
+            [
+                ["GPU-seven", "N/A", "N/A", "Single Bit ECC"],
+                ["GPU-seven", "N/A", "N/A", "Double Bit ECC"],
+            ],
+        ),
+    ],
+)
+def test_snapshot_health_rejects_malformed_h100_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    gpu_rows: list[list[str]],
+    remap_rows: list[list[str]],
+    retired_rows: list[list[str]],
+) -> None:
+    responses = {
+        "gpu": gpu_rows,
+        "remapped-rows": remap_rows,
+        "retired-pages": retired_rows,
+    }
+    monkeypatch.setattr(
+        gpu_gate,
+        "_run_nvidia_smi",
+        lambda query, **_kwargs: responses[query.split(":", 1)[0]],
+    )
+
+    with pytest.raises(GpuGateError, match="health|retired|remap|UUID|integer"):
+        gpu_gate.snapshot_health((7,))
 
 
 @pytest.mark.parametrize("kind", ["file", "directory", "symlink"])
