@@ -384,6 +384,11 @@ project. The worker follows
 [vLLM's documented pre-extracted-frame transport](https://docs.vllm.ai/en/latest/features/multimodal_inputs/#pre-extracted-frame-sequences-with-media_io_kwargs)
 so the workstation and H100 require no shared filesystem.
 
+The Task 15 deployment is vLLM `0.23.0` from immutable container image ID
+`sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7`.
+The recorded endpoint identity is
+`h100-cosmos3-nano-vllm-0.23.0@sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7`.
+
 ### Sampling and cross-host transport
 
 The local Python worker owns all sampling. Let `F` be the positive FPS in
@@ -409,6 +414,7 @@ sent as one `data:video/jpeg;base64,...` `video_url`. `extra_body` contains:
   "media_io_kwargs": {
     "video": {
       "fps": 50.0,
+      "num_frames": -1,
       "frames_indices": [0, 25, 50],
       "total_num_frames": 2060,
       "duration": 41.2,
@@ -419,11 +425,19 @@ sent as one `data:video/jpeg;base64,...` `video_url`. `extra_body` contains:
 ```
 
 The actual values come from the source episode. `fps` is `F`, not 2;
+`num_frames` is explicitly `-1` so vLLM does not restore its 32-frame default
+when the request overrides `fps`;
 `duration` is `D`; and `frames_indices` preserves the 2 fps samples on the
 original timeline. The request artifact replaces the base64 field with its
 SHA-256 and records the source-video hash, exact indices, parquet timestamps,
 decoder version, resize rule, and JPEG parameters. This fully specifies the
 model input without storing another large copy of it.
+
+This is a pre-first-success transport correction: the earlier live attempt was
+rejected before producing any response or proposal. `pnp-trash-cosmos-v2`
+continues to identify the unchanged prompt/response schema; the first successful
+episode-4 smoke freezes the corrected request bytes and deployed vLLM build in
+provenance before any full batch is allowed.
 
 An episode is `manual_only` without a model call when `D > 120`, the sampled
 frame count exceeds 240, the comma-joined base64 ASCII payload after the URL
@@ -478,6 +492,7 @@ the OpenAI client's `extra_body.media_io_kwargs` is serialized as the top-level
   "media_io_kwargs": {
     "video": {
       "fps": 50.0,
+      "num_frames": -1,
       "frames_indices": [0, 25, 50],
       "total_num_frames": 2060,
       "duration": 41.2,

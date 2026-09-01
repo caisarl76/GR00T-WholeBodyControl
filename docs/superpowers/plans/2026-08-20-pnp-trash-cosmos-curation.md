@@ -47,6 +47,11 @@ The authenticated feature worktree must be clean before any runtime command.
 Never redirect this plan to the dirty primary visualizer checkout, and never
 stash, reset, or overwrite user-owned changes outside the feature worktree.
 
+The Task 15 runtime is pinned to installed vLLM `0.23.0`, container image ID
+`sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7`,
+and provenance identity
+`h100-cosmos3-nano-vllm-0.23.0@sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7`.
+
 ## File map
 
 New backend code:
@@ -515,6 +520,7 @@ For the real 50 Hz fixture, expected sampled indices begin `[0, 25, 50, 75]` and
     "media_io_kwargs": {
       "video": {
         "fps": 50.0,
+        "num_frames": -1,
         "frames_indices": [0, 25, 50],
         "total_num_frames": 2060,
         "duration": 41.2,
