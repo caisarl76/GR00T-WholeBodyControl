@@ -945,6 +945,16 @@ def _failure_record(gate: str, error: BaseException) -> dict[str, str]:
     return {"gate": gate, "error_type": type(error).__name__, "message": message}
 
 
+def _assert_checkpoint_manifest_unchanged(
+    checkpoint: Path,
+    expected_manifest: list[dict[str, object]],
+) -> None:
+    current_files = _scan_checkpoint_files(checkpoint)
+    current_manifest = _build_file_manifest(checkpoint, current_files)
+    if current_manifest != expected_manifest:
+        raise CheckpointError("checkpoint content changed during offline load")
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -994,6 +1004,14 @@ def main(
         except BaseException as exc:
             failures.append(_failure_record("offline_load", exc))
             offline_log = f"offline load failed ({type(exc).__name__})\n"
+        try:
+            _assert_checkpoint_manifest_unchanged(arguments.checkpoint, files)
+        except BaseException as exc:
+            failures.append(_failure_record("post_offline_structure", exc))
+            offline = None
+            offline_log = (
+                f"{offline_log.rstrip()}\npost-offline checkpoint structure failed ({type(exc).__name__})\n"
+            )
     elif arguments.offline_load:
         offline_log = "offline load not run because structural verification failed\n"
 

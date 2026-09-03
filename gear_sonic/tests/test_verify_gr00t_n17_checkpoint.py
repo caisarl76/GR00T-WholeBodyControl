@@ -1270,6 +1270,70 @@ def test_cli_runs_offline_child_only_after_structural_success(tmp_path: Path) ->
     assert launched_for == [str(successful_checkpoint)]
 
 
+@pytest.mark.parametrize("mutation", ["modify", "add", "remove"])
+def test_cli_rejects_checkpoint_manifest_change_by_successful_offline_child(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    initial_files = verify_checkpoint_structure(checkpoint, expected_step=5)["files"]
+    cache_root = (tmp_path / "cache").resolve()
+    output_dir = (tmp_path / "changed-checkpoint-verdict").resolve()
+
+    def process_runner(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        if mutation == "modify":
+            (checkpoint / "training_args.bin").write_bytes(b"modified")
+        elif mutation == "add":
+            (checkpoint / "child-created.txt").write_text("unexpected", encoding="utf-8")
+        else:
+            (checkpoint / "statistics.json").unlink()
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(_offline_process_result(cache_root)),
+            stderr="",
+        )
+
+    exit_code = main(
+        _cli_arguments(checkpoint, cache_root, output_dir, offline=True),
+        offline_process_runner=process_runner,
+    )
+
+    assert exit_code == 1
+    assert json.loads((output_dir / "files.json").read_text(encoding="utf-8")) == initial_files
+    verdict = json.loads((output_dir / "verdict.json").read_text(encoding="utf-8"))
+    assert verdict["status"] == "fail"
+    assert verdict["structural_status"] == "pass"
+    assert verdict["offline_load_status"] == "fail"
+    assert [failure["gate"] for failure in verdict["failures"]] == ["post_offline_structure"]
+
+
+def test_cli_checks_checkpoint_manifest_even_when_offline_child_fails(tmp_path: Path) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    initial_files = verify_checkpoint_structure(checkpoint, expected_step=5)["files"]
+    cache_root = (tmp_path / "cache").resolve()
+    output_dir = (tmp_path / "failed-child-changed-checkpoint-verdict").resolve()
+
+    def process_runner(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        (checkpoint / "training_args.bin").write_bytes(b"modified")
+        return SimpleNamespace(returncode=2, stdout="", stderr="child failure")
+
+    exit_code = main(
+        _cli_arguments(checkpoint, cache_root, output_dir, offline=True),
+        offline_process_runner=process_runner,
+    )
+
+    assert exit_code == 1
+    assert json.loads((output_dir / "files.json").read_text(encoding="utf-8")) == initial_files
+    verdict = json.loads((output_dir / "verdict.json").read_text(encoding="utf-8"))
+    assert verdict["status"] == "fail"
+    assert verdict["structural_status"] == "pass"
+    assert verdict["offline_load_status"] == "fail"
+    assert [failure["gate"] for failure in verdict["failures"]] == [
+        "offline_load",
+        "post_offline_structure",
+    ]
+
+
 @pytest.mark.parametrize("output_kind", ["relative", "existing"])
 def test_cli_requires_an_absolute_nonexistent_output_directory(tmp_path: Path, output_kind: str) -> None:
     checkpoint = _write_checkpoint_fixture(tmp_path)
