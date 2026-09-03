@@ -936,7 +936,12 @@ do not enter the training dataset.
 
 A syntactically invalid or schema-invalid successful response receives one
 text-only structured repair request containing the invalid response and
-validation errors, with the same `response_format`,
+validation errors. When the initial response is statically valid, its repair
+grammar freezes every valid status, phase, caption, confidence, and evidence
+field as a constant, derives completion metadata from those statuses, and
+opens only validation-implicated time fields within the exact episode
+duration. Otherwise it falls back to the closed seven-segment generation
+grammar. The request uses
 `max_completion_tokens: 2048`, and no transport retry. Dynamic time validation
 errors include the exact canonical `duration_s` so the repair cannot invent an
 out-of-range endpoint. A semantic
@@ -964,7 +969,8 @@ authenticated initial response and its deterministic validation errors. Its
 SHA-256 must equal the append-only repair exchange request hash persisted in
 `curation.sqlite3`; the hash and exchange position become part of the frozen
 smoke authority. This proves that the accepted repair used the reviewed
-structured, text-only request without video or `media_io_kwargs`.
+structured, text-only request without video or `media_io_kwargs`, including
+the response-specific field-preservation constraints.
 
 ## Resumable Cosmos Batch Lifecycle
 

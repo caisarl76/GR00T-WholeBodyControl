@@ -52,8 +52,10 @@ The Task 15 runtime is pinned to installed vLLM `0.23.0`, container image ID
 and provenance identity
 `h100-cosmos3-nano-vllm-0.23.0@sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7`.
 Before the first operator-approved smoke, live compatibility findings require
-the initial and repair calls to use the tested vLLM JSON-schema
-`response_format`. It guarantees seven closed segment objects while the full
+the initial and repair calls to use tested vLLM JSON-schema
+`response_format` values. The initial grammar guarantees seven closed segment
+objects; a statically valid repair input derives a stricter grammar that
+freezes valid semantic/evidence fields and opens only implicated times while the full
 canonical v2 schema and dynamic validator remain the acceptance authority.
 
 ## File map
@@ -541,7 +543,7 @@ For the real 50 Hz fixture, expected sampled indices begin `[0, 25, 50, 75]` and
 }
 ```
 
-The values are fixture-derived; `fps` is source fps, not 2. Exercise stop success, length failure, missing choices, connection retry, retryable 408/429/5xx, non-retryable 4xx, timeout, one schema-repair request, and repair failure. The vLLM-compatible generation schema must avoid unsupported `prefixItems` and `if`/`then`/`else`, close every object, require exactly seven segment objects and all eight segment keys, and constrain `not_observed` fields to null. The full canonical schema and dynamic validator remain authoritative. The standalone repair request must use the same `response_format`, embed the canonical minified v2 response schema, preserve valid observed statuses/evidence, forbid downgrading them to `not_observed`, include exact `duration_s` in time-bound errors, and enforce the `missing_steps`/`episode_complete` equivalence without resending video.
+The values are fixture-derived; `fps` is source fps, not 2. Exercise stop success, length failure, missing choices, connection retry, retryable 408/429/5xx, non-retryable 4xx, timeout, one schema-repair request, and repair failure. The vLLM-compatible generation schema must avoid unsupported `prefixItems` and `if`/`then`/`else`, close every object, require exactly seven segment objects and all eight segment keys, and constrain `not_observed` fields to null. The full canonical schema and dynamic validator remain authoritative. For a statically valid invalid response, the standalone repair request must derive a response-specific `response_format` that freezes valid statuses/phases/captions/confidence/evidence, derives completion metadata, and opens only validation-implicated time fields within exact `duration_s`; malformed input uses the generic seven-segment grammar. It must also embed the canonical minified v2 response schema and must not resend video.
 
 - [ ] Implement artifact writes as `temporary file -> flush -> file fsync -> atomic rename -> parent fsync -> SHA-256 -> database reference`. `request.json` contains the redacted base64 descriptor and full sampling metadata; response text is exact UTF-8 model content; `parsed.json` is written only after validation; repair text exists only after a repair response.
 
