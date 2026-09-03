@@ -51,6 +51,10 @@ The Task 15 runtime is pinned to installed vLLM `0.23.0`, container image ID
 `sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7`,
 and provenance identity
 `h100-cosmos3-nano-vllm-0.23.0@sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7`.
+Before the first operator-approved smoke, live compatibility findings require
+the initial and repair calls to use the tested vLLM JSON-schema
+`response_format`. It guarantees seven closed segment objects while the full
+canonical v2 schema and dynamic validator remain the acceptance authority.
 
 ## File map
 
@@ -516,22 +520,28 @@ For the real 50 Hz fixture, expected sampled indices begin `[0, 25, 50, 75]` and
   "temperature": 0,
   "seed": 0,
   "max_completion_tokens": 4096,
-  "extra_body": {
-    "media_io_kwargs": {
-      "video": {
-        "fps": 50.0,
-        "num_frames": -1,
-        "frames_indices": [0, 25, 50],
-        "total_num_frames": 2060,
-        "duration": 41.2,
-        "do_sample_frames": false
-      }
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "pnp_trash_cosmos_v2",
+      "strict": true,
+      "schema": "the vLLM-compatible seven-segment generation schema"
+    }
+  },
+  "media_io_kwargs": {
+    "video": {
+      "fps": 50.0,
+      "num_frames": -1,
+      "frames_indices": [0, 25, 50],
+      "total_num_frames": 2060,
+      "duration": 41.2,
+      "do_sample_frames": false
     }
   }
 }
 ```
 
-The values are fixture-derived; `fps` is source fps, not 2. Exercise stop success, length failure, missing choices, connection retry, retryable 408/429/5xx, non-retryable 4xx, timeout, one schema-repair request, and repair failure. The standalone repair request must embed the canonical minified v2 response schema, require all seven ordered phases and all eight segment keys, and forbid omission of required null-valued keys.
+The values are fixture-derived; `fps` is source fps, not 2. Exercise stop success, length failure, missing choices, connection retry, retryable 408/429/5xx, non-retryable 4xx, timeout, one schema-repair request, and repair failure. The vLLM-compatible generation schema must avoid unsupported `prefixItems` and `if`/`then`/`else`, close every object, require exactly seven segment objects and all eight segment keys, and constrain `not_observed` fields to null. The full canonical schema and dynamic validator remain authoritative. The standalone repair request must use the same `response_format`, embed the canonical minified v2 response schema, preserve valid observed statuses/evidence, forbid downgrading them to `not_observed`, include exact `duration_s` in time-bound errors, and enforce the `missing_steps`/`episode_complete` equivalence without resending video.
 
 - [ ] Implement artifact writes as `temporary file -> flush -> file fsync -> atomic rename -> parent fsync -> SHA-256 -> database reference`. `request.json` contains the redacted base64 descriptor and full sampling metadata; response text is exact UTF-8 model content; `parsed.json` is written only after validation; repair text exists only after a repair response.
 
@@ -1040,7 +1050,7 @@ git commit -m "docs: add trash curation operations runbook"
 
 - [ ] Start the configured FastAPI and Next.js services and open the workspace. Configured FastAPI startup creates the canonical source manifest and initializes `curation.sqlite3` before serving. Confirm the displayed source fingerprint matches the user-approved 2026-08-28 190-file manifest, including immutable ancillary `pnp_trash.xlsx`, and the review summary is 92 `pending` on a fresh workspace. Task 14's temporary tests do not complete this real approved-source loopback/browser smoke; it remains pending until secure runtime configuration is loaded here.
 
-- [ ] Run Cosmos capability preflight and pin source episode 4 for the representative smoke. Before creating its batch, require the operator-provided lexical source path to equal the configured `local/pnp_trash` alias, resolve that path to its existing canonical directory (supporting the approved `outputs` ancestor symlink), and pass the canonical path to the registered-source validator; changed aliases, dangling targets, and non-directory targets fail before the POST. Authenticate its approved-source metadata, parquet, and video through the persisted manifest and production alignment proof: exactly 2,060 frames at 50 fps, 41.2 seconds, 83 samples, within 120 seconds/240 samples. Episode 0 is ineligible at 6,435 frames/128.7 seconds. The smoke passes only with job state `completed`, a status `job_id` exactly equal to the nonempty ID returned by that smoke POST, exactly one `succeeded` attempt, zero `manual_only`/`retryable`, and active-proposal coverage one. Capture the exact attempt ID; require regular non-symlink `request.json`, initial `response.txt`, optional `repair-response.txt`, `parsed.json`, proposal contact-sheet PNG, and receipt. Resolve the authoritative raw response through `parsed.raw_response_sha256`; enforce the exact closed request/parsed schemas, rerun `prove_alignment_and_select` over the authenticated full float parquet timeline, compare exact selected indices and actual `p[i]` timestamps, require the registered source-video hash, and bind the receipt to dataset/source/proposal/episode/transition frames/path/PNG hash and size. Inspect the authoritative raw response, parsed v2 result, sampling, contact sheet, and UI rendering. Enter the runbook's exact operator confirmation and freeze its canonical evidence authority bound to the smoke job and attempt IDs.
+- [ ] Run Cosmos capability preflight and pin source episode 4 for the representative smoke. Before creating its batch, require the operator-provided lexical source path to equal the configured `local/pnp_trash` alias, resolve that path to its existing canonical directory (supporting the approved `outputs` ancestor symlink), and pass the canonical path to the registered-source validator; changed aliases, dangling targets, and non-directory targets fail before the POST. Authenticate its approved-source metadata, parquet, and video through the persisted manifest and production alignment proof: exactly 2,060 frames at 50 fps, 41.2 seconds, 83 samples, within 120 seconds/240 samples. Episode 0 is ineligible at 6,435 frames/128.7 seconds. The smoke passes only with job state `completed`, a status `job_id` exactly equal to the nonempty ID returned by that smoke POST, exactly one `succeeded` attempt, zero `manual_only`/`retryable`, and active-proposal coverage one. Capture the exact attempt ID; require regular non-symlink `request.json`, initial `response.txt`, optional `repair-response.txt`, `parsed.json`, proposal contact-sheet PNG, and receipt. Resolve the authoritative raw response through `parsed.raw_response_sha256`; enforce the exact closed request/parsed schemas—including the tested structured `response_format` on the initial wire request—and, when repair is authoritative, reconstruct its exact structured text-only body and match its SHA-256 to the append-only repair exchange in `curation.sqlite3`. Rerun `prove_alignment_and_select` over the authenticated full float parquet timeline, compare exact selected indices and actual `p[i]` timestamps, require the registered source-video hash, and bind the receipt to dataset/source/proposal/episode/transition frames/path/PNG hash and size. Inspect the authoritative raw response, parsed v2 result, sampling, contact sheet, and UI rendering. Enter the runbook's exact operator confirmation and freeze its canonical evidence authority bound to the smoke job and attempt IDs. Earlier unconfirmed attempts, including technically valid but semantically incomplete proposals, do not authorize the full batch.
 
 - [ ] Only after the shell contains the exact evidence/UI confirmation and canonical authority bound to the successful smoke job and attempt IDs, refetch and revalidate that smoke and all frozen artifact hashes, again requiring its status `job_id` to equal the confirmed smoke POST ID. Then create a batch for all 92 episodes through `POST /api/curation/batches`; before launching its worker, require the full status to carry the exact nonempty job ID just returned by the POST and exactly 92 closed queued attempt rows, compare the fresh configuration's source/prompt/model/endpoint/transport/sampling/limits with the smoke authority, and require the exact episode set `0..91`. Run:
 

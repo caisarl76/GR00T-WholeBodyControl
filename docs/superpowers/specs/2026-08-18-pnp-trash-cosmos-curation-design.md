@@ -433,11 +433,13 @@ SHA-256 and records the source-video hash, exact indices, parquet timestamps,
 decoder version, resize rule, and JPEG parameters. This fully specifies the
 model input without storing another large copy of it.
 
-This is a pre-first-success transport correction: the earlier live attempt was
-rejected before producing any response or proposal. `pnp-trash-cosmos-v2`
-continues to identify the unchanged prompt/response schema; the first successful
-episode-4 smoke freezes the corrected request bytes and deployed vLLM build in
-provenance before any full batch is allowed.
+This is a pre-first-operator-approved-smoke compatibility correction. Earlier
+live attempts exposed the vLLM frame cap, an incomplete repair schema, and a
+semantically incomplete proposal; none was operator-confirmed and no full batch
+was created. `pnp-trash-cosmos-v2` continues to identify the strict accepted
+response contract. The next successful episode-4 smoke freezes the corrected
+request bytes and deployed vLLM build in provenance before any full batch is
+allowed.
 
 An episode is `manual_only` without a model call when `D > 120`, the sampled
 frame count exceeds 240, the comma-joined base64 ASCII payload after the URL
@@ -452,6 +454,8 @@ The request is deterministic:
 - one user message containing the `video_url` followed by the frozen prompt;
 - `temperature: 0` and `seed: 0`;
 - `max_completion_tokens: 4096`;
+- `response_format` containing the closed vLLM-compatible seven-segment JSON
+  grammar described below;
 - one video per request and worker concurrency one;
 - 120-second HTTP timeout;
 - at most two initial transport attempts, retrying only connection failures,
@@ -489,6 +493,14 @@ the OpenAI client's `extra_body.media_io_kwargs` is serialized as the top-level
   "seed": 0,
   "max_completion_tokens": 4096,
   "stream": false,
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "pnp_trash_cosmos_v2",
+      "strict": true,
+      "schema": "<vLLM-compatible-seven-segment-generation-schema>"
+    }
+  },
   "media_io_kwargs": {
     "video": {
       "fps": 50.0,
@@ -518,6 +530,8 @@ Identify these phases exactly once and in this order:
 5 lean_down_to_black_trash_bin: lean down and position over the bin.
 6 drop_object_into_black_trash_bin: release the object into the bin.
 7 stand_straight: return to and hold a standing-straight pose.
+For step 6, use completed when the object visibly leaves the gripper or is visibly inside the bin in a later sampled frame; the exact release instant need not be sampled.
+For step 7, use completed when the post-release view rises and ends upright with the hands in a neutral pose; a short visible final hold counts.
 Use visible evidence only. Do not infer a completed phase when it is absent or ambiguous.
 For each phase set status to completed, partial, or not_observed. Use completed only when the described subtask succeeds. Use partial when the phase is attempted but does not successfully complete, including interrupted or failed attempts. Use not_observed when there is no visible evidence for an attempt.
 For completed or partial phases provide visible start/end times, confidence, and evidence. For not_observed phases set start_s, end_s, confidence, and evidence to null.
@@ -529,6 +543,15 @@ You may first emit one <think>...</think> block. After it, emit exactly one JSON
 The model does not decide the final object name, hand, or turn direction.
 
 ### Response schema
+
+The request's `response_format` is a generation grammar, not a replacement for
+the canonical response schema below. It closes the top-level object, requires
+exactly seven closed eight-key segment objects, and uses `anyOf` to distinguish
+timed `completed`/`partial` segments from null-valued `not_observed` segments.
+It deliberately omits `prefixItems` and `if`/`then`/`else`, which the pinned
+vLLM structured-output compiler does not support. The worker still validates
+every returned object against the full ordered schema and all dynamic
+invariants before creating a proposal.
 
 An initial or repair call is accepted only for HTTP `200` whose JSON body is
 within the response limit, contains a nonempty `choices` array, and has a
@@ -912,8 +935,11 @@ times, captions, status, confidence, and evidence remain audit/review aids and
 do not enter the training dataset.
 
 A syntactically invalid or schema-invalid successful response receives one
-text-only repair request containing the invalid response and validation
-errors, with `max_completion_tokens: 2048` and no transport retry. A semantic
+text-only structured repair request containing the invalid response and
+validation errors, with the same `response_format`,
+`max_completion_tokens: 2048`, and no transport retry. Dynamic time validation
+errors include the exact canonical `duration_s` so the repair cannot invent an
+out-of-range endpoint. A semantic
 incomplete result is stored as such and is not repaired. Exhausted transport,
 parse, or schema failures become `manual_only`. Thus an episode makes at most
 three model calls: two bounded initial transport attempts and one repair.
@@ -923,11 +949,22 @@ response rules, but contains no video or `media_io_kwargs`. Its sole user text
 starts with `Return only one corrected JSON object matching
 pnp-trash-cosmos-v2.\n`, requires exactly seven ordered phase objects, lists
 all eight required segment keys, forbids omitting null-valued keys, and embeds
-the canonical minified v2 response schema. That prefix is followed by a
+the canonical minified v2 response schema. It also requires preservation of
+every valid status/evidence field, forbids downgrading `completed` or `partial`
+to `not_observed`, and restates the exact `missing_steps`/`episode_complete`
+equivalence. That prefix is followed by a
 canonical minified JSON object with
 `validation_errors: string[]` and `invalid_response: string`. The invalid
 response is capped at 64 KiB before building the request; a larger value skips
 repair and becomes `manual_only`.
+
+If the repair response is authoritative for the representative smoke, the
+smoke evidence gate reconstructs the exact repair wire body from the
+authenticated initial response and its deterministic validation errors. Its
+SHA-256 must equal the append-only repair exchange request hash persisted in
+`curation.sqlite3`; the hash and exchange position become part of the frozen
+smoke authority. This proves that the accepted repair used the reviewed
+structured, text-only request without video or `media_io_kwargs`.
 
 ## Resumable Cosmos Batch Lifecycle
 
