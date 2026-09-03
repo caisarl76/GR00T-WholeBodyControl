@@ -244,6 +244,8 @@ def _validate_raw_model_identity(path: Path, *, label: str) -> None:
         raise CheckpointError(f"{label} model_name is not canonical")
     if model_config.get("model_revision") != COSMOS_REVISION:
         raise CheckpointError(f"{label} model_revision is not the exact pinned revision")
+    if model_config.get("use_flash_attention") is not True:
+        raise CheckpointError(f"{label} use_flash_attention must be exactly true")
 
 
 def _validate_required_configuration_artifacts(checkpoint: Path) -> None:
@@ -637,9 +639,13 @@ def _verify_offline_load_worker(
                 raise CheckpointError("model config does not use the canonical Cosmos model ID")
             if getattr(model_config, "model_revision", None) != COSMOS_REVISION:
                 raise CheckpointError("model config revision differs from the pinned Cosmos revision")
+            if getattr(model_config, "use_flash_attention", None) is not True:
+                raise CheckpointError("model config use_flash_attention must be exactly true")
             backbone_class = runtime.get_backbone_cls(model_config)
             if getattr(backbone_class, "__name__", None) != "Qwen3Backbone":
                 raise CheckpointError("pinned selector did not return Qwen3Backbone")
+
+            model_config.use_flash_attention = False
 
             transformers_loading_kwargs = {
                 "trust_remote_code": True,
@@ -649,6 +655,7 @@ def _verify_offline_load_worker(
             }
             loaded = runtime.model_class.from_pretrained(
                 checkpoint,
+                config=model_config,
                 transformers_loading_kwargs=transformers_loading_kwargs,
                 output_loading_info=True,
                 **transformers_loading_kwargs,
@@ -656,6 +663,13 @@ def _verify_offline_load_worker(
             if type(loaded) is not tuple or len(loaded) != 2:
                 raise CheckpointError("model load did not return loading_info")
             model, loading_info = loaded
+            loaded_model_config = getattr(model, "config", None)
+            if getattr(loaded_model_config, "model_name", None) != COSMOS_MODEL_ID:
+                raise CheckpointError("loaded model config does not retain the canonical Cosmos model ID")
+            if getattr(loaded_model_config, "model_revision", None) != COSMOS_REVISION:
+                raise CheckpointError("loaded model config does not retain the pinned Cosmos revision")
+            if getattr(loaded_model_config, "use_flash_attention", None) is not False:
+                raise CheckpointError("loaded model config does not retain the CPU attention fallback")
             _validate_loading_info(loading_info)
             processor = runtime.processor_class.from_pretrained(
                 checkpoint,
@@ -674,10 +688,16 @@ def _verify_offline_load_worker(
                 "cosmos_snapshot": str(_absolute_without_resolving(expected_snapshot)),
                 "model_class": type(model).__name__,
                 "processor_class": type(processor).__name__,
+                "cpu_attention_fallback": {
+                    "saved_use_flash_attention": True,
+                    "runtime_use_flash_attention": False,
+                    "fallback_applied": True,
+                },
                 "log_lines": [
                     "offline environment active",
                     "pinned Cosmos snapshot resolved locally",
                     "Qwen3Backbone selector verified",
+                    "CPU attention fallback active: use_flash_attention=False",
                     f"GR00T model loaded: {type(model).__name__}",
                     f"GR00T processor loaded: {type(processor).__name__}",
                     "model loading_info is empty",
@@ -735,12 +755,28 @@ def _validate_offline_child_result(value: object, cache_root: Path) -> dict[str,
     }
     if any(value.get(key) != expected for key, expected in exact_fields.items()):
         raise CheckpointError("offline child returned an invalid pinned identity")
+    fallback = value.get("cpu_attention_fallback")
+    if (
+        type(fallback) is not dict
+        or set(fallback)
+        != {
+            "saved_use_flash_attention",
+            "runtime_use_flash_attention",
+            "fallback_applied",
+        }
+        or fallback["saved_use_flash_attention"] is not True
+        or fallback["runtime_use_flash_attention"] is not False
+        or fallback["fallback_applied"] is not True
+    ):
+        raise CheckpointError("offline child returned an invalid CPU attention fallback record")
     for key in ("model_class", "processor_class"):
         if type(value.get(key)) is not str or not value[key]:
             raise CheckpointError("offline child returned an invalid class record")
     log_lines = value.get("log_lines")
     if type(log_lines) is not list or any(type(line) is not str for line in log_lines):
         raise CheckpointError("offline child returned invalid log records")
+    if "CPU attention fallback active: use_flash_attention=False" not in log_lines:
+        raise CheckpointError("offline child log omits the CPU attention fallback record")
     return value
 
 

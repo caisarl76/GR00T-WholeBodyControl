@@ -30,6 +30,14 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
 
 
+def _checkpoint_content_manifest(checkpoint: Path) -> dict[str, str]:
+    return {
+        path.relative_to(checkpoint).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(checkpoint.rglob("*"))
+        if path.is_file()
+    }
+
+
 def _write_checkpoint_fixture(root: Path, step: int = 5) -> Path:
     checkpoint = root / f"checkpoint-{step}"
     checkpoint.mkdir(parents=True)
@@ -70,7 +78,11 @@ def _write_checkpoint_fixture(root: Path, step: int = 5) -> Path:
         (checkpoint / filename).write_bytes(b"fixture")
     _write_json(
         checkpoint / "config.json",
-        {"model_name": COSMOS_MODEL_ID, "model_revision": COSMOS_REVISION},
+        {
+            "model_name": COSMOS_MODEL_ID,
+            "model_revision": COSMOS_REVISION,
+            "use_flash_attention": True,
+        },
     )
     _write_json(
         checkpoint / "processor_config.json",
@@ -87,7 +99,11 @@ def _write_checkpoint_fixture(root: Path, step: int = 5) -> Path:
         (experiment_cfg / filename).write_bytes(b"fixture")
     _write_json(
         experiment_cfg / "final_model_config.json",
-        {"model_name": COSMOS_MODEL_ID, "model_revision": COSMOS_REVISION},
+        {
+            "model_name": COSMOS_MODEL_ID,
+            "model_revision": COSMOS_REVISION,
+            "use_flash_attention": True,
+        },
     )
     return checkpoint
 
@@ -181,6 +197,29 @@ def test_checkpoint_rejects_missing_or_wrong_raw_model_identity(
     _write_json(checkpoint / relative_path, model_config)
 
     with pytest.raises(CheckpointError, match="model_(?:name|revision)"):
+        verify_checkpoint_structure(checkpoint, expected_step=5)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["config.json", "experiment_cfg/final_model_config.json"],
+)
+@pytest.mark.parametrize("use_flash_attention", [None, False, 1, "true"])
+def test_checkpoint_requires_production_flash_attention_in_raw_model_configs(
+    tmp_path: Path,
+    relative_path: str,
+    use_flash_attention: object,
+) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    model_config = {
+        "model_name": COSMOS_MODEL_ID,
+        "model_revision": COSMOS_REVISION,
+    }
+    if use_flash_attention is not None:
+        model_config["use_flash_attention"] = use_flash_attention
+    _write_json(checkpoint / relative_path, model_config)
+
+    with pytest.raises(CheckpointError, match="use_flash_attention.*true"):
         verify_checkpoint_structure(checkpoint, expected_step=5)
 
 
@@ -347,6 +386,7 @@ def _offline_dependencies(
     model_info: dict[str, object] | None = None,
     model_name: str = COSMOS_MODEL_ID,
     model_revision: str = COSMOS_REVISION,
+    use_flash_attention: object = True,
     selector_name: str = "Qwen3Backbone",
     snapshot_result: Path | None = None,
     cache_read_only: bool = True,
@@ -354,6 +394,7 @@ def _offline_dependencies(
     model_error: BaseException | None = None,
     processor_model_name: str = COSMOS_MODEL_ID,
     model_info_repo: str = COSMOS_MODEL_ID,
+    returned_model_config_overrides: dict[str, object] | None = None,
     snapshot_config: dict[str, object] | None = None,
     snapshot_config_link: str | None = None,
 ) -> SimpleNamespace:
@@ -395,9 +436,22 @@ def _offline_dependencies(
         @classmethod
         def from_pretrained(cls, path: Path, **kwargs: object) -> SimpleNamespace:
             events.append(("config", path, kwargs))
-            return SimpleNamespace(model_name=model_name, model_revision=model_revision)
+            return SimpleNamespace(
+                model_name=model_name,
+                model_revision=model_revision,
+                use_flash_attention=use_flash_attention,
+            )
 
     class LoadedModel:
+        def __init__(self, config: object) -> None:
+            values = {
+                "model_name": getattr(config, "model_name", None),
+                "model_revision": getattr(config, "model_revision", None),
+                "use_flash_attention": getattr(config, "use_flash_attention", None),
+                **(returned_model_config_overrides or {}),
+            }
+            self.config = SimpleNamespace(**values)
+
         def __del__(self) -> None:
             events.append("model-released")
 
@@ -417,7 +471,7 @@ def _offline_dependencies(
                     "mismatched_keys": [],
                     "error_msgs": [],
                 }
-            return LoadedModel(), info
+            return LoadedModel(kwargs.get("config")), info
 
     class LoadedProcessor:
         model_name = processor_model_name
@@ -507,6 +561,7 @@ def test_offline_worker_requires_environment_before_import_and_uses_exact_pins(
     events: list[object] = []
     dependencies = _offline_dependencies(cache_root, events)
     _set_exact_offline_environment(monkeypatch)
+    checkpoint_manifest_before = _checkpoint_content_manifest(checkpoint)
 
     def dependency_loader() -> SimpleNamespace:
         events.append(
@@ -536,6 +591,12 @@ def test_offline_worker_requires_environment_before_import_and_uses_exact_pins(
     assert result["status"] == "pass"
     assert result["model_class"] == "LoadedModel"
     assert result["processor_class"] == "LoadedProcessor"
+    assert result["cpu_attention_fallback"] == {
+        "saved_use_flash_attention": True,
+        "runtime_use_flash_attention": False,
+        "fallback_applied": True,
+    }
+    assert "CPU attention fallback active: use_flash_attention=False" in result["log_lines"]
     assert events[0] == (
         "loader",
         {
@@ -566,12 +627,57 @@ def test_offline_worker_requires_environment_before_import_and_uses_exact_pins(
             "revision": COSMOS_REVISION,
             "cache_dir": str(hub_cache),
         }
+    config_call = next(event for event in events if isinstance(event, tuple) and event[0] == "config")
+    assert config_call[2] == {
+        "local_files_only": True,
+        "cache_dir": str(hub_cache),
+    }
+    model_call = next(event for event in events if isinstance(event, tuple) and event[0] == "model")
+    runtime_config = model_call[2]["config"]
+    assert runtime_config.use_flash_attention is False
+    assert runtime_config.model_name == COSMOS_MODEL_ID
+    assert runtime_config.model_revision == COSMOS_REVISION
+    assert model_call[2] == {
+        "config": runtime_config,
+        "transformers_loading_kwargs": {
+            "trust_remote_code": True,
+            "local_files_only": True,
+            "revision": COSMOS_REVISION,
+            "cache_dir": str(hub_cache),
+        },
+        "output_loading_info": True,
+        "trust_remote_code": True,
+        "local_files_only": True,
+        "revision": COSMOS_REVISION,
+        "cache_dir": str(hub_cache),
+    }
+    processor_call = next(event for event in events if isinstance(event, tuple) and event[0] == "processor")
+    assert processor_call[2] == {
+        "transformers_loading_kwargs": {
+            "trust_remote_code": True,
+            "local_files_only": True,
+            "revision": COSMOS_REVISION,
+            "cache_dir": str(hub_cache),
+        },
+        "trust_remote_code": True,
+        "local_files_only": True,
+        "revision": COSMOS_REVISION,
+        "cache_dir": str(hub_cache),
+    }
+    assert json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))["use_flash_attention"] is True
+    assert (
+        json.loads((checkpoint / "experiment_cfg/final_model_config.json").read_text(encoding="utf-8"))[
+            "use_flash_attention"
+        ]
+        is True
+    )
     assert events[-2:] == ["gc", "empty-cache"]
     assert events.index("model-released") < events.index("gc")
     assert events.index("processor-released") < events.index("gc")
     assert ("model-info-tags", ["qwen3_vl"]) in events
     assert ("processor-model-info-tags", ["qwen3_vl"]) in events
     assert dependencies.huggingface_hub.model_info is dependencies.original_model_info
+    assert _checkpoint_content_manifest(checkpoint) == checkpoint_manifest_before
 
 
 @pytest.mark.parametrize(
@@ -727,6 +833,92 @@ def test_offline_load_rejects_pin_or_runtime_mismatch(
         )
 
 
+@pytest.mark.parametrize("use_flash_attention", [None, False, 1, "true"])
+def test_offline_worker_requires_persisted_production_flash_attention_before_cpu_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_flash_attention: object,
+) -> None:
+    _set_exact_offline_environment(monkeypatch)
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    cache_root = tmp_path / "cache"
+    events: list[object] = []
+    dependencies = _offline_dependencies(
+        cache_root,
+        events,
+        use_flash_attention=use_flash_attention,
+    )
+
+    with pytest.raises(CheckpointError, match="use_flash_attention.*true"):
+        _verify_offline_load_worker(
+            checkpoint,
+            cache_root,
+            COSMOS_REVISION,
+            dependency_loader=lambda: dependencies,
+        )
+
+    assert not any(isinstance(event, tuple) and event[0] == "model" for event in events)
+
+
+@pytest.mark.parametrize(
+    "returned_model_config_overrides",
+    [
+        {"model_name": "other/model"},
+        {"model_revision": "wrong-revision"},
+        {"use_flash_attention": True},
+        {"use_flash_attention": None},
+    ],
+)
+def test_offline_worker_rejects_returned_model_config_that_loses_cpu_fallback_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    returned_model_config_overrides: dict[str, object],
+) -> None:
+    _set_exact_offline_environment(monkeypatch)
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    cache_root = tmp_path / "cache"
+    events: list[object] = []
+    dependencies = _offline_dependencies(
+        cache_root,
+        events,
+        returned_model_config_overrides=returned_model_config_overrides,
+    )
+
+    with pytest.raises(CheckpointError, match="loaded model config"):
+        _verify_offline_load_worker(
+            checkpoint,
+            cache_root,
+            COSMOS_REVISION,
+            dependency_loader=lambda: dependencies,
+        )
+
+
+def test_offline_worker_failure_does_not_mutate_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_exact_offline_environment(monkeypatch)
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    cache_root = tmp_path / "cache"
+    events: list[object] = []
+    dependencies = _offline_dependencies(
+        cache_root,
+        events,
+        model_error=RuntimeError("CPU load failed"),
+    )
+    checkpoint_manifest_before = _checkpoint_content_manifest(checkpoint)
+
+    with pytest.raises(CheckpointError, match="offline load failed"):
+        _verify_offline_load_worker(
+            checkpoint,
+            cache_root,
+            COSMOS_REVISION,
+            dependency_loader=lambda: dependencies,
+        )
+
+    assert _checkpoint_content_manifest(checkpoint) == checkpoint_manifest_before
+
+
 @pytest.mark.parametrize("loading_key", ["missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"])
 def test_offline_load_rejects_nonempty_loading_information(
     tmp_path: Path,
@@ -767,7 +959,15 @@ def _offline_process_result(cache_root: Path) -> dict[str, object]:
         "cosmos_snapshot": str(snapshot),
         "model_class": "LoadedModel",
         "processor_class": "LoadedProcessor",
-        "log_lines": ["offline worker passed"],
+        "cpu_attention_fallback": {
+            "saved_use_flash_attention": True,
+            "runtime_use_flash_attention": False,
+            "fallback_applied": True,
+        },
+        "log_lines": [
+            "CPU attention fallback active: use_flash_attention=False",
+            "offline worker passed",
+        ],
     }
 
 
@@ -824,6 +1024,61 @@ def test_verify_offline_load_launches_fresh_child_with_exact_environment(
         "checkpoint": str(checkpoint),
         "cosmos_revision": COSMOS_REVISION,
     }
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        None,
+        False,
+        True,
+        {},
+        {
+            "saved_use_flash_attention": False,
+            "runtime_use_flash_attention": False,
+            "fallback_applied": True,
+        },
+        {
+            "saved_use_flash_attention": True,
+            "runtime_use_flash_attention": True,
+            "fallback_applied": True,
+        },
+        {
+            "saved_use_flash_attention": True,
+            "runtime_use_flash_attention": False,
+            "fallback_applied": True,
+            "unexpected": True,
+        },
+        {
+            "saved_use_flash_attention": 1,
+            "runtime_use_flash_attention": 0,
+            "fallback_applied": 1,
+        },
+    ],
+)
+def test_verify_offline_load_rejects_inexact_cpu_attention_fallback_record(
+    tmp_path: Path,
+    fallback: object,
+) -> None:
+    checkpoint = _write_checkpoint_fixture(tmp_path)
+    cache_root = (tmp_path / "cache").resolve()
+    child_result = _offline_process_result(cache_root)
+    child_result["cpu_attention_fallback"] = fallback
+
+    def process_runner(_command: list[str], **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(child_result),
+            stderr="",
+        )
+
+    with pytest.raises(CheckpointError, match="offline child result rejected"):
+        verify_offline_load(
+            checkpoint,
+            cache_root,
+            COSMOS_REVISION,
+            process_runner=process_runner,
+        )
 
 
 def test_verify_offline_load_rejects_albumentations_conflict_before_child(
