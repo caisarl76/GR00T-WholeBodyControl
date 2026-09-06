@@ -36,6 +36,7 @@ from scipy.spatial.transform import Rotation as R, Rotation as sRot
 import torch
 import zmq
 
+from gear_sonic.utils.teleop import input_readers
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -864,8 +865,26 @@ def init_hand_ik_solvers():
     return None, None
 
 
-def get_controller_inputs():
-    """Fetch controller button/trigger states from XRoboToolkit."""
+# Readers that expose `get_controller_data()` returning the IsaacTeleop
+# controller_data dict schema (left/right trigger/squeeze, thumbstick, clicks).
+# Tuple form keeps the dispatch sites uniform if/when a second reader speaks
+# the same schema.
+_ISAAC_TELEOP_READERS = (input_readers.IsaacTeleopReader,)
+
+
+def get_controller_inputs(reader=None):
+    """Fetch controller button/trigger states from XRoboToolkit or IsaacTeleop."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, 0.0, 0.0, 0.0, 0.0
+        return (
+            False,
+            float(ctrl.get("left_trigger_value", 0.0)),
+            float(ctrl.get("right_trigger_value", 0.0)),
+            float(ctrl.get("left_squeeze_value", 0.0)),
+            float(ctrl.get("right_squeeze_value", 0.0)),
+        )
     left_trigger = xrt.get_left_trigger()
     right_trigger = xrt.get_right_trigger()
     left_grip = xrt.get_left_grip()
@@ -874,8 +893,20 @@ def get_controller_inputs():
     return left_menu_button, left_trigger, right_trigger, left_grip, right_grip
 
 
-def get_controller_axes():
+def get_controller_axes(reader=None):
     """Fetch joystick axes (lx, ly, rx, ry). Falls back to zeros if not available."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return 0.0, 0.0, 0.0, 0.0
+        left_thumbstick = ctrl.get("left_thumbstick", [0.0, 0.0])
+        right_thumbstick = ctrl.get("right_thumbstick", [0.0, 0.0])
+        return (
+            float(left_thumbstick[0]),
+            float(left_thumbstick[1]),
+            float(right_thumbstick[0]),
+            float(right_thumbstick[1]),
+        )
     if xrt is None:
         return 0.0, 0.0, 0.0, 0.0
     try:
@@ -890,8 +921,10 @@ def get_controller_axes():
         return 0.0, 0.0, 0.0, 0.0
 
 
-def get_menu_buttons():
+def get_menu_buttons(reader=None):
     """Fetch both menu buttons (left, right). Falls back to False if not available."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        return False, False
     if xrt is None:
         return False, False
 
@@ -907,8 +940,16 @@ def get_menu_buttons():
     return left, right
 
 
-def get_axis_clicks():
+def get_axis_clicks(reader=None):
     """Fetch both axis click buttons (left, right). Falls back to False if not available."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, False
+        return (
+            float(ctrl.get("left_thumbstick_click", 0.0)) > 0.5,
+            float(ctrl.get("right_thumbstick_click", 0.0)) > 0.5,
+        )
     if xrt is None:
         return False, False
 
@@ -924,8 +965,16 @@ def get_axis_clicks():
     return left, right
 
 
-def get_face_buttons():
+def get_face_buttons(reader=None):
     """Fetch primary face buttons A and X. Returns (a_pressed, x_pressed)."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, False
+        return (
+            float(ctrl.get("right_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_primary_click", 0.0)) > 0.5,
+        )
     if xrt is None:
         return False, False
     try:
@@ -936,8 +985,18 @@ def get_face_buttons():
         return False, False
 
 
-def get_abxy_buttons():
+def get_abxy_buttons(reader=None):
     """Fetch A,B,X,Y face buttons as booleans (a,b,x,y)."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, False, False, False
+        return (
+            float(ctrl.get("right_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("right_secondary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_secondary_click", 0.0)) > 0.5,
+        )
     if xrt is None:
         return False, False, False, False
     try:
@@ -1036,6 +1095,18 @@ class PicoReader:
     def get_latest(self):
         with self._lock:
             return self._latest
+
+    @property
+    def disconnected(self) -> bool:
+        return False
+
+    def clear_disconnect(self):
+        pass
+
+    def get_timestamp_ns(self) -> int:
+        if xrt is None:
+            return 0
+        return int(xrt.get_time_stamp_ns())
 
     def _run(self):
         last_report = time.time()
@@ -1283,17 +1354,19 @@ def _pose_stream_common(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    reader=None,
     hand_profile: str = "dex3",
 ):
     """Shared pose streaming loop used by run_pico."""
-    if xrt is None:
-        raise ImportError(
-            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run pose streaming."
-        )
+    if reader is None:
+        if xrt is None:
+            raise ImportError(
+                "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run pose streaming."
+            )
 
-    # Create reader and start it
-    reader = PicoReader(max_queue_size=buffer_size)
-    reader.start()
+        # Create reader and start it
+        reader = PicoReader(max_queue_size=buffer_size)
+        reader.start()
 
     # Create 3-point pose processor with visualization settings
     three_point = ThreePointPose(
@@ -1704,7 +1777,7 @@ class PoseStreamer:
     def __init__(
         self,
         socket,
-        reader: PicoReader,
+        reader: "PicoReader | input_readers.IsaacTeleopReader",
         three_point: ThreePointPose,
         num_frames_to_send: int,
         target_fps: int,
@@ -1835,11 +1908,11 @@ class PoseStreamer:
         latest_data = compute_from_body_poses(
             self.parent_indices, self.device, sample["body_poses_np"]
         )
-        (left_menu_button, left_trigger, right_trigger, left_grip, right_grip) = (
-            get_controller_inputs()
+        left_menu_button, left_trigger, right_trigger, left_grip, right_grip = get_controller_inputs(
+            self.reader
         )
         # Get A and B button states for data collection control
-        a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+        a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
 
         # Data collection toggle logic (edge-triggered)
         # Left grip + A = toggle_data_collection
@@ -1985,7 +2058,7 @@ class PoseStreamer:
             self.buffer_cleared = False
 
         # Get joystick axes for yaw accumulation
-        _, _, rx, _ = get_controller_axes()
+        _, _, rx, _ = get_controller_axes(self.reader)
         self.yaw_accumulator.update(rx, self.frame_time)
 
         # Only send if buffer is full and we're not waiting for fresh data
@@ -2047,6 +2120,37 @@ class PoseStreamer:
         self.frame_start = time.time()
 
 
+def _init_input_source(
+    input_source: str,
+    buffer_size: int,
+) -> "PicoReader | input_readers.IsaacTeleopReader":
+    """Create, start, and wait for readiness of the requested teleop input source."""
+    if input_source == "isaac-teleop":
+        reader = input_readers.IsaacTeleopReader(max_queue_size=buffer_size)
+        reader.start()
+        print("Using Isaac Teleop (in-process CloudXR / DeviceIO), waiting for data...")
+        while reader.get_latest() is None:
+            print("waiting for Isaac Teleop body data (connect the headset to CloudXR)...")
+            time.sleep(1)
+        return reader
+
+    if xrt is None:
+        raise ImportError(
+            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
+        )
+
+    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
+    xrt.init()
+    print("Waiting for body tracking data...")
+    while not xrt.is_body_data_available():
+        print("waiting for body data...")
+        time.sleep(1)
+
+    reader = PicoReader(max_queue_size=buffer_size)
+    reader.start()
+    return reader
+
+
 def run_pico(
     buffer_size: int = 15,
     port: int = 5556,
@@ -2060,18 +2164,10 @@ def run_pico(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     hand_profile: str = "dex3",
+    input_source: str = "xrt",
 ):
-    """Run Pico body tracking with real-time visualization and ZMQ streaming."""
-    if xrt is None:
-        raise ImportError(
-            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
-        )
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
-    xrt.init()
-    print("Waiting for body tracking data...")
-    while not xrt.is_body_data_available():
-        print("waiting for body data...")
-        time.sleep(1)
+    """Run body tracking with real-time visualization and ZMQ streaming."""
+    reader = _init_input_source(input_source, buffer_size)
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
@@ -2099,6 +2195,7 @@ def run_pico(
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
             hand_profile=hand_profile,
+            reader=reader,
         )
     finally:
         socket.close()
@@ -2466,7 +2563,7 @@ class PlannerStreamer:
     def __init__(
         self,
         socket,
-        reader: PicoReader,
+        reader: "PicoReader | input_readers.IsaacTeleopReader",
         three_point: ThreePointPose,
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
@@ -2686,7 +2783,7 @@ class PlannerStreamer:
                 xrt_timestamp = latest_sample.get("timestamp_ns")
             else:
                 latest_sample = None
-                xrt_timestamp = xrt.get_time_stamp_ns()
+                xrt_timestamp = self.reader.get_timestamp_ns()
             duplicate_xr_sample = xrt_timestamp == self.last_xrt_timestamp
             can_freeze_vr3pt = (
                 stream_mode == StreamMode.PLANNER_VR_3PT
@@ -2698,7 +2795,7 @@ class PlannerStreamer:
             self.last_xrt_timestamp = xrt_timestamp
 
             # A+B => next mode; X+Y => previous mode (rising edges)
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
             ab_now = bool(a_pressed) and bool(b_pressed) and not bool(x_pressed) and not bool(y_pressed)
             xy_now = bool(x_pressed) and bool(y_pressed) and not bool(a_pressed) and not bool(b_pressed)
             if ab_now and not self.prev_ab:
@@ -2711,7 +2808,7 @@ class PlannerStreamer:
             self.prev_xy = xy_now
 
             # Read axes/joysticks to control movement, facing, speed and mode
-            lx, ly, rx, ry = get_controller_axes()
+            lx, ly, rx, ry = get_controller_axes(self.reader)
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
             facing = self.yaw_accumulator.update(rx, self.dt)
@@ -2797,7 +2894,7 @@ class PlannerStreamer:
                     right_trigger,
                     left_grip,
                     right_grip,
-                ) = get_controller_inputs()
+                ) = get_controller_inputs(self.reader)
                 lh_joints, rh_joints = self.compute_hand_joints(
                     left_trigger, left_grip, right_trigger, right_grip
                 )
@@ -2862,6 +2959,7 @@ def run_pico_manager(
     controller_3pt_log_interval: float = 1.0,
     disable_xr_staleness_watchdog: bool = False,
     hand_profile: str = "dex3",
+    input_source: str = "xrt",
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2869,13 +2967,15 @@ def run_pico_manager(
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
     """
-    if xrt is None:
-        raise ImportError(
-            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run the manager."
-        )
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
-    xrt.init()
     if controller_3pt:
+        if input_source != "xrt":
+            raise ValueError("--controller_3pt requires --input-source xrt")
+        if xrt is None:
+            raise ImportError(
+                "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run the manager."
+            )
+        subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
+        xrt.init()
         print("Controller 3PT mode enabled: using headset + two controller poses only.")
         print("Full-body POSE mode is disabled; use PLANNER and VR_3PT modes.")
         print(
@@ -2902,10 +3002,7 @@ def run_pico_manager(
         if not controller_3pt_log_dir:
             controller_3pt_log_dir = os.path.join("outputs", "controller_3pt_calibration")
     else:
-        print("Waiting for body tracking data...")
-        while not xrt.is_body_data_available():
-            print("waiting for body data...")
-            time.sleep(1)
+        reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -2921,9 +3018,9 @@ def run_pico_manager(
     except Exception:
         pass
 
-    # Create shared reader and 3-point pose processor
-    reader = (
-        ControllerPoseReader(
+    # Controller-only tracking must not wait for full-body data.
+    if controller_3pt:
+        reader = ControllerPoseReader(
             max_queue_size=buffer_size,
             left_controller_offset_rpy=left_controller_offset_rpy,
             right_controller_offset_rpy=right_controller_offset_rpy,
@@ -2931,10 +3028,7 @@ def run_pico_manager(
             headset_pose_convention=headset_pose_convention,
             headset_orientation_convention=headset_orientation_convention,
         )
-        if controller_3pt
-        else PicoReader(max_queue_size=buffer_size)
-    )
-    reader.start()
+        reader.start()
 
     three_point = ThreePointPose(
         enable_vis_vr3pt=enable_vis_vr3pt,
@@ -3027,11 +3121,11 @@ def run_pico_manager(
         prev_right_axis_click = False
         while True:
             # Poll Pico controller for buttons/axes
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs()
+            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
 
-            left_axis_click, right_axis_click = get_axis_clicks()
+            left_axis_click, right_axis_click = get_axis_clicks(reader)
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = bool(a_pressed) and bool(x_pressed) and not bool(b_pressed) and not bool(y_pressed)
@@ -3477,6 +3571,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable manager-side XR stale-frame stop/freeze checks. Use only for harnessed diagnostics.",
     )
+    parser.add_argument(
+        "--input-source",
+        type=str,
+        default="xrt",
+        choices=["xrt", "isaac-teleop"],
+        help=(
+            "Input source: 'xrt' for XRoboToolkit SDK (default), "
+            "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
+        ),
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -3536,6 +3640,7 @@ if __name__ == "__main__":
             controller_3pt_log_interval=args.controller_3pt_log_interval,
             disable_xr_staleness_watchdog=args.disable_xr_staleness_watchdog,
             hand_profile=args.hand_profile,
+            input_source=args.input_source,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -3552,4 +3657,5 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             hand_profile=args.hand_profile,
+            input_source=args.input_source,
         )

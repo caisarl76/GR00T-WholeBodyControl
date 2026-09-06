@@ -213,6 +213,8 @@ show_usage() {
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --disable-dex3-hands    Do not create Dex3 DDS hand endpoints"
     echo "  --dry-run               Print the final deploy command and exit"
+    echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
+    echo "  --motor-kd-scale SPEC   Scale Kd for hardware motor indices/ranges"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -255,6 +257,8 @@ OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
 DISABLE_DEX3_HANDS=false
 DRY_RUN=false
+MOTOR_KP_SCALES=()
+MOTOR_KD_SCALES=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -326,6 +330,22 @@ while [[ $# -gt 0 ]]; do
         --dry-run)
             DRY_RUN=true
             shift
+            ;;
+        --motor-kp-scale)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --motor-kp-scale requires <motor-list>=<factor>${NC}" >&2
+                exit 1
+            fi
+            MOTOR_KP_SCALES+=("$2")
+            shift 2
+            ;;
+        --motor-kd-scale)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --motor-kd-scale requires <motor-list>=<factor>${NC}" >&2
+                exit 1
+            fi
+            MOTOR_KD_SCALES+=("$2")
+            shift 2
             ;;
         sim|real)
             INTERFACE_MODE="$1"
@@ -401,6 +421,13 @@ fi
 if [[ "$DISABLE_DEX3_HANDS" == true ]]; then
     EXTRA_ARGS+=("--disable-dex3-hands")
 fi
+
+for scale in "${MOTOR_KP_SCALES[@]}"; do
+    EXTRA_ARGS+=("--motor-kp-scale" "$scale")
+done
+for scale in "${MOTOR_KD_SCALES[@]}"; do
+    EXTRA_ARGS+=("--motor-kd-scale" "$scale")
+done
 
 DEPLOY_ARGS=(
     g1_deploy_onnx_ref
@@ -552,7 +579,8 @@ echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
-echo -e "  Extra Args:         ${GREEN}${EXTRA_ARGS[*]}${NC}"
+printf -v EXTRA_ARGS_DISPLAY ' %q' "${EXTRA_ARGS[@]}"
+echo -e "  Extra Args:         ${GREEN}${EXTRA_ARGS_DISPLAY# }${NC}"
 fi
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
@@ -567,7 +595,7 @@ echo -e "${BLUE}    --input-type $INPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --zmq-host $ZMQ_HOST${NC}"
 if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
-echo -e "${BLUE}    ${EXTRA_ARGS[*]}${NC}"
+echo -e "${BLUE}    ${EXTRA_ARGS_DISPLAY# }${NC}"
 fi
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"

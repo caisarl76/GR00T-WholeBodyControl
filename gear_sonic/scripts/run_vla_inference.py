@@ -14,7 +14,7 @@ running PolicyServer.
 Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   p  -> pause / resume the policy loop
   k  -> start / stop the C++ control loop
-  i  -> send initial pose and switch to POSE mode
+  i  -> prepare CALIB_FULL in PLANNER, or blend to the standing latent pose when selected
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
   [  -> toggle left hand open/closed for initial pose
   ]  -> toggle right hand open/closed for initial pose
@@ -139,6 +139,12 @@ class InferenceConfig:
     # Prompt / eval
     prompt: str = "demo"
     """The language prompt for the VLA policy."""
+
+    # Initial pose
+    initial_pose_blend_duration: float = 1.0
+    """Duration (seconds) for smooth interpolation with initial_pose=standing. The robot
+    blends from its current motion token to the initial pose token over this
+    period. Set to 0 to snap instantly (no blend)."""
 
     # Debug
     verbose_timing: bool = False
@@ -470,6 +476,7 @@ def main(config: InferenceConfig):
 
     def publish_latent_initial_pose(left_hand: np.ndarray | None = None, right_hand: np.ndarray | None = None):
         """Publish the streamed-motion latent initial token."""
+        nonlocal last_sent_motion_token
         if left_hand is None or right_hand is None:
             left_hand, right_hand = _initial_pose_hands()
         zmq_message = pack_latent_action_message(
@@ -479,6 +486,7 @@ def main(config: InferenceConfig):
             right_hand_joints=right_hand,
         )
         zmq_socket.send(zmq_message)
+        last_sent_motion_token = LATENT_INITIAL_MOTION_TOKEN.copy()
         print_green("Sent latent initial pose via ZMQ")
         time.sleep(1.0)
 
@@ -532,9 +540,66 @@ def main(config: InferenceConfig):
             )
         )
 
+    def blend_to_initial_pose(duration_s: float) -> bool:
+        """Smoothly interpolate from the last sent motion token to the initial pose.
+
+        Linearly blends over ``duration_s`` seconds at the action publish rate,
+        sending intermediate tokens each loop iteration. Returns True if blend
+        was performed, False if skipped (no previous token available).
+        """
+        nonlocal last_sent_motion_token
+        if last_sent_motion_token is None:
+            print("No previous motion token — snapping to initial pose instead.")
+            publish_latent_initial_pose()
+            return False
+
+        start_token = last_sent_motion_token.copy()
+        target_token = LATENT_INITIAL_MOTION_TOKEN.copy()
+        num_steps = max(1, round(config.action_publish_rate * duration_s))
+        step_period = 1.0 / config.action_publish_rate
+
+        left_hand = (
+            _compute_closed_hand_joints("L")
+            if initial_pose_left_hand_closed
+            else np.zeros(7, dtype=np.float32)
+        )
+        right_hand = (
+            _compute_closed_hand_joints("R")
+            if initial_pose_right_hand_closed
+            else np.zeros(7, dtype=np.float32)
+        )
+
+        print(
+            f"Blending to initial pose over {duration_s:.2f}s "
+            f"({num_steps} steps at {config.action_publish_rate} Hz)"
+        )
+
+        for step in range(num_steps):
+            t_step_start = time.monotonic()
+            alpha = (step + 1) / num_steps
+            blended_token = ((1.0 - alpha) * start_token + alpha * target_token).astype(
+                np.float32
+            )
+            zmq_message = pack_latent_action_message(
+                motion_token=blended_token,
+                frame_index=np.array([0], dtype=np.int64),
+                left_hand_joints=left_hand,
+                right_hand_joints=right_hand,
+            )
+            zmq_socket.send(zmq_message)
+            last_sent_motion_token = blended_token.copy()
+
+            elapsed = time.monotonic() - t_step_start
+            remaining = step_period - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
+        print_green("Initial pose blend complete.")
+        return True
+
     def send_cpp_control_command(start: bool, planner: bool = False):
         """Send C++ control loop start/stop commands via ZMQ."""
-        nonlocal cpp_loop_running, cpp_mode
+        nonlocal cpp_loop_running, cpp_mode, last_sent_motion_token
         try:
             cmd_msg = build_command_message(start=start, stop=not start, planner=planner)
             zmq_socket.send(cmd_msg)
@@ -546,6 +611,8 @@ def main(config: InferenceConfig):
                 cpp_mode = "PLANNER" if planner else "POSE"
             else:
                 cpp_mode = "OFF"
+            if planner or not start:
+                last_sent_motion_token = None
             print_green(f"Sent ZMQ command: {action_str} control loop ({mode_str} mode)")
             return True
         except Exception as e:
@@ -560,6 +627,7 @@ def main(config: InferenceConfig):
     inference_interval = 1.0 / config.rate
 
     zmq_frame_counter = 0
+    last_sent_motion_token: np.ndarray | None = None
 
     PROMPT_MSG_PREFIX = "prompt:"
 
@@ -568,7 +636,7 @@ def main(config: InferenceConfig):
         nonlocal pose_start_pending
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
-        nonlocal zmq_frame_counter
+        nonlocal zmq_frame_counter, last_sent_motion_token
 
         key = keyboard_listener.read_msg()
         if key is None:
@@ -590,6 +658,28 @@ def main(config: InferenceConfig):
             print("Keyboard: 's' (stop recording success -- handled by data exporter)")
         elif key == "f":
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
+        elif key == "i" and config.initial_pose == "standing":
+            if not cpp_loop_running:
+                print("C++ control loop is not running; press 'k' first.")
+                return
+            pause_loop = True
+            initial_pose_ready = False
+            pose_start_pending = False
+            cached_action_chunk = None
+            action_chunk_index = 0
+            last_inference_time = 0.0
+            zmq_frame_counter = 0
+            if (
+                cpp_mode == "POSE"
+                and config.initial_pose_blend_duration > 0
+                and last_sent_motion_token is not None
+            ):
+                blend_to_initial_pose(config.initial_pose_blend_duration)
+            else:
+                publish_latent_initial_pose()
+            if send_cpp_control_command(start=True, planner=False):
+                initial_pose_ready = True
+                print("Standing initial pose ready in POSE mode; press 'p' to start inference")
         elif key == "i":
             transition = plan_i_transition(
                 InferenceControlState(
@@ -623,6 +713,17 @@ def main(config: InferenceConfig):
             initial_pose_ready = transition.next_state.initial_pose_ready
             print("Holding CALIB_FULL in PLANNER mode; press 'p' to start inference")
         elif key == "p":
+            if config.initial_pose == "standing":
+                if not cpp_loop_running or not initial_pose_ready:
+                    print("Standing initial pose is not ready; press 'k' then 'i' first.")
+                    return
+                pause_loop = not pause_loop
+                pose_start_pending = False
+                cached_action_chunk = None
+                action_chunk_index = 0
+                last_inference_time = 0.0
+                print(f"{'Paused' if pause_loop else 'Resumed'} policy loop in POSE mode")
+                return
             transition = plan_p_transition(
                 InferenceControlState(
                     pause_loop=pause_loop,
@@ -787,7 +888,12 @@ def main(config: InferenceConfig):
                     pass
 
             if pause_loop:
-                if cpp_loop_running and cpp_mode == "PLANNER" and initial_pose_ready:
+                if (
+                    config.initial_pose == "calib_full"
+                    and cpp_loop_running
+                    and cpp_mode == "PLANNER"
+                    and initial_pose_ready
+                ):
                     now = time.monotonic()
                     if now - last_calib_full_hold_time >= 0.2:
                         publish_calib_full_hold_pose()
@@ -857,6 +963,7 @@ def main(config: InferenceConfig):
                         right_hand_joints=right_hand_joints,
                     )
                     zmq_socket.send(zmq_message)
+                    last_sent_motion_token = motion_token.copy()
                     if zmq_frame_counter % 50 == 0:
                         print_green(
                             f"ZMQ: Sent latent action - "

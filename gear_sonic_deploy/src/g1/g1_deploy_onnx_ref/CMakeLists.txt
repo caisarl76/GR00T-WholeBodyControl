@@ -4,6 +4,7 @@ set(EXECUTABLE_NAME g1_deploy_onnx_ref)
 # ZMQ manager path does not need ROS2 and onboard ROS2 headers can conflict
 # with the bare-metal deploy toolchain.
 option(BUILD_ROS2 "Build optional ROS2 input/output support" OFF)
+option(BUILD_DEPLOY_TESTS "Build deploy-side test executables" OFF)
 
 if(BUILD_DEPLOY_TESTS)
   add_executable(dex3_hand_field_decoder_test

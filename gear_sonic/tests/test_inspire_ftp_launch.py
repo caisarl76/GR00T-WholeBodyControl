@@ -56,11 +56,37 @@ def test_default_launcher_keeps_dex3_flags_implicit():
     )
     assert _build_pico_command(config, REPO_ROOT) == (
         f"cd {REPO_ROOT} && source .venv_teleop/bin/activate && "
-        "python gear_sonic/scripts/pico_manager_thread_server.py --manager"
+        "python gear_sonic/scripts/pico_manager_thread_server.py --input-source xrt --manager"
     )
     assert _build_deploy_command(config, REPO_ROOT) == (
         f"cd {REPO_ROOT / 'gear_sonic_deploy'} && ./deploy.sh --input-type zmq_manager --zmq-host localhost sim"
     )
+
+
+def test_nondefault_pico_input_composes_with_inspire_profile():
+    config = DataCollectionLaunchConfig(
+        sim=True, hand_profile="inspire_ftp", pico_input_source="isaac-teleop"
+    )
+
+    command = _build_pico_command(config, REPO_ROOT)
+
+    assert "--hand-profile inspire_ftp" in command
+    assert "--input-source isaac-teleop" in command
+
+
+def test_deploy_motor_scales_compose_with_inspire_hand_disable():
+    config = DataCollectionLaunchConfig(
+        sim=True,
+        hand_profile="inspire_ftp",
+        deploy_motor_kp_scale="4,10=1.5",
+        deploy_motor_kd_scale="4,10=0.5",
+    )
+
+    command = _build_deploy_command(config, REPO_ROOT)
+
+    assert "--disable-dex3-hands" in command
+    assert "--motor-kp-scale 4,10=1.5" in command
+    assert "--motor-kd-scale 4,10=0.5" in command
 
 
 def test_launcher_rejects_real_inspire_before_external_actions():
@@ -70,8 +96,13 @@ def test_launcher_rejects_real_inspire_before_external_actions():
 
 def test_inspire_launcher_does_not_start_dex3_schema_exporter(monkeypatch):
     sent_commands = []
+    prerequisite_configs = []
 
-    monkeypatch.setattr(launch_module, "_check_prerequisites", lambda **_: None)
+    monkeypatch.setattr(
+        launch_module,
+        "_check_prerequisites",
+        lambda **kwargs: prerequisite_configs.append(kwargs.get("config")),
+    )
     monkeypatch.setattr(launch_module, "_kill_existing_session", lambda: None)
     monkeypatch.setattr(launch_module, "_create_tmux_session", lambda: None)
     monkeypatch.setattr(launch_module, "_check_pane_alive", lambda _: True)
@@ -88,14 +119,18 @@ def test_inspire_launcher_does_not_start_dex3_schema_exporter(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout=""),
     )
 
-    main(DataCollectionLaunchConfig(sim=True, hand_profile="inspire_ftp"))
+    inspire_config = DataCollectionLaunchConfig(sim=True, hand_profile="inspire_ftp")
+    main(inspire_config)
+    assert prerequisite_configs[-1] is inspire_config
 
     assert any("deploy.sh" in command for _, command in sent_commands)
     assert any("pico_manager_thread_server.py" in command for _, command in sent_commands)
     assert not any("run_data_exporter.py" in command for _, command in sent_commands)
 
     sent_commands.clear()
-    main(DataCollectionLaunchConfig(sim=True, hand_profile="dex3"))
+    dex3_config = DataCollectionLaunchConfig(sim=True, hand_profile="dex3")
+    main(dex3_config)
+    assert prerequisite_configs[-1] is dex3_config
     assert any("run_data_exporter.py" in command for _, command in sent_commands)
 
 

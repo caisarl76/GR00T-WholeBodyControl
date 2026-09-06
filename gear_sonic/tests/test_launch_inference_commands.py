@@ -79,3 +79,16 @@ def test_no_deploy_inference_command_targets_external_deploy_defaults() -> None:
     assert "--state-zmq-port 5557" in command
     assert "--action-zmq-host '*'" in command
     assert "--action-zmq-port 5556" in command
+
+
+def test_external_deploy_command_forwards_motor_scales() -> None:
+    config = launch_inference.InferenceLaunchConfig(
+        deploy=False,
+        deploy_motor_kp_scale="4,10=1.5",
+        deploy_motor_kd_scale="4,10=0.5",
+    )
+
+    command = launch_inference._build_deploy_command(Path("/repo"), config)
+
+    assert "--motor-kp-scale 4,10=1.5" in command
+    assert "--motor-kd-scale 4,10=0.5" in command
