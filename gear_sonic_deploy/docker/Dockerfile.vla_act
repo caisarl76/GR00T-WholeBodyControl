@@ -1,0 +1,11 @@
+FROM python:3.10-slim-bookworm
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg libglib2.0-0 libgl1 git build-essential \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install torch==2.7.1+cu126 torchvision==0.22.1+cu126 --extra-index-url https://download.pytorch.org/whl/cu126
+RUN pip install lerobot==0.4.4 pandas pyarrow
+WORKDIR /workspace
+COPY gear_sonic/scripts/infer_g1_dex3_act.py gear_sonic/scripts/serve_g1_dex3_act.py \
+     gear_sonic/scripts/prepare_g1_act_observation.py ./
+CMD ["python", "serve_g1_dex3_act.py", "--checkpoint", "/models/g1-dex3-act"]
