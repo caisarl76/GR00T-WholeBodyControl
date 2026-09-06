@@ -1,0 +1,167 @@
+{
+  "run_date": "2026-09-07",
+  "scope": "Recorded-observation ACT integration with native SONIC v1.1 and MuJoCo G1+Dex3. No live camera, language, object interaction, or manipulation success claim.",
+  "model": {
+    "repo": "ambitiousmangosteen/g1-dex3-toastedbread-act-las",
+    "revision": "570d35d5c8267b9f8f271cd3b3b53cb1af7dada1",
+    "sha256": "3ab2dcd032442c4ee6bf9b217d1ba32ac9059f7b86c184b67a30412165cec42b",
+    "language_conditioned": false
+  },
+  "dataset": {
+    "repo": "unitreerobotics/G1_Dex3_ToastedBread_Dataset",
+    "revision": "02cb29161f5adb2981a072aa35b408d82a556d07",
+    "episode": 0,
+    "observation_frames": [
+      0,
+      100,
+      200,
+      300,
+      400,
+      500
+    ]
+  },
+  "sonic": {
+    "repo": "nvidia/GEAR-SONIC",
+    "revision": "6733128a3d8a523b1418b06bca3cdf61c8b0987f",
+    "policy": "sonic_v1_1",
+    "encoder_mode": 0
+  },
+  "startup": [
+    "keyboard9",
+    "backspace",
+    "nominal SONIC standing",
+    "measured settling",
+    "ACT references"
+  ],
+  "motion_metrics": {
+    "post_ACT_start_seconds": 52.79999999999855,
+    "min_base_height_m": 0.7603258394868855,
+    "max_base_tilt_deg": 3.5099895940621706,
+    "max_abs_waist_deg": [
+      5.090804446663317,
+      2.019307905335725,
+      2.2893492129312416
+    ],
+    "both_feet_contact_fraction": 1.0,
+    "arm_peak_to_peak_rad": {
+      "left": [
+        0.7165498213341195,
+        0.4579711931958321,
+        0.5651114961006505,
+        0.6688089343411043,
+        0.8389405829428818,
+        0.48024948308318205,
+        0.6749740616551966
+      ],
+      "right": [
+        1.5291514670824058,
+        0.6366028656934948,
+        0.5808257149746351,
+        0.7935852409912529,
+        1.2322016501146469,
+        1.0610746490354979,
+        1.0909113051706387
+      ]
+    },
+    "hand_peak_to_peak_rad": {
+      "left": [
+        0.3639361608244405,
+        0.9363097533192937,
+        0.4126041552530126,
+        0.9907544177996395,
+        1.5607827677658819,
+        1.2424091896613554,
+        1.0227295780798824
+      ],
+      "right": [
+        0.6674208266753145,
+        0.8765807475708456,
+        0.3898239818323035,
+        1.0827210224818173,
+        1.7059819691366265,
+        1.1436202275415874,
+        1.6041146911356896
+      ]
+    },
+    "reset_to_standing_control_ms": 77.826942,
+    "reset_to_ACT_start_seconds": 1.537885277,
+    "falls": 0,
+    "automatic_resets_after_ACT": 0,
+    "reference_tracking_rms_rad": {
+      "left_arm": 0.11878694405596722,
+      "right_arm": 0.12631011308427778,
+      "left_hand": 0.056482338737472056,
+      "right_hand": 0.10236594209627911
+    }
+  },
+  "native": {
+    "source_action_frames": 600,
+    "active_ticks": 1399,
+    "expired_hold_ticks": 67,
+    "frames_executed": 1249,
+    "reference_pairing_passed": true,
+    "malformed_and_replayed_chunks_executed": false,
+    "errors": []
+  },
+  "source_sha256": {
+    "sim/observations.jsonl": "6718f11e313e3476e15e9283ceeda4830c3233bd6c8209901848d00d6ee59876",
+    "native.jsonl": "a045e5c598d1387ce34dbda304a95d2f09b07f667855df972132195b17630b44",
+    "replay/actions.npy": "4a765e266f3dbdcec514752b3050a0897eaad197c82aaef40d78cdf5a5c71eb1",
+    "replay/reference.npz": "12432343984c09402fd3de478111430d408e8c8e4d54819a09f0511f97e5c797"
+  },
+  "video_outputs": [
+    {
+      "file": "act_sonic_v1_1_g1_dex3_full.mp4",
+      "sha256": "77eee3a7a46dba163d5dc7d6859c83c520a16f5944c2de9d2cbdefb429776702",
+      "probe": {
+        "programs": [],
+        "streams": [
+          {
+            "codec_name": "h264",
+            "width": 1920,
+            "height": 1080,
+            "pix_fmt": "yuv420p",
+            "avg_frame_rate": "30/1",
+            "nb_read_frames": "911"
+          }
+        ],
+        "format": {
+          "duration": "30.367000",
+          "size": "12692395"
+        }
+      },
+      "full_decode_check": "passed"
+    },
+    {
+      "file": "act_sonic_v1_1_g1_dex3_action.mp4",
+      "sha256": "77b65e7204fa62186224a08f61147d3f491d408bbcf410982fc3f2d1f310fb17",
+      "probe": {
+        "programs": [],
+        "streams": [
+          {
+            "codec_name": "h264",
+            "width": 1920,
+            "height": 1080,
+            "pix_fmt": "yuv420p",
+            "avg_frame_rate": "30/1",
+            "nb_read_frames": "660"
+          }
+        ],
+        "format": {
+          "duration": "22.000000",
+          "size": "10840041"
+        }
+      },
+      "full_decode_check": "passed"
+    }
+  ],
+  "source_observation_sha256": [
+    "1e1d7daba297f3449e42dbd7befe20f15c531decf2b6a6e4c812a65050030652",
+    "b18cf8e0c431f664239fec386d7864d5e0766b428536e396eb3f1f8c5dabb8af",
+    "a37a2fc692cea49219953bfcefe4ff6e5ae66f1e6830a3491de8a87ed8cc75f4",
+    "b290126d688b63826331e4ddf16fc919bcf9790c80836adc25d720a81fd3355d",
+    "e25f6edc4ded8ab6e153cb7a59ff1c0fdb1ebaea16cd98e128efff99bb43c1f9",
+    "f2267cc905ce4743a09f2583015e7841aa878c7b8281c90c9788360e92dc7dc1"
+  ],
+  "video_scope": "Saved measured qpos rendered at30fps with mj_forward; no new physics/inference; fullvideo911frames/30.367s and action660frames/22s. Large videos/logs/checkpoints remain runtime artifacts."
+}

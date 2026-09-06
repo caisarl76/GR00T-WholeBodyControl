@@ -102,6 +102,8 @@ Documentation
    tutorials/data_collection
    tutorials/vla_workflow
    tutorials/vla_inference
+   tutorials/vla_adapter_h100
+   tutorials/vla_adapter_validation
 
 .. toctree::
    :maxdepth: 2

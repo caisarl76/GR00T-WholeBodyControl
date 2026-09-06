@@ -252,7 +252,7 @@ def run(args) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--act-url", default="http://jihun-g1-act-integration-20260906:8080")
+    parser.add_argument("--act-url", default="http://g1-vla-act:8080")
     parser.add_argument("--observation", required=True, type=Path, action="append")
     parser.add_argument("--sim-output", required=True, type=Path)
     parser.add_argument("--controller-log", required=True, type=Path)
