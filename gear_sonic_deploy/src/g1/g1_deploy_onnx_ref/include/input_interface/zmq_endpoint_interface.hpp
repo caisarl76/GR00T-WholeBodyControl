@@ -71,6 +71,7 @@
 #include "dex3_hand_field_decoder.hpp"
 #include "zmq_packed_message_subscriber.hpp"
 #include "streamed_motion_merger.hpp"
+#include "adapter_packet_layout.hpp"
 
 /**
  * @class ZMQEndpointInterface
@@ -586,6 +587,114 @@ public:
     }
     
 private:
+    std::optional<bool> adapter_schedule_mode_;
+    int64_t adapter_session_id_ = -1;
+    int64_t adapter_last_chunk_id_ = -1;
+
+    bool HasAdapterFields() const {
+        for (const auto& field : buffered_header_.fields) {
+            if (field.name == "adapter_session_id" || field.name == "adapter_chunk_id" ||
+                field.name == "adapter_deadline_ns") return true;
+        }
+        return false;
+    }
+
+    // Guard legacy body decoding before it touches buffers. This bounded v1
+    // extension deliberately has no optional teleoperation or timestamp fields.
+    bool PreflightAdapterPacket() const {
+        if (buffered_header_.endian != "le" && buffered_header_.endian != "be") return false;
+        return ValidateAdapterPacketLayout(buffered_header_.fields, buffered_buffers_);
+    }
+
+    std::optional<int64_t> AdapterScalar(const std::string& name, bool swap) const {
+        std::optional<int64_t> value;
+        for (size_t i = 0; i < buffered_header_.fields.size(); ++i) {
+            const auto& field = buffered_header_.fields[i];
+            if (field.name != name) continue;
+            if (value || field.dtype != "i64" || field.shape.size() != 1 ||
+                field.shape[0] != 1 || buffered_buffers_[i].size() != sizeof(int64_t)) return std::nullopt;
+            int64_t decoded;
+            std::memcpy(&decoded, buffered_buffers_[i].data(), sizeof(decoded));
+            value = swap ? byte_swap(decoded) : decoded;
+        }
+        return value;
+    }
+
+    bool AdapterHandRows(const std::string& name, bool swap, int frames,
+                         std::vector<std::array<double, 7>>& rows) const {
+        bool found = false;
+        for (size_t i = 0; i < buffered_header_.fields.size(); ++i) {
+            const auto& field = buffered_header_.fields[i];
+            if (field.name != name) continue;
+            if (found || field.shape.size() != 2 || field.shape[0] != frames || field.shape[1] != 7) return false;
+            found = true;
+            const size_t width = field.dtype == "f32" ? sizeof(float) : field.dtype == "f64" ? sizeof(double) : 0;
+            const auto& bytes = buffered_buffers_[i];
+            if (!width || bytes.size() != size_t(frames) * 7 * width) return false;
+            rows.resize(frames);
+            for (int frame = 0; frame < frames; ++frame) {
+                for (int joint = 0; joint < 7; ++joint) {
+                    const auto* ptr = bytes.data() + (frame * 7 + joint) * width;
+                    double value;
+                    if (width == sizeof(float)) {
+                        float item;
+                        std::memcpy(&item, ptr, sizeof(item));
+                        value = swap ? byte_swap(item) : item;
+                    } else {
+                        std::memcpy(&value, ptr, sizeof(value));
+                        if (swap) value = byte_swap(value);
+                    }
+                    if (!IsFiniteAdapterValue(value)) return false;
+                    rows[frame][joint] = value;
+                }
+            }
+        }
+        return found;
+    }
+
+    // Explicit native-v1 extension. Deadlines use CLOCK_MONOTONIC nanoseconds;
+    // sender and receiver must share the same kernel clock (our Docker test).
+    bool DecodeAdapterSchedule(StreamedMotionMerger::IncomingData& data, bool swap) const {
+        const bool tagged = HasAdapterFields();
+        if (adapter_schedule_mode_ && *adapter_schedule_mode_ != tagged) return false;
+        if (!tagged) return true;
+        if (!decode_dex3_hands_ || data.protocol_version != 1 || data.num_frames < 1 ||
+            data.num_frames > 14900 || data.num_joints != 29 || data.num_quat_bodies != 1 ||
+            data.frame_indices.size() != size_t(data.num_frames) ||
+            data.joint_pos.size() != size_t(data.num_frames) ||
+            data.joint_vel.size() != size_t(data.num_frames) ||
+            data.body_quat.size() != size_t(data.num_frames)) return false;
+        const auto session = AdapterScalar("adapter_session_id", swap);
+        const auto chunk = AdapterScalar("adapter_chunk_id", swap);
+        const auto deadline = AdapterScalar("adapter_deadline_ns", swap);
+        const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (!session || !chunk || !deadline || *session <= 0 || *chunk < 0 ||
+            *deadline <= now || *deadline - now > 30'000'000'000LL ||
+            (adapter_session_id_ >= 0 && (*session != adapter_session_id_ || *chunk <= adapter_last_chunk_id_))) return false;
+        std::vector<std::array<double, 7>> left, right;
+        if (!AdapterHandRows("left_hand_joints", swap, data.num_frames, left) ||
+            !AdapterHandRows("right_hand_joints", swap, data.num_frames, right)) return false;
+        data.adapter_reference_frames.resize(data.num_frames);
+        for (int frame = 0; frame < data.num_frames; ++frame) {
+            const auto index = data.frame_indices[frame];
+            if (index < 0 || index > 2'147'468'647LL ||
+                (frame && index != data.frame_indices[frame - 1] + 1) ||
+                data.joint_pos[frame].size() != 29 || data.joint_vel[frame].size() != 29 ||
+                data.body_quat[frame].size() != 1) return false;
+            for (double value : data.joint_pos[frame]) if (!IsFiniteAdapterValue(value)) return false;
+            for (double value : data.joint_vel[frame]) if (!IsFiniteAdapterValue(value)) return false;
+            double norm = 0;
+            for (double value : data.body_quat[frame][0]) {
+                if (!IsFiniteAdapterValue(value)) return false;
+                norm += value * value;
+            }
+            if (!(norm >= 0.998001 && norm <= 1.002001)) return false;
+            data.adapter_reference_frames[frame] = {true, *session, *chunk, index, *deadline, left[frame], right[frame]};
+        }
+        return true;
+    }
+
     std::optional<std::array<double, 7>> DecodeDex3HandFieldAt(
         int field_index, bool needs_byte_swap) const {
         if (!decode_dex3_hands_ || field_index < 0 ||
@@ -606,6 +715,9 @@ private:
     /// Called on construction, when toggling ZMQ mode, and on safety reset.
     void ResetStreamedMotion() {
         motion_merger_.Reset();
+        adapter_schedule_mode_.reset();
+        adapter_session_id_ = -1;
+        adapter_last_chunk_id_ = -1;
         active_protocol_version_ = -1;  // Reset protocol version tracking
         // Update legacy fields for backward compatibility
         streamed_motion_ = std::make_shared<MotionSequence>();
@@ -660,6 +772,10 @@ private:
         
         // Check protocol version
         int protocol_version = buffered_header_.version;
+        if ((HasAdapterFields() && protocol_version != 1) ||
+            (adapter_schedule_mode_ && *adapter_schedule_mode_ != HasAdapterFields())) return result;
+        if (HasAdapterFields() && active_protocol_version_ != -1 && active_protocol_version_ != 1) return result;
+        if (HasAdapterFields() && !PreflightAdapterPacket()) return result;
         if constexpr (DEBUG_LOGGING) {
             std::cout << "[ZMQEndpointInterface] Protocol version: " << protocol_version << std::endl;
         }
@@ -1544,13 +1660,7 @@ private:
         // ===== STEP 3: Validate protocol version (application-specific) =====
         
         // Check protocol version before merging
-        if (active_protocol_version_ == -1) {
-            // First message - establish protocol version
-            active_protocol_version_ = protocol_version;
-            if constexpr (DEBUG_LOGGING) {
-                std::cout << "[ZMQEndpointInterface] Protocol version " << active_protocol_version_ << " established" << std::endl;
-            }
-        } else if (active_protocol_version_ != protocol_version) {
+        if (active_protocol_version_ != -1 && active_protocol_version_ != protocol_version) {
             // Protocol version changed - this is an error
             std::cerr << "[ZMQEndpointInterface] ERROR: Protocol version changed from " 
                       << active_protocol_version_ << " to " << protocol_version << std::endl;
@@ -1575,6 +1685,11 @@ private:
         incoming_data.num_quat_bodies = num_quat_bodies;
         incoming_data.num_smpl_joints = num_smpl_joints;
         incoming_data.num_smpl_poses = num_smpl_poses;
+
+        if (!DecodeAdapterSchedule(incoming_data, needs_swap)) {
+            std::cerr << "[VLA adapter] Rejected invalid, expired, or replayed reference packet" << std::endl;
+            return result;
+        }
         
         // Call the reusable merger to handle sliding window logic
         auto merge_result = motion_merger_.MergeIncomingData(incoming_data, current_playback_frame);
@@ -1583,6 +1698,12 @@ private:
         if (!merge_result.motion) {
             std::cerr << "[ZMQEndpointInterface] Failed to merge incoming data" << std::endl;
             return result;
+        }
+        active_protocol_version_ = protocol_version;
+        adapter_schedule_mode_ = !incoming_data.adapter_reference_frames.empty();
+        if (*adapter_schedule_mode_) {
+            adapter_session_id_ = incoming_data.adapter_reference_frames.front().session_id;
+            adapter_last_chunk_id_ = incoming_data.adapter_reference_frames.front().chunk_id;
         }
         
         // Convert MergeResult to DecodeResult
@@ -1600,7 +1721,7 @@ private:
         result.protocol_version = merge_result.protocol_version;
         
         // Handle hand joints: set hand joint values directly from decoded data
-        if (has_left_hand_joints || has_right_hand_joints) {
+        if (!*adapter_schedule_mode_ && (has_left_hand_joints || has_right_hand_joints)) {
             has_hand_joints_ = true;
             
             if (has_left_hand_joints) {
