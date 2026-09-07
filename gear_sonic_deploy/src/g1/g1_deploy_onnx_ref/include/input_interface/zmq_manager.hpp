@@ -404,6 +404,9 @@ class ZMQManager : public InputInterface {
       } else {
         // Streamed motion mode: delegate to pose interface
         if (pose_interface_) {
+          // Network start belongs to the selected input route. The endpoint
+          // otherwise receives start only from its local keyboard handler.
+          if (start_control_ && !stop_control_) pose_interface_->start_control = true;
           pose_interface_->handle_input(motion_reader, current_motion, current_frame,
                                        operator_state, reinitialize_heading,
                                        heading_state_buffer,

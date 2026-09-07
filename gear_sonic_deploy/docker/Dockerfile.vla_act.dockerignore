@@ -1,0 +1,9 @@
+# The ACT image copies only its standalone inference and observation scripts.
+# Keep checkpoints, datasets, reports, caches, and repository history out of
+# the build context.
+**
+!gear_sonic/
+!gear_sonic/scripts/
+!gear_sonic/scripts/infer_g1_dex3_act.py
+!gear_sonic/scripts/serve_g1_dex3_act.py
+!gear_sonic/scripts/prepare_g1_act_observation.py

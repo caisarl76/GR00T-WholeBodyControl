@@ -5,8 +5,28 @@ set(EXECUTABLE_NAME g1_deploy_onnx_ref)
 # with the bare-metal deploy toolchain.
 option(BUILD_ROS2 "Build optional ROS2 input/output support" OFF)
 option(BUILD_DEPLOY_TESTS "Build deploy-side test executables" OFF)
+find_package(Eigen3 REQUIRED)
 
 if(BUILD_DEPLOY_TESTS)
+  add_executable(adapter_packet_layout_test tests/adapter_packet_layout_test.cpp)
+  target_include_directories(adapter_packet_layout_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME adapter_packet_layout_test COMMAND adapter_packet_layout_test)
+  add_executable(adapter_reference_schedule_test tests/adapter_reference_schedule_test.cpp)
+  target_include_directories(adapter_reference_schedule_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  set_target_properties(adapter_reference_schedule_test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  add_test(NAME adapter_reference_schedule_test COMMAND adapter_reference_schedule_test)
+
+  add_executable(adapter_reference_merger_test tests/adapter_reference_merger_test.cpp)
+  target_include_directories(adapter_reference_merger_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(adapter_reference_merger_test PRIVATE Eigen3::Eigen)
+  set_target_properties(adapter_reference_merger_test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  add_test(NAME adapter_reference_merger_test COMMAND adapter_reference_merger_test)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(adapter_packet_layout_test PRIVATE -UNDEBUG)
+    target_compile_options(adapter_reference_schedule_test PRIVATE -UNDEBUG)
+    target_compile_options(adapter_reference_merger_test PRIVATE -UNDEBUG)
+  endif()
+
   add_executable(dex3_hand_field_decoder_test
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/dex3_hand_field_decoder_test.cpp)
   target_include_directories(dex3_hand_field_decoder_test PRIVATE
@@ -179,8 +199,6 @@ if(BUILD_DEPLOY_TESTS AND ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
 elseif(BUILD_DEPLOY_TESTS)
   message(WARNING "⚠️  libzmq not found - skipping zmq_pose_subscriber_test")
 endif()
-
-find_package(Eigen3 REQUIRED)
 
 set(EXE_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/include/

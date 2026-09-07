@@ -42,6 +42,7 @@
 #include "../include/fk.hpp"
 #include "../include/policy_parameters.hpp"
 #include "../include/math_utils.hpp"
+#include "../include/adapter_reference_schedule.hpp"
 
 /**
  * @struct MotionSequence
@@ -56,6 +57,7 @@
  * the MotionSequence.
  */
 struct MotionSequence {
+    std::vector<AdapterReferenceFrame> adapter_reference_frames;
     std::string name = "";    ///< Human-readable motion name (folder name or "streamed" / "planner_motion").
     int timesteps = 0;        ///< Total number of frames in this motion.
 

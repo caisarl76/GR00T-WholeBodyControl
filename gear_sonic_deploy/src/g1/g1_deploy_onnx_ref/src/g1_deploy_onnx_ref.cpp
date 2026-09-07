@@ -217,6 +217,14 @@ class G1Deploy {
     int current_frame_ = 0;
     int saved_frame_for_observation_window_ = 0; // for observation window
     std::mutex current_motion_mutex_; // for current motion and frame synchronization
+    // Last successfully commanded body/hand pair, used for adapter lease expiry.
+    std::array<double, 29> adapter_applied_body_{};
+    std::array<double, 4> adapter_applied_quat_{1, 0, 0, 0};
+    std::array<double, 7> adapter_applied_left_{}, adapter_applied_right_{};
+    AdapterReferenceFrame adapter_applied_row_{};
+    bool adapter_have_applied_ = false;
+    std::ofstream adapter_trace_;
+    bool adapter_trace_initialized_ = false;
     
     // =========================================================================
     // Local motion planner and movement state
@@ -4006,8 +4014,51 @@ class G1Deploy {
           int current_encoder_mode_copy;
           bool current_play_copy;
           std::shared_ptr<const MotionSequence> current_motion_copy = nullptr;
+          bool adapter_tick = false;
+          bool adapter_expired_hold = false;
+          AdapterReferenceFrame adapter_tick_row{};
           {
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
+            if (current_motion_ && !current_motion_->adapter_reference_frames.empty()) {
+              adapter_tick = true;
+              has_upper_body_data_ = false;
+              const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch()).count();
+              bool fresh = current_frame_ >= 0 && current_frame_ < current_motion_->timesteps;
+              // v1.1 mode 0 consumes ten future samples with stride five.
+              for (int offset = 0; fresh && offset <= 45; offset += 5) {
+                const int idx = std::min(current_frame_ + offset, current_motion_->timesteps - 1);
+                const auto& row = current_motion_->adapter_reference_frames.at(idx);
+                fresh = row.valid && row.expires_at_ns > now_ns;
+              }
+              if (!fresh || current_motion_->name == "adapter_expired_hold") {
+                adapter_expired_hold = true;
+                operator_state.play = false;
+                if (!adapter_have_applied_) {
+                  // No successful controller command exists to hold yet.
+                  operator_state.stop = true;
+                  return;
+                }
+                if (current_motion_->name != "adapter_expired_hold") {
+                  auto hold = std::make_shared<MotionSequence>(*current_motion_);
+                  hold->name = "adapter_expired_hold";
+                  for (int frame = 0; frame < hold->timesteps; ++frame) {
+                    std::copy(adapter_applied_body_.begin(), adapter_applied_body_.end(), hold->JointPositions(frame));
+                    std::fill_n(hold->JointVelocities(frame), 29, 0.0);
+                    hold->BodyQuaternions(frame)[0] = adapter_applied_quat_;
+                    hold->adapter_reference_frames[frame] = adapter_applied_row_;
+                  }
+                  current_motion_ = hold;
+                }
+                left_hand_joint_buffer_ = adapter_applied_left_;
+                right_hand_joint_buffer_ = adapter_applied_right_;
+                adapter_tick_row = adapter_applied_row_;
+              } else {
+                adapter_tick_row = current_motion_->adapter_reference_frames.at(current_frame_);
+                left_hand_joint_buffer_ = adapter_tick_row.left;
+                right_hand_joint_buffer_ = adapter_tick_row.right;
+              }
+            }
             current_frame_copy = current_frame_;
             current_motion_copy = current_motion_;
             current_encoder_mode_copy = current_motion_copy->GetEncodeMode();
@@ -4065,6 +4116,37 @@ class G1Deploy {
           }
           
           auto hand_joint_end_time = std::chrono::steady_clock::now();
+
+          // Commit only after policy and hand commands were successfully created.
+          if (current_motion_copy && current_motion_copy->GetNumJoints() == 29 &&
+              current_motion_copy->GetNumBodyQuaternions() > 0) {
+            std::copy_n(current_motion_copy->JointPositions(current_frame_copy), 29, adapter_applied_body_.begin());
+            adapter_applied_quat_ = current_motion_copy->BodyQuaternions(current_frame_copy)[0];
+            adapter_applied_left_ = left_hand_joint_buffer_;
+            adapter_applied_right_ = right_hand_joint_buffer_;
+            adapter_applied_row_ = adapter_tick_row;
+            adapter_have_applied_ = true;
+          }
+          if (adapter_tick) {
+            if (!adapter_trace_initialized_) {
+              if (const char* path = std::getenv("SONIC_ADAPTER_TRACE")) adapter_trace_.open(path);
+              adapter_trace_initialized_ = true;
+            }
+            if (adapter_trace_) {
+              const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch()).count();
+              nlohmann::json row = {
+                {"monotonic_ns", now_ns}, {"mode", adapter_expired_hold ? "expired_hold" : "active"},
+                {"encoder_mode", current_motion_copy->GetEncodeMode()},
+                {"session_id", adapter_tick_row.session_id}, {"chunk_id", adapter_tick_row.chunk_id},
+                {"reference_frame", adapter_tick_row.reference_frame}, {"deadline_ns", adapter_tick_row.expires_at_ns},
+                {"body_reference_isaac", adapter_applied_body_}, {"left_hand_reference", adapter_applied_left_},
+                {"right_hand_reference", adapter_applied_right_}, {"token", token_state_data_}
+              };
+              adapter_trace_ << row.dump() << '\n';
+              adapter_trace_.flush();
+            }
+          }
 
           // Publish output data (state logger data, robot config, command/motion data) to all output interfaces
           for (auto& output_interface : output_interfaces_) {

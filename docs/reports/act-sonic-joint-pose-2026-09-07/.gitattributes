@@ -1,0 +1,3 @@
+# Keep these small report images directly readable on GitHub without LFS.
+*.png -filter -diff -merge
+*.csv text eol=lf

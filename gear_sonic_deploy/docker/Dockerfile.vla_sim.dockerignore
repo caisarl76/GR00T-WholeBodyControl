@@ -1,0 +1,29 @@
+# Keep the simulation build context limited to the package, native deployment
+# tree, robot meshes, and bundled third-party/native dependencies. This image
+# needs those assets even though generated reports and model files are mounted
+# at runtime.
+**
+!gear_sonic/
+!gear_sonic/**
+!gear_sonic_deploy/
+!gear_sonic_deploy/**
+!external_dependencies/
+!external_dependencies/unitree_sdk2_python/
+!external_dependencies/unitree_sdk2_python/**
+# Exclude generated content inside the otherwise included source trees.
+**/.git
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/build
+**/target
+**/outputs
+**/logs
+**/.venv*
+**/*.onnx
+**/*.pt
+**/*.pth
+**/*.ckpt
+**/*.safetensors
+**/*.engine

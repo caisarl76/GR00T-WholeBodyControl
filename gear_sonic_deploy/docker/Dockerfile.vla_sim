@@ -1,0 +1,55 @@
+# Build from the repository root. The VLA uses a separate Python environment.
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu22.04
+FROM ${CUDA_IMAGE}
+
+ARG TENSORRT_VERSION=10.13.3.9-1+cuda12.9
+ARG ONNXRUNTIME_VERSION=1.16.3
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config git git-lfs curl ca-certificates \
+    python3 python3-dev python3-venv python3-pip \
+    libyaml-cpp-dev libeigen3-dev libmsgpack-dev libzmq3-dev \
+    nlohmann-json3-dev libgtest-dev zlib1g-dev \
+    libgl1 libegl1 libosmesa6 libglfw3 libglib2.0-0 libxrender1 libxext6 \
+    libnvinfer-dev=${TENSORRT_VERSION} \
+    libnvinfer10=${TENSORRT_VERSION} \
+    libnvinfer-plugin-dev=${TENSORRT_VERSION} \
+    libnvinfer-plugin10=${TENSORRT_VERSION} \
+    libnvonnxparsers-dev=${TENSORRT_VERSION} \
+    libnvonnxparsers10=${TENSORRT_VERSION} \
+    libnvinfer-headers-dev=${TENSORRT_VERSION} \
+    libnvinfer-headers-plugin-dev=${TENSORRT_VERSION} \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl --fail --location --retry 3 \
+    https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz \
+    -o /tmp/onnxruntime.tgz \
+    && mkdir -p /opt/onnxruntime \
+    && tar -xzf /tmp/onnxruntime.tgz --strip-components=1 -C /opt/onnxruntime \
+    && rm /tmp/onnxruntime.tgz
+
+RUN python3 -m venv /opt/sonic-sim \
+    && /opt/sonic-sim/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/sonic-sim/bin/pip install --no-cache-dir \
+       torch==2.8.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+ENV PATH=/opt/sonic-sim/bin:${PATH}
+ENV CUDA_HOME=/usr/local/cuda
+ENV onnxruntime_ROOT=/opt/onnxruntime
+ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV MUJOCO_GL=osmesa
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /workspace/GR00T-WholeBodyControl
+COPY gear_sonic ./gear_sonic
+COPY external_dependencies/unitree_sdk2_python ./external_dependencies/unitree_sdk2_python
+RUN pip install --no-cache-dir -e 'gear_sonic[sim,vla_tools]' \
+    -e external_dependencies/unitree_sdk2_python pytest
+COPY gear_sonic_deploy ./gear_sonic_deploy
+RUN cmake -S gear_sonic_deploy -B /opt/sonic-build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_ROS2=OFF -DBUILD_DEPLOY_TESTS=ON \
+    -DTensorRT_FIND_COMPONENTS='nvinfer;nvinfer_plugin;nvonnxparser' \
+    && cmake --build /opt/sonic-build --parallel 8
+
+# Runtime launcher must explicitly select simulation and loopback DDS.
+# Model artifacts and run outputs are mounted separately by the test launcher.
+CMD ["python", "gear_sonic/scripts/run_vla_adapter_sim.py", "--help"]

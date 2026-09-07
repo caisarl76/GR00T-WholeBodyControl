@@ -1,0 +1,13 @@
+{
+  "tests_passed": 18,
+  "ruff": "passed",
+  "diff_check": "passed",
+  "independent_reference_recomposition_max_error": 0.0,
+  "native_reference_max_error_rad": 0.0,
+  "source_sha256": {
+    "gear_sonic/scripts/compare_g1_act_sonic_joints.py": "69e39e86b6734529dbf3838474b278eaeafc7bfe0faadfeb65fc39aed5a97424",
+    "gear_sonic/scripts/compare_g1_act_hand_poses.py": "3160309f4b71555e26b09d99678821d22890ac6361e54805df625676eb9852df",
+    "gear_sonic/tests/test_g1_act_joint_comparison.py": "ec04d143f591961c83b03302a1db95c70d905f231a3fa7a0f04ce97ee60a70ed",
+    "gear_sonic/tests/test_g1_act_hand_poses.py": "aad36f8d8799e3d06d79fc3fcc74f4f72833159fabb754d74099d31d20737e4b"
+  }
+}

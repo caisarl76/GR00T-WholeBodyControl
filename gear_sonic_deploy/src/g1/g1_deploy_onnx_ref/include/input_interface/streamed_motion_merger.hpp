@@ -50,6 +50,7 @@
 #include <iostream>
 #include <iomanip>
 #include <cstring>
+#include "../adapter_reference_schedule.hpp"
 
 // Forward declaration – MotionSequence is defined in motion_data_reader.hpp.
 struct MotionSequence;
@@ -93,6 +94,7 @@ public:
         std::vector<std::vector<std::array<double, 3>>> smpl_pose;    ///< [frame][pose][axis-angle x,y,z].
         
         std::vector<int64_t> frame_indices;  ///< Monotonic global frame indices (required).
+        std::vector<AdapterReferenceFrame> adapter_reference_frames;
         
         int protocol_version = 1;    ///< Protocol version (1, 2, or 3).
         bool catch_up_enabled = true; ///< true → use MAX_GAP_FRAMES; false → allow infinite delay.
@@ -159,6 +161,11 @@ public:
             merge_dst_frame,
             did_catchup
         );
+        if (!data.adapter_reference_frames.empty() &&
+            (merge_dst_frame < 0 || data.num_frames > 15000 - merge_dst_frame)) {
+            std::cerr << "[StreamedMotionMerger] Adapter schedule exceeds motion capacity" << std::endl;
+            return result;
+        }
         
         // Create new motion sequence
         auto new_motion = CreateNewMotion(data);
@@ -218,6 +225,10 @@ private:
             std::cerr << "[StreamedMotionMerger] Missing required fields (body_quat or frame_indices)" << std::endl;
             return false;
         }
+        if (!ValidateAdapterReferenceFrames(data.adapter_reference_frames, data.num_frames, data.frame_indices)) return false;
+        if (!data.adapter_reference_frames.empty() &&
+            (data.protocol_version != 1 || data.num_frames > 15000 ||
+             data.num_joints != 29 || data.num_quat_bodies != 1)) return false;
         
         // Validate protocol-specific requirements
         if (data.protocol_version == 3) {
@@ -366,6 +377,7 @@ private:
         
         // Initialize body_part_indexes (typically just root for streaming)
         new_motion->SetBodyPartIndexes({0});
+        if (!data.adapter_reference_frames.empty()) new_motion->adapter_reference_frames.resize(15000);
         
         return new_motion;
     }
@@ -383,7 +395,6 @@ private:
         if (!old_motion || old_motion->timesteps <= 0) {
             return;
         }
-        
         int old_window_end = old_window_start + frame_step * old_motion->timesteps;
         
         // Find overlap between old data and needed range
@@ -403,6 +414,9 @@ private:
         int copy_src_idx = (frame_step > 0) ? (start_offset_old / frame_step) : 0;
         int copy_dst_idx = (frame_step > 0) ? (start_offset_new / frame_step) : 0;
         int copy_count = (frame_step > 0) ? (overlap_span / frame_step) : 0;
+        if (!old_motion->adapter_reference_frames.empty() && !new_motion->adapter_reference_frames.empty()) {
+            for (int i = 0; i < copy_count; ++i) new_motion->adapter_reference_frames[copy_dst_idx + i] = old_motion->adapter_reference_frames[copy_src_idx + i];
+        }
         
         if constexpr (DEBUG_LOGGING) {
             std::cout << "[StreamedMotionMerger] Copying old data: "
@@ -467,6 +481,11 @@ private:
         std::shared_ptr<MotionSequence> motion,
         int dst_frame_offset
     ) {
+        if (!data.adapter_reference_frames.empty()) {
+            for (int frame = 0; frame < data.num_frames; ++frame) {
+                motion->adapter_reference_frames[dst_frame_offset + frame] = data.adapter_reference_frames[frame];
+            }
+        }
         // Copy joint data if present
         if (!data.joint_pos.empty() && !data.joint_vel.empty()) {
             for (int frame = 0; frame < data.num_frames; ++frame) {
@@ -514,4 +533,3 @@ private:
 };
 
 #endif // STREAMED_MOTION_MERGER_HPP
-

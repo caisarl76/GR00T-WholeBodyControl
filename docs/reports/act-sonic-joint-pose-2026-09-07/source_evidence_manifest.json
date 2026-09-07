@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "description": "Saved numerical evidence for corrected-act-run6; no checkpoints or dataset images.",
+  "files": {
+    "native.jsonl": "a045e5c598d1387ce34dbda304a95d2f09b07f667855df972132195b17630b44",
+    "sim/observations.jsonl": "6718f11e313e3476e15e9283ceeda4830c3233bd6c8209901848d00d6ee59876",
+    "sim/joint_contract.json": "043080f9b2a318ca4f12fbf581a3c1511b24250f1c11a61ed851d8b559fd5150",
+    "replay/actions.npy": "4a765e266f3dbdcec514752b3050a0897eaad197c82aaef40d78cdf5a5c71eb1",
+    "replay/reference.npz": "12432343984c09402fd3de478111430d408e8c8e4d54819a09f0511f97e5c797",
+    "replay/composition.json": "3a89d7a95c6b02ddff457444060602fd9db343f3f5bf4cc90408cd01b39d42b5",
+    "replay/grounded_baseline.json": "87da404845d48e70d8d3d04b0a7b518f4c16c06fed54760293793f8b70151519",
+    "result-video/render-manifest.json": "33c5145fd85fe2c766ba6f077270fdecbbb1018fd8e51dede58918f259b6793d"
+  },
+  "archive_sha256": "0abdf632587462347a258912346529cc97af5902c594d5efa2025c0a553be6d3"
+}
