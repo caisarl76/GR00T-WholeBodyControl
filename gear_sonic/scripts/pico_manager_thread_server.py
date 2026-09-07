@@ -747,28 +747,146 @@ def process_smpl_joints(body_pose, global_orient, transl):
     }
 
 
-def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
-    """
-    Generate finger position data from Pico controller button states.
+_PINCH_OPEN_GRIP = 0.2
+# Dex3 deployment motor_cmd order, shared with dex3_hands.hpp.
+DEX3_MOTOR_ORDER = (
+    "thumb0",
+    "thumb1",
+    "thumb2",
+    "middle0",
+    "middle1",
+    "index0",
+    "index1",
+)
+# Median right-hand states captured from rt/dex3/right/state.
+_RIGHT_PINCH_OPEN = np.array(
+    [
+        0.40253138542175293,
+        -0.1496349275112152,
+        -0.016162125393748283,
+        0.6290951371192932,
+        -0.03359885886311531,
+        -0.02111954055726528,
+        -0.030526945367455482,
+    ],
+    dtype=np.float64,
+)
+_RIGHT_PINCH_CLOSED = np.array(
+    [
+        0.4024966359138489,
+        -0.7084636688232422,
+        -0.01614512875676155,
+        1.4996159076690674,
+        -0.033972788602113724,
+        -0.021152639761567116,
+        -0.030526945367455482,
+    ],
+    dtype=np.float64,
+)
+_DEX3_HAND_MIRROR = np.array(
+    [1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float64
+)
 
-    Args:
-        hand: "left" or "right"
-        trigger: Trigger button value (0-1)
-        grip: Grip button value (0-1)
 
-    Returns:
-        Array of shape [25, 4, 4] representing fingertip positions
-    """
+def _pinch_endpoints(hand: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return hardware-calibrated open/closed pinch endpoints for one hand."""
+    hand = hand.lower()
+    if hand == "right":
+        return _RIGHT_PINCH_OPEN.copy(), _RIGHT_PINCH_CLOSED.copy()
+    if hand == "left":
+        return (
+            _RIGHT_PINCH_OPEN * _DEX3_HAND_MIRROR,
+            _RIGHT_PINCH_CLOSED * _DEX3_HAND_MIRROR,
+        )
+    raise ValueError("hand must be 'left' or 'right'")
+
+
+def compute_pinch_joints(hand: str, grip: float) -> np.ndarray:
+    """Map Grip/Squeeze to ALL_OPEN -> PINCH_OPEN -> PINCH_CLOSED."""
+    grip = float(grip)
+    if not np.isfinite(grip):
+        grip = 0.0
+    grip = float(np.clip(grip, 0.0, 1.0))
+
+    pinch_open, pinch_closed = _pinch_endpoints(hand)
+    if grip <= _PINCH_OPEN_GRIP:
+        alpha = grip / _PINCH_OPEN_GRIP
+        return alpha * pinch_open
+
+    alpha = (grip - _PINCH_OPEN_GRIP) / (1.0 - _PINCH_OPEN_GRIP)
+    return pinch_open + alpha * (pinch_closed - pinch_open)
+
+
+def generate_grasp_finger_data(hand: str, trigger: float) -> np.ndarray:
+    """Generate synthetic fingertip data for the existing Dex3 grasp."""
     fingertips = np.zeros([25, 4, 4])
 
     thumb = 0
     middle = 10
-    # Control thumb based on shoulder button state (index 4 is thumb tip)
-    fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
+    fingertips[4 + thumb, 0, 3] = 1.0
     if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+        fingertips[4 + middle, 0, 3] = 1.0
 
     return fingertips
+
+
+class DataCollectionChordTracker:
+    """Recognize recording chords without consuming multi-button controls."""
+
+    _COLLECTION = "collection"
+    _ABORT = "abort"
+    _INVALID = "invalid"
+
+    def __init__(self):
+        self._candidate = None
+
+    def update(
+        self,
+        a_pressed: bool,
+        b_pressed: bool,
+        x_pressed: bool,
+        y_pressed: bool,
+        left_grip: float,
+    ) -> tuple[bool, bool]:
+        """Commit a clean Grip+A or Grip+B gesture when face buttons release."""
+        a_pressed = bool(a_pressed)
+        b_pressed = bool(b_pressed)
+        x_pressed = bool(x_pressed)
+        y_pressed = bool(y_pressed)
+        face_buttons_pressed = a_pressed or b_pressed or x_pressed or y_pressed
+        grip_active = left_grip > 0.5
+
+        if not face_buttons_pressed:
+            result = (
+                self._candidate == self._COLLECTION and grip_active,
+                self._candidate == self._ABORT and grip_active,
+            )
+            self._candidate = None
+            return result
+
+        if self._candidate == self._INVALID:
+            return False, False
+
+        if not grip_active:
+            self._candidate = self._INVALID
+            return False, False
+
+        collection_chord = a_pressed and not (b_pressed or x_pressed or y_pressed)
+        abort_chord = b_pressed and not (a_pressed or x_pressed or y_pressed)
+
+        if self._candidate is None:
+            if collection_chord:
+                self._candidate = self._COLLECTION
+            elif abort_chord:
+                self._candidate = self._ABORT
+            else:
+                self._candidate = self._INVALID
+        elif self._candidate == self._COLLECTION and not collection_chord:
+            self._candidate = self._INVALID
+        elif self._candidate == self._ABORT and not abort_chord:
+            self._candidate = self._INVALID
+
+        return False, False
 
 
 # Joystick deadzone threshold
@@ -1009,6 +1127,14 @@ def get_abxy_buttons(reader=None):
         return False, False, False, False
 
 
+def _compute_hand_joints_for_inputs(solver, hand, trigger, grip) -> np.ndarray:
+    """Dispatch one hand to higher-priority grasp or calibrated pinch."""
+    if trigger > 0.5:
+        finger_data = generate_grasp_finger_data(hand, trigger)
+        return solver({"position": finger_data})
+    return compute_pinch_joints(hand, grip)
+
+
 def compute_hand_joints_from_inputs(
     left_solver,
     right_solver,
@@ -1029,10 +1155,12 @@ def compute_hand_joints_from_inputs(
         raise ValueError(f"unsupported hand profile: {hand_profile}")
 
     if left_solver is not None and right_solver is not None:
-        left_finger_data = generate_finger_data("left", left_trigger, left_grip)
-        right_finger_data = generate_finger_data("right", right_trigger, right_grip)
-        left_hand_joints = left_solver({"position": left_finger_data})
-        right_hand_joints = right_solver({"position": right_finger_data})
+        left_hand_joints = _compute_hand_joints_for_inputs(
+            left_solver, "left", left_trigger, left_grip
+        )
+        right_hand_joints = _compute_hand_joints_for_inputs(
+            right_solver, "right", right_trigger, right_grip
+        )
     else:
         left_hand_joints = np.zeros((1, 7), dtype=np.float32)
         right_hand_joints = np.zeros((1, 7), dtype=np.float32)
@@ -1856,9 +1984,7 @@ class PoseStreamer:
         self.next_target_ns = None
         self.frame_start = time.time()
 
-        # Data collection button state tracking (edge-triggered)
-        self.toggle_data_collection_last = False
-        self.toggle_data_abort_last = False
+        self.data_collection_chords = DataCollectionChordTracker()
 
         self.buffer_cleared = (
             True  # Start with buffer cleared - wait for full buffer before first send
@@ -1914,17 +2040,13 @@ class PoseStreamer:
         # Get A and B button states for data collection control
         a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(self.reader)
 
-        # Data collection toggle logic (edge-triggered)
-        # Left grip + A = toggle_data_collection
-        # Left grip + B = toggle_data_abort
-        toggle_data_collection_tmp = a_pressed and left_grip > 0.5
-        toggle_data_abort_tmp = b_pressed and left_grip > 0.5
-
-        # Detect rising edge
-        toggle_data_collection = toggle_data_collection_tmp and not self.toggle_data_collection_last
-        toggle_data_abort = toggle_data_abort_tmp and not self.toggle_data_abort_last
-        self.toggle_data_collection_last = toggle_data_collection_tmp
-        self.toggle_data_abort_last = toggle_data_abort_tmp
+        toggle_data_collection, toggle_data_abort = self.data_collection_chords.update(
+            a_pressed,
+            b_pressed,
+            x_pressed,
+            y_pressed,
+            left_grip,
+        )
 
         left_hand_joints, right_hand_joints = self.compute_hand_joints(
             left_trigger, left_grip, right_trigger, right_grip
@@ -2600,7 +2722,7 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
 
-        # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
+        # Hand IK solvers for Dex3 trigger grasp and grip/squeeze pinch in VR 3PT mode
         if hand_profile == "inspire_ftp":
             self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
         elif hand_profile == "dex3":
@@ -3108,8 +3230,7 @@ def run_pico_manager(
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
-    prev_toggle_dc = False
-    prev_toggle_da = False
+    data_collection_chords = DataCollectionChordTracker()
     xr_watchdog = XRStalenessWatchdog()
     if disable_xr_staleness_watchdog:
         print("WARNING: XR staleness watchdog disabled.")
@@ -3320,12 +3441,13 @@ def run_pico_manager(
                 current_mode = new_mode
 
             # Mode-independent: send manager_state for data exporter
-            toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
-            toggle_da_tmp = bool(b_pressed) and left_grip_mgr > 0.5
-            toggle_dc = toggle_dc_tmp and not prev_toggle_dc
-            toggle_da = toggle_da_tmp and not prev_toggle_da
-            prev_toggle_dc = toggle_dc_tmp
-            prev_toggle_da = toggle_da_tmp
+            toggle_dc, toggle_da = data_collection_chords.update(
+                a_pressed,
+                b_pressed,
+                x_pressed,
+                y_pressed,
+                left_grip_mgr,
+            )
             socket.send(
                 pack_pose_message(
                     {
