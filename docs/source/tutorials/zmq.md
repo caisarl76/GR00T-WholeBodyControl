@@ -164,6 +164,18 @@ the thumb-middle pinch-open pre-shape, and `1.0` brings the thumb and middle
 fingertips together. Motion is linearly interpolated from all-open to pinch-open
 over `0.0–0.2`, then from pinch-open to pinch-closed over `0.2–1.0`.
 
+To inspect the calibrated right-hand stages without starting deployment, install the
+`gear_sonic[sim]` dependencies and fetch the repository's Git LFS hand meshes, then run
+from the repository root:
+
+```sh
+PYTHONPATH=. MUJOCO_GL=egl python gear_sonic/scripts/render_dex3_pinch_primitive.py \
+  --output outputs/dex3_thumb_middle_pinch.png
+```
+
+The static image shows all-open, pinch-open, intermediate, and pinch-closed poses
+with the seven motor commands. `MUJOCO_GL=egl` selects headless rendering on Linux.
+
 All mode control on the deployment side is done from the keyboard:
 
 | Key | Action |
