@@ -1,0 +1,16 @@
+{
+  "fresh_archive_extraction": "passed",
+  "all_packaged_input_sha256": "passed",
+  "numeric_baseline_comparison": "passed",
+  "samples": 977,
+  "focused_tests_passed": 18,
+  "ruff": "passed",
+  "relative_document_links": "passed",
+  "tested_platform": "macOS, Python 3.11, MuJoCo 3.3.7",
+  "ubuntu_docker_build": "not executed",
+  "comparison_tool_commits": [
+    "73fd5c5",
+    "41ea1c8"
+  ],
+  "reproduce_script_sha256": "9eaad5671be65d5416bfbdf7d2e084d701cdb8b0a386ea90b4c1eb250e46db20"
+}

@@ -5,6 +5,13 @@ SONIC v1.1 and MuJoCo G1 with two Dex3 hands. It uses recorded observations from
 the first episode of Unitree's ToastedBread dataset. The result validates action
 transport, standing startup, and measured arm/hand movement.
 
+The follow-up [joint and palm comparison](../../reports/act-sonic-joint-pose-2026-09-07/README.md)
+includes all 28 joint errors, hand position/orientation plots, the numerical
+source evidence, and Ubuntu reproduction commands. It confirms exact reference
+transport but does not establish identical ACT and measured actions. Raw ACT
+versus measured palm error is 1.98 cm / 6.50° RMS on the left and
+3.84 cm / 8.47° RMS on the right.
+
 ![Confirmed G1 and both Dex3 hands](../_static/vla_adapter/confirmed-action.png)
 
 ## Startup and reference execution
