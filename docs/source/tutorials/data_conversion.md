@@ -103,9 +103,9 @@ The command succeeds only if all five selected episodes validate and merge. Chec
 
 The main target action fields are:
 
-- `action.motion_token`: float32 `[64]` SONIC token generated from nominal standing legs/waist plus the source arm trajectory.
+- `action.motion_token`: float64 `[64]` SONIC token generated from nominal standing legs/waist plus the source arm trajectory.
 - `teleop.left_hand_joints` and `teleop.right_hand_joints`: float32 `[7]` raw, side-specific Dex3 DDS commands.
-- `action.wbc`: float32 `[43]` absolute 29-body + 14-hand target in RobotModel field order.
+- `action.wbc`: float64 `[43]` absolute 29-body + 14-hand target in RobotModel field order.
 
 The converter does not clip joint values, repair quaternions, cross episode boundaries, or substitute cameras.
 
