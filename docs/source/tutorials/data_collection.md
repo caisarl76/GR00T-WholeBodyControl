@@ -372,7 +372,7 @@ There are two ways to control recording: **PICO VR controllers** (recommended du
 | **Left Grip + A** | **Toggle** recording — starts a new episode, or stops and saves the current one |
 | **Left Grip + B** | **Discard** the current episode (saved to disk but flagged for removal during post-processing) |
 
-These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent of the mode-switching controls.
+These exact chords work in any manager mode (POSE, PLANNER, etc.) and are independent of the mode-switching controls. Hold Left Grip through pressing and releasing A or B; the recording command is committed when the face button is released. Keep the other face buttons released, because combinations such as A+X, B+Y, A+B, and A+B+X+Y remain reserved for mode and policy control.
 
 **Keyboard over ZMQ:**
 

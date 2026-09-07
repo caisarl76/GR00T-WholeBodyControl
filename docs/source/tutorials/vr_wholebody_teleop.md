@@ -258,7 +258,8 @@ Below is the **recovery procedure** — if you accidentally enter a badly calibr
 | **Toggle POSE** | **A+X** | Switches between PLANNER ↔ POSE. OR from VR_3PT (entered via PLANNER) → POSE. |
 | **Toggle PLANNER_FROZEN_UPPER** | **B+Y** | Switches between POSE ↔ PLANNER_FROZEN_UPPER. From VR_3PT, freezes the current upper-body state and enters PLANNER_FROZEN_UPPER. |
 | **Toggle VR_3PT** | **Left Stick Click** | From any Planner mode → VR_3PT (triggers CALIB). Click again to return. |
-| **Hand grasp** | **Trigger** (per hand) | Controls the corresponding hand's grasp. |
+| **Dex3 hand grasp** | **Trigger** (per hand) | Controls the existing grasp in POSE and VR_3PT modes. Above `0.5` overrides pinch on that hand. |
+| **Dex3 hand pinch** | **Grip/Squeeze** (per hand) | Controls an analog two-stage thumb-middle pinch in POSE and VR_3PT modes: all-open at `0.0`, thumb-middle pre-shape at `0.2`, and fingertip contact at `1.0`. |
 
 ### Joystick Controls (Planner Modes)
 
