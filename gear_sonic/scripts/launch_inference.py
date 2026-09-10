@@ -5,10 +5,10 @@ Starts the inference stack in a single tmux session:
 
     Window 0 — inference (4 panes):
     ┌───────────────────────┬───────────────────────┐
-    │ Pane 0: C++ Deploy    │ Pane 1: VLA Inference │
+    │ Pane 0: C++ Deploy    │ Pane 2: VLA Inference │
     │ (gear_sonic_deploy)   │ (.venv_inference)     │
     ├───────────────────────┼───────────────────────┤
-    │ Pane 2: Keyboard Pub  │ Pane 3: Data Exporter │
+    │ Pane 1: Keyboard Pub  │ Pane 3: Data Exporter │
     │ (.venv_inference)     │ (.venv_data_collection)│
     └───────────────────────┴───────────────────────┘
 
@@ -30,15 +30,16 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_inference.py                        # real robot
     python gear_sonic/scripts/launch_inference.py --sim                  # MuJoCo sim
     python gear_sonic/scripts/launch_inference.py --no-data-exporter     # no recording pane
+    python gear_sonic/scripts/launch_pnp_trash_left_eval.py full         # external PC2 deploy
 """
 
-from dataclasses import dataclass
-from pathlib import Path
-import os
-import shutil
-import signal
-import socket
 import base64
+from dataclasses import dataclass
+import os
+from pathlib import Path
+import shlex
+import shutil
+import socket
 import subprocess
 import sys
 import textwrap
@@ -49,6 +50,7 @@ def _bootstrap_venv():
     """Re-exec with the .venv_inference Python if tyro is not available."""
     try:
         import tyro  # noqa: F401
+
         return
     except ImportError:
         pass
@@ -68,7 +70,7 @@ def _bootstrap_venv():
 
 _bootstrap_venv()
 
-import tyro
+import tyro  # noqa: E402
 
 
 def _get_local_ip() -> str:
@@ -90,6 +92,15 @@ class InferenceLaunchConfig:
     # Deployment mode
     sim: bool = False
     """Run against MuJoCo sim instead of real robot."""
+
+    deploy: bool = True
+    """Start the local C++ deploy process."""
+
+    state_zmq_host: str = "localhost"
+    """Host serving robot state."""
+
+    action_zmq_host: str = "localhost"
+    """Local address to bind the action publisher; the external controller subscribes here."""
 
     # C++ deploy options
     deploy_input_type: str = "zmq_manager"
@@ -166,15 +177,12 @@ def _check_prerequisites(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
     if not (repo_root / ".venv_inference" / "bin" / "activate").exists():
-        errors.append(
-            ".venv_inference not found. Run: bash install_scripts/install_inference.sh"
-        )
+        errors.append(".venv_inference not found. Run: bash install_scripts/install_inference.sh")
 
     deploy_dir = repo_root / "gear_sonic_deploy"
-    if not (deploy_dir / "deploy.sh").exists():
+    if config.deploy and not (deploy_dir / "deploy.sh").exists():
         errors.append(
-            f"gear_sonic_deploy/deploy.sh not found at {deploy_dir}. "
-            "Ensure the deploy directory is set up."
+            f"gear_sonic_deploy/deploy.sh not found at {deploy_dir}. Ensure the deploy directory is set up."
         )
 
     if config.data_exporter:
@@ -185,9 +193,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             )
 
     if config.sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
-        errors.append(
-            ".venv_sim not found. Set up the simulation venv first."
-        )
+        errors.append(".venv_sim not found. Set up the simulation venv first.")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -197,11 +203,8 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         sys.exit(1)
 
 
-def _kill_existing_session():
-    subprocess.run(
-        ["tmux", "kill-session", "-t", SESSION_NAME],
-        capture_output=True,
-    )
+def _session_exists() -> bool:
+    return subprocess.run(["tmux", "has-session", "-t", SESSION_NAME], capture_output=True).returncode == 0
 
 
 def _create_tmux_session():
@@ -210,10 +213,7 @@ def _create_tmux_session():
         check=True,
     )
     subprocess.run(
-        ["tmux", "set-option", "-t", SESSION_NAME, "-g", "mouse", "on"],
-    )
-    subprocess.run(
-        ["tmux", "bind-key", "-T", "root", "C-\\", "kill-session"],
+        ["tmux", "set-option", "-t", SESSION_NAME, "mouse", "on"],
     )
     subprocess.run(
         ["tmux", "rename-window", "-t", f"{SESSION_NAME}:0", "inference"],
@@ -254,8 +254,13 @@ def _check_pane_alive(pane_index: int) -> bool:
 def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
+    if config.sim and not config.deploy:
+        print("ERROR: --sim cannot be combined with --no-deploy.")
+        sys.exit(2)
     _check_prerequisites(config)
-    _kill_existing_session()
+    if _session_exists():
+        print(f"Session '{SESSION_NAME}' already exists; reattach with: tmux attach -t {SESSION_NAME}")
+        sys.exit(1)
 
     exporter_prompt = config.task_prompt if config.task_prompt else config.prompt
 
@@ -285,7 +290,7 @@ def main(config: InferenceLaunchConfig):
             ["tmux", "new-window", "-t", SESSION_NAME, "-n", "sim"],
         )
         sim_cmd = (
-            f"cd {repo_root} && "
+            f"cd {shlex.quote(str(repo_root))} && "
             f"source .venv_sim/bin/activate && "
             f"python gear_sonic/scripts/run_sim_loop.py "
             f"--enable-image-publish --enable-offscreen "
@@ -303,39 +308,49 @@ def main(config: InferenceLaunchConfig):
         )
 
     # --- Pane 0 (top-left): C++ Deploy ---
-    deploy_mode = "sim" if config.sim else "real"
-    deploy_cmd = (
-        f"cd {repo_root / 'gear_sonic_deploy'} && "
-        f"./deploy.sh "
-        f"--input-type {config.deploy_input_type} "
-        f"--zmq-host {config.deploy_zmq_host} "
-    )
-    if config.deploy_checkpoint:
-        deploy_cmd += f"--cp {config.deploy_checkpoint} "
-    if config.deploy_obs_config:
-        deploy_cmd += f"--obs-config {config.deploy_obs_config} "
-    if config.deploy_planner:
-        deploy_cmd += f"--planner {config.deploy_planner} "
-    if config.deploy_motion_data:
-        deploy_cmd += f"--motion-data {config.deploy_motion_data} "
-    if config.deploy_output_type:
-        deploy_cmd += f"--output-type {config.deploy_output_type} "
-    deploy_cmd += deploy_mode
+    if config.deploy:
+        deploy_mode = "sim" if config.sim else "real"
+        deploy_cmd = (
+            f"cd {shlex.quote(str(repo_root / 'gear_sonic_deploy'))} && ./deploy.sh "
+            f"--input-type {shlex.quote(config.deploy_input_type)} "
+            f"--zmq-host {shlex.quote(config.deploy_zmq_host)} "
+        )
+        deploy_options = (
+            ("--cp", config.deploy_checkpoint),
+            ("--obs-config", config.deploy_obs_config),
+            ("--planner", config.deploy_planner),
+            ("--motion-data", config.deploy_motion_data),
+            ("--output-type", config.deploy_output_type),
+        )
+        for option, value in deploy_options:
+            if value:
+                deploy_cmd += f"{option} {shlex.quote(value)} "
+        deploy_cmd += deploy_mode
+        print("Starting C++ deploy (pane 0)...")
+        _send_to_pane(0, deploy_cmd, wait=3.0)
+    else:
+        note = (
+            f"External PC2 {config.state_zmq_host}: keep the existing SONIC v1.1 console open. "
+            f"It must use --input-type zmq_manager --zmq-host {config.action_zmq_host} "
+            f"--output-type zmq (actions: {config.action_zmq_host}:5556; "
+            f"state: {config.state_zmq_host}:5557)."
+        )
+        _send_to_pane(0, f"echo {shlex.quote(note)}", wait=0.2)
 
-    print("Starting C++ deploy (pane 0)...")
-    _send_to_pane(0, deploy_cmd, wait=3.0)
-
-    if not _check_pane_alive(0):
+    if config.deploy and not _check_pane_alive(0):
         print("WARNING: C++ deploy pane may have failed to start.")
 
-    # --- Pane 2 (bottom-left): Keyboard Publisher ---
+    # --- Pane 1 (bottom-left): Keyboard Publisher ---
     keyboard_script = textwrap.dedent("""\
         import zmq, time
         ctx = zmq.Context()
         pub = ctx.socket(zmq.PUB)
         pub.bind('tcp://localhost:5580')
         time.sleep(0.5)
-        print('Keyboard publisher ready. Keys: p=pause, k=start/stop, i=init pose, [/]=toggle hands, t=prompt')
+        print('Keyboard publisher ready. Enter after each command.')
+        print('p=pause, k=start/stop, i=standing, m=manual planner, [/]=hands, t=prompt')
+        print('Manual planner: w/s=forward/back, a/d=left/right, q/e=turn, z=stop.')
+        print('Movement stays on. Same key toggles off; z stops all.')
         while True:
             key = input()
             if key.startswith('t '):
@@ -347,47 +362,51 @@ def main(config: InferenceLaunchConfig):
     """)
     encoded = base64.b64encode(keyboard_script.encode()).decode()
     keyboard_cmd = (
-        f"cd {repo_root} && "
+        f"cd {shlex.quote(str(repo_root))} && "
         f"source .venv_inference/bin/activate && "
         f"python -c \"import base64;exec(base64.b64decode('{encoded}'))\""
     )
 
-    print("Starting keyboard publisher (pane 2)...")
+    print("Starting keyboard publisher (pane 1)...")
     _send_to_pane(1, keyboard_cmd, wait=2.0)
 
     # --- Pane 3 (bottom-right): Data Exporter (optional) ---
     if config.data_exporter:
         exporter_cmd = (
-            f"cd {repo_root} && "
+            f"cd {shlex.quote(str(repo_root))} && "
             f"source .venv_data_collection/bin/activate && "
-            f"python gear_sonic/scripts/run_data_exporter.py "
-            f"--task-prompt '{exporter_prompt}' "
+            f"python -m gear_sonic.scripts.run_data_exporter "
+            f"--task-prompt {shlex.quote(exporter_prompt)} "
             f"--data-collection-frequency {config.data_exporter_frequency} "
-            f"--camera-host {config.camera_host} "
-            f"--camera-port {config.camera_port}"
+            f"--camera-host {shlex.quote(config.camera_host)} "
+            f"--camera-port {config.camera_port} "
+            f"--state-zmq-host {shlex.quote(config.state_zmq_host)} "
+            f"--sonic-zmq-host {shlex.quote(config.action_zmq_host)}"
         )
         if config.dataset_name:
-            exporter_cmd += f" --dataset-name '{config.dataset_name}'"
+            exporter_cmd += f" --dataset-name {shlex.quote(config.dataset_name)}"
 
         print("Starting data exporter (pane 3)...")
         _send_to_pane(3, exporter_cmd, wait=2.0)
 
-    # --- Pane 1 (top-right): VLA Inference ---
+    # --- Pane 2 (top-right): VLA Inference ---
     inference_cmd = (
-        f"cd {repo_root} && "
+        f"cd {shlex.quote(str(repo_root))} && "
         f"source .venv_inference/bin/activate && "
-        f"python gear_sonic/scripts/run_vla_inference.py "
-        f"--host {config.policy_host} "
+        f"python -m gear_sonic.scripts.run_vla_inference "
+        f"--host {shlex.quote(config.policy_host)} "
         f"--port {config.policy_port} "
-        f"--embodiment-tag {config.embodiment_tag} "
-        f"--prompt '{config.prompt}' "
+        f"--embodiment-tag {shlex.quote(config.embodiment_tag)} "
+        f"--prompt {shlex.quote(config.prompt)} "
         f"--action-publish-rate {config.action_publish_rate} "
         f"--action-horizon {config.action_horizon} "
-        f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--camera-host {shlex.quote(config.camera_host)} "
+        f"--camera-port {config.camera_port} "
+        f"--state-zmq-host {shlex.quote(config.state_zmq_host)} "
+        f"--action-zmq-host {shlex.quote(config.action_zmq_host)}"
     )
 
-    print("Starting VLA inference (pane 1)...")
+    print("Starting VLA inference (pane 2)...")
     _send_to_pane(2, inference_cmd, wait=1.0)
 
     # Select the VLA inference pane
@@ -406,19 +425,23 @@ def main(config: InferenceLaunchConfig):
         print("    MuJoCo Simulator (.venv_sim)")
         print()
     print("  Window 'inference':")
-    print("    Pane 0 (top-left):     C++ Deploy")
+    print("    Pane 0 (top-left):     " + ("C++ Deploy" if config.deploy else "PC2 deployment notes"))
     print("    Pane 1 (bottom-left):  Keyboard Publisher")
     print("    Pane 2 (top-right):    VLA Inference  <-- you are here")
     if config.data_exporter:
         print("    Pane 3 (bottom-right): Data Exporter")
     print()
-    print("  ** deploy.sh (pane 0) is waiting for confirmation --")
-    print("     click on pane 0 and press Enter to proceed **")
+    if config.deploy:
+        print("  ** deploy.sh (pane 0) is waiting for confirmation --")
+        print("     click on pane 0 and press Enter to proceed **")
     print()
     print("  Keyboard controls (type in pane 1):")
     print("    p        - Pause / resume inference")
     print("    k        - Start / stop C++ control loop")
-    print("    i        - Send initial pose")
+    print("    i        - Pause policy and return to straight standing")
+    print("    m        - Toggle manual planner / paused POSE mode")
+    print("    w/s a/d  - Toggle forward/back and left/right (Enter after each key)")
+    print("    q/e z    - Manual turn left/right and stop")
     print("    [        - Toggle left hand open/closed (initial pose)")
     print("    ]        - Toggle right hand open/closed (initial pose)")
     print("    t <text> - Change inference prompt")
@@ -432,7 +455,6 @@ def main(config: InferenceLaunchConfig):
     if config.sim:
         print("    Ctrl+b, n / p       - Next / previous window")
     print("    Ctrl+b, d           - Detach from session")
-    print("    Ctrl+\\              - Kill entire session")
     print("=" * 60)
 
     try:
@@ -450,16 +472,6 @@ def main(config: InferenceLaunchConfig):
         print(f"  Kill:      tmux kill-session -t {SESSION_NAME}")
 
 
-def _signal_handler(_sig, _frame):
-    print("\nShutdown requested...")
-    subprocess.run(
-        ["tmux", "kill-session", "-t", SESSION_NAME],
-        capture_output=True,
-    )
-    sys.exit(0)
-
-
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, _signal_handler)
     config = tyro.cli(InferenceLaunchConfig)
     main(config)
