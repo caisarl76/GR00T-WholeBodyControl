@@ -74,9 +74,7 @@ COMMAND_TOPICS: Mapping[str, str] = {
     "right": "rt/inspire_hand/ctrl/r",
 }
 
-SOURCE_PROTOCOLS: Mapping[str, Mapping[str, int]] = {
-    "pico": {"manager_state": 4, "inspire_hand": 1},
-}
+SOURCE_VERSIONS: Mapping[str, int] = {"manager_state": 4, "inspire_hand": 1}
 
 
 @dataclass(frozen=True, slots=True)
@@ -688,17 +686,10 @@ def _optional_toggle(fields: dict[str, Any], name: str) -> bool | None:
     return bool(value[0])
 
 
-def _source_topics(source_profile: str) -> Mapping[str, int]:
-    try:
-        return SOURCE_PROTOCOLS[source_profile]
-    except KeyError as exc:
-        raise ValueError("source_profile must be 'pico' (optical q6)") from exc
-
-
-def _decode_bridge_payload(raw: bytes, topic: str, *, source_profile: str = "pico") -> DecodedBridgePayload:
+def _decode_bridge_payload(raw: bytes, topic: str) -> DecodedBridgePayload:
     """Validate and copy one packet without assigning an event timestamp."""
 
-    expected_version = _source_topics(source_profile).get(topic)
+    expected_version = SOURCE_VERSIONS.get(topic)
     if expected_version is None:
         raise ValueError(f"unsupported bridge topic: {topic!r}")
     fields = unpack_pose_message(raw, topic=topic)
@@ -769,12 +760,10 @@ def _stamp_bridge_payload(decoded: DecodedBridgePayload, received_ns: int) -> Br
     )  # type: ignore[arg-type]
 
 
-def decode_bridge_packet(
-    raw: bytes, topic: str, received_ns: int, *, source_profile: str = "pico"
-) -> BridgePacket:
+def decode_bridge_packet(raw: bytes, topic: str, received_ns: int) -> BridgePacket:
     """Strictly decode and timestamp one already topic-identified packet."""
 
-    decoded = _decode_bridge_payload(raw, topic, source_profile=source_profile)
+    decoded = _decode_bridge_payload(raw, topic)
     return _stamp_bridge_payload(decoded, received_ns)
 
 
@@ -784,9 +773,8 @@ def create_zmq_subscriber(
     *,
     context: Any | None = None,
     zmq_module: Any | None = None,
-    source_profile: str = "pico",
 ) -> Any:
-    """Create the bridge's single, bounded three-topic SUB socket."""
+    """Create the bridge's bounded optical command/state SUB socket."""
 
     if type(host) is not str or not host:
         raise ValueError("host must be a nonempty string")
@@ -802,7 +790,7 @@ def create_zmq_subscriber(
         socket.setsockopt(zmq_module.RCVHWM, ZMQ_RCVHWM)
         socket.setsockopt(zmq_module.LINGER, 0)
         socket.setsockopt(zmq_module.MAXMSGSIZE, MAX_ZMQ_MESSAGE_BYTES)
-        for topic in _source_topics(source_profile):
+        for topic in SOURCE_VERSIONS:
             socket.setsockopt_string(zmq_module.SUBSCRIBE, topic)
         socket.connect(f"tcp://{host}:{port}")
     except BaseException:
@@ -814,10 +802,10 @@ def create_zmq_subscriber(
     return socket
 
 
-def _packet_topic(raw: bytes, *, source_profile: str = "pico") -> str:
+def _packet_topic(raw: bytes) -> str:
     if type(raw) is not bytes:
         raise TypeError("ZMQ packet must be bytes")
-    matches = [topic for topic in _source_topics(source_profile) if raw.startswith(topic.encode("ascii"))]
+    matches = [topic for topic in SOURCE_VERSIONS if raw.startswith(topic.encode("ascii"))]
     if len(matches) != 1:
         raise ValueError("packet does not have one exact authorized topic prefix")
     return matches[0]
@@ -840,10 +828,6 @@ def drain_zmq_packets(
         raise ValueError("max_drain_ns must be a positive built-in int")
     if zmq_module is None:
         import zmq as zmq_module
-    source_profile = getattr(controller, "source_profile", None)
-    if source_profile not in SOURCE_PROTOCOLS:
-        raise ValueError("controller must expose a valid source_profile")
-
     start_ns = monotonic_ns()
     current_ns = start_ns
     received_count = 0
@@ -866,8 +850,8 @@ def drain_zmq_packets(
             time_budget_exhausted = current_ns - start_ns >= max_drain_ns
             continue
         try:
-            topic = _packet_topic(raw, source_profile=source_profile)
-            decoded = _decode_bridge_payload(raw, topic, source_profile=source_profile)
+            topic = _packet_topic(raw)
+            decoded = _decode_bridge_payload(raw, topic)
         except (TypeError, ValueError):
             rejected_count += 1
             current_ns = monotonic_ns()
@@ -1071,7 +1055,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=5556)
     parser.add_argument("--network-interface", default="enP8p1s0")
     parser.add_argument("--publish", action="store_true")
-    parser.add_argument("--source-profile", choices=tuple(SOURCE_PROTOCOLS), default="pico")
     parser.add_argument("--status-port", type=int, default=5563)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--evidence-log", default="")
@@ -1418,7 +1401,6 @@ def build_status_record(
 
     manager = controller.manager_provenance
     pair = controller.latest_pair
-    source_profile = getattr(controller, "source_profile", "pico")
     left_state, right_state = controller.hand_states
     left_age, right_age = controller.hand_state_ages_ns(now_ns)
     latest_left, latest_right = controller.latest_targets
@@ -1458,9 +1440,9 @@ def build_status_record(
         "source": None
         if pair is None
         else {
-            "profile": _bounded_text(source_profile),
+            "profile": "pico",
             "topic": _bounded_text(pair.topic),
-            "version": _source_topics(source_profile).get(pair.topic),
+            "version": SOURCE_VERSIONS.get(pair.topic),
             "age_ns": controller.source_age_ns(now_ns),
         },
         "raw_source_targets": raw_source_targets,
@@ -1888,9 +1870,6 @@ def run_bridge(args: argparse.Namespace, dependencies: RuntimeDependencies | Non
     """Construct, run, and clean up the monitor-first PC2 bridge."""
 
     dependencies = RuntimeDependencies() if dependencies is None else dependencies
-    source_profile = getattr(args, "source_profile", "pico")
-    if source_profile not in SOURCE_PROTOCOLS:
-        raise ValueError("source_profile must be 'pico' (optical q6)")
     signal_source = None
     socket = None
     status_publisher = None
@@ -1916,7 +1895,6 @@ def run_bridge(args: argparse.Namespace, dependencies: RuntimeDependencies | Non
                 args.port,
                 context=dependencies.zmq_context,
                 zmq_module=dependencies.zmq_module,
-                source_profile=source_profile,
             )
         status_publisher = (
             dependencies.status_publisher_factory(args.status_port)
@@ -1926,9 +1904,7 @@ def run_bridge(args: argparse.Namespace, dependencies: RuntimeDependencies | Non
             )
         )
         dds = dependencies.dds_loader(args.network_interface)
-        controller = dependencies.controller_factory(
-            source_profile=source_profile,
-        )
+        controller = dependencies.controller_factory()
         inbox = InboundInbox()
         for side, topic in STATE_TOPICS.items():
             subscriber = dds.subscriber_factory(topic, dds.state_type)

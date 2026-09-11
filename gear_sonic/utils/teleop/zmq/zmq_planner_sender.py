@@ -16,6 +16,7 @@ import numpy as np
 
 HEADER_SIZE = 1280
 WIRE_DTYPES = {"f32": "<f4", "f64": "<f8", "i32": "<i4", "i64": "<i8", "u8": "u1", "bool": "?"}
+DTYPE_TO_WIRE = {np.dtype(dtype).newbyteorder("="): name for name, dtype in WIRE_DTYPES.items()}
 
 
 def _build_header(fields: list, version: int = 1, count: int = 1) -> bytes:
@@ -181,19 +182,8 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) ->
         if isinstance(value, np.ndarray):
             # Determine dtype string
             native_dtype = value.dtype.newbyteorder("=")
-            if native_dtype == np.float32:
-                dtype_str = "f32"
-            elif native_dtype == np.float64:
-                dtype_str = "f64"
-            elif native_dtype == np.int32:
-                dtype_str = "i32"
-            elif native_dtype == np.int64:
-                dtype_str = "i64"
-            elif native_dtype == np.uint8:
-                dtype_str = "u8"
-            elif native_dtype == np.dtype(bool):
-                dtype_str = "bool"
-            else:
+            dtype_str = DTYPE_TO_WIRE.get(native_dtype)
+            if dtype_str is None:
                 raise ValueError(f"Unsupported packed dtype for {key}: {value.dtype}")
 
             fields.append({"name": key, "dtype": dtype_str, "shape": list(value.shape)})

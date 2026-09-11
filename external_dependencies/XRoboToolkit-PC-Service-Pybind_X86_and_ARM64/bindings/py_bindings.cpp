@@ -151,8 +151,6 @@ void commitHandSnapshot(HandSnapshot& current, HandSnapshot parsed) {
     current = parsed;
 }
 
-std::array<double, 7> LeftControllerPose;
-std::array<double, 7> RightControllerPose;
 std::array<double, 7> HeadsetPose;
 
 std::array<std::array<double, 7>, 26> LeftHandTrackingState;
@@ -177,22 +175,6 @@ std::array<std::string, 3> MotionTrackerSerialNumbers;  // Serial numbers of the
 int64_t MotionTimeStampNs = 0;  // Motion data timestamp
 int NumMotionDataAvailable = 0;  // number of motion trackers
 
-
-bool LeftMenuButton;
-double LeftTrigger;
-double LeftGrip;
-std::array<double, 2> LeftAxis{0.0, 0.0};
-bool LeftAxisClick;
-bool LeftPrimaryButton;
-bool LeftSecondaryButton;
-
-bool RightMenuButton;
-double RightTrigger;
-double RightGrip;
-std::array<double, 2> RightAxis{0.0, 0.0};
-bool RightAxisClick;
-bool RightPrimaryButton;
-bool RightSecondaryButton;
 
 int64_t TimeStampNs;
 
@@ -279,14 +261,6 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
                         parsed.binding_generation = LeftControllerSnapshot.binding_generation + 1;
                         parsed.receipt_timestamp_ns = steadyTimeNs();
                         LeftControllerSnapshot = parsed;
-                        LeftControllerPose = parsed.pose;
-                        LeftTrigger = parsed.trigger;
-                        LeftGrip = parsed.grip;
-                        LeftMenuButton = parsed.menu_button;
-                        LeftAxis = parsed.axis;
-                        LeftAxisClick = parsed.axis_click;
-                        LeftPrimaryButton = parsed.primary_button;
-                        LeftSecondaryButton = parsed.secondary_button;
                     }
                 }
                 if (value.contains("Controller") && value["Controller"].is_object() &&
@@ -297,14 +271,6 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
                         parsed.binding_generation = RightControllerSnapshot.binding_generation + 1;
                         parsed.receipt_timestamp_ns = steadyTimeNs();
                         RightControllerSnapshot = parsed;
-                        RightControllerPose = parsed.pose;
-                        RightTrigger = parsed.trigger;
-                        RightGrip = parsed.grip;
-                        RightMenuButton = parsed.menu_button;
-                        RightAxis = parsed.axis;
-                        RightAxisClick = parsed.axis_click;
-                        RightPrimaryButton = parsed.primary_button;
-                        RightSecondaryButton = parsed.secondary_button;
                     }
                 }
                 if (value.contains("Hand") && value["Hand"].is_object() &&
@@ -452,12 +418,12 @@ void deinit() {
 
 std::array<double, 7> getLeftControllerPose() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftControllerPose;
+    return LeftControllerSnapshot.pose;
 }
 
 std::array<double, 7> getRightControllerPose() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightControllerPose;
+    return RightControllerSnapshot.pose;
 }
 
 std::array<double, 7> getHeadsetPose() {
@@ -467,73 +433,73 @@ std::array<double, 7> getHeadsetPose() {
 
 double getLeftTrigger() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftTrigger;
+    return LeftControllerSnapshot.trigger;
 }
 
 double getLeftGrip() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftGrip;
+    return LeftControllerSnapshot.grip;
 }
 
 double getRightTrigger() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightTrigger;
+    return RightControllerSnapshot.trigger;
 }
 
 double getRightGrip() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightGrip;
+    return RightControllerSnapshot.grip;
 }
 
 bool getLeftMenuButton() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftMenuButton;
+    return LeftControllerSnapshot.menu_button;
 }
 
 bool getRightMenuButton() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightMenuButton;
+    return RightControllerSnapshot.menu_button;
 }
 
 bool getLeftAxisClick() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftAxisClick;
+    return LeftControllerSnapshot.axis_click;
 }
 
 bool getRightAxisClick() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightAxisClick;
+    return RightControllerSnapshot.axis_click;
 }
 
 std::array<double, 2> getLeftAxis() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftAxis;
+    return LeftControllerSnapshot.axis;
 }
 
 
 std::array<double, 2> getRightAxis() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightAxis;
+    return RightControllerSnapshot.axis;
 }
 
 bool getLeftPrimaryButton() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftPrimaryButton;
+    return LeftControllerSnapshot.primary_button;
 }
 
 bool getRightPrimaryButton() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightPrimaryButton;
+    return RightControllerSnapshot.primary_button;
 }
 
 bool getLeftSecondaryButton() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftSecondaryButton;
+    return LeftControllerSnapshot.secondary_button;
 }
 
 bool getRightSecondaryButton() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightSecondaryButton;
+    return RightControllerSnapshot.secondary_button;
 }
 
 int64_t getTimeStampNs() {

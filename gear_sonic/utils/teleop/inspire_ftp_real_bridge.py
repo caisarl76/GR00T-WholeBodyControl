@@ -9,8 +9,7 @@ from dataclasses import dataclass
 import enum
 import math
 import struct
-from typing import Annotated, Mapping, get_args, get_origin
-import uuid
+from typing import Annotated, get_args, get_origin
 
 import numpy as np
 
@@ -182,43 +181,6 @@ def _provenance_corruption_reason(
     return None
 
 
-class PublisherProvenanceClock:
-    """Assign one publisher session and epochs to accepted stream modes."""
-
-    def __init__(self, session_id: bytes | None = None, initial_mode: int = 0) -> None:
-        self._session_id = uuid.uuid4().bytes if session_id is None else session_id
-        initial = StreamProvenance(self._session_id, 0, initial_mode)
-        self._mode_epoch = initial.mode_epoch
-        self._stream_mode = initial.stream_mode
-
-    def snapshot(self) -> StreamProvenance:
-        """Return the immutable provenance for the current accepted mode."""
-
-        return StreamProvenance(self._session_id, self._mode_epoch, self._stream_mode)
-
-    def accept_mode(self, mode: int) -> StreamProvenance:
-        """Accept a mode, advancing the epoch only when it changes."""
-
-        requested = StreamProvenance(self._session_id, self._mode_epoch, mode)
-        if requested.stream_mode == self._stream_mode:
-            return self.snapshot()
-        if self._mode_epoch == MAX_MODE_EPOCH:
-            raise RuntimeError("mode epoch exhausted; restart publisher")
-        self._mode_epoch += 1
-        self._stream_mode = requested.stream_mode
-        return self.snapshot()
-
-
-def append_provenance(fields: Mapping[str, np.ndarray], provenance: StreamProvenance) -> dict[str, np.ndarray]:
-    """Copy fields and append their canonical provenance as the final field."""
-
-    if PROVENANCE_FIELD in fields:
-        raise ValueError("pv must be appended exactly once")
-    result = dict(fields)
-    result[PROVENANCE_FIELD] = provenance.to_array()
-    return result
-
-
 def _is_exact_bounded_sequence(annotation: object, scalar_name: str) -> bool:
     """Recognize the generated CycloneDDS ``sequence<T, 6>`` contract."""
 
@@ -325,11 +287,8 @@ def _bounded_counts(target: SixInts, baseline: SixInts) -> SixInts:
 class InspireFtpSafetyController:
     """Pure fail-open state machine for two real Inspire FTP hands."""
 
-    def __init__(self, *, source_profile: str = "pico") -> None:
-        if source_profile != "pico":
-            raise ValueError("this bridge accepts only optical PICO q6")
+    def __init__(self) -> None:
         self._state = BridgeState.MONITORING
-        self._source_profile = source_profile
         self._armed = False
         self._manager_provenance: StreamProvenance | None = None
         self._manager_received_ns: int | None = None
@@ -403,10 +362,6 @@ class InspireFtpSafetyController:
     @property
     def latest_pair(self) -> HandPair | None:
         return self._latest_pair
-
-    @property
-    def source_profile(self) -> str:
-        return self._source_profile
 
     @property
     def latest_targets(self) -> tuple[SixInts, SixInts]:

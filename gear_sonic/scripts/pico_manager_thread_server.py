@@ -3317,13 +3317,8 @@ def run_pico_manager(
                     max(0, min(int(LocomotionMode.INJURED_WALK), int(planner_streamer.mode) + direction))
                 )
             tracking = current_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT)
-            for command in (
-                [RecordingCommand.TOGGLE]
-                if action == "record"
-                else [RecordingCommand.ABORT]
-                if action == "abort"
-                else []
-            ):
+            if action in ("record", "abort"):
+                command = RecordingCommand.TOGGLE if action == "record" else RecordingCommand.ABORT
                 recorder.enqueue(command, tick_ns, tracking=tracking and hand_input != "off")
             for key in keys:
                 if key in "cs":

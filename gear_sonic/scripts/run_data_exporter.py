@@ -838,9 +838,6 @@ class GrootDataCollector:
 
         if hand_features is not None:
             frame_data.update(hand_features)
-            if self.hand_profile == "inspire_ftp":
-                frame_data.pop("teleop.left_hand_joints", None)
-                frame_data.pop("teleop.right_hand_joints", None)
 
         self._add_images_to_frame_data(frame_data)
 
