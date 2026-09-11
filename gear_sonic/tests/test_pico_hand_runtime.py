@@ -52,7 +52,7 @@ def make_runtime(monkeypatch):
     def retargeter(profile, side):
         size = 7 if profile == "dex3" else 6
         return SimpleNamespace(
-            lower=np.zeros(size), upper=np.ones(size), retarget=lambda points: np.ones(size) * 0.5
+            side=side, lower=np.zeros(size), upper=np.ones(size), retarget=lambda points: np.ones(size) * 0.5
         )
 
     monkeypatch.setattr(runtime, "HandRetargeter", retargeter)
@@ -343,3 +343,52 @@ def test_diagnostics_mark_uninitialized_clock_unavailable(make_runtime):
     fields = r.diagnostics(PV, 1, body_sent=True)
     assert fields["left_timestamp_source"].item() == -1
     assert fields["right_timestamp_source"].item() == -1
+
+
+@pytest.mark.parametrize("value", [-0.0007002827478572726, -0.000917662, -0.001])
+def test_right_index_near_zero_admission_preserves_raw_feedback_and_slew(make_runtime, value):
+    r = make_runtime()
+    measured = np.zeros(7)
+    measured[5] = value
+    r.socket.packets.append(dex_feedback(right_hand_q=measured.tolist()))
+    r.poll_feedback(BASE)
+    assert r.ready(BASE)
+    assert r.feedback_blockers(BASE) == []
+    sample = snapshot()
+    r.sdk.get_right_hand_snapshot = lambda: sample
+    previous = None
+    for frame in range(6):
+        now = BASE + frame * 20_000_000
+        sample["source_timestamp_ns"] = sample["binding_generation"] = frame + 1
+        r.socket.packets.append(dex_feedback(frame + 2, right_hand_q=measured.tolist()))
+        r.step(body(now), now, enabled=True)
+        out = r.outputs[1]
+        assert out.reason == HandReason.OK
+        assert out.state == (TrackingState.WAITING if frame < 4 else TrackingState.RECOVERING)
+        assert out.command[5] >= 0
+        if frame <= 4:
+            assert out.command[5] == 0
+        if previous is not None:
+            assert np.max(np.abs(out.command - previous)) <= 2.0 * 0.02 + 1e-7
+        previous = out.command
+        assert r.measured_inputs[1][5] == value
+        assert r.measured(now)[1][5] == value
+    assert r.measured(BASE + 200_000_000) == [None, None]
+    assert not r.ready(BASE + 200_000_000)
+
+
+@pytest.mark.parametrize("side,joint,value", [
+    ("right", 5, -0.001000001), ("right", 5, -0.0047),
+    ("left", 5, -0.0007), ("right", 4, -0.0007), ("right", 5, 1.0007),
+    ("right", 5, float("nan")),
+])
+def test_near_zero_allowance_does_not_hide_other_feedback_errors(make_runtime, side, joint, value):
+    r = make_runtime()
+    measured = np.zeros(7)
+    measured[joint] = value
+    r.socket.packets.append(dex_feedback(**{f"{side}_hand_q": measured.tolist()}))
+    r.poll_feedback(BASE)
+    assert not r.ready(BASE)
+    assert any(message.startswith(side + ":") for message in r.feedback_blockers(BASE))
+    r.step(body(), BASE, enabled=True)
+    assert r.outputs[("left", "right").index(side)].reason == HandReason.FEEDBACK_UNAVAILABLE

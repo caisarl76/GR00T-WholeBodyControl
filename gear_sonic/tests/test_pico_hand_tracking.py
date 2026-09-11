@@ -271,3 +271,31 @@ def test_startup_invalid_or_disabled_optical_uses_latest_measured_baseline(profi
     output = tracker.step(None, np.zeros(3), np.full(size, 0.2), 160_000_000)
     assert output.state == TrackingState.HOLDING
     np.testing.assert_array_equal(output.command, held)
+
+
+
+def test_right_index_measurement_allowance_does_not_accept_invalid_target():
+    retargeter = Retargeter()
+    retargeter.side = "right"
+    retargeter.lower[:] = 0
+    retargeter.target[5] = -0.0007002827478572726
+    tracker = HandTracker(retargeter)
+    measured = np.zeros(7)
+    measured[5] = retargeter.target[5]
+    for frame in range(5):
+        output = step(tracker, frame + 1, frame * 20_000_000, measured=measured)
+    assert output.reason == HandReason.RETARGET_FAILED
+    assert output.state == TrackingState.HOLDING
+    assert output.command[5] == 0
+    assert output.target is None
+
+
+def test_inspire_does_not_inherit_dex3_measurement_allowance():
+    retargeter = Retargeter(size=6)
+    retargeter.side = "right"
+    tracker = HandTracker(retargeter, "inspire_ftp")
+    measured = np.zeros(6)
+    measured[5] = -0.0007
+    output = step(tracker, 1, 0, measured=measured)
+    assert output.reason == HandReason.FEEDBACK_UNAVAILABLE
+    assert output.command is None

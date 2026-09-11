@@ -143,8 +143,11 @@ be fresh.
 Dex3 admission reads the DDS `left_hand_q` / `right_hand_q` fields from
 `g1_debug`. The similarly named `*_hand_q_measured` visualization fields can
 contain commanded positions and must not supply the startup baseline. Measured
-Dex3 positions within 1e-4 rad of a joint limit are clamped to that limit;
-larger excursions still block admission. An arming refusal now prints the
+Dex3 positions within 1e-4 rad of a joint limit are clamped to that limit.
+For measured right `index_0` only, a lower excursion up to 0.001 rad is
+admitted and projected to zero; raw capture retains the original measurement.
+This narrowly scoped allowance addresses recorded near-zero feedback rejection
+and does not widen commanded joint limits. Larger excursions still block admission. An arming refusal now prints the
 specific transport, schema, DDS or joint-limit failure.
 
 ## Simulation test commands on this host
@@ -411,6 +414,9 @@ currently supports Dex3 only.
 
 ## Remaining work and verification scope
 
+See [post-merge evidence and qualification steps](pico_hand_followups.md) for
+the resolved audit items, capture measurements, and current handoffs.
+
 User-operated MuJoCo tests confirmed Dex3 and Inspire finger movement. Real
 G1 + Dex3 tests on PC2 with SONIC v1.1 confirmed both hands, pinch, wrist
 rotation, and open/close at an increased `--hand-max-rate`. These observations
@@ -426,9 +432,10 @@ attached-hand qualification gates.
   nearly straight while the headset visualization reportedly bent correctly.
   Check raw landmarks, flags, target, command and measured joints together;
   do not infer working finger data from body FPS or hand activity alone.
-- **Near-limit feedback rejection:** a captured right index measurement around
-  -0.0007 rad exceeded the current 0.0001-rad limit tolerance. Quantify sensor
-  noise and physical limits before deciding whether to change this tolerance.
+- **Near-limit feedback rejection:** offline diagnosis identified right
+  `index_0` excursions below zero. A measurement-only allowance is under
+  validation; physical zero characterization and real confirmation remain
+  pending. See the linked evidence record.
 - **Full fist closure is not gesture calibration.** DexPilot matches landmark
   geometry within robot joint limits. `--hand-max-rate` changes speed, not the
   final pose. Full-travel fist calibration remains separate work.

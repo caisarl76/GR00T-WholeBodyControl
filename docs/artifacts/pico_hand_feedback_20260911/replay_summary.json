@@ -1,0 +1,278 @@
+{
+  "base_commit": "d56efdb",
+  "physical_confirmation": false,
+  "rates": "Inferred from command saturation; baseline replay exactly reproduced recorded commands at these rates. Original launch flags were not recorded.",
+  "captures": {
+    "pico_dex3_real_20260911_141239": {
+      "baseline": {
+        "frames": 9528,
+        "duration_s": 191.425240405,
+        "max_rate": 0.5,
+        "counts": {
+          "nonfinite_emitted": 0,
+          "out_of_bounds_emitted": 0,
+          "rate_violations": 0,
+          "held_command_changes": 0,
+          "late_or_nonholding_freezes": 6,
+          "early_recovery_admissions": 0,
+          "early_tracking_transitions": 0,
+          "retarget_rejections": 0,
+          "out_of_bounds_targets_rejected": 0,
+          "nonfinite_targets_rejected": 0
+        },
+        "d0_qualified": false,
+        "qualification_status": "failed",
+        "replay_safety_checks_pass": false,
+        "freeze_events": [
+          {
+            "side": 0,
+            "tick_ns": 2722210877556,
+            "age_ns": 8730796779,
+            "holding": false
+          },
+          {
+            "side": 0,
+            "tick_ns": 2776263916230,
+            "age_ns": 100314393,
+            "holding": true
+          },
+          {
+            "side": 1,
+            "tick_ns": 2722210877556,
+            "age_ns": 8730796779,
+            "holding": false
+          },
+          {
+            "side": 1,
+            "tick_ns": 2776263916230,
+            "age_ns": 100314393,
+            "holding": true
+          },
+          {
+            "side": 1,
+            "tick_ns": 2776404373403,
+            "age_ns": 240771566,
+            "holding": true
+          },
+          {
+            "side": 1,
+            "tick_ns": 2776524697316,
+            "age_ns": 361095479,
+            "holding": true
+          },
+          {
+            "side": 1,
+            "tick_ns": 2779815859157,
+            "age_ns": 3652257320,
+            "holding": true
+          },
+          {
+            "side": 1,
+            "tick_ns": 2779916238422,
+            "age_ns": 3752636585,
+            "holding": true
+          }
+        ],
+        "body_cadence": {
+          "gap_p99_ms": 20.118087,
+          "gap_max_ms": 221.159043,
+          "pass": false
+        },
+        "processing_p99_ms": 3.465816559999999,
+        "missing_qualification_evidence": [
+          "Original APK uses host content-change timing, not device sample freshness evidence.",
+          "Capture duration is below 600 seconds.",
+          "At least one required pose label has fewer than 1000 frames.",
+          "Finger identity/order and absence of hand-caused body mode transitions require qualification review.",
+          "Offline processing timing is not proof of the live deployment-host timing gate."
+        ]
+      },
+      "followup": {
+        "frames": 9528,
+        "duration_s": 191.425240405,
+        "max_rate": 0.5,
+        "counts": {
+          "nonfinite_emitted": 0,
+          "out_of_bounds_emitted": 0,
+          "rate_violations": 0,
+          "held_command_changes": 0,
+          "late_or_nonholding_freezes": 2,
+          "early_recovery_admissions": 0,
+          "early_tracking_transitions": 0,
+          "retarget_rejections": 0,
+          "out_of_bounds_targets_rejected": 0,
+          "nonfinite_targets_rejected": 0
+        },
+        "d0_qualified": false,
+        "qualification_status": "failed",
+        "replay_safety_checks_pass": false,
+        "freeze_events": [
+          {
+            "side": 0,
+            "tick_ns": 2722210877556,
+            "age_ns": 8730796779,
+            "holding": false
+          },
+          {
+            "side": 0,
+            "tick_ns": 2776263916230,
+            "age_ns": 100314393,
+            "holding": true
+          },
+          {
+            "side": 1,
+            "tick_ns": 2722210877556,
+            "age_ns": 8730796779,
+            "holding": false
+          },
+          {
+            "side": 1,
+            "tick_ns": 2776263916230,
+            "age_ns": 100314393,
+            "holding": true
+          }
+        ],
+        "body_cadence": {
+          "gap_p99_ms": 20.118087,
+          "gap_max_ms": 221.159043,
+          "pass": false
+        },
+        "processing_p99_ms": 3.3862464099999996,
+        "missing_qualification_evidence": [
+          "Original APK uses host content-change timing, not device sample freshness evidence.",
+          "Capture duration is below 600 seconds.",
+          "At least one required pose label has fewer than 1000 frames.",
+          "Finger identity/order and absence of hand-caused body mode transitions require qualification review.",
+          "Offline processing timing is not proof of the live deployment-host timing gate."
+        ]
+      }
+    },
+    "pico_dex3_real_20260909_180008": {
+      "baseline": {
+        "frames": 2284,
+        "duration_s": 46.565366313,
+        "max_rate": 2.0,
+        "counts": {
+          "nonfinite_emitted": 0,
+          "out_of_bounds_emitted": 0,
+          "rate_violations": 0,
+          "held_command_changes": 0,
+          "late_or_nonholding_freezes": 2,
+          "early_recovery_admissions": 0,
+          "early_tracking_transitions": 0,
+          "retarget_rejections": 0,
+          "out_of_bounds_targets_rejected": 0,
+          "nonfinite_targets_rejected": 0
+        },
+        "d0_qualified": false,
+        "qualification_status": "failed",
+        "replay_safety_checks_pass": false,
+        "freeze_events": [
+          {
+            "side": 0,
+            "tick_ns": 1931026516522467,
+            "age_ns": 5779252443,
+            "holding": false
+          },
+          {
+            "side": 0,
+            "tick_ns": 1931064232212415,
+            "age_ns": 100296229,
+            "holding": true
+          },
+          {
+            "side": 1,
+            "tick_ns": 1931026516522467,
+            "age_ns": 5779252443,
+            "holding": false
+          },
+          {
+            "side": 1,
+            "tick_ns": 1931064232212415,
+            "age_ns": 100296229,
+            "holding": true
+          }
+        ],
+        "body_cadence": {
+          "gap_p99_ms": 26.38619671999999,
+          "gap_max_ms": 222.044063,
+          "pass": false
+        },
+        "processing_p99_ms": 15.126805950000001,
+        "missing_qualification_evidence": [
+          "Original APK uses host content-change timing, not device sample freshness evidence.",
+          "Capture duration is below 600 seconds.",
+          "At least one required pose label has fewer than 1000 frames.",
+          "Finger identity/order and absence of hand-caused body mode transitions require qualification review.",
+          "Offline processing timing is not proof of the live deployment-host timing gate."
+        ]
+      },
+      "followup": {
+        "frames": 2284,
+        "duration_s": 46.565366313,
+        "max_rate": 2.0,
+        "counts": {
+          "nonfinite_emitted": 0,
+          "out_of_bounds_emitted": 0,
+          "rate_violations": 0,
+          "held_command_changes": 0,
+          "late_or_nonholding_freezes": 2,
+          "early_recovery_admissions": 0,
+          "early_tracking_transitions": 0,
+          "retarget_rejections": 0,
+          "out_of_bounds_targets_rejected": 0,
+          "nonfinite_targets_rejected": 0
+        },
+        "d0_qualified": false,
+        "qualification_status": "failed",
+        "replay_safety_checks_pass": false,
+        "freeze_events": [
+          {
+            "side": 0,
+            "tick_ns": 1931026516522467,
+            "age_ns": 5779252443,
+            "holding": false
+          },
+          {
+            "side": 0,
+            "tick_ns": 1931064232212415,
+            "age_ns": 100296229,
+            "holding": true
+          },
+          {
+            "side": 1,
+            "tick_ns": 1931026516522467,
+            "age_ns": 5779252443,
+            "holding": false
+          },
+          {
+            "side": 1,
+            "tick_ns": 1931064232212415,
+            "age_ns": 100296229,
+            "holding": true
+          }
+        ],
+        "body_cadence": {
+          "gap_p99_ms": 26.38619671999999,
+          "gap_max_ms": 222.044063,
+          "pass": false
+        },
+        "processing_p99_ms": 14.248914440000002,
+        "missing_qualification_evidence": [
+          "Original APK uses host content-change timing, not device sample freshness evidence.",
+          "Capture duration is below 600 seconds.",
+          "At least one required pose label has fewer than 1000 frames.",
+          "Finger identity/order and absence of hand-caused body mode transitions require qualification review.",
+          "Offline processing timing is not proof of the live deployment-host timing gate."
+        ]
+      }
+    }
+  },
+  "minimal_repro": {
+    "capture": "pico_dex3_real_20260911_141239/hands/capture_000035.npz",
+    "row": 42,
+    "sha256": "462fa06fe2acc490c8e5b5831b98b12ea785f3f6ef832b6d8435963f9e8dfc5d",
+    "right_index_0_rad": -0.0007002827478572726,
+    "transport_metadata": "synthetic fresh DDS/local metadata isolates numerical admission; original snapshot remains INACTIVE"
+  }
+}

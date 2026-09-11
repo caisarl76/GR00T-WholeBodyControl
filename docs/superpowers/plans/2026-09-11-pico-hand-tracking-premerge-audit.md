@@ -1,5 +1,10 @@
 # PICO optical hand tracking — pre-merge audit, 2026-09-11
 
+**Historical audit — integration items below were resolved in merged PR #9
+(`d56efdb`).** See [post-merge status](../../source/pico_hand_followups.md) for
+the current remaining work. The old dirty worktree is intentionally preserved;
+its status does not describe merged main.
+
 PR preparation paused at the user's request. No commit, push, PR creation or
 merge was performed by this audit. Target under consideration is
 caisarl76/GR00T-WholeBodyControl main (fork/main e9dd3af).

@@ -226,6 +226,9 @@ class _ObservedRetargeter:
     def __init__(self, implementation):
         self.implementation = implementation
         self.lower, self.upper = implementation.lower, implementation.upper
+        # Preserve hand identity for measured-feedback bounds validation.
+        if hasattr(implementation, "side"):
+            self.side = implementation.side
         self.raw_target = None
         self.out_of_bounds_targets = 0
         self.nonfinite_targets = 0

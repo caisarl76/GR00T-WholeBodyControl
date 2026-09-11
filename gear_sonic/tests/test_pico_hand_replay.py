@@ -11,10 +11,14 @@ from gear_sonic.utils.teleop.pico_hand_tracking import HandReason, HandTracker, 
 
 
 class FakeRetargeter:
-    def __init__(self, target=0.0, size=7):
+    def __init__(self, target=0.0, size=7, side=None):
         self.lower = np.full(size, -1.0 if size == 7 else 0.0)
+        if side == "right" and size == 7:
+            self.lower[5] = 0.0
         self.upper = np.ones(size)
         self.target = target
+        if side is not None:
+            self.side = side
 
     def retarget(self, points):
         return np.full(len(self.lower), self.target)
@@ -67,6 +71,17 @@ def test_bad_retarget_candidates_are_counted_without_unsafe_emissions():
     assert output["raw_target"][4, 0, 0] == 2
     assert output["reason"][4, 0] == HandReason.RETARGET_FAILED
     assert report["replay_safety_checks_pass"]
+
+
+def test_replay_preserves_right_side_for_measured_feedback_admission():
+    arrays = synthetic_capture(1)
+    arrays["measured"][0, 1, 5] = -0.0007
+    output, _ = replay(
+        arrays,
+        retargeters=[FakeRetargeter(side="left"), FakeRetargeter(side="right")],
+    )
+    assert output["command_present"][0, 1]
+    assert output["emitted"][0, 1, 5] == 0
 
 
 def test_capture_shards_copy_inputs_preserve_outputs_and_replay(tmp_path):

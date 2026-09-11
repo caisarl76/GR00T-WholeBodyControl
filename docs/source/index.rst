@@ -97,6 +97,7 @@ Documentation
    tutorials/manager
    tutorials/isaac_teleop_publisher_setup
    pico_optical_hand_tracking
+   pico_hand_followups
    tutorials/vr_wholebody_teleop
    tutorials/xr_upperbody_bridge
    tutorials/live_camera_teleop
