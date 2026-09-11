@@ -250,7 +250,7 @@ class PicoHandRuntime:
             return [f"Hand packet diagnostic unavailable: {type(exc).__name__}: {exc}"]
 
     def ready(self, now_ns):
-        return all(t._bounded(q) is not None for t, q in zip(self.trackers, self.measured(now_ns)))
+        return all(t._bounded(q, measured=True) is not None for t, q in zip(self.trackers, self.measured(now_ns)))
 
     def feedback_blockers(self, now_ns):
         """Explain admission failure without changing its freshness or limit checks."""
@@ -284,7 +284,7 @@ class PicoHandRuntime:
                     f"bridge_state={int(self.feedback['bridge_state'][0])}"
                 )
                 continue
-            if tracker._bounded(measured) is None:
+            if tracker._bounded(measured, measured=True) is None:
                 blockers.append(
                     f"{side}: measured joints malformed, nonfinite or outside command limits: {measured}"
                 )

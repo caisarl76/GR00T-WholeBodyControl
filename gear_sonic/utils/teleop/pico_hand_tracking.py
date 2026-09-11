@@ -140,7 +140,7 @@ class HandTracker:
         self.valid_streak = 0
         self.converged_streak = 0
 
-    def _bounded(self, value):
+    def _bounded(self, value, *, measured=False):
         if value is None:
             return None
         try:
@@ -149,10 +149,21 @@ class HandTracker:
             return None
         # DDS float32 measurements can slightly cross a MuJoCo soft joint limit.
         epsilon = 1e-4 if self.lower.size == 7 else 0.0
+        lower_epsilon = np.full(self.lower.shape, epsilon, dtype=np.float64)
+        if (
+            measured
+            and self.lower.size == 7
+            and getattr(self.retargeter, "side", None) == "right"
+            and self.lower[5] == 0
+        ):
+            # Dex3 order: thumb 0..2, middle 3..4, index 5..6. Real captures
+            # reach -0.000918 rad at right index_0's zero stop. Admit only
+            # this measured lower excursion; targets retain the original check.
+            lower_epsilon[5] = 1e-3
         if (
             q.shape != self.lower.shape
             or not np.isfinite(q).all()
-            or np.any(q < self.lower - epsilon)
+            or np.any(q < self.lower - lower_epsilon)
             or np.any(q > self.upper + epsilon)
         ):
             return None
@@ -201,7 +212,7 @@ class HandTracker:
         elif age_ns >= 100_000_000:
             reason = HandReason.SOURCE_STALE
 
-        measured_q = self._bounded(measured)
+        measured_q = self._bounded(measured, measured=True)
         if self.command is None and measured_q is not None:
             self.command = measured_q
         elif self.state == TrackingState.WAITING and measured_q is not None:

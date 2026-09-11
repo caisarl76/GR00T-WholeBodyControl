@@ -319,3 +319,17 @@ def test_recorded_open_thumb_tip_points_in_human_direction(side):
     expected /= np.linalg.norm(expected)
     error_degrees = np.rad2deg(np.arccos(np.clip(actual @ expected, -1, 1)))
     assert error_degrees < 5, f"Open thumb points inward by {error_degrees:.1f} degrees"
+
+
+
+def test_feedback_allowance_matches_real_dex3_right_index_order():
+    from gear_sonic.utils.teleop.pico_hand_tracking import HandTracker
+
+    retargeter = r.HandRetargeter("dex3", "right")
+    assert r._output_names("dex3", "right")[5] == "right_hand_index_0_joint"
+    measured = np.clip(np.zeros(7), retargeter.lower, retargeter.upper)
+    measured[5] = -0.0007002827478572726
+    tracker = HandTracker(retargeter)
+    bounded = tracker._bounded(measured, measured=True)
+    assert bounded is not None and bounded[5] == 0
+    assert tracker._bounded(measured) is None
