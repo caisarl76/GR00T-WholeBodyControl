@@ -15,7 +15,7 @@ pre-merge cleanup scope. Python/NumPy, DexPilot 0.4.6, C++/DDS/ZMQ, MuJoCo.
 - [x] Update recording migration guide, toctree, qualification and known issues.
 - [x] Run core/native/recording/simulation tests and compile deployment.
 - [x] Review final diff; commit selected source/assets without local LFS noise.
-- [ ] Push integration branch and create PR; do not merge automatically.
+- [x] Push integration branch and create PR; do not merge automatically.
 
 No PC2 installation, headset modification, or real control starts are part of
 this integration. Open-thumb geometry, upstream intermittent articulation,
@@ -54,3 +54,7 @@ No real robot, PC2 install or headset changes were performed for this PR.
 Final exporter/runtime/recorder and main target-frame conversion suite: **107 passed**
 after the legacy cleanup fix. Staged scope: 71 files; no model binaries, SDK
 binaries, raw captures, or LFS materialization changes.
+
+PR: https://github.com/caisarl76/GR00T-WholeBodyControl/pull/9
+Integration commit: `c5c6d8c`. Original tested worktree is preserved; merge is
+a separate action.
