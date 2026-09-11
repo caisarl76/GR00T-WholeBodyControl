@@ -56,6 +56,7 @@ class DefaultEnv:
         self.hand_type = self.robot.HAND_TYPE
         self.inspire_hand_plant = None
         self.inspire_hand_subscriber = None
+        self.inspire_hand_adapter = None
         self.sim_dt = self.config["SIMULATE_DT"]
         self.obs = None
         if self.hand_type == "inspire_ftp":
@@ -168,15 +169,6 @@ class DefaultEnv:
         self.mj_data = mujoco.MjData(self.mj_model)
         self.mj_model.opt.timestep = self.sim_dt
         if self.hand_type == "inspire_ftp":
-            hand_state = InspireCommandState(
-                stale_after_s=self.config.get("INSPIRE_HAND_COMMAND_TIMEOUT_S", 0.25),
-                max_slew_speed=self.config.get(
-                    "INSPIRE_HAND_MAX_SLEW_SPEED",
-                    self.config.get(
-                        "INSPIRE_HAND_MAX_OPEN_SPEED", DEFAULT_MAX_SLEW_SPEED
-                    ),
-                ),
-            )
             self.inspire_hand_plant = InspireFtpMujocoPlant.resolve(
                 self.mj_model,
                 self.mj_data,
@@ -185,11 +177,24 @@ class DefaultEnv:
                 left_actuator_names=self.robot.LEFT_HAND_ACTUATOR_NAMES or None,
                 right_actuator_names=self.robot.RIGHT_HAND_ACTUATOR_NAMES or None,
             )
-            self.inspire_hand_subscriber = InspireFtpZmqSubscriber(
-                host=self.config.get("INSPIRE_HAND_ZMQ_HOST", "localhost"),
-                port=self.config.get("INSPIRE_HAND_ZMQ_PORT", 5556),
-                state=hand_state,
-            )
+            source = self.config.get("INSPIRE_HAND_COMMAND_SOURCE", "controller")
+            if source == "controller":
+                hand_state = InspireCommandState(
+                    stale_after_s=self.config.get("INSPIRE_HAND_COMMAND_TIMEOUT_S", 0.25),
+                    max_slew_speed=self.config.get(
+                        "INSPIRE_HAND_MAX_SLEW_SPEED",
+                        self.config.get(
+                            "INSPIRE_HAND_MAX_OPEN_SPEED", DEFAULT_MAX_SLEW_SPEED
+                        ),
+                    ),
+                )
+                self.inspire_hand_subscriber = InspireFtpZmqSubscriber(
+                    host=self.config.get("INSPIRE_HAND_ZMQ_HOST", "localhost"),
+                    port=self.config.get("INSPIRE_HAND_ZMQ_PORT", 5556),
+                    state=hand_state,
+                )
+            elif source != "optical":
+                raise ValueError(f"Invalid Inspire hand command source: {source!r}")
             self.inspire_hand_plant.write_targets(OPEN, OPEN)
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
@@ -218,8 +223,7 @@ class DefaultEnv:
                 self.qvel_offset = 1
             else:
                 raise ValueError(
-                    "No root link found --"
-                    "The absolute static root will make the simulation unstable."
+                    "No root link found --The absolute static root will make the simulation unstable."
                 )
 
         # Enable the elastic band
@@ -569,12 +573,15 @@ class DefaultEnv:
                 body_torques, -self.torque_limit, self.torque_limit
             )
             self.mj_data.ctrl[self.body_actuator_index] = self.torques
-            now = time.monotonic()
-            self.inspire_hand_subscriber.poll(now=now)
-            left_command, right_command = self.inspire_hand_subscriber.state.advance(
-                now=now, dt=self.sim_dt
-            )
-            self.inspire_hand_plant.write_targets(left_command, right_command)
+            if self.inspire_hand_adapter is not None:
+                self.inspire_hand_adapter.step(now=time.monotonic(), dt=self.sim_dt)
+            elif self.inspire_hand_subscriber is not None:
+                now = time.monotonic()
+                self.inspire_hand_subscriber.poll(now=now)
+                left_command, right_command = self.inspire_hand_subscriber.state.advance(
+                    now=now, dt=self.sim_dt
+                )
+                self.inspire_hand_plant.write_targets(left_command, right_command)
         else:
             hand_torques = self.compute_hand_torques()
             # -1: actuator array is 0-based while joint indices from the model are 1-based
@@ -695,10 +702,16 @@ class DefaultEnv:
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
         if self.inspire_hand_plant is not None:
-            self.inspire_hand_subscriber.state.reset()
             self.inspire_hand_plant.write_targets(OPEN, OPEN)
+        if self.inspire_hand_subscriber is not None:
+            self.inspire_hand_subscriber.state.reset()
+        if self.inspire_hand_adapter is not None:
+            self.inspire_hand_adapter.reset()
 
     def close(self):
+        if self.inspire_hand_adapter is not None:
+            self.inspire_hand_adapter.close()
+            self.inspire_hand_adapter = None
         if self.inspire_hand_subscriber is not None:
             self.inspire_hand_subscriber.close()
             self.inspire_hand_subscriber = None
@@ -732,20 +745,28 @@ class BaseSimulator:
             self.sim_env = DefaultEnv(config, env_name, **kwargs)
         else:
             raise ValueError(
-                f"Invalid environment name: {env_name}. "
-                f"Only 'default' is supported in this minimal build."
+                f"Invalid environment name: {env_name}. Only 'default' is supported in this minimal build."
             )
 
-        try:
-            if self.config.get("INTERFACE", None):
-                ChannelFactoryInitialize(self.config["DOMAIN_ID"], self.config["INTERFACE"])
-            else:
-                ChannelFactoryInitialize(self.config["DOMAIN_ID"])
-        except Exception as e:
-            print(f"Note: Channel factory initialization attempt: {e}")
+        if self.config.get("INTERFACE", None):
+            ChannelFactoryInitialize(self.config["DOMAIN_ID"], self.config["INTERFACE"])
+        else:
+            ChannelFactoryInitialize(self.config["DOMAIN_ID"])
 
         self.init_unitree_bridge()
         self.sim_env.set_unitree_bridge(self.unitree_bridge)
+        if (
+            self.robot.HAND_TYPE == "inspire_ftp"
+            and self.config.get("INSPIRE_HAND_COMMAND_SOURCE", "controller") == "optical"
+        ):
+            from gear_sonic.utils.mujoco_sim.pico_inspire_sim import PicoInspireSim
+
+            self.sim_env.inspire_hand_adapter = PicoInspireSim(
+                self.sim_env.inspire_hand_plant,
+                host=self.config.get("INSPIRE_HAND_ZMQ_HOST", "127.0.0.1"),
+                port=self.config.get("INSPIRE_HAND_ZMQ_PORT", 5556),
+                status_port=self.config.get("INSPIRE_HAND_STATUS_PORT", 5563),
+            )
 
         self.init_subscriber()
         self.init_publisher()
@@ -822,6 +843,7 @@ class BaseSimulator:
     def close(self):
         self._running = False
         try:
+            self.sim_env.close()
             if self.sim_env.image_publish_process is not None:
                 self.sim_env.image_publish_process.stop()
             if self.sim_env.viewer is not None:

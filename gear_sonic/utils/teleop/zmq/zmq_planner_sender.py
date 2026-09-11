@@ -8,12 +8,14 @@ deserialize without out-of-band schema knowledge.
 from __future__ import annotations
 
 import json
+import math
 import struct
 from typing import Sequence
 
 import numpy as np
 
 HEADER_SIZE = 1280
+WIRE_DTYPES = {"f32": "<f4", "f64": "<f8", "i32": "<i4", "i64": "<i8", "u8": "u1", "bool": "?"}
 
 
 def _build_header(fields: list, version: int = 1, count: int = 1) -> bytes:
@@ -29,9 +31,7 @@ def _build_header(fields: list, version: int = 1, count: int = 1) -> bytes:
     return header_json.ljust(HEADER_SIZE, b"\x00")
 
 
-def build_command_message(
-    start: bool, stop: bool, planner: bool, delta_heading: float | None = None
-) -> bytes:
+def build_command_message(start: bool, stop: bool, planner: bool, delta_heading: float | None = None) -> bytes:
     """
     Assemble a 'command' topic message:
       - start: u8 (1=start control)
@@ -111,30 +111,22 @@ def build_planner_message(
 
     # Add upper body position and velocity to payload, optionally
     if upper_body_position is not None:
-        fields.append(
-            {"name": "upper_body_position", "dtype": "f32", "shape": [len(upper_body_position)]}
-        )
+        fields.append({"name": "upper_body_position", "dtype": "f32", "shape": [len(upper_body_position)]})
         for value in upper_body_position:
             payload += struct.pack("<f", float(value))
 
     if upper_body_velocity is not None:
-        fields.append(
-            {"name": "upper_body_velocity", "dtype": "f32", "shape": [len(upper_body_velocity)]}
-        )
+        fields.append({"name": "upper_body_velocity", "dtype": "f32", "shape": [len(upper_body_velocity)]})
         for value in upper_body_velocity:
             payload += struct.pack("<f", float(value))
 
     if left_hand_position is not None:
-        fields.append(
-            {"name": "left_hand_joints", "dtype": "f32", "shape": [len(left_hand_position)]}
-        )
+        fields.append({"name": "left_hand_joints", "dtype": "f32", "shape": [len(left_hand_position)]})
         for value in left_hand_position:
             payload += struct.pack("<f", float(value))
 
     if right_hand_position is not None:
-        fields.append(
-            {"name": "right_hand_joints", "dtype": "f32", "shape": [len(right_hand_position)]}
-        )
+        fields.append({"name": "right_hand_joints", "dtype": "f32", "shape": [len(right_hand_position)]})
         for value in right_hand_position:
             payload += struct.pack("<f", float(value))
 
@@ -144,9 +136,7 @@ def build_planner_message(
             payload += struct.pack("<f", float(value))
 
     if vr_3pt_orientation is not None:
-        fields.append(
-            {"name": "vr_orientation", "dtype": "f32", "shape": [len(vr_3pt_orientation)]}
-        )
+        fields.append({"name": "vr_orientation", "dtype": "f32", "shape": [len(vr_3pt_orientation)]})
         for value in vr_3pt_orientation:
             payload += struct.pack("<f", float(value))
 
@@ -190,20 +180,21 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) ->
     for key, value in pose_data.items():
         if isinstance(value, np.ndarray):
             # Determine dtype string
-            if value.dtype == np.float32:
+            native_dtype = value.dtype.newbyteorder("=")
+            if native_dtype == np.float32:
                 dtype_str = "f32"
-            elif value.dtype == np.float64:
+            elif native_dtype == np.float64:
                 dtype_str = "f64"
-            elif value.dtype == np.int32:
+            elif native_dtype == np.int32:
                 dtype_str = "i32"
-            elif value.dtype == np.int64:
+            elif native_dtype == np.int64:
                 dtype_str = "i64"
-            elif value.dtype == bool:
+            elif native_dtype == np.uint8:
+                dtype_str = "u8"
+            elif native_dtype == np.dtype(bool):
                 dtype_str = "bool"
             else:
-                # Default to f32, cast if needed
-                dtype_str = "f32"
-                value = value.astype(np.float32)
+                raise ValueError(f"Unsupported packed dtype for {key}: {value.dtype}")
 
             fields.append({"name": key, "dtype": dtype_str, "shape": list(value.shape)})
 
@@ -214,6 +205,8 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) ->
                 value = value.astype(value.dtype.newbyteorder("<"))
 
             binary_data.append(value.tobytes())
+        else:
+            raise TypeError(f"Packed field {key} must be a numpy array")
 
     # Build header using common utility
     header_bytes = _build_header(fields, version=version, count=1)
@@ -224,3 +217,42 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) ->
 
     packed_message = topic_bytes + header_bytes + data_bytes
     return packed_message
+
+
+def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
+    """Decode exact little-endian fields; reject unknown types and extra bytes."""
+    prefix = topic.encode("utf-8")
+    offset = len(prefix) + HEADER_SIZE
+    if not packed_data.startswith(prefix) or len(packed_data) < offset:
+        raise ValueError("Invalid packed topic/header length")
+    header = json.loads(packed_data[len(prefix) : offset].split(b"\0", 1)[0])
+    if not isinstance(header, dict) or header.get("endian") != "le" or not isinstance(header.get("fields"), list):
+        raise ValueError("Invalid packed endian/fields")
+    result = {"version": header.get("v", 0), "endian": "le"}
+    for field in header["fields"]:
+        if not isinstance(field, dict):
+            raise ValueError("Invalid packed field declaration")
+        name, shape, kind = field.get("name"), field.get("shape"), field.get("dtype")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in result
+            or not isinstance(kind, str)
+            or kind not in WIRE_DTYPES
+            or not isinstance(shape, list)
+            or len(shape) > 32
+            or any(type(n) is not int or not 0 <= n <= np.iinfo(np.intp).max for n in shape)
+        ):
+            raise ValueError("Invalid packed field declaration")
+        dtype = np.dtype(WIRE_DTYPES[kind])
+        size = math.prod(shape) * dtype.itemsize
+        if offset + size > len(packed_data):
+            raise ValueError("Truncated packed field")
+        raw = packed_data[offset : offset + size]
+        if kind == "bool" and any(b not in (0, 1) for b in raw):
+            raise ValueError("Invalid boolean byte")
+        result[name] = np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
+        offset += size
+    if offset != len(packed_data):
+        raise ValueError("Trailing packed payload bytes")
+    return result

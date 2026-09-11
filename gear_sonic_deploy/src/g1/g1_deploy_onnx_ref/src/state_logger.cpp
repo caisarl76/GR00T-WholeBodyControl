@@ -100,12 +100,14 @@ uint64_t StateLogger::LogFullState(const std::array<double, 4>& base_quat,
                                    const std::span<double>& right_hand_dq,
                                    const std::span<double>& last_left_hand_action,
                                    const std::span<double>& last_right_hand_action,
-                                   double ros_timestamp) {
+                                   double ros_timestamp,
+                                   std::array<std::chrono::steady_clock::time_point, 2> hand_feedback_time) {
   Entry e;
   e.index = next_index_.fetch_add(1, std::memory_order_relaxed);
   e.timestamp = std::chrono::system_clock::now();
   e.timestamp_monotonic = std::chrono::steady_clock::now();
   e.ros_timestamp = ros_timestamp;
+  e.hand_feedback_time = hand_feedback_time;
   e.base_quat = base_quat;
   e.base_ang_vel = base_ang_vel;
   e.base_accel = base_accel;
@@ -503,4 +505,3 @@ Entry StateLogger::makeZeroEntry_() const {
   e.token_state.clear();
   return e;
 }
-

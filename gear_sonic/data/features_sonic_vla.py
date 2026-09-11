@@ -352,18 +352,39 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "dtype": "float32",
             "shape": (9,),
             "names": [
-                "lwrist_x", "lwrist_y", "lwrist_z",
-                "rwrist_x", "rwrist_y", "rwrist_z",
-                "neck_x", "neck_y", "neck_z",
+                "lwrist_x",
+                "lwrist_y",
+                "lwrist_z",
+                "rwrist_x",
+                "rwrist_y",
+                "rwrist_z",
+                "neck_x",
+                "neck_y",
+                "neck_z",
             ],
         },
         "teleop.vr_3pt_orientation": {
             "dtype": "float32",
             "shape": (18,),
             "names": [
-                "lwrist_r00", "lwrist_r10", "lwrist_r01", "lwrist_r11", "lwrist_r02", "lwrist_r12",
-                "rwrist_r00", "rwrist_r10", "rwrist_r01", "rwrist_r11", "rwrist_r02", "rwrist_r12",
-                "neck_r00", "neck_r10", "neck_r01", "neck_r11", "neck_r02", "neck_r12",
+                "lwrist_r00",
+                "lwrist_r10",
+                "lwrist_r01",
+                "lwrist_r11",
+                "lwrist_r02",
+                "lwrist_r12",
+                "rwrist_r00",
+                "rwrist_r10",
+                "rwrist_r01",
+                "rwrist_r11",
+                "rwrist_r02",
+                "rwrist_r12",
+                "neck_r00",
+                "neck_r10",
+                "neck_r01",
+                "neck_r11",
+                "neck_r02",
+                "neck_r12",
             ],
         },
     }
@@ -396,12 +417,17 @@ def get_wrist_camera_modality_config() -> dict:
 
 
 def get_g1_robot_model(
-    waist_location: Literal[
-        "lower_body", "upper_body", "lower_and_upper_body"
-    ] = "lower_and_upper_body",
+    waist_location: Literal["lower_body", "upper_body", "lower_and_upper_body"] = "lower_and_upper_body",
     high_elbow_pose: bool = False,
+    hand_profile: Literal["dex3", "inspire_ftp"] = "dex3",
 ):
     """Instantiate the G1 + ThreeFinger RobotModel for Sonic VLA."""
+    if hand_profile == "inspire_ftp":
+        from gear_sonic.data.pico_hand_features import get_inspire_episode_model
+
+        return get_inspire_episode_model(waist_location, high_elbow_pose)
+    if hand_profile != "dex3":
+        raise ValueError("unsupported hand profile")
     from gear_sonic.data.robot_model.instantiation.g1 import instantiate_g1_robot_model
 
     return instantiate_g1_robot_model(

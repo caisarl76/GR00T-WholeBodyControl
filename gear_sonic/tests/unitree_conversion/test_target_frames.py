@@ -432,8 +432,8 @@ def test_exporter_registers_episode_tasks_in_first_occurrence_order(
         _wait_image_writer=lambda: None,
         _save_episode_table=lambda _buffer, _index: None,
         encode_episode_videos=lambda _index: {},
-        create_episode_buffer=lambda: {},
-        create_video_writer=lambda: {},
+        create_episode_buffer=lambda: {"episode_index": 1},
+        create_video_writer=lambda episode_index=None: {},
     )
     (tmp_path / "episode.parquet").touch()
     monkeypatch.setattr(exporter_module, "validate_episode_buffer", lambda *_args: None)

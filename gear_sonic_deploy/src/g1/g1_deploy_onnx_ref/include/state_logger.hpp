@@ -110,6 +110,7 @@ class StateLogger {
     std::vector<double> right_hand_dq;     // size = 7 (dq velocities)
     std::vector<double> last_left_hand_action;  // size = 7
     std::vector<double> last_right_hand_action; // size = 7
+    std::array<std::chrono::steady_clock::time_point, 2> hand_feedback_time{};
 
     // Post-state data (set after initial state logging via LogPostState)
     bool has_post_state_data = false;
@@ -170,7 +171,8 @@ class StateLogger {
                         const std::span<double>& right_hand_dq,
                         const std::span<double>& last_left_hand_action,
                         const std::span<double>& last_right_hand_action,
-                        double ros_timestamp = 0.0);
+                        double ros_timestamp = 0.0,
+                        std::array<std::chrono::steady_clock::time_point, 2> hand_feedback_time = {});
 
   /**
    * Log post-state data (e.g., token state from encoder) to the most recent entry.

@@ -212,6 +212,7 @@ show_usage() {
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --disable-dex3-hands    Do not create Dex3 DDS hand endpoints"
+    echo "  --live-pose-playback    Skip accumulated streamed pose backlog"
     echo "  --dry-run               Print the final deploy command and exit"
     echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
     echo "  --motor-kd-scale SPEC   Scale Kd for hardware motor indices/ranges"
@@ -246,6 +247,7 @@ MOTION_DATA_DEFAULT="reference/example/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
+LIVE_POSE_PLAYBACK=false
 
 # Initialize with defaults (will be set after parsing)
 CHECKPOINT="$CHECKPOINT_DEFAULT"
@@ -327,6 +329,10 @@ while [[ $# -gt 0 ]]; do
             DISABLE_DEX3_HANDS=true
             shift
             ;;
+        --live-pose-playback)
+            LIVE_POSE_PLAYBACK=true
+            shift
+            ;;
         --dry-run)
             DRY_RUN=true
             shift
@@ -352,7 +358,10 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            # Could be interface name or IP
+            if [[ "$1" == --* ]]; then
+                echo -e "${RED}Error: unknown option: $1${NC}" >&2
+                exit 1
+            fi
             INTERFACE_MODE="$1"
             shift
             ;;
@@ -381,6 +390,15 @@ resolve_interface "$INTERFACE_MODE"
 echo -e "Resolved interface: ${GREEN}$TARGET${NC}"
 echo -e "Environment type:   ${GREEN}$ENV_TYPE${NC}"
 echo ""
+
+# The ZMQ feedback publisher needs this port before any build work.
+if [[ "$DRY_RUN" != true && ( "$OUTPUT_TYPE" == "all" || "$OUTPUT_TYPE" == "zmq" ) ]] && command -v lsof >/dev/null 2>&1; then
+    if ZMQ_PORT_USERS=$(lsof -nP -iTCP:5557 -sTCP:LISTEN 2>/dev/null) && [[ -n "$ZMQ_PORT_USERS" ]]; then
+        echo -e "${RED}Error: ZMQ output port 5557 is already in use:${NC}" >&2
+        echo "$ZMQ_PORT_USERS" >&2
+        exit 1
+    fi
+fi
 
 # ============================================================================
 # Configuration
@@ -420,6 +438,10 @@ if [[ "$ENV_TYPE" == "sim" ]]; then
 fi
 if [[ "$DISABLE_DEX3_HANDS" == true ]]; then
     EXTRA_ARGS+=("--disable-dex3-hands")
+fi
+
+if [[ "$LIVE_POSE_PLAYBACK" == true ]]; then
+    EXTRA_ARGS+=("--live-pose-playback")
 fi
 
 for scale in "${MOTOR_KP_SCALES[@]}"; do

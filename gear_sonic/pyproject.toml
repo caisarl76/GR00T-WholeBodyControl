@@ -38,6 +38,8 @@ teleop = [
     "msgpack-numpy",
     "pin",
     "pyvista; platform_machine != 'aarch64'",
+    "dex-retargeting==0.4.6",
+    "pyyaml",
 ]
 # MuJoCo simulation (run_sim_loop.py and related scripts)
 # Usage: pip install -e "gear_sonic[sim]"
@@ -125,7 +127,7 @@ include = ["gear_sonic*"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-gear_sonic = ["py.typed", "**/*.json", "**/*.yaml"]
+gear_sonic = ["py.typed", "**/*.json", "**/*.yaml", "utils/teleop/hand_assets/**/*.yml", "utils/teleop/hand_assets/**/*.urdf", "utils/teleop/hand_assets/LICENSE", "scripts/pico_hand_viewer.html", "data/robot_model/model_data/g1/*inspire_ftp.xml", "data/robot_model/model_data/g1/g1_41dof_inspire_episode.urdf"]
 
 [tool.setuptools.dynamic]
 version = {attr = "gear_sonic.version.VERSION"}

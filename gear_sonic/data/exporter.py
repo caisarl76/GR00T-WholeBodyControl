@@ -72,9 +72,7 @@ class ArgsConfig:
         allowed_keys: list[str] | None = None,
     ):
         instance = cls()
-        instance.update(
-            config_dict=config_dict, strict=strict, skip_keys=skip_keys, allowed_keys=allowed_keys
-        )
+        instance.update(config_dict=config_dict, strict=strict, skip_keys=skip_keys, allowed_keys=allowed_keys)
         return instance
 
     def to_dict(self):
@@ -129,9 +127,7 @@ class Gr00tDatasetMetadata(LeRobotDatasetMetadata):
     def validate_modality_config(modality_config: dict) -> None:
         valid_keys = ["state", "action", "video", "annotation"]
         if not all(key in modality_config for key in valid_keys):
-            raise ValueError(
-                f"Modality config must contain all of the following keys: {valid_keys}"
-            )
+            raise ValueError(f"Modality config must contain all of the following keys: {valid_keys}")
         for key in valid_keys:
             if key not in modality_config:
                 raise ValueError(f"Modality config must contain a '{key}' key")
@@ -212,8 +208,7 @@ class Gr00tDataExporter(LeRobotDataset):
                 )
             except RepositoryNotFoundError as e:
                 raise ValueError(
-                    f"Failed to resume from corrupted dataset. "
-                    f"Please manually check the dataset at {save_root}"
+                    f"Failed to resume from corrupted dataset. Please manually check the dataset at {save_root}"
                 ) from e
         else:
             if not isinstance(script_config, dict):
@@ -229,6 +224,19 @@ class Gr00tDataExporter(LeRobotDataset):
                 script_config=script_config,
                 use_videos=True,
             )
+
+        if isinstance(script_config, dict) and "hand_profile" in script_config:
+            actual_profile = obj.meta.info.get("script_config", {}).get("hand_profile", "dex3")
+            if actual_profile != script_config["hand_profile"]:
+                raise ValueError("dataset hand profile differs from exporter profile")
+            for key, expected in features.items():
+                actual = obj.meta.features.get(key)
+                if (
+                    actual is None
+                    or actual["dtype"] != expected["dtype"]
+                    or tuple(actual["shape"]) != tuple(expected["shape"])
+                ):
+                    raise ValueError(f"dataset feature differs from requested profile: {key}")
 
         obj.tolerance_s = tolerance_s
         obj.video_backend = "pyav"
@@ -251,14 +259,15 @@ class Gr00tDataExporter(LeRobotDataset):
         obj.video_writers = obj.create_video_writer()
         return obj
 
-    def create_video_writer(self) -> dict[str, VideoWriter]:
+    def create_video_writer(self, episode_index: int | None = None) -> dict[str, VideoWriter]:
         if getattr(self, "_pre_encoded_videos", False):
             return {}
+        if episode_index is None:
+            episode_index = self.episode_buffer["episode_index"]
         video_writers = {}
         for key in self.meta.video_keys:
             video_writers[key] = VideoWriter(
-                self.root
-                / self.meta.get_video_file_path(self.episode_buffer["episode_index"], key),
+                self.root / self.meta.get_video_file_path(episode_index, key),
                 self.meta.shapes[key][1],
                 self.meta.shapes[key][0],
                 self.fps,
@@ -306,8 +315,7 @@ class Gr00tDataExporter(LeRobotDataset):
 
             if key not in self.features:
                 raise ValueError(
-                    f"An element of the frame is not in the features. "
-                    f"'{key}' not in '{self.features.keys()}'."
+                    f"An element of the frame is not in the features. '{key}' not in '{self.features.keys()}'."
                 )
 
             if self.features[key]["dtype"] in ["image", "video"]:
@@ -359,8 +367,8 @@ class Gr00tDataExporter(LeRobotDataset):
         self._pre_encoded_video_paths = {}
 
     def save_episode(self, episode_data: dict | None = None) -> None:
-        if not episode_data:
-            episode_buffer = self.episode_buffer
+        original_buffer = self.episode_buffer if episode_data is None else episode_data
+        episode_buffer = copy.deepcopy(original_buffer)
 
         if getattr(self, "_pre_encoded_videos", False) and set(self._pre_encoded_video_paths) != set(
             self.meta.video_keys
@@ -374,9 +382,7 @@ class Gr00tDataExporter(LeRobotDataset):
         episode_tasks = list(dict.fromkeys(tasks))
         episode_index = episode_buffer["episode_index"]
 
-        episode_buffer["index"] = np.arange(
-            self.meta.total_frames, self.meta.total_frames + episode_length
-        )
+        episode_buffer["index"] = np.arange(self.meta.total_frames, self.meta.total_frames + episode_length)
         episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
 
         for task in episode_tasks:
@@ -401,9 +407,7 @@ class Gr00tDataExporter(LeRobotDataset):
         self._save_episode_table(episode_buffer, episode_index)
 
         non_video_features = {k: v for k, v in self.features.items() if v["dtype"] not in ["video"]}
-        non_vid_ep_buffer = {
-            k: v for k, v in episode_buffer.items() if k in non_video_features.keys()
-        }
+        non_vid_ep_buffer = {k: v for k, v in episode_buffer.items() if k in non_video_features.keys()}
         ep_stats = compute_episode_stats(non_vid_ep_buffer, non_video_features)
 
         if len(self.meta.video_keys) > 0:
@@ -432,27 +436,34 @@ class Gr00tDataExporter(LeRobotDataset):
         parquet_files = list(self.root.rglob("*.parquet"))
         assert len(parquet_files) == self.num_episodes
 
-        img_dir = self.root / "images"
-        if img_dir.is_dir():
-            shutil.rmtree(self.root / "images")
-
-        if not episode_data:
-            self.episode_buffer = self.create_episode_buffer()
-            self.video_writers = self.create_video_writer()
-            self._pre_encoded_video_paths = {}
-
         for key in self.meta.video_keys:
             video_path = os.path.join(self.root, self.meta.get_video_file_path(episode_index, key))
             if not os.path.exists(video_path):
-                raise FileNotFoundError(
-                    f"Video path: {video_path} does not exist for episode {episode_index}"
-                )
+                raise FileNotFoundError(f"Video path: {video_path} does not exist for episode {episode_index}")
 
         parquet_path = os.path.join(self.root, self.meta.get_data_file_path(episode_index))
         if not os.path.exists(parquet_path):
-            raise FileNotFoundError(
-                f"Parquet path: {parquet_path} does not exist for episode {episode_index}"
-            )
+            raise FileNotFoundError(f"Parquet path: {parquet_path} does not exist for episode {episode_index}")
+
+        # Complete fallible setup and durable flushes before retiring capture data.
+        next_buffer = self.create_episode_buffer() if episode_data is None else None
+        for path in self.root.rglob("*"):
+            if path.is_file() and "images" not in path.relative_to(self.root).parts:
+                with path.open("rb") as saved:
+                    os.fsync(saved.fileno())
+        for directory in [self.root, *[p for p in self.root.rglob("*") if p.is_dir()]]:
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        if episode_data is None:
+            next_writers = self.create_video_writer(episode_index=int(next_buffer["episode_index"]))
+            self.episode_buffer = next_buffer
+            self.video_writers = next_writers
+            self._pre_encoded_video_paths = {}
+        # Scratch image cleanup cannot turn a durable episode into a failed save.
+        shutil.rmtree(self.root / "images", ignore_errors=True)
 
     def encode_episode_videos(self, episode_index: int) -> dict:
         video_paths = {}
@@ -462,9 +473,9 @@ class Gr00tDataExporter(LeRobotDataset):
 
     def save_episode_as_discarded(self) -> None:
         """Flag ongoing episode as discarded and save it to disk."""
-        self.meta.info["discarded_episode_indices"] = self.meta.info.get(
-            "discarded_episode_indices", []
-        ) + [self.episode_buffer["episode_index"]]
+        self.meta.info["discarded_episode_indices"] = self.meta.info.get("discarded_episode_indices", []) + [
+            self.episode_buffer["episode_index"]
+        ]
         self.save_episode()
 
 
@@ -473,9 +484,7 @@ class Gr00tDataExporter(LeRobotDataset):
 # ---------------------------------------------------------------------------
 
 
-def hf_transform_to_torch_by_features(
-    features: datasets.Sequence, items_dict: dict[torch.Tensor | None]
-):
+def hf_transform_to_torch_by_features(features: datasets.Sequence, items_dict: dict[torch.Tensor | None]):
     for key in items_dict:
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
@@ -497,9 +506,7 @@ def hf_transform_to_torch_by_features(
                 "int32": torch.int32,
                 "int64": torch.int64,
             }
-            items_dict[key] = [
-                torch.tensor(x, dtype=dtype_mapping[dtype_str]) for x in items_dict[key]
-            ]
+            items_dict[key] = [torch.tensor(x, dtype=dtype_mapping[dtype_str]) for x in items_dict[key]]
     return items_dict
 
 
@@ -519,9 +526,7 @@ class TypedLeRobotDataset(LeRobotDataset):
             path = str(self.root / "data")
             hf_dataset = load_dataset("parquet", data_dir=path, split="train")
         else:
-            files = [
-                str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes
-            ]
+            files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
             hf_dataset = load_dataset("parquet", data_files=files, split="train")
 
         hf_dataset.set_transform(partial(hf_transform_to_torch_by_features, hf_dataset.features))
