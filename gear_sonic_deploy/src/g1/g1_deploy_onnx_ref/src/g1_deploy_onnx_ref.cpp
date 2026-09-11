@@ -86,6 +86,7 @@
 
 // Motion Data Reader
 #include "../include/motion_data_reader.hpp"
+#include "../include/streamed_motion_playback.hpp"
 
 // Math utilities
 #include "../include/math_utils.hpp"
@@ -216,6 +217,7 @@ class G1Deploy {
     std::shared_ptr<const MotionSequence> current_motion_ = nullptr;
     int current_frame_ = 0;
     int saved_frame_for_observation_window_ = 0; // for observation window
+    bool live_pose_playback_ = false;
     std::mutex current_motion_mutex_; // for current motion and frame synchronization
     
     // =========================================================================
@@ -2174,7 +2176,8 @@ class G1Deploy {
       double initial_max_close_ratio = 1.0,
       bool enable_dex3_hands = true,
       Vr3PtSafetyFilter::Config vr3pt_filter_config = Vr3PtSafetyFilter::Config{},
-      MotorGainScaleConfig motor_gain_scales = {})
+      MotorGainScaleConfig motor_gain_scales = {},
+      bool live_pose_playback = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2184,6 +2187,7 @@ class G1Deploy {
         counter_(0),
         mode_pr_(Mode::PR),
         mode_machine_(0),
+        live_pose_playback_(live_pose_playback),
         disable_crc_check_(disable_crc_check),
         program_state_(ProgramState::INIT),
         motor_gain_scales_(motor_gain_scales),
@@ -2197,6 +2201,11 @@ class G1Deploy {
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
+
+      if (live_pose_playback_) {
+        std::cout << "[INFO] Live pose playback enabled: skip streamed backlog while retaining the observation window"
+                  << std::endl;
+      }
 
       const auto kp_scales = format_motor_gain_scales(motor_gain_scales_.kp);
       const auto kd_scales = format_motor_gain_scales(motor_gain_scales_.kd);
@@ -2948,16 +2957,21 @@ class G1Deploy {
       std::array<double, 7> right_hand_q = {0.0};
       std::array<double, 7> right_hand_dq = {0.0};
       
-      auto left_hand_state_ptr = enable_dex3_hands_ ? dex3_hands_.getState(true) : nullptr;
-      if (left_hand_state_ptr) {
+      const auto left_hand_data = dex3_hands_.getStateWithTime(true);
+      const auto right_hand_data = dex3_hands_.getStateWithTime(false);
+      std::array<std::chrono::steady_clock::time_point, 2> hand_feedback_time{};
+      auto left_hand_state_ptr = enable_dex3_hands_ ? left_hand_data.data : nullptr;
+      if (left_hand_state_ptr && left_hand_state_ptr->motor_state().size() == 7) {
+        hand_feedback_time[0] = left_hand_data.timestamp;
         for (int i = 0; i < 7; ++i) {
           left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
           left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
         }
       }
       
-      auto right_hand_state_ptr = enable_dex3_hands_ ? dex3_hands_.getState(false) : nullptr;
-      if (right_hand_state_ptr) {
+      auto right_hand_state_ptr = enable_dex3_hands_ ? right_hand_data.data : nullptr;
+      if (right_hand_state_ptr && right_hand_state_ptr->motor_state().size() == 7) {
+        hand_feedback_time[1] = right_hand_data.timestamp;
         for (int i = 0; i < 7; ++i) {
           right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
           right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
@@ -2981,7 +2995,7 @@ class G1Deploy {
                                     std::span(right_hand_dq),
                                     std::span(last_left_hand_action),
                                     std::span(last_right_hand_action),
-                                    ros_timestamp);
+                                    ros_timestamp, hand_feedback_time);
       }
       return true;
     }
@@ -3242,7 +3256,8 @@ class G1Deploy {
      *
      * 2. **Reference-motion mode**: Advances current_frame_ by 1.  Clamps or
      *    resets to 0 when the motion ends (except for "streamed" motions,
-     *    which hold the last valid frame while waiting for new data).
+     *    which hold the last valid frame while waiting for new data, or skip
+     *    to the latest frame with enough future context in live pose mode).
      *
      * @return True on success.
      */
@@ -3491,8 +3506,11 @@ class G1Deploy {
             std::cout << "Reset to frame 0." << std::endl;
           }
         } else {
-          if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
-            current_frame_ = current_frame_ - 1;
+          const int previous_frame = current_frame_ - 1;
+          current_frame_ = SelectStreamedPlaybackFrame(
+              previous_frame, current_motion_->timesteps,
+              saved_frame_for_observation_window_, live_pose_playback_);
+          if (current_frame_ == previous_frame) {
             std::cout << "Motion " << current_motion_->name << " completed and waiting following motion" << std::endl;                    
           }
         }
@@ -4248,6 +4266,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --zmq-topic <topic>: ZMQ topic/prefix (default: pose)" << std::endl;
     std::cout << "  --zmq-conflate: enable ZMQ CONFLATE (default: disabled)" << std::endl;
     std::cout << "  --zmq-verbose: enable ZMQ subscriber verbose logs" << std::endl;
+    std::cout << "  --live-pose-playback: skip streamed backlog while retaining the observation window (default: OFF)" << std::endl;
     std::cout << "  --zmq-out-port <port>: ZMQ port for output (default: 5557)" << std::endl;
     std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
     std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
@@ -4302,6 +4321,7 @@ int main(int argc, char const* argv[]) {
   std::string zmq_topic = "pose";
   bool zmq_conflate = false;  // default off; enable with --zmq-conflate
   bool zmq_verbose = false;
+  bool live_pose_playback = false;
   bool enableMotionRecording = false;  // default off; enable with --enable-motion-recording
   int zmq_out_port = 5557;
   std::string zmq_out_topic = "g1_debug";
@@ -4492,6 +4512,8 @@ int main(int argc, char const* argv[]) {
       zmq_conflate = true;
     } else if (std::string(argv[i]) == "--zmq-verbose") {
       zmq_verbose = true;
+    } else if (std::string(argv[i]) == "--live-pose-playback") {
+      live_pose_playback = true;
     } else if (std::string(argv[i]) == "--enable-motion-recording") {
       enableMotionRecording = true;
       std::cout << "[INFO] Motion recording enabled" << std::endl;
@@ -4619,7 +4641,8 @@ int main(int argc, char const* argv[]) {
     initial_max_close_ratio,
     enable_dex3_hands,
     vr3pt_filter_config,
-    motor_gain_scales
+    motor_gain_scales,
+    live_pose_playback
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

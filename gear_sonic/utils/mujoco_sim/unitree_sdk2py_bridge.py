@@ -70,6 +70,10 @@ class UnitreeSdk2Bridge:
         self.left_hand_cmd_lock = threading.Lock()
         self.right_hand_cmd_lock = threading.Lock()
 
+        self.left_hand_cmd = HandCmd_default() if self.enable_dex3_dds_hands else None
+        self.right_hand_cmd = HandCmd_default() if self.enable_dex3_dds_hands else None
+        self.reset()
+
         # Unitree sdk2 message
         self.low_state = LowState_default()
         self.low_state_puber = ChannelPublisher("rt/lowstate", LowState_)
@@ -102,15 +106,11 @@ class UnitreeSdk2Bridge:
         self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
         self.low_cmd_suber.Init(self.LowCmdHandler, 1)
 
-        self.left_hand_cmd = None
         self.left_hand_cmd_suber = None
-        self.right_hand_cmd = None
         self.right_hand_cmd_suber = None
         if self.enable_dex3_dds_hands:
-            self.left_hand_cmd = HandCmd_default()
             self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
             self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
-            self.right_hand_cmd = HandCmd_default()
             self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
             self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
 
@@ -140,8 +140,6 @@ class UnitreeSdk2Bridge:
             "left": 15,
         }
         self.joystick = None
-
-        self.reset()
 
     def reset(self):
         with self.low_cmd_lock:

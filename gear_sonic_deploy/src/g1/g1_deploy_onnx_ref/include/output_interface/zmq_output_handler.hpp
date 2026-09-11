@@ -21,7 +21,7 @@
  * ## `{user_topic}` (e.g. `g1_debug`) — published every tick
  * ---------------------------------------------------------------------------
  *
- * A single msgpack map with up to 30 keys (28 always-present + 2 conditional).
+ * A single msgpack map with up to 35 keys (33 always-present + 2 conditional).
  * All joints are in **MuJoCo order** (remapped from IsaacLab via
  * `isaaclab_to_mujoco`).
  *
@@ -48,6 +48,8 @@
  *  12  | right_hand_q           | double[7]    | Right-hand joint positions (from state logger).
  *  13  | right_hand_dq          | double[7]    | Right-hand joint velocities.
  *      |                        |              |
+ *      | left_hand_feedback_age_ns / right_hand_feedback_age_ns | int64 | DDS receipt age; -1 if unavailable.
+ *      | left_hand_feedback_valid / right_hand_feedback_valid | bool | Finite 7-joint feedback younger than 100 ms.
  *      | **Policy actions**     |              |
  *  14  | last_action            | double[29]   | Last body action (scaled + default offsets).
  *  15  | last_left_hand_action  | double[7]    | Last left-hand action.
@@ -99,6 +101,10 @@
 #ifndef ZMQ_OUTPUT_HANDLER_HPP
 #define ZMQ_OUTPUT_HANDLER_HPP
 
+#include <algorithm>
+#include <bit>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <iostream>
 #include <chrono>
@@ -269,7 +275,6 @@ private:
 
         std::vector<StateLogger::Entry> entries = state_logger_.GetLatest(1);
         const StateLogger::Entry& state = entries[0];
-        msgpack::packer<msgpack::sbuffer> pk(&state_data_sbuf_);
 
         HeadingState heading_state;
         bool has_heading_state = false;
@@ -279,10 +284,23 @@ private:
             has_heading_state = true;
         }
 
-        // State-logger fields: 18 base + 2 optional heading
+        pack_state(state_data_sbuf_, state, output_data_map_,
+                   has_heading_state ? &heading_state : nullptr);
+    }
+
+public:
+    // Pure serialization shared with hardware-free checks; freshness is evaluated at publish time.
+    static void pack_state(msgpack::sbuffer& buffer, const StateLogger::Entry& state,
+                           const std::map<std::string, std::vector<double>>& visualization,
+                           const HeadingState* heading = nullptr,
+                           std::chrono::steady_clock::time_point feedback_now = std::chrono::steady_clock::now()) {
+        buffer.clear();
+        msgpack::packer<msgpack::sbuffer> pk(&buffer);
+        const bool has_heading_state = heading != nullptr;
+        // State-logger fields: 22 base + 2 optional heading
         // Visualisation fields: output_data_map_.size() (typically 11)
-        int num_state_fields = has_heading_state ? 20 : 18;
-        int num_viz_fields = static_cast<int>(output_data_map_.size());
+        int num_state_fields = has_heading_state ? 24 : 22;
+        int num_viz_fields = static_cast<int>(visualization.size());
         pk.pack_map(num_state_fields + num_viz_fields);
 
         // ---- State-logger fields ----
@@ -292,6 +310,26 @@ private:
 
         pk.pack("index");
         pk.pack(state.index);
+
+        // Transport freshness cannot make an old DDS hand measurement fresh.
+        for (size_t side = 0; side < 2; ++side) {
+            const auto stamp = state.hand_feedback_time[side];
+            const auto& q = side == 0 ? state.left_hand_q : state.right_hand_q;
+            const bool present = stamp != std::chrono::steady_clock::time_point{} &&
+                                 stamp <= feedback_now && q.size() == 7 &&
+                                 std::all_of(q.begin(), q.end(), [](double v) {
+                                     // -ffast-math permits std::isfinite to assume every value is finite.
+                                     static_assert(std::numeric_limits<double>::is_iec559);
+                                     return (std::bit_cast<uint64_t>(v) & UINT64_C(0x7ff0000000000000)) !=
+                                            UINT64_C(0x7ff0000000000000);
+                                 });
+            const int64_t age_ns = present ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               feedback_now - stamp).count() : -1;
+            pk.pack(side == 0 ? "left_hand_feedback_age_ns" : "right_hand_feedback_age_ns");
+            pk.pack(age_ns);
+            pk.pack(side == 0 ? "left_hand_feedback_valid" : "right_hand_feedback_valid");
+            pk.pack(present && age_ns < 100000000);
+        }
 
         pk.pack("ros_timestamp");
         pk.pack(state.ros_timestamp);
@@ -388,10 +426,10 @@ private:
         if (has_heading_state) {
             pk.pack("init_base_quat");
             pk.pack_array(4);
-            for (const auto& val : heading_state.init_base_quat) pk.pack(val);
+            for (const auto& val : heading->init_base_quat) pk.pack(val);
 
             pk.pack("delta_heading");
-            pk.pack(heading_state.delta_heading);
+            pk.pack(heading->delta_heading);
         }
 
         // ---- Visualisation fields (from output_data_map_) ----
@@ -399,13 +437,14 @@ private:
         //       base_trans_measured, base_quat_measured, body_q_measured,
         //       left_hand_q_measured, right_hand_q_measured,
         //       vr_3point_position, vr_3point_orientation, vr_3point_compliance
-        for (const auto& [key, values] : output_data_map_) {
+        for (const auto& [key, values] : visualization) {
             pk.pack(key);
             pk.pack_array(values.size());
             for (const auto& val : values) pk.pack(val);
         }
     }
 
+private:
     /// Serialise a config map into the given sbuffer.
     static void pack_robot_config(msgpack::sbuffer& sbuf,
                                   const std::map<std::string, std::variant<std::string, int, double, bool>>& config) {

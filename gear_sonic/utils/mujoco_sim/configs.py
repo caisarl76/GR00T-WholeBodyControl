@@ -17,6 +17,7 @@ from gear_sonic.utils.network.network_utils import resolve_interface
 
 WBC_VERSIONS = ["sonic_model12"]
 
+
 @dataclass
 class ArgsConfigTemplate:
     """Args Config for running the data collection loop."""
@@ -65,6 +66,7 @@ def override_wbc_config(
 ) -> dict:
     """Override WBC YAML values with dataclass values."""
     key_to_value = {
+        "INSPIRE_HAND_COMMAND_SOURCE": config.hand_command_source,
         "INTERFACE": config.interface,
         "ENV_TYPE": config.env_type,
         "VERSION": config.wbc_version,
@@ -147,7 +149,10 @@ class BaseConfig(ArgsConfigTemplate):
     """Enable hand functionality."""
 
     hand_profile: Literal["dex3", "inspire_ftp"] = "dex3"
-    """Hand model and command owner used by simulation and teleoperation."""
+    """Hand model used by simulation and teleoperation."""
+
+    hand_command_source: Literal["controller", "optical"] = "controller"
+    """Inspire simulation command transport; optical uses measured-feedback packets."""
 
     high_elbow_pose: bool = False
     """Enable high elbow pose configuration."""
@@ -303,9 +308,7 @@ class BaseConfig(ArgsConfigTemplate):
             self.gravity_compensation_joints = ["arms"]
 
         try:
-            self.commit_id = (
-                subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
-            )
+            self.commit_id = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
         except Exception:
             self.commit_id = ""
 
@@ -319,15 +322,20 @@ class BaseConfig(ArgsConfigTemplate):
         if self.wbc_version == "sonic_model12":
             config_path = configs_dir / "g1_29dof_sonic_model12.yaml"
         else:
-            raise ValueError(
-                f"Invalid wbc_version: {self.wbc_version}, please use one of: "
-                f"sonic_model12"
-            )
+            raise ValueError(f"Invalid wbc_version: {self.wbc_version}, please use one of: sonic_model12")
 
         with open(config_path) as file:
             wbc_config = yaml.load(file, Loader=yaml.FullLoader)
 
+        if self.hand_command_source not in ("controller", "optical"):
+            raise ValueError(f"Invalid hand command source: {self.hand_command_source!r}")
+        if self.hand_command_source == "optical" and self.hand_profile != "inspire_ftp":
+            raise ValueError("Optical hand command source requires the Inspire hand profile")
         if self.hand_profile == "inspire_ftp":
+            if self.env_type != "sim":
+                raise ValueError("Inspire MuJoCo hand profile requires the sim interface")
+            if not self.with_hands:
+                raise ValueError("Inspire MuJoCo hand profile requires hands enabled")
             inspire_path = (
                 configs_dir / "g1_29dof_sonic_model12_inspire_ftp.yaml"
             )

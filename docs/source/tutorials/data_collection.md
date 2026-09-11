@@ -363,27 +363,32 @@ is not specified, a timestamped name is generated automatically.
 
 ### Recording Controls
 
-There are two ways to control recording: **PICO VR controllers** (recommended during teleop) or **keyboard over ZMQ**.
+The manager and exporter now use acknowledged recording commands by default.
+Run both from the same revision and select the same `--hand-profile`.
+The exporter publishes its recording status on port `5562`. Recording is
+available in POSE or PLANNER_VR_3PT with hand input enabled; first start SONIC
+and enable tracking, then wait for fresh exporter status.
 
-**PICO VR Controllers (via `manager_state` topic):**
-
-| Input | Action |
+| Input in the manager | Action |
 |---|---|
-| **Left Grip + A** | **Toggle** recording — starts a new episode, or stops and saves the current one |
-| **Left Grip + B** | **Discard** the current episode (saved to disk but flagged for removal during post-processing) |
+| **Left Grip + A** | Toggle recording |
+| **Left Grip + B** | Abort the current episode without saving |
+| Terminal `c` | Start recording |
+| Terminal `s` | Stop and save recording |
 
-These exact chords work in any manager mode (POSE, PLANNER, etc.) and are independent of the mode-switching controls. Hold Left Grip through pressing and releasing A or B; the recording command is committed when the face button is released. Keep the other face buttons released, because combinations such as A+X, B+Y, A+B, and A+B+X+Y remain reserved for mode and policy control.
+Release all buttons/grips between controller chords and hold each chord for
+at least 0.3 seconds. A+X, B+Y and A+B+X+Y remain reserved for tracking, freeze,
+and policy control. Wait for the exporter’s RECORDING acknowledgement before
+collecting a demonstration and its IDLE acknowledgement after saving. IDLE
+means the save completed, rather than merely accepting a stop request.
+Tracking exit is blocked while recording or save status is uncertain.
 
-**Keyboard over ZMQ:**
-
-| Key | Action |
-|---|---|
-| `c` | **Toggle** recording (same as Left Grip + A) |
-| `x` | **Discard** episode (same as Left Grip + B — flagged for removal) |
-
-```{note}
-Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.
-```
+The old keyboard ZMQ channel on port `5580` is **not enabled by default**.
+`--legacy-recording-controls` opts the exporter into the old toggle/discard
+interface for older producers, including keyboard `c`/`x`. It rejects the
+new managed protocol; do not pair that flag with the current managed streamer.
+See [PICO optical hand tracking](../pico_optical_hand_tracking.md) for hand
+profiles, recorder startup, and raw hand capture independent of dataset recording.
 
 ---
 
