@@ -107,5 +107,7 @@ VR entry checks and upstream reference smoothing remain intact. A compiled
 regression reproduces the old target/history mismatch; the repaired binary also
 improves root-height and tilt transients in the captured-pose comparison with VR
 fields retained. See the [live diagnosis and controlled replay](../artifacts/sonic_output_ramp_20260914/README.md).
-Live confirmation of the repaired disturbance and separate investigation of
-later sustained-POSE falls remain pending. PC2 has not been updated.
+A subsequent live MuJoCo retest completed ten switches with finger input disabled;
+the user confirmed the balance loss was gone. Full optical-hand integration,
+physical G1 confirmation, and separate investigation of later sustained-POSE
+falls remain pending. PC2 has not been updated.

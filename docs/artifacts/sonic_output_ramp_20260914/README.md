@@ -47,8 +47,8 @@ repair. Corrected return-to-planner peaks were below their pre-switch maxima.
 ![Matched-speed comparison](comparison.png)
 
 This is a controlled standing-pose replay, not a repeat of arbitrary live body
-motion. It supports the identified mechanism and repair, but live operator and
-physical G1 confirmation remain pending. The live capture also has later
+motion. It supports the identified mechanism and repair, and the subsequent live operator retest confirmed that the one-second balance
+loss was gone. Physical G1 confirmation remains pending. The live capture also has later
 fall/reset episodes beginning 5.4 seconds after its final switch; their separate
 cause has not been established. They must not be dismissed as post-stop data.
 
@@ -103,3 +103,19 @@ measurements without starting control:
 The latter script is specific to the archived live capture and regenerates its
 report; it is not a general pass/fail qualification tool. `command_age_ms=-1` in
 replay physics CSVs is an unimplemented placeholder, not a latency measurement.
+
+## Live confirmation after repair
+
+The user repeated ten live A+X switches using rebuilt commit `20805c8`, then
+explicitly confirmed: **“Balance loss is gone.”** This test used `--hand-input off`
+to keep the unrelated right-thumb feedback gate from blocking POSE entry.
+Both directions were exercised with support disabled. There were zero paused
+reference ticks and zero root-height/tilt fall-threshold crossings during the
+logged control interval. The operator used several intervals shorter than the
+requested five seconds; these are recorded results, not a timing qualification.
+
+See [live_after/summary.json](live_after/summary.json) and its compressed source
+measurements. The three test processes were stopped afterward. Optical-hand
+integration of this latest repair and physical PC2/G1 confirmation remain next;
+no PC2 installation was performed. The earlier sustained-POSE fall/reset episodes
+remain a separate investigation and are not claimed resolved by these switches.
