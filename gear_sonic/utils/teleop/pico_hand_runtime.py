@@ -21,11 +21,29 @@ class PicoPublisher:
         self.generation = 0
         self.body_sent = False
         self.last_commands = None
+        self._preparing = False
+        self._prepared_body = None
+
+    def prepare_body(self, run_once):
+        """Compute one destination packet without publishing or changing provenance."""
+        self._prepared_body = None
+        self._preparing = True
+        try:
+            run_once()
+            return self._prepared_body
+        finally:
+            self._preparing = False
+            self._prepared_body = None
 
     def send(self, message):
         topic = "pose" if message.startswith(b"pose") else "planner" if message.startswith(b"planner") else None
         if topic is None:
             self.socket.send(message)
+            return
+        if self._preparing:
+            if self._prepared_body is not None:
+                raise RuntimeError("A streamer must prepare at most one body packet per tick")
+            self._prepared_body = message
             return
         data = unpack_pose_message(message, topic)
         version = data.pop("version")

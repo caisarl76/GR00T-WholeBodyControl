@@ -20,8 +20,8 @@
  *   - `planner = true`  → PLANNER mode (movement commands from the planner topic).
  *   - `planner = false` → STREAMED_MOTION mode (pose data from the pose topic).
  *
- * On each mode switch, safety resets are triggered and the planner buffer is
- * cleared to prevent stale commands from leaking across modes.
+ * Mode switches prepare the destination while the active reference keeps playing.
+ * Reference ownership changes only once destination data is ready.
  *
  * ## Planner Timeout
  *
@@ -242,7 +242,6 @@ class ZMQManager : public InputInterface {
       }
 
       // Translate received command to control flags and handle mode switching
-      bool trigger_zmq_toggle = false;
       {
         std::lock_guard<std::mutex> lock(command_mutex_);
         if (latest_command_.valid) {
@@ -258,40 +257,21 @@ class ZMQManager : public InputInterface {
           ManagedMode new_mode = latest_command_.planner ? ManagedMode::PLANNER : ManagedMode::STREAMED_MOTION;
           
           if (new_mode != active_mode_) {
-            // Trigger safety reset on mode switch
-            TriggerSafetyReset();
-            if (pose_interface_) {
-              pose_interface_->TriggerSafetyReset();
-            }
-
+            planner_init_started_.reset();
             if (new_mode == ManagedMode::PLANNER) {
-              std::cout << "[ZMQManager] Switched to: PLANNER mode (safety reset)" << std::endl;
-              if (latest_planner_message_.valid) {
-                constexpr auto PLANNER_MESSAGE_TIMEOUT = std::chrono::milliseconds(100);
-                auto time_since_last_planner = std::chrono::steady_clock::now() - latest_planner_message_.timestamp;
-                if (time_since_last_planner < PLANNER_MESSAGE_TIMEOUT) {
-                  // Valid planner message within timeout - use it
-                  // Update upper body control state based on this message
-                  has_upper_body_control_ = latest_planner_message_.upper_body_position.has_value();
-
-                  // Update hand joints control state based on this message
-                  has_hand_joints_ = latest_planner_message_.left_hand_joints.has_value() || 
-                                     latest_planner_message_.right_hand_joints.has_value();
-                }
-              }
-            } else if (new_mode == ManagedMode::STREAMED_MOTION) {
-              std::cout << "[ZMQManager] Switched to: STREAMED MOTION mode (safety reset)" << std::endl;
-              trigger_zmq_toggle = true;
-
-              // Clear planner buffer when switching away from planner mode
-              {
-                std::lock_guard<std::mutex> lock(planner_mutex_);
-                latest_planner_message_.valid = false;
-                latest_planner_message_.timestamp = {};
-                is_planner_ready_ = false;
-                switch_from_teleop_to_planner_ = true;
-              }
-              std::cout << "[ZMQManager] Cleared planner buffer" << std::endl;
+              pose_interface_->SuspendManagedStream();
+              planner_transition_requested_ = true;
+              std::cout << "[ZMQManager] Preparing PLANNER mode" << std::endl;
+            } else {
+              pose_interface_->PrepareManagedStream(pose_controls_active_);
+              pose_handoff_started_ = std::chrono::steady_clock::now();
+              is_planner_ready_ = false;
+              switch_from_teleop_to_planner_ = true;
+              planner_transition_requested_ = false;
+              std::lock_guard<std::mutex> planner_lock(planner_mutex_);
+              latest_planner_message_.valid = false;
+              latest_planner_message_.timestamp = {};
+              std::cout << "[ZMQManager] Preparing STREAMED MOTION mode" << std::endl;
             }
           }
 
@@ -305,10 +285,6 @@ class ZMQManager : public InputInterface {
       if (active_mode_ == ManagedMode::STREAMED_MOTION && pose_interface_) {
         // In streamed motion mode: update pose interface
         pose_interface_->update();
-        if (trigger_zmq_toggle) {
-          pose_interface_->TriggerZMQToggle();
-          std::cout << "[ZMQManager] ZMQ streaming enabled" << std::endl;
-        }
       }
     }
 
@@ -391,6 +367,9 @@ class ZMQManager : public InputInterface {
         
         // Clear hand joints control state
         has_hand_joints_ = false;
+        planner_init_started_.reset();
+        pose_interface_->SuspendManagedStream();
+        return;  // Stop takes precedence over a simultaneous start/mode request.
       }
 
       // Delegate based on current mode
@@ -416,6 +395,14 @@ class ZMQManager : public InputInterface {
             }
             std::cout << "[ZMQManager] Started control in streamed motion mode" << std::endl;
           }
+          if (pose_interface_->ManagedHandoffPending() &&
+              std::chrono::steady_clock::now() - pose_handoff_started_ > std::chrono::seconds(5)) {
+            operator_state.stop = true;
+            planner_state.enabled = false;
+            planner_state.initialized = false;
+            pose_interface_->SuspendManagedStream();
+            return;
+          }
           pose_interface_->handle_input(motion_reader, current_motion, current_frame,
                                        operator_state, reinitialize_heading,
                                        heading_state_buffer,
@@ -425,71 +412,79 @@ class ZMQManager : public InputInterface {
       }
     }
 
+    void OnPlannerReferenceCommitted() override {
+      pose_controls_active_ = false;
+    }
+
     // Forward getters to pose interface when in streamed motion mode
     bool HasVR3PointControl() const override {
-      if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
+      if (UsePoseControls()) {
         return pose_interface_->HasVR3PointControl();
       }
       return has_vr_3point_control_;
     }
 
     bool HasHandJoints() const override {
-      if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
+      if (UsePoseControls()) {
         return pose_interface_->HasHandJoints();
       }
       return has_hand_joints_;
     }
 
     bool HasExternalTokenState() const override {
-      if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
+      if (UsePoseControls()) {
         return pose_interface_->HasExternalTokenState();
       }
       return has_external_token_state_;
     }
 
     std::pair<bool, std::array<double, 9>> GetVR3PointPosition() const override {
-      if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
+      if (UsePoseControls()) {
         return pose_interface_->GetVR3PointPosition();
       }
       return InputInterface::GetVR3PointPosition();
     }
 
     std::pair<bool, std::array<double, 12>> GetVR3PointOrientation() const override {
-      if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
+      if (UsePoseControls()) {
         return pose_interface_->GetVR3PointOrientation();
       }
       return InputInterface::GetVR3PointOrientation();
     }
 
     std::array<double, 3> GetVR3PointCompliance() const override {
-      if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
+      if (UsePoseControls()) {
         return pose_interface_->GetVR3PointCompliance();
       }
       return InputInterface::GetVR3PointCompliance();
     }
 
     std::pair<bool, std::array<double, 7>> GetHandPose(bool is_left) const override {
-      if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
+      if (UsePoseControls()) {
         return pose_interface_->GetHandPose(is_left);
       }
       return InputInterface::GetHandPose(is_left);
     }
 
     std::pair<bool, std::vector<double>> GetExternalTokenState() const override {
-      if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
+      if (UsePoseControls()) {
         return pose_interface_->GetExternalTokenState();
       }
       return InputInterface::GetExternalTokenState();
     }
 
     std::optional<std::chrono::steady_clock::time_point> GetLastUpdateTime() const override {
-      if ((active_mode_ == ManagedMode::STREAMED_MOTION) && pose_interface_) {
+      if (UsePoseControls()) {
         return pose_interface_->GetLastUpdateTime();
       }
       return InputInterface::GetLastUpdateTime();
     }
 
   private:
+    bool UsePoseControls() const {
+      return pose_interface_ && pose_controls_active_;
+    }
+
     // Handle planner mode input (similar to GamepadManager::handleGamepadPlannerInput)
     void handlePlannerInput(MotionDataReader& motion_reader,
                            std::shared_ptr<const MotionSequence>& current_motion,
@@ -502,132 +497,26 @@ class ZMQManager : public InputInterface {
                            DataBuffer<MovementState>& movement_state_buffer,
                            std::mutex& current_motion_mutex) {
       
-      // Handle safety reset from interface manager (same as GamepadManager)
-      if (CheckAndClearSafetyReset()) {
-        {
-          std::lock_guard<std::mutex> lock(current_motion_mutex);
-          operator_state.play = false;
-        }
-        if (operator_state.start) {
-          if (planner_state.enabled && planner_state.initialized) {
-            // Planner is already on, keep it as is (don't touch initialized flag)
-            {
-              std::lock_guard<std::mutex> lock(current_motion_mutex);
-              if (current_motion->GetEncodeMode() == 1) {
-                current_motion->SetEncodeMode(0);
-              }
-              operator_state.play = true;
-            }
-            auto current_facing = movement_state_buffer.GetDataWithTime().data->facing_direction;
-            std::cout << "[ZMQManager] Safety reset: Planner kept enabled with current state" << std::endl;
-          } else {
-            // Planner was disabled, set initial movement state
-            movement_state_buffer.SetData(MovementState(static_cast<int>(LocomotionMode::IDLE), 
-                                                        {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, -1.0f, -1.0f));
-
-            // Now enable planner
-            planner_state.enabled = true;
-            std::cout << "[ZMQManager] Planner enabled" << std::endl;
-
-            // Wait for planner to be initialized with timeout (5 seconds)
-            auto wait_start = std::chrono::steady_clock::now();
-            constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
-            while (planner_state.enabled) {
-              {
-                std::lock_guard<std::mutex> lock(current_motion_mutex);
-                if (current_motion->name == "planner_motion") {
-                  break;
-                }
-              }
-              std::this_thread::sleep_for(std::chrono::milliseconds(100));
-              auto elapsed = std::chrono::steady_clock::now() - wait_start;
-              if (elapsed > PLANNER_INIT_TIMEOUT) {
-                std::cerr << "[ZMQCommandManager ERROR] Planner initialization timeout after 5 seconds" << std::endl;
-                operator_state.stop = true;
-                return;
-              }
-              std::cout << "[ZMQManager] Waiting for planner to be initialized" << std::endl;
-            }
-
-            // Check if planner is enabled and initialized
-            if (!planner_state.enabled || !planner_state.initialized) {
-              std::cerr << "[ZMQCommandManager ERROR] Planner failed to initialize. Stopping control." << std::endl;
-              operator_state.stop = true;
-              return;
-            }
-
-            is_planner_ready_ = true;
-
-            // Play motion
-            {
-              std::lock_guard<std::mutex> lock(current_motion_mutex);
-              operator_state.play = true;
-            }
-          }
-        }
-        return;
-      }
-
-      // Handle start control
-      if (start_control_ && !operator_state.start) {
+      const bool safety_reset = CheckAndClearSafetyReset();
+      const bool starting = start_control_ && !operator_state.start;
+      if (starting) {
         operator_state.start = true;
-        {
-          std::lock_guard<std::mutex> lock(current_motion_mutex);
-          operator_state.play = false;
-          reinitialize_heading = true;
-        }
-
-        // Ensure planner is enabled
-        if (!planner_state.enabled) {
-          planner_state.enabled = true;
-          std::cout << "[ZMQManager] Planner enabled" << std::endl;
-        }
-        
-        // Wait for initialization
-        auto wait_start = std::chrono::steady_clock::now();
-        constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
-        while (planner_state.enabled) {
-          {
-            std::lock_guard<std::mutex> lock(current_motion_mutex);
-            if (current_motion->name == "planner_motion") {
-              std::cout << "[ZMQManager] motion name is planner_motion" << std::endl;
-              break;
-            }
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
-          auto elapsed = std::chrono::steady_clock::now() - wait_start;
-          if (elapsed > PLANNER_INIT_TIMEOUT) {
-            std::cerr << "[ZMQCommandManager ERROR] Planner initialization timeout" << std::endl;
-            operator_state.stop = true;
-            return;
-          }
-          std::cout << "[ZMQManager] Waiting for planner to be initialized" << std::endl;
-        }
-        
-        // Check if planner is enabled and initialized
-        if (!planner_state.enabled || !planner_state.initialized) {
-          std::cerr << "[ZMQCommandManager ERROR] Planner failed to initialize. Stopping control." << std::endl;
-          operator_state.stop = true;
-          return;
-        }
-        
-        is_planner_ready_ = true;
-
-        {
-          std::lock_guard<std::mutex> lock(current_motion_mutex);
-          operator_state.play = true;
-        }
+        reinitialize_heading = true;
       }
+      const bool begin_planner = (planner_transition_requested_ || safety_reset || starting) &&
+                                 operator_state.start;
+      planner_transition_requested_ = false;
 
-      // Apply planner commands if planner is ready
-      if (planner_state.enabled && planner_state.initialized) {
+      // Publish the destination command before enabling inference. Until it is
+      // ready, the control loop keeps advancing the previous reference.
+      if (operator_state.start) {
         std::lock_guard<std::mutex> lock(planner_mutex_);
         
         // Check for planner timeout (1 second)
         constexpr auto PLANNER_TIMEOUT = std::chrono::milliseconds(1000);
         auto time_since_last_planner = std::chrono::steady_clock::now() - latest_planner_message_.timestamp;
         
-        if (latest_planner_message_.valid) {
+        if (latest_planner_message_.valid && time_since_last_planner < PLANNER_TIMEOUT) {
           // Valid planner message within timeout - use it
           // Update upper body control state based on this message
           has_upper_body_control_ = latest_planner_message_.upper_body_position.has_value();
@@ -665,7 +554,7 @@ class ZMQManager : public InputInterface {
           // Clear planner buffer to avoid using stale data
           latest_planner_message_.valid = false;
 
-        } else if (!latest_planner_message_.valid && time_since_last_planner >= PLANNER_TIMEOUT) {
+        } else if (time_since_last_planner >= PLANNER_TIMEOUT) {
           // Planner timeout - reset to IDLE and clear buffer
           has_upper_body_control_ = false;
 
@@ -694,21 +583,46 @@ class ZMQManager : public InputInterface {
         }
       }
 
-      if (has_vr_3point_control_ && !last_has_vr_3point_control_) {
-        std::cout << "[ZMQManager] VR 3-point control enabled" << std::endl;
+      {
         std::lock_guard<std::mutex> lock(current_motion_mutex);
-        if (current_motion->GetEncodeMode() >= 0) {
-              current_motion->SetEncodeMode(1);
+        if (begin_planner) {
+          planner_state.preserve_heading_on_init = operator_state.play && !starting;
+          if (!planner_state.enabled) {
+            ++planner_state.generation;
+            planner_state.initialized = false;
+          }
+          planner_state.enabled = true;
+          planner_init_started_ = std::chrono::steady_clock::now();
+        }
+        if (planner_init_started_) {
+          if (!planner_state.enabled) {
+            operator_state.stop = true;
+            planner_init_started_.reset();
+            return;
+          }
+          if (planner_state.initialized && current_motion->name == "planner_motion" &&
+              current_motion->timesteps > 0) {
+            is_planner_ready_ = true;
+            operator_state.play = true;
+            planner_init_started_.reset();
+          } else if (std::chrono::steady_clock::now() - *planner_init_started_ >
+                     std::chrono::seconds(5)) {
+            std::cerr << "[ZMQManager] Planner initialization timeout" << std::endl;
+            operator_state.stop = true;
+            planner_state.enabled = false;
+            planner_state.initialized = false;
+            planner_init_started_.reset();
+            return;
+          }
         }
       }
-      else if (!has_vr_3point_control_ && last_has_vr_3point_control_) {
-        std::cout << "[ZMQManager] VR 3-point control disabled" << std::endl;
+
+      if (is_planner_ready_) {
         std::lock_guard<std::mutex> lock(current_motion_mutex);
-        if (current_motion->GetEncodeMode() >= 0) {
-              current_motion->SetEncodeMode(0);
+        if (current_motion->name == "planner_motion" && current_motion->GetEncodeMode() >= 0) {
+          current_motion->SetEncodeMode(has_vr_3point_control_ ? 1 : 0);
         }
       }
-      last_has_vr_3point_control_ = has_vr_3point_control_;
     }
 
     // Callback handlers - just update buffer, no queue
@@ -1264,13 +1178,15 @@ class ZMQManager : public InputInterface {
 
     /// True once the planner has been initialised and is generating motions.
     bool is_planner_ready_ = false;
+    bool planner_transition_requested_ = false;
+    std::optional<std::chrono::steady_clock::time_point> planner_init_started_;
+    std::chrono::steady_clock::time_point pose_handoff_started_{};
     /// True when transitioning from streamed-motion (teleop) back to planner mode;
     /// used to keep forwarding VR/hand data from the pose interface until planner is ready.
     bool switch_from_teleop_to_planner_ = false;
 
-    /// Tracks the previous frame's VR-3-point state to detect enable/disable transitions
-    /// and automatically toggle encoder mode accordingly.
-    bool last_has_vr_3point_control_ = false;
+    /// The committed source owns hand/VR/token controls through pending reversals.
+    std::atomic<bool> pose_controls_active_{false};
     Vr3PtSafetyFilter vr3pt_filter_;
     bool vr3pt_estop_requested_ = false;
 };

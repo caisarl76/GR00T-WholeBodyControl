@@ -85,6 +85,8 @@ class Harness:
         pending_start=False,
         finish_save=True,
         skip_body_ticks=(),
+        skip_pose_ticks=(),
+        skip_planner_ticks=(),
         suppress_ack_ticks=(),
         malformed_shutdown_ack=False,
     ):
@@ -93,6 +95,8 @@ class Harness:
         self.feedback_from, self.lost_left_from = feedback_from, lost_left_from
         self.pending_start, self.finish_save = pending_start, finish_save
         self.skip_body_ticks = set(skip_body_ticks)
+        self.skip_pose_ticks = set(skip_pose_ticks)
+        self.skip_planner_ticks = set(skip_planner_ticks)
         self.suppress_ack_ticks = set(suppress_ack_ticks)
         self.malformed_shutdown_ack = malformed_shutdown_ack
         self.hand_snapshot_reads, self.hand_outputs = [], {}
@@ -249,6 +253,8 @@ class Harness:
                 if owner.tick in owner.skip_body_ticks:
                     return
                 topic = "pose" if mode is None else "planner"
+                if owner.tick in (owner.skip_pose_ticks if mode is None else owner.skip_planner_ticks):
+                    return
                 fields = {
                     "body_q": np.zeros(29, np.float32),
                     "left_hand_joints": np.full(7, 0.9, np.float32),
@@ -760,3 +766,148 @@ def test_optical_rejects_isaac_input_before_initialization(monkeypatch, manager)
     monkeypatch.setattr(manager, "_init_input_source", unexpected)
     with pytest.raises(ValueError, match="Optical hands require"):
         manager.run_pico_manager(hand_input="optical", input_source="isaac-teleop")
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mode_handoff_keeps_source_until_destination_packet(monkeypatch, manager, reverse):
+    keys = {9: "t", 12: "t"} if reverse else {9: "t"}
+    start, ready = (12, 18) if reverse else (9, 15)
+    kwargs = {"skip_planner_ticks" if reverse else "skip_pose_ticks": range(start, ready)}
+    h = Harness(monkeypatch, manager, keys=keys, end=ready + 2, **kwargs).run()
+    old_topic, new_topic = ("pose", "planner") if reverse else ("planner", "pose")
+    for tick in range(start, ready):
+        assert any(t == tick and topic == old_topic for t, topic, _ in h.messages)
+        assert not any(t == tick and topic == "command" for t, topic, _ in h.messages)
+    at_commit = [(topic, fields) for tick, topic, fields in h.messages if tick == ready]
+    topics = [topic for topic, _ in at_commit]
+    assert topics.index("manager_state") < topics.index(new_topic) < topics.index("command")
+    state = next(fields for topic, fields in at_commit if topic == "manager_state")
+    body = next(fields for topic, fields in at_commit if topic == new_topic)
+    np.testing.assert_array_equal(state["pv"], body["pv"])
+    assert not any(fields["stop"][0] for _, topic, fields in h.messages if topic == "command")
+
+
+def test_tracking_toggle_cancels_pending_pose(monkeypatch, manager):
+    h = Harness(monkeypatch, manager, keys={9: "t", 12: "t"}, skip_pose_ticks=range(9, 15), end=18).run()
+    assert not any(topic == "pose" for _, topic, _ in h.messages)
+    commands = [fields for _, topic, fields in h.messages if topic == "command"]
+    assert len(commands) == 1 and commands[0]["planner"][0]
+
+
+def test_stop_preempts_pending_pose(monkeypatch, manager):
+    h = Harness(monkeypatch, manager, keys={9: "t"}, stop_tick=11, skip_pose_ticks=range(9, 30), end=20).run()
+    commands = [(tick, fields) for tick, topic, fields in h.messages if topic == "command"]
+    assert commands[-1][0] == 13
+    assert commands[-1][1]["stop"][0]
+    assert not any(topic == "pose" for _, topic, _ in h.messages)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_destination_timeout_keeps_active_source(monkeypatch, manager, reverse):
+    keys = {9: "t", 12: "t"} if reverse else {9: "t"}
+    start = 12 if reverse else 9
+    kwargs = {"skip_planner_ticks" if reverse else "skip_pose_ticks": range(start, 100)}
+    h = Harness(monkeypatch, manager, keys=keys, end=75, **kwargs).run()
+    assert not any(tick >= start and topic == "command" for tick, topic, _ in h.messages)
+    expected = manager.StreamMode.POSE if reverse else manager.StreamMode.PLANNER
+    assert all(state["stream_mode"][0] == expected.value for tick, state in h.states().items() if tick >= start)
+
+
+@pytest.mark.parametrize("outcome", ["ready", "tracking_cancel", "freeze_cancel", "timeout"])
+def test_frozen_planner_handoff_waits_for_body_and_can_cancel(monkeypatch, manager, outcome):
+    keys = {9: "t", 15: "t"} if outcome == "tracking_cancel" else {9: "t"}
+    h = Harness(
+        monkeypatch,
+        manager,
+        keys=keys,
+        skip_planner_ticks=range(12, 100 if outcome == "timeout" else 18),
+        end=70 if outcome == "timeout" else 21,
+    )
+    original_chords = manager.ControllerChords
+
+    class Chords(original_chords):
+        def poll(self, *args, **kwargs):
+            action = super().poll(*args, **kwargs)
+            if h.tick == 12 or outcome == "freeze_cancel" and h.tick == 15:
+                return "freeze"
+            return action
+
+    snapshots = []
+    monkeypatch.setattr(manager, "ControllerChords", Chords)
+    monkeypatch.setattr(
+        manager.PlannerStreamer,
+        "save_upper_body_position_target",
+        lambda self: snapshots.append(h.tick),
+        raising=False,
+    )
+    h.run()
+    assert snapshots == [12]
+    until = 18 if outcome == "ready" else h.end
+    for tick in range(12, until):
+        assert h.states()[tick]["stream_mode"][0] == manager.StreamMode.POSE.value
+        assert any(t == tick and topic == "pose" for t, topic, _ in h.messages)
+        assert not any(t == tick and topic == "command" for t, topic, _ in h.messages)
+    if outcome == "ready":
+        messages = [(topic, fields) for tick, topic, fields in h.messages if tick == 18]
+        topics = [topic for topic, _ in messages]
+        assert topics.index("manager_state") < topics.index("planner") < topics.index("command")
+        state = next(fields for topic, fields in messages if topic == "manager_state")
+        body = next(fields for topic, fields in messages if topic == "planner")
+        assert state["stream_mode"][0] == manager.StreamMode.PLANNER_FROZEN_UPPER_BODY.value
+        np.testing.assert_array_equal(state["pv"], body["pv"])
+
+
+def test_real_pose_buffer_prepares_before_manager_switch(monkeypatch, manager):
+    pose_class = manager.PoseStreamer
+    h = Harness(monkeypatch, manager, keys={9: "t", 18: "t", 21: "t"}, end=29)
+    monkeypatch.setattr(manager, "PoseStreamer", pose_class)
+    monkeypatch.setattr(manager.torch, "device", lambda name: name, raising=False)
+    monkeypatch.setattr(manager.torch, "cuda", SimpleNamespace(is_available=lambda: False), raising=False)
+
+    class Tensor:
+        def __init__(self, value):
+            self.value = value
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.value
+
+    identity = np.array([[1.0, 0, 0, 0]])
+    monkeypatch.setattr(
+        manager,
+        "compute_from_body_poses",
+        lambda *args: {
+            "smpl_pose": Tensor(np.zeros((1, 63))),
+            "smpl_joints_local": Tensor(np.zeros((1, 24, 3))),
+            "global_orient_quat": Tensor(identity),
+        },
+    )
+    monkeypatch.setattr(manager, "decompose_rotation_aa", lambda *args: (identity, identity))
+    monkeypatch.setattr(
+        manager.PicoReader,
+        "get_latest",
+        lambda self: {
+            "timestamp_ns": h.now,
+            "body_poses_np": np.zeros((24, 7)),
+        },
+    )
+    monkeypatch.setattr(manager.ThreePointPose, "enable_smpl_vis", False, raising=False)
+    monkeypatch.setattr(
+        manager.ThreePointPose,
+        "process_smpl_pose",
+        lambda *args, **kwargs: np.tile([0.0, 0, 0, 1, 0, 0, 0], (3, 1)),
+        raising=False,
+    )
+    h.run(num_frames_to_send=5)
+    commands = [(tick, bool(fields["planner"][0])) for tick, topic, fields in h.messages if topic == "command"]
+    assert commands == [(5, True), (14, False), (18, True), (26, False)]
+    for start in (9, 21):
+        for tick in range(start, start + 5):
+            assert any(t == tick and topic == "planner" for t, topic, _ in h.messages)
+            assert not any(t == tick and topic == "pose" for t, topic, _ in h.messages)
+        assert any(t == start + 5 and topic == "pose" for t, topic, _ in h.messages)

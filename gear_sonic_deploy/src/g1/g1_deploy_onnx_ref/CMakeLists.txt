@@ -206,6 +206,18 @@ set(EXE_LIBS
 )
 
 
+if(BUILD_DEPLOY_TESTS)
+  add_executable(zmq_mode_handoff_test tests/zmq_mode_handoff_test.cpp)
+  target_include_directories(zmq_mode_handoff_test PRIVATE ${EXE_INCLUDES})
+  target_link_libraries(zmq_mode_handoff_test PRIVATE ${EXE_LIBS})
+  # Invoke real receive callbacks deterministically, without test hooks in production.
+  target_compile_options(zmq_mode_handoff_test PRIVATE -fno-access-control)
+  set_target_properties(zmq_mode_handoff_test PROPERTIES
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  add_test(NAME zmq_mode_handoff_test COMMAND zmq_mode_handoff_test)
+endif()
+
+
 # build the main executable:
 add_executable(${EXECUTABLE_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref.cpp)
 target_include_directories(${EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/ ${PROJECT_SOURCE_DIR}/src)

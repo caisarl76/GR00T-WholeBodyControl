@@ -446,3 +446,8 @@ attached-hand qualification gates.
 Keep follow-up results with the capture identifiers and exact revisions. The
 read-only viewer above can compare source articulation with robot actions
 without commanding a robot.
+
+## POSE / PLANNER transition repair
+
+See [SONIC mode handoff](sonic_mode_handoff.md) for preparation, cancellation,
+and the simulation checks required before deploying the mode-switch repair.

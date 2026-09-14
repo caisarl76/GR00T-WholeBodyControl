@@ -571,6 +571,16 @@ class G1Deploy {
       if (current_motion_->GetNumBodyQuaternions() == 0) { return; }
       if (!state_logger_) { return; }
 
+      if (planner_ && planner_->planner_state_.heading_handoff) {
+        if (!reinitialize_heading_) {
+          const auto heading = heading_state_buffer_.GetDataWithTime().data;
+          heading_state_buffer_.SetData(planner_->planner_state_.heading_handoff->Rebase(
+              heading ? *heading : HeadingState(), init_ref_data_root_rot_array_));
+        }
+        // An explicit heading reset takes precedence over a pending handoff.
+        planner_->planner_state_.heading_handoff.reset();
+      }
+
       if (reinitialize_heading_) {
         double sample_dt = control_dt_;
         auto hist = state_logger_->GetLatest(1, sample_dt);
@@ -3268,7 +3278,8 @@ class G1Deploy {
         std::lock_guard<std::mutex> planner_lock(planner_->planner_motion_mutex_);
         
         // Check if the planner thread has finished generating a valid animation:
-        if (planner_->motion_available_ && planner_->planner_motion_50hz_.timesteps > 0) {
+        if (planner_->motion_available_ && planner_->planner_motion_50hz_.timesteps > 0 &&
+            planner_->motion_generation_ == planner_->planner_state_.generation.load()) {
           
           const auto &planner_motion_gen = planner_->planner_motion_50hz_;
           planner_->motion_available_ = false;
@@ -3401,13 +3412,26 @@ class G1Deploy {
               (*planner_motion_file_) << std::endl;
             }
 
+            // Capture the outgoing yaw before changing ownership. The control
+            // observation step consumes this pair and preserves world heading.
+            if (is_the_first_time && planner_->planner_state_.preserve_heading_on_init &&
+                current_motion_->timesteps > 0 && current_motion_->GetNumBodyQuaternions() > 0) {
+              planner_->planner_state_.QueueHeadingHandoff(
+                  current_motion_->BodyQuaternions(std::clamp(current_frame_, 0, current_motion_->timesteps - 1))[0],
+                  planner_motion_->BodyQuaternions(0)[0]);
+            }
             // switch the current motion to planner_motion:
             current_frame_ = 0;
             // Assign shared_ptr directly - planner_motion_ is already a shared_ptr
             current_motion_ = planner_motion_;
+            input_interface_->OnPlannerReferenceCommitted();
             idle_readapt_stored_ = false;
             if(is_the_first_time) {
-              reinitialize_heading_ = true;
+              if (planner_->planner_state_.preserve_heading_on_init) {
+                planner_->planner_state_.preserve_heading_on_init = false;
+              } else {
+                reinitialize_heading_ = true;
+              }
             }
           }
         }
@@ -3637,8 +3661,8 @@ class G1Deploy {
         (*record_input_file_) << operator_state.start << ",";
         (*record_input_file_) << operator_state.stop << ",";
 
-        (*record_input_file_) << planner_state.enabled << ",";
-        (*record_input_file_) << planner_state.initialized << ",";
+        (*record_input_file_) << planner_state.enabled.load() << ",";
+        (*record_input_file_) << planner_state.initialized.load() << ",";
         
         (*record_input_file_) << movement_state_data.data->locomotion_mode << ",";
         (*record_input_file_) << movement_state_data.data->movement_direction[0] << ",";
@@ -3681,13 +3705,20 @@ class G1Deploy {
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
       
       if (planner_ && planner_->planner_state_.enabled) {
+        // Pin ownership before choosing an init/replan path or reading its inputs.
+        const auto generation = planner_->planner_state_.generation.load();
         if (ls) {
           if (!planner_->planner_state_.initialized) {
             try {
               std::cout << "Initializing planner..." << std::endl;
-              planner_motion_->timesteps = 0;
+              {
+                std::lock_guard<std::mutex> lock(current_motion_mutex_);
+                if (!planner_->planner_state_.enabled ||
+                    generation != planner_->planner_state_.generation.load()) return;
+                planner_motion_->timesteps = 0;
+                planner_motion_->SetEncodeMode(initial_encoder_mode_);
+              }
               std::cout << "Setting planner_motion encode mode to " << initial_encoder_mode_ << std::endl;
-              planner_motion_->SetEncodeMode(initial_encoder_mode_);
               // Get base quaternion and joint positions from robot state
               std::array<double, 4> base_quat = float_to_double<4>(ls->imu_state().quaternion());
               std::array<double, 29> joint_positions;
@@ -3695,10 +3726,26 @@ class G1Deploy {
                 joint_positions[i] = ls->motor_state()[i].q();
               }
               // Initialize planner with robot state
-              if(!planner_->Initialize(base_quat, joint_positions)) {
+              MovementState initial_movement(0, {0, 0, 0}, {1, 0, 0}, -1, -1);
+              {
+                std::lock_guard<std::mutex> lock(current_motion_mutex_);
+                if (planner_->planner_state_.preserve_heading_on_init) {
+                  const auto prepared = movement_state_buffer_.GetDataWithTime().data;
+                  if (prepared) initial_movement = *prepared;
+                }
+              }
+              if(!planner_->Initialize(base_quat, joint_positions, initial_movement, generation)) {
                 throw std::runtime_error("Error when initializing planner");
               }
 
+              {
+                std::lock_guard<std::mutex> lock(current_motion_mutex_);
+                if (!planner_->planner_state_.enabled ||
+                    generation != planner_->planner_state_.generation.load()) {
+                  planner_->planner_state_.initialized = false;
+                  return;  // This inference belongs to an abandoned mode.
+                }
+              }
               std::cout << "Planner initialized successfully!" << std::endl;
               
               // Start recording session for planner motion (if enabled)
@@ -3710,6 +3757,9 @@ class G1Deploy {
               }
               
             } catch (const std::exception& e) {
+              std::unique_lock<std::mutex> motion_lock(current_motion_mutex_);
+              if (!planner_->planner_state_.enabled ||
+                  generation != planner_->planner_state_.generation.load()) return;
               std::cout << "✗ Error initializing planner: " << e.what() << std::endl;
               std::cout << "Disabling planner to prevent further errors..." << std::endl;
               planner_->planner_state_.enabled = false;
@@ -3717,7 +3767,6 @@ class G1Deploy {
               planner_motion_->timesteps = 0;
               // reset operator state and current motion and frame
               {
-                std::lock_guard<std::mutex> lock(current_motion_mutex_);
                 operator_state.play = false;
                 current_frame_ = 0;
                 current_motion_ = motion_reader_.GetMotionShared(motion_reader_.current_motion_index_);
@@ -3856,12 +3905,17 @@ class G1Deploy {
                 movement_speed,
                 target_height,
                 movement_direction,
-                facing_direction
+                facing_direction,
+                -1,
+                generation
               )) {
                 throw std::runtime_error("Error when updating planner");
               }
               
             } catch (const std::exception& e) {
+              std::unique_lock<std::mutex> motion_lock(current_motion_mutex_);
+              if (!planner_->planner_state_.enabled ||
+                  generation != planner_->planner_state_.generation.load()) return;
               std::cout << "✗ Error during planning update: " << e.what() << std::endl;
               std::cout << "Disabling planner to prevent further errors..." << std::endl;
               planner_->planner_state_.enabled = false;
@@ -3869,7 +3923,6 @@ class G1Deploy {
               planner_motion_->timesteps = 0;
               // reset operator state and current motion and frame
               {
-                std::lock_guard<std::mutex> lock(current_motion_mutex_);
                 operator_state.play = false;
                 current_frame_ = 0;
                 current_motion_ = motion_reader_.GetMotionShared(motion_reader_.current_motion_index_);

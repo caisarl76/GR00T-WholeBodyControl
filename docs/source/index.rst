@@ -98,6 +98,7 @@ Documentation
    tutorials/isaac_teleop_publisher_setup
    pico_optical_hand_tracking
    pico_hand_followups
+   sonic_mode_handoff
    tutorials/vr_wholebody_teleop
    tutorials/xr_upperbody_bridge
    tutorials/live_camera_teleop
