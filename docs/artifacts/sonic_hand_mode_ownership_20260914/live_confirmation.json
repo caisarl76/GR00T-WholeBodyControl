@@ -1,0 +1,18 @@
+{
+  "date": "2026-09-14",
+  "environment": "local MuJoCo, SONIC v1.1, Dex3 optical",
+  "user_confirmation": "confirmed. a+x working on switching modes",
+  "capture": "manager-im9wQq",
+  "transitions": [
+    "[Manager] StreamMode switch: OFF -> PLANNER",
+    "[Manager] StreamMode switch: PLANNER -> POSE",
+    "[Manager] StreamMode switch: POSE -> PLANNER",
+    "[Manager] StreamMode switch: PLANNER -> POSE",
+    "[Manager] StreamMode switch: POSE -> PLANNER",
+    "[Manager] StreamMode switch: PLANNER -> POSE",
+    "[Manager] StreamMode switch: POSE -> PLANNER",
+    "[Manager] StreamMode switch: PLANNER -> POSE",
+    "[Manager] StreamMode switch: POSE -> PLANNER"
+  ],
+  "scope": "operator-confirmed switching; not physical G1 or timing qualification"
+}

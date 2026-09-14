@@ -204,7 +204,7 @@ def test_production_pose_planner_and_diagnostic_headers_fit_1200_bytes():
     publisher.send(planner)
     assert header_size(sent[-1], "planner") <= 1200
     decoded = unpack_pose_message(sent[-1], "planner")
-    np.testing.assert_array_equal(decoded["right_hand_joints"], held[1])
+    assert "left_hand_joints" not in decoded and "right_hand_joints" not in decoded
 
     diagnostic = {
         "pv": PV,

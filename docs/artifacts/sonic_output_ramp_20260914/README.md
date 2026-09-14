@@ -116,6 +116,7 @@ requested five seconds; these are recorded results, not a timing qualification.
 
 See [live_after/summary.json](live_after/summary.json) and its compressed source
 measurements. The three test processes were stopped afterward. Optical-hand
-integration of this latest repair and physical PC2/G1 confirmation remain next;
+integration subsequently passed repeated A+X switches; see the
+[hand ownership record](../sonic_hand_mode_ownership_20260914/README.md). Physical PC2/G1 confirmation remains pending;
 no PC2 installation was performed. The earlier sustained-POSE fall/reset episodes
 remain a separate investigation and are not claimed resolved by these switches.

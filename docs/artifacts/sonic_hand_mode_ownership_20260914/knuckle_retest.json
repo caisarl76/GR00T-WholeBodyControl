@@ -1,0 +1,17 @@
+{
+  "source": "manager-P2Vsb4",
+  "samples": 36643,
+  "window": "last 1000 captured ticks (~20 seconds)",
+  "sides": {
+    "left": {
+      "prior_rejected_final_1000": 0,
+      "corrected_rejected_final_1000": 0,
+      "remaining_rejected_full_capture": 34846
+    },
+    "right": {
+      "prior_rejected_final_1000": 1000,
+      "corrected_rejected_final_1000": 0,
+      "remaining_rejected_full_capture": 34853
+    }
+  }
+}

@@ -3449,12 +3449,12 @@ def run_pico_manager(
             ):
                 print("[Manager] Stop/save recording and wait for IDLE ACK before disabling tracking")
                 new_mode = current_mode
-            if (
-                hands is not None
-                and new_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT)
-                and not tracking
-                and not hands.ready(tick_ns)
-            ):
+            entering_optical = (
+                new_mode == StreamMode.POSE and current_mode != StreamMode.POSE
+                if hand_profile == "dex3"
+                else new_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT) and not tracking
+            )
+            if hands is not None and entering_optical and not hands.ready(tick_ns):
                 print("[Manager] Waiting for fresh measured hand feedback before optical tracking")
                 for blocker in hands.feedback_blockers(tick_ns):
                     print(f"[Manager]   {blocker}")
@@ -3563,10 +3563,16 @@ def run_pico_manager(
             publisher.pv = state_fields["pv"]
             publisher.generation = sample_generation
             publisher.body_sent = False
+            optical_enabled = new_mode == StreamMode.POSE or (
+                hand_profile != "dex3" and new_mode == StreamMode.PLANNER_VR_3PT
+            )
             # Advance each optical hand once per tick, independent of body arrivals.
             if hands is not None:
                 hands.step(
-                    reader.get_latest(), tick_ns, enabled=new_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT)
+                    reader.get_latest(), tick_ns, enabled=optical_enabled,
+                    # Use the same feedback snapshot admitted above. Polling
+                    # again could invalidate the first POSE hand baseline.
+                    poll_feedback=False,
                 )
 
             # Run one iteration of the new mode
@@ -3647,7 +3653,7 @@ def run_pico_manager(
                         hands.body_wrists,
                         hands.measured_inputs,
                         hands.outputs,
-                        enabled=current_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT),
+                        enabled=optical_enabled,
                         body_sent=publisher.body_sent,
                         hand_sent=hand_sent,
                         pv=state_fields["pv"],

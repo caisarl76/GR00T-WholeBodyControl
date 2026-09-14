@@ -133,7 +133,7 @@ def test_dex_measured_limit_roundoff_is_clamped_but_large_excursions_rejected(ma
     assert r.ready(BASE)
     r.step(body(), BASE, enabled=False)
     np.testing.assert_array_equal(r.commands(), [np.zeros(7), np.ones(7)])
-    r.socket.packets.append(dex_feedback(2, left_hand_q=[-0.0047] * 7))
+    r.socket.packets.append(dex_feedback(2, left_hand_q=[-0.0201] * 7))
     r.poll_feedback(BASE)
     assert not r.ready(BASE)
 
@@ -345,7 +345,7 @@ def test_diagnostics_mark_uninitialized_clock_unavailable(make_runtime):
     assert fields["right_timestamp_source"].item() == -1
 
 
-@pytest.mark.parametrize("value", [-0.0007002827478572726, -0.000917662, -0.001])
+@pytest.mark.parametrize("value", [-0.0007002827478572726, -0.000917662, -0.001, -0.02])
 def test_right_index_near_zero_admission_preserves_raw_feedback_and_slew(make_runtime, value):
     r = make_runtime()
     measured = np.zeros(7)
@@ -378,8 +378,8 @@ def test_right_index_near_zero_admission_preserves_raw_feedback_and_slew(make_ru
 
 
 @pytest.mark.parametrize("side,joint,value", [
-    ("right", 5, -0.001000001), ("right", 5, -0.0047),
-    ("left", 5, -0.0007), ("right", 4, -0.0007), ("right", 5, 1.0007),
+    ("right", 5, -0.020000001), ("right", 5, -0.05),
+    ("left", 5, -0.0201), ("right", 4, -0.0201), ("right", 5, 1.0201),
     ("right", 5, float("nan")),
 ])
 def test_near_zero_allowance_does_not_hide_other_feedback_errors(make_runtime, side, joint, value):
@@ -392,3 +392,172 @@ def test_near_zero_allowance_does_not_hide_other_feedback_errors(make_runtime, s
     assert any(message.startswith(side + ":") for message in r.feedback_blockers(BASE))
     r.step(body(), BASE, enabled=True)
     assert r.outputs[("left", "right").index(side)].reason == HandReason.FEEDBACK_UNAVAILABLE
+
+
+@pytest.mark.parametrize("measured", [
+    [-0.8329587578773499, -0.5226656794548035, -0.9470111131668091,
+     1.3914557695388794, 1.7438240051269531, 1.3232935667037964, 1.7463444471359253],
+    [0.0014184658648446202, -0.013307612389326096, -1.742186188697815,
+     1.5447142124176025, 1.742560625076294, 1.5710546970367432, 1.7458572387695312],
+])
+def test_pose_reentry_with_captured_right_index_stop_feedback(make_runtime, measured):
+    """Sep14 optical MuJoCo run: A+X was recognized but ready() blocked re-entry."""
+    r = make_runtime()
+    right = r.trackers[1]
+    right.lower[:] = [-1.04719755, -1.04719755, -1.74532925, 0, 0, 0, 0]
+    right.upper[:] = [1.04719755, 0.72431163, 0, 1.57079632, 1.74532925, 1.57079632, 1.74532925]
+    right.retargeter.retarget = lambda points: (right.lower + right.upper) / 2
+    measured = np.array(measured)
+    initial = np.clip(measured, right.lower, right.upper)
+    sample = snapshot()
+    r.sdk.get_left_hand_snapshot = r.sdk.get_right_hand_snapshot = lambda: sample
+    for frame in range(12):
+        now = BASE + frame * 20_000_000
+        sample["source_timestamp_ns"] = sample["binding_generation"] = frame + 1
+        q = initial if frame < 6 else measured
+        r.socket.packets.append(dex_feedback(frame + 1, right_hand_q=q.tolist()))
+        r.step(body(now), now, enabled=frame < 6)
+    assert right.state == TrackingState.HOLDING
+    held = initial.astype(np.float32)
+    # This is the manager's PLANNER -> POSE admission gate, with fresh DDS data.
+    assert r.ready(now), r.feedback_blockers(now)
+    for frame in range(12, 18):
+        now = BASE + frame * 20_000_000
+        sample["source_timestamp_ns"] = sample["binding_generation"] = frame + 1
+        r.socket.packets.append(dex_feedback(frame + 1, right_hand_q=measured.tolist()))
+        r.step(body(now), now, enabled=True)
+        out = r.outputs[1]
+        assert out.reason == HandReason.OK
+        if frame < 16:
+            assert out.state == TrackingState.WAITING
+            np.testing.assert_array_equal(out.command, held)
+        assert np.all(out.command >= right.lower - 1e-7)
+        assert np.all(out.command <= right.upper + 1e-7)
+        assert np.max(np.abs(out.command - held)) <= 2.0 * 0.02 + 1e-7
+        np.testing.assert_array_equal(r.measured_inputs[1], measured)
+        held = out.command.copy()
+    assert out.state in (TrackingState.RECOVERING, TrackingState.TRACKING)
+
+
+@pytest.mark.parametrize("side", [0, 1])
+def test_native_planner_fist_can_seed_bounded_pose_entry(make_runtime, side):
+    r = make_runtime()
+    tracker = r.trackers[side]
+    right_lower = np.array([-1.04719755, -1.04719755, -1.74532925, 0, 0, 0, 0])
+    right_upper = np.array([1.04719755, 0.72431163, 0, 1.57079632, 1.74532925, 1.57079632, 1.74532925])
+    tracker.lower[:] = right_lower if side else -right_upper
+    tracker.upper[:] = right_upper if side else -right_lower
+    fist = np.array([0, 0, -1.75, 1.57, 1.75, 1.57, 1.75]) * (1 if side else -1)
+    key = f"{('left', 'right')[side]}_hand_q"
+    r.socket.packets.append(dex_feedback(**{key: fist.tolist()}))
+    r.poll_feedback(BASE)
+    assert r.ready(BASE), r.feedback_blockers(BASE)
+    r.step(body(), BASE, enabled=True)
+    np.testing.assert_allclose(r.outputs[side].command, np.clip(fist, tracker.lower, tracker.upper))
+    np.testing.assert_array_equal(r.measured_inputs[side], fist)
+    assert tracker._bounded(fist) is None  # Native fist is not an optical target.
+    fist[6] += 0.03 * (1 if side else -1)
+    r.socket.packets.append(dex_feedback(2, **{key: fist.tolist()}))
+    r.poll_feedback(BASE)
+    assert not r.ready(BASE)
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("joint", [3, 5])
+@pytest.mark.parametrize("excursion,accepted", [(0.00025833, True), (0.0127, True), (0.02, True), (0.02000001, False)])
+def test_fist_knuckle_soft_stop_feedback_is_measured_only(make_runtime, side, joint, excursion, accepted):
+    r = make_runtime()
+    tracker = r.trackers[("left", "right").index(side)]
+    sign = 1 if side == "right" else -1
+    if sign > 0:
+        tracker.upper[joint] = 1.57079632
+    else:
+        tracker.lower[joint] = -1.57079632
+    measured = np.full(7, 0.5)
+    measured[joint] = sign * (1.57079632 + excursion)
+    r.socket.packets.append(dex_feedback(**{f"{side}_hand_q": measured.tolist()}))
+    r.poll_feedback(BASE)
+    assert r.ready(BASE) == accepted
+    assert tracker._bounded(measured) is None  # Never admit an out-of-range optical target.
+    r.step(body(), BASE, enabled=True)
+    np.testing.assert_array_equal(r.measured_inputs[("left", "right").index(side)], measured)
+    if accepted:
+        np.testing.assert_allclose(r.commands()[("left", "right").index(side)][joint], sign * 1.57079632)
+        assert not r.ready(BASE + 100_000_000)
+    else:
+        assert r.outputs[("left", "right").index(side)].reason == HandReason.FEEDBACK_UNAVAILABLE
+
+
+def test_pose_reentry_reseeds_from_planner_feedback_without_resetting_source_clock(make_runtime):
+    r = make_runtime()
+    sample = snapshot()
+    r.sdk.get_left_hand_snapshot = r.sdk.get_right_hand_snapshot = lambda: sample
+    for frame in range(20):
+        now = BASE + frame * 20_000_000
+        sample["source_timestamp_ns"] = sample["binding_generation"] = frame + 1
+        q = [0.2] * 7 if frame < 10 else [0.9] * 7
+        r.socket.packets.append(dex_feedback(frame + 1, left_hand_q=q, right_hand_q=q))
+        if frame == 15:
+            r.poll_feedback(now)
+            assert r.ready(now)
+            # An unrelated newer packet must not replace the admitted snapshot
+            # between the manager's entry gate and its first POSE hand command.
+            r.socket.packets.append(dex_feedback(100, left_hand_feedback_valid=False))
+        r.step(body(now), now, enabled=frame < 10 or frame >= 15, poll_feedback=frame != 15)
+        if frame == 15:
+            r.socket.packets.clear()
+        if frame >= 15:
+            np.testing.assert_allclose(r.outputs[1].command, 0.9)
+            assert r.trackers[1].source_timestamp_ns == frame + 1
+            assert r.outputs[1].source_epoch == 0
+            assert r.outputs[1].state == (TrackingState.WAITING if frame < 19 else TrackingState.RECOVERING)
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("joint", range(7))
+@pytest.mark.parametrize("value,bounded", [(-0.02, 0.0), (1.02, 1.0)])
+def test_uniform_dex3_feedback_tolerance_preserves_raw_and_target_limits(make_runtime, side, joint, value, bounded):
+    r = make_runtime()
+    index = ("left", "right").index(side)
+    q = np.full(7, 0.5)
+    q[joint] = value
+    r.socket.packets.append(dex_feedback(**{f"{side}_hand_q": q.tolist()}))
+    r.poll_feedback(BASE)
+    assert r.ready(BASE)
+    assert r.trackers[index]._bounded(q) is None
+    r.step(body(), BASE, enabled=True)
+    assert r.commands()[index][joint] == bounded
+    np.testing.assert_array_equal(r.measured_inputs[index], q)
+    assert not r.ready(BASE + 100_000_000)
+    q[joint] += -1e-6 if value < 0 else 1e-6
+    assert r.trackers[index]._bounded(q, measured=True) is None
+
+
+def test_offline_replay_matches_runtime_across_planner_fist_reentry(make_runtime):
+    from gear_sonic.scripts.replay_pico_hands import replay
+    from gear_sonic.tests.test_pico_hand_replay import FakeRetargeter, synthetic_capture
+    from gear_sonic.utils.teleop.pico_hand_log import snapshot_at
+
+    arrays = synthetic_capture(25)
+    arrays["tick_ns"] += BASE
+    arrays["enabled"] = np.ones(25, dtype=bool)
+    arrays["enabled"][10:15] = False
+    arrays["measured"][:10] = 0.2
+    arrays["measured"][10:] = 0.9
+    r = make_runtime()
+    commands, states = [], []
+    for frame, now in enumerate(arrays["tick_ns"]):
+        r.sdk.get_left_hand_snapshot = lambda: snapshot_at(arrays, frame, 0)
+        r.sdk.get_right_hand_snapshot = lambda: snapshot_at(arrays, frame, 1)
+        r.socket.packets.append(dex_feedback(
+            frame + 1, left_hand_q=arrays["measured"][frame, 0].tolist(),
+            right_hand_q=arrays["measured"][frame, 1].tolist(),
+        ))
+        r.step(body(now), int(now), enabled=bool(arrays["enabled"][frame]))
+        commands.append(np.stack(r.commands()))
+        states.append([out.state for out in r.outputs])
+    result, report = replay(arrays, retargeters=[FakeRetargeter(0.5), FakeRetargeter(0.5)])
+    np.testing.assert_array_equal(result["emitted"], commands)
+    np.testing.assert_array_equal(result["state"], states)
+    np.testing.assert_allclose(result["emitted"][15], 0.9)
+    assert report["replay_safety_checks_pass"]

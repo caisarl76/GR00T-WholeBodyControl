@@ -66,7 +66,7 @@ class PicoPublisher:
         if self.hand_input != "controller":
             for side in ("left", "right"):
                 data.pop(f"{side}_hand_joints", None)
-            if self.hands is not None and self.hand_profile == "dex3":
+            if self.hands is not None and self.hand_profile == "dex3" and topic == "pose":
                 for side, command in zip(("left", "right"), self.hands.commands()):
                     if command is not None:
                         data[f"{side}_hand_joints"] = command
@@ -187,8 +187,9 @@ class PicoHandRuntime:
                 measured.append(None)
         return measured
 
-    def step(self, sample, now_ns, *, enabled):
-        self.poll_feedback(now_ns)
+    def step(self, sample, now_ns, *, enabled, poll_feedback=True):
+        if poll_feedback:
+            self.poll_feedback(now_ns)
         measured = self.measured(now_ns)
         body = None
         try:

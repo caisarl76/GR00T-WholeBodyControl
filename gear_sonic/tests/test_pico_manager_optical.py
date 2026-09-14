@@ -281,9 +281,9 @@ class Harness:
                 super().__init__(*args, **kwargs)
                 owner.hands = self
 
-            def step(self, sample, now_ns, *, enabled):
+            def step(self, sample, now_ns, *, enabled, **kwargs):
                 owner.steps.append((owner.tick, now_ns, enabled))
-                result = super().step(sample, now_ns, enabled=enabled)
+                result = super().step(sample, now_ns, enabled=enabled, **kwargs)
                 owner.hand_outputs[owner.tick] = tuple(self.outputs)
                 return result
 
@@ -405,8 +405,10 @@ def test_manager_orders_state_body_and_optical_generation_once_per_tick(monkeypa
             validate_inspire_hand(inspire)
             assert inspire["sample_generation"][0] == tick
             assert [topic for topic, _ in messages].index("inspire_hand") > 1
-        else:
+        elif states[tick]["stream_mode"][0] == manager.StreamMode.POSE.value:
             np.testing.assert_array_equal(body["left_hand_joints"], diagnostics["left_command"])
+        else:
+            assert "left_hand_joints" not in body and "right_hand_joints" not in body
     assert len(h.steps) == 18 and len({tick for tick, _, _ in h.steps}) == 18
     assert all(seconds == pytest.approx(0.02) for tick, seconds in h.sleeps if tick >= 0)
     assert not any(fields["stop"][0] for _, topic, fields in h.messages if topic == "command")
@@ -505,8 +507,49 @@ def test_actual_planner_abxy_startup_sends_only_neutral_planner_and_one_start(mo
         assert fields["speed"].tolist() == fields["height"].tolist() == [-1.0]
         assert not any(name.startswith(("upper_body_", "vr_")) or name == "body_q" for name in fields)
         for side in ("left", "right"):
-            np.testing.assert_array_equal(fields[f"{side}_hand_joints"], np.zeros(7))
+            assert f"{side}_hand_joints" not in fields
     assert all(not enabled for _, _, enabled in h.steps)
+
+
+@pytest.mark.parametrize("knuckle", [1.57, 1.5710546970367432])
+def test_dex3_pose_planner_pose_uses_native_fist_and_fresh_optical_baseline(monkeypatch, manager, knuckle):
+    h = Harness(monkeypatch, manager, keys={9: "t", 17: "t", 25: "t"}, end=32)
+
+    def retargeter(profile, side):
+        lower = np.array([-1.04719755, -1.04719755, -1.74532925, 0, 0, 0, 0])
+        upper = np.array([1.04719755, 0.72431163, 0, 1.57079632, 1.74532925, 1.57079632, 1.74532925])
+        if side == "left":
+            lower, upper = -upper, -lower
+        return SimpleNamespace(side=side, lower=lower, upper=upper, retarget=lambda points: (lower + upper) / 2)
+
+    monkeypatch.setattr(hr, "HandRetargeter", retargeter)
+    original_feedback = h.feedback_wire
+
+    def feedback(topic):
+        raw = original_feedback(topic)
+        if h.tick < 17 or topic != "g1_debug":
+            return raw
+        fields = msgpack.unpackb(raw[len(topic):], raw=False)
+        for side, sign in (("left", -1), ("right", 1)):
+            fields[f"{side}_hand_q"] = (sign * np.array([0, 0, -1.75, knuckle, 1.75, knuckle, 1.75])).tolist()
+        return topic.encode() + msgpack.packb(fields)
+
+    h.feedback_wire = feedback
+    h.run()
+    states = h.states()
+    assert states[9]["stream_mode"][0] == states[25]["stream_mode"][0] == manager.StreamMode.POSE.value
+    assert states[17]["stream_mode"][0] == manager.StreamMode.PLANNER.value
+    for tick, topic, fields in h.messages:
+        if topic == "planner":
+            assert "left_hand_joints" not in fields and "right_hand_joints" not in fields
+        if topic == "pose":
+            assert "left_hand_joints" in fields and "right_hand_joints" in fields
+            if 25 <= tick <= 29:
+                for side, sign in (("left", -1), ("right", 1)):
+                    bounded_knuckle = min(knuckle, 1.57079632)
+                    expected = sign * np.array([0, 0, -1.74532925, bounded_knuckle, 1.74532925, bounded_knuckle, 1.74532925])
+                    np.testing.assert_allclose(fields[f"{side}_hand_joints"], expected)
+    assert all(not enabled for tick, _, enabled in h.steps if 17 <= tick < 25)
 
 
 @pytest.mark.parametrize("kind", ["pose", "planner"])

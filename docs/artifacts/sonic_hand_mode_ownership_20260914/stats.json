@@ -1,0 +1,339 @@
+{
+  "samples": 5078,
+  "duration_s": 105.173015602,
+  "enable_switches": [
+    {
+      "row": 0,
+      "s": 0.0,
+      "enabled": false
+    },
+    {
+      "row": 511,
+      "s": 10.29869215,
+      "enabled": true
+    },
+    {
+      "row": 3001,
+      "s": 63.520777053,
+      "enabled": false
+    }
+  ],
+  "sides": {
+    "left": {
+      "nonfinite_samples": 140,
+      "finite_rejected_samples": 24,
+      "joints": {
+        "left_hand_thumb_0_joint": {
+          "min": -0.8695518970489502,
+          "max": 0.44695326685905457,
+          "lower": -1.0471975803375244,
+          "upper": 1.0471975803375244,
+          "max_lower_excursion_rad": 0.0,
+          "max_upper_excursion_rad": 0.0,
+          "samples_outside_1e4": 0,
+          "max_excursion_row": 1467,
+          "max_excursion_s": 30.016883883000002,
+          "command_at_max_excursion": -0.7021771669387817,
+          "first_outside_s": null
+        },
+        "left_hand_thumb_1_joint": {
+          "min": -0.20151416957378387,
+          "max": 1.0567717552185059,
+          "lower": -0.7243116497993469,
+          "upper": 1.0471975803375244,
+          "max_lower_excursion_rad": 0.0,
+          "max_upper_excursion_rad": 0.009574174880981445,
+          "samples_outside_1e4": 13,
+          "max_excursion_row": 326,
+          "max_excursion_s": 6.541393134000001,
+          "command_at_max_excursion": 1.0400466918945312,
+          "first_outside_s": 5.277412451
+        },
+        "left_hand_thumb_2_joint": {
+          "min": -0.001420577522367239,
+          "max": 1.7150359153747559,
+          "lower": 0.0,
+          "upper": 1.7453292608261108,
+          "max_lower_excursion_rad": 0.001420577522367239,
+          "max_upper_excursion_rad": 0.0,
+          "samples_outside_1e4": 11,
+          "max_excursion_row": 368,
+          "max_excursion_s": 7.3839845120000005,
+          "command_at_max_excursion": 0.0006813434883952141,
+          "first_outside_s": 6.942649393000001
+        },
+        "left_hand_middle_0_joint": {
+          "min": -1.3974056243896484,
+          "max": 3.884178295265883e-05,
+          "lower": -1.5707963705062866,
+          "upper": 0.0,
+          "max_lower_excursion_rad": 0.0,
+          "max_upper_excursion_rad": 3.884178295265883e-05,
+          "samples_outside_1e4": 0,
+          "max_excursion_row": 349,
+          "max_excursion_s": 7.002836948000001,
+          "command_at_max_excursion": 0.0,
+          "first_outside_s": null
+        },
+        "left_hand_middle_1_joint": {
+          "min": -1.7085561752319336,
+          "max": 7.762256245769095e-06,
+          "lower": -1.7453292608261108,
+          "upper": 0.0,
+          "max_lower_excursion_rad": 0.0,
+          "max_upper_excursion_rad": 7.762256245769095e-06,
+          "samples_outside_1e4": 0,
+          "max_excursion_row": 349,
+          "max_excursion_s": 7.002836948000001,
+          "command_at_max_excursion": 0.0,
+          "first_outside_s": null
+        },
+        "left_hand_index_0_joint": {
+          "min": -1.0476709604263306,
+          "max": 9.374604269396514e-05,
+          "lower": -1.5707963705062866,
+          "upper": 0.0,
+          "max_lower_excursion_rad": 0.0,
+          "max_upper_excursion_rad": 9.374604269396514e-05,
+          "samples_outside_1e4": 0,
+          "max_excursion_row": 329,
+          "max_excursion_s": 6.601549194,
+          "command_at_max_excursion": 0.0,
+          "first_outside_s": null
+        },
+        "left_hand_index_1_joint": {
+          "min": -1.7276357412338257,
+          "max": 1.3299199054017663e-05,
+          "lower": -1.7453292608261108,
+          "upper": 0.0,
+          "max_lower_excursion_rad": 0.0,
+          "max_upper_excursion_rad": 1.3299199054017663e-05,
+          "samples_outside_1e4": 0,
+          "max_excursion_row": 337,
+          "max_excursion_s": 6.762098585,
+          "command_at_max_excursion": 0.0,
+          "first_outside_s": null
+        }
+      },
+      "last_command_change": {
+        "row": 2889,
+        "s": 61.268176524000005,
+        "command": [
+          -0.47260600328445435,
+          0.768383800983429,
+          0.5915409326553345,
+          -0.4039976894855499,
+          -0.6227630972862244,
+          -0.1944568157196045,
+          -1.1449689865112305
+        ]
+      },
+      "phases": {
+        "enabled": {
+          "samples": 2490,
+          "finite_rejected": 0,
+          "min": [
+            -0.8695518970489502,
+            -0.20151416957378387,
+            0.009744695387780666,
+            -1.3974056243896484,
+            -1.7085561752319336,
+            -1.0476709604263306,
+            -1.7276357412338257
+          ],
+          "max": [
+            0.44695326685905457,
+            0.8949897885322571,
+            1.7150359153747559,
+            -0.0006386591703630984,
+            -5.164622052689083e-05,
+            -0.003639819100499153,
+            -4.228129910188727e-05
+          ]
+        },
+        "after_exit": {
+          "samples": 2077,
+          "finite_rejected": 0,
+          "min": [
+            -0.46315717697143555,
+            0.7749527096748352,
+            0.59153151512146,
+            -0.4433220624923706,
+            -0.620356559753418,
+            -0.1919727325439453,
+            -1.1419637203216553
+          ],
+          "max": [
+            -0.461040735244751,
+            0.7797145843505859,
+            0.5931888818740845,
+            -0.39853987097740173,
+            -0.5696449279785156,
+            -0.18134845793247223,
+            -1.0966345071792603
+          ]
+        }
+      }
+    },
+    "right": {
+      "nonfinite_samples": 140,
+      "finite_rejected_samples": 2858,
+      "joints": {
+        "right_hand_thumb_0_joint": {
+          "min": -0.9024321436882019,
+          "max": 0.7422959804534912,
+          "lower": -1.0471975803375244,
+          "upper": 1.0471975803375244,
+          "max_lower_excursion_rad": 0.0,
+          "max_upper_excursion_rad": 0.0,
+          "samples_outside_1e4": 0,
+          "max_excursion_row": 3772,
+          "max_excursion_s": 78.989861605,
+          "command_at_max_excursion": -0.864254891872406,
+          "first_outside_s": null
+        },
+        "right_hand_thumb_1_joint": {
+          "min": -0.9711538553237915,
+          "max": 0.7477843761444092,
+          "lower": -1.0471975803375244,
+          "upper": 0.7243116497993469,
+          "max_lower_excursion_rad": 0.0,
+          "max_upper_excursion_rad": 0.023472726345062256,
+          "samples_outside_1e4": 15,
+          "max_excursion_row": 277,
+          "max_excursion_s": 5.558256433,
+          "command_at_max_excursion": 0.6737847328186035,
+          "first_outside_s": 5.558256433
+        },
+        "right_hand_thumb_2_joint": {
+          "min": -1.7062331438064575,
+          "max": 0.013536348007619381,
+          "lower": -1.7453292608261108,
+          "upper": 0.0,
+          "max_lower_excursion_rad": 0.0,
+          "max_upper_excursion_rad": 0.013536348007619381,
+          "samples_outside_1e4": 84,
+          "max_excursion_row": 208,
+          "max_excursion_s": 4.173875740000001,
+          "command_at_max_excursion": -0.013730393722653389,
+          "first_outside_s": 2.848960404
+        },
+        "right_hand_middle_0_joint": {
+          "min": -3.266417115810327e-05,
+          "max": 1.404690146446228,
+          "lower": 0.0,
+          "upper": 1.5707963705062866,
+          "max_lower_excursion_rad": 3.266417115810327e-05,
+          "max_upper_excursion_rad": 0.0,
+          "samples_outside_1e4": 0,
+          "max_excursion_row": 337,
+          "max_excursion_s": 6.762098585,
+          "command_at_max_excursion": 0.0,
+          "first_outside_s": null
+        },
+        "right_hand_middle_1_joint": {
+          "min": -5.794498520117486e-06,
+          "max": 1.7466039657592773,
+          "lower": 0.0,
+          "upper": 1.7453292608261108,
+          "max_lower_excursion_rad": 5.794498520117486e-06,
+          "max_upper_excursion_rad": 0.001274704933166504,
+          "samples_outside_1e4": 43,
+          "max_excursion_row": 3062,
+          "max_excursion_s": 64.74457871,
+          "command_at_max_excursion": 1.7453292608261108,
+          "first_outside_s": 64.724505987
+        },
+        "right_hand_index_0_joint": {
+          "min": -6.538004527101293e-05,
+          "max": 1.328079104423523,
+          "lower": 0.0,
+          "upper": 1.5707963705062866,
+          "max_lower_excursion_rad": 6.538004527101293e-05,
+          "max_upper_excursion_rad": 0.0,
+          "samples_outside_1e4": 0,
+          "max_excursion_row": 337,
+          "max_excursion_s": 6.762098585,
+          "command_at_max_excursion": 0.0,
+          "first_outside_s": null
+        },
+        "right_hand_index_1_joint": {
+          "min": -1.0833810847543646e-05,
+          "max": 1.746675968170166,
+          "lower": 0.0,
+          "upper": 1.7453292608261108,
+          "max_lower_excursion_rad": 1.0833810847543646e-05,
+          "max_upper_excursion_rad": 0.0013467073440551758,
+          "samples_outside_1e4": 2774,
+          "max_excursion_row": 3840,
+          "max_excursion_s": 80.353999785,
+          "command_at_max_excursion": 1.7453292608261108,
+          "first_outside_s": 49.423074617000005
+        }
+      },
+      "last_command_change": {
+        "row": 2303,
+        "s": 49.402900407000004,
+        "command": [
+          -0.864254891872406,
+          -0.9199979305267334,
+          -0.8733639717102051,
+          1.4086874723434448,
+          1.7453292608261108,
+          1.3609838485717773,
+          1.7453292608261108
+        ]
+      },
+      "phases": {
+        "enabled": {
+          "samples": 2490,
+          "finite_rejected": 697,
+          "min": [
+            -0.8581165075302124,
+            -0.9711538553237915,
+            -1.7062331438064575,
+            0.004474750719964504,
+            0.00013467571989167482,
+            0.005956131499260664,
+            0.00012759273522533476
+          ],
+          "max": [
+            0.7422959804534912,
+            0.19825515151023865,
+            -0.06093605235219002,
+            1.398028016090393,
+            1.7380424737930298,
+            1.3119474649429321,
+            1.7459193468093872
+          ],
+          "rejected_with_2mrad_upper_[6]": 0,
+          "rejected_with_2mrad_upper_[4, 6]": 0
+        },
+        "after_exit": {
+          "samples": 2077,
+          "finite_rejected": 2077,
+          "min": [
+            -0.9024321436882019,
+            -0.5347829461097717,
+            -0.9564123749732971,
+            1.3908064365386963,
+            1.7380720376968384,
+            1.2908573150634766,
+            1.7458752393722534
+          ],
+          "max": [
+            -0.733953058719635,
+            -0.5083615183830261,
+            -0.8578959107398987,
+            1.404690146446228,
+            1.7466039657592773,
+            1.328079104423523,
+            1.746675968170166
+          ],
+          "rejected_with_2mrad_upper_[6]": 43,
+          "rejected_with_2mrad_upper_[4, 6]": 0
+        }
+      }
+    }
+  }
+}
