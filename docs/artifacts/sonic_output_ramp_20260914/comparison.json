@@ -1,0 +1,353 @@
+{
+  "baseline_nominal": {
+    "switches": [
+      {
+        "to": "streamed",
+        "wall": 267733.39607300004,
+        "windows": {
+          "pre": {
+            "tilt_max": 3.310588129235858,
+            "height_min": 0.7865722592493891
+          },
+          "early": {
+            "tilt_max": 4.346536849240694,
+            "height_min": 0.7687513170543263
+          },
+          "late": {
+            "tilt_max": 5.214355414563968,
+            "height_min": 0.784292611235648
+          }
+        }
+      },
+      {
+        "to": "planner_motion",
+        "wall": 267738.496127,
+        "windows": {
+          "pre": {
+            "tilt_max": 4.664625014912854,
+            "height_min": 0.7851204764989953
+          },
+          "early": {
+            "tilt_max": 5.611019489858369,
+            "height_min": 0.7801599538206108
+          },
+          "late": {
+            "tilt_max": 3.128325795966418,
+            "height_min": 0.7857975939032845
+          }
+        }
+      },
+      {
+        "to": "streamed",
+        "wall": 267743.416072,
+        "windows": {
+          "pre": {
+            "tilt_max": 2.057093341105217,
+            "height_min": 0.7861632326608665
+          },
+          "early": {
+            "tilt_max": 3.508401208540616,
+            "height_min": 0.7759985532331911
+          },
+          "late": {
+            "tilt_max": 5.920664188128776,
+            "height_min": 0.7856246538731698
+          }
+        }
+      },
+      {
+        "to": "planner_motion",
+        "wall": 267748.496055,
+        "windows": {
+          "pre": {
+            "tilt_max": 4.801514811333486,
+            "height_min": 0.7857597299938966
+          },
+          "early": {
+            "tilt_max": 5.715708534335492,
+            "height_min": 0.7814401418273174
+          },
+          "late": {
+            "tilt_max": 4.741749710716814,
+            "height_min": 0.7869568285147014
+          }
+        }
+      },
+      {
+        "to": "streamed",
+        "wall": 267753.419023,
+        "windows": {
+          "pre": {
+            "tilt_max": 1.9007990365546001,
+            "height_min": 0.7867312119248002
+          },
+          "early": {
+            "tilt_max": 2.916620204630807,
+            "height_min": 0.7789978740954239
+          },
+          "late": {
+            "tilt_max": 5.657952394100885,
+            "height_min": 0.7856784580808674
+          }
+        }
+      },
+      {
+        "to": "planner_motion",
+        "wall": 267758.498369,
+        "windows": {
+          "pre": {
+            "tilt_max": 4.748604967495326,
+            "height_min": 0.7857284305655512
+          },
+          "early": {
+            "tilt_max": 5.616051845035225,
+            "height_min": 0.7810325558192794
+          },
+          "late": {
+            "tilt_max": 2.4210085592066015,
+            "height_min": 0.7862630971871417
+          }
+        }
+      }
+    ],
+    "min_root_height_m": 0.7687513170543263,
+    "max_root_tilt_deg": 5.920664188128776,
+    "physics_wall_ratio": 0.8154912298448561,
+    "fall_events": [],
+    "output_ramp_starts": 6
+  },
+  "patched_nominal": {
+    "switches": [
+      {
+        "to": "streamed",
+        "wall": 267985.550097,
+        "windows": {
+          "pre": {
+            "tilt_max": 3.161841807780864,
+            "height_min": 0.7861546995071196
+          },
+          "early": {
+            "tilt_max": 4.332155163446839,
+            "height_min": 0.7854235494050913
+          },
+          "late": {
+            "tilt_max": 4.526309091759264,
+            "height_min": 0.7855271432490423
+          }
+        }
+      },
+      {
+        "to": "planner_motion",
+        "wall": 267990.630098,
+        "windows": {
+          "pre": {
+            "tilt_max": 4.484741580388381,
+            "height_min": 0.7857505581957844
+          },
+          "early": {
+            "tilt_max": 4.125073958515964,
+            "height_min": 0.7857747576165792
+          },
+          "late": {
+            "tilt_max": 2.2301935262219974,
+            "height_min": 0.7862330040436907
+          }
+        }
+      },
+      {
+        "to": "streamed",
+        "wall": 267995.5501,
+        "windows": {
+          "pre": {
+            "tilt_max": 1.760325679582054,
+            "height_min": 0.786762707533648
+          },
+          "early": {
+            "tilt_max": 4.372871363051278,
+            "height_min": 0.7854731238576618
+          },
+          "late": {
+            "tilt_max": 4.473035829596272,
+            "height_min": 0.7855010441105106
+          }
+        }
+      },
+      {
+        "to": "planner_motion",
+        "wall": 268000.630099,
+        "windows": {
+          "pre": {
+            "tilt_max": 4.443629239814851,
+            "height_min": 0.7854731420494017
+          },
+          "early": {
+            "tilt_max": 4.292163602610878,
+            "height_min": 0.7854694904566555
+          },
+          "late": {
+            "tilt_max": 2.1483911294796973,
+            "height_min": 0.7861006092405637
+          }
+        }
+      },
+      {
+        "to": "streamed",
+        "wall": 268005.550093,
+        "windows": {
+          "pre": {
+            "tilt_max": 1.5963490806246268,
+            "height_min": 0.7866057579613558
+          },
+          "early": {
+            "tilt_max": 4.355761100569268,
+            "height_min": 0.7853412711367419
+          },
+          "late": {
+            "tilt_max": 4.420537989832583,
+            "height_min": 0.7853924782750175
+          }
+        }
+      },
+      {
+        "to": "planner_motion",
+        "wall": 268010.630107,
+        "windows": {
+          "pre": {
+            "tilt_max": 4.3934860943979315,
+            "height_min": 0.7853713103868503
+          },
+          "early": {
+            "tilt_max": 4.2567042625546865,
+            "height_min": 0.7853692303057147
+          },
+          "late": {
+            "tilt_max": 2.085401785075313,
+            "height_min": 0.7859889509748377
+          }
+        }
+      }
+    ],
+    "min_root_height_m": 0.7833091569704206,
+    "max_root_tilt_deg": 4.526309091759264,
+    "physics_wall_ratio": 0.961600027487533,
+    "fall_events": [],
+    "output_ramp_starts": 0
+  },
+  "baseline_repeat": {
+    "switches": [
+      {
+        "to": "streamed",
+        "wall": 268157.042205,
+        "windows": {
+          "pre": {
+            "tilt_max": 4.444918490118701,
+            "height_min": 0.7738196603851789
+          },
+          "early": {
+            "tilt_max": 6.4631377755984545,
+            "height_min": 0.7644253652661659
+          },
+          "late": {
+            "tilt_max": 6.001799648753447,
+            "height_min": 0.782032916983955
+          }
+        }
+      },
+      {
+        "to": "planner_motion",
+        "wall": 268162.042192,
+        "windows": {
+          "pre": {
+            "tilt_max": 5.280366464709662,
+            "height_min": 0.7827053168053176
+          },
+          "early": {
+            "tilt_max": 6.401080957745184,
+            "height_min": 0.7776810232436846
+          },
+          "late": {
+            "tilt_max": 2.6121723356938555,
+            "height_min": 0.7853954098146346
+          }
+        }
+      },
+      {
+        "to": "streamed",
+        "wall": 268167.022198,
+        "windows": {
+          "pre": {
+            "tilt_max": 2.186319035845495,
+            "height_min": 0.7854223693007636
+          },
+          "early": {
+            "tilt_max": 3.7878787459256498,
+            "height_min": 0.776662638213437
+          },
+          "late": {
+            "tilt_max": 5.812415335832837,
+            "height_min": 0.784983751834805
+          }
+        }
+      },
+      {
+        "to": "planner_motion",
+        "wall": 268172.042197,
+        "windows": {
+          "pre": {
+            "tilt_max": 4.905670928069836,
+            "height_min": 0.7852453065008906
+          },
+          "early": {
+            "tilt_max": 5.8803645855160065,
+            "height_min": 0.7793916425688979
+          },
+          "late": {
+            "tilt_max": 2.581348709499016,
+            "height_min": 0.7863352975717293
+          }
+        }
+      },
+      {
+        "to": "streamed",
+        "wall": 268177.042198,
+        "windows": {
+          "pre": {
+            "tilt_max": 1.9207210981833733,
+            "height_min": 0.7863220619190818
+          },
+          "early": {
+            "tilt_max": 3.8818673458207718,
+            "height_min": 0.7686329468639777
+          },
+          "late": {
+            "tilt_max": 5.657329132629272,
+            "height_min": 0.784375048319
+          }
+        }
+      },
+      {
+        "to": "planner_motion",
+        "wall": 268182.042205,
+        "windows": {
+          "pre": {
+            "tilt_max": 4.534902952944126,
+            "height_min": 0.7852066466971749
+          },
+          "early": {
+            "tilt_max": 5.485964396809027,
+            "height_min": 0.7785171373430413
+          },
+          "late": {
+            "tilt_max": 2.470027411952171,
+            "height_min": 0.7860624552105548
+          }
+        }
+      }
+    ],
+    "min_root_height_m": 0.7644253652661659,
+    "max_root_tilt_deg": 6.4631377755984545,
+    "physics_wall_ratio": 0.9675177175945884,
+    "fall_events": [],
+    "output_ramp_starts": 6
+  }
+}

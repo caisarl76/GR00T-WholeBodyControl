@@ -305,12 +305,6 @@ class G1Deploy {
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
 
-    static constexpr double kTeleopOutputRampDuration = 1.0;
-    bool last_has_vr_3point_data_ = false;
-    bool last_has_upper_body_data_ = false;
-    bool teleop_output_ramp_active_ = false;
-    double teleop_output_ramp_elapsed_ = 0.0;
-    std::array<double, G1_NUM_MOTOR> teleop_output_ramp_start_q_{};
     bool enable_dex3_hands_ = true;
     
     // =========================================================================
@@ -3010,48 +3004,6 @@ class G1Deploy {
       return true;
     }
 
-    void StartTeleopOutputRamp(const char* reason) {
-      auto low_state_data = low_state_buffer_.GetDataWithTime();
-      const std::shared_ptr<const LowState_> ls = low_state_data.data;
-      if (ls) {
-        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-          teleop_output_ramp_start_q_[i] = ls->motor_state()[i].q();
-        }
-      } else {
-        const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
-        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-          teleop_output_ramp_start_q_[i] = mc ? mc->q_target.at(i) : default_angles[i];
-        }
-      }
-
-      teleop_output_ramp_elapsed_ = 0.0;
-      teleop_output_ramp_active_ = kTeleopOutputRampDuration > 0.0;
-      if (teleop_output_ramp_active_) {
-        std::cout << "[Control] Teleop output ramp started ("
-                  << kTeleopOutputRampDuration << "s, " << reason << ")" << std::endl;
-      }
-    }
-
-    void ApplyTeleopOutputRamp(MotorCommand& motor_command) {
-      if (!teleop_output_ramp_active_) { return; }
-
-      teleop_output_ramp_elapsed_ += control_dt_;
-      double alpha = std::clamp(
-          teleop_output_ramp_elapsed_ / kTeleopOutputRampDuration, 0.0, 1.0);
-      alpha = alpha * alpha * (3.0 - 2.0 * alpha);
-
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-        const double target = motor_command.q_target.at(i);
-        motor_command.q_target.at(i) = static_cast<float>(
-            teleop_output_ramp_start_q_[i] * (1.0 - alpha) + target * alpha);
-      }
-
-      if (alpha >= 1.0) {
-        teleop_output_ramp_active_ = false;
-        std::cout << "[Control] Teleop output ramp complete" << std::endl;
-      }
-    }
-
     /**
      * @brief Snapshot all input-interface data into local buffers.
      *
@@ -3081,19 +3033,6 @@ class G1Deploy {
       std::tie(has_right_hand_data_, right_hand_joint_buffer_) = input_interface_->GetHandPose(false);
       std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
       std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
-
-      if (has_vr_3point_data_ != last_has_vr_3point_data_) {
-        StartTeleopOutputRamp(
-            has_vr_3point_data_ ? "enter VR_3PT" : "exit VR_3PT");
-      }
-      last_has_vr_3point_data_ = has_vr_3point_data_;
-
-      if (has_upper_body_data_ != last_has_upper_body_data_) {
-        StartTeleopOutputRamp(
-            has_upper_body_data_ ? "enter upper-body joint teleop"
-                                 : "exit upper-body joint teleop");
-      }
-      last_has_upper_body_data_ = has_upper_body_data_;
 
       auto last_update_time = input_interface_->GetLastUpdateTime();
       if (last_update_time.has_value()) {
@@ -3249,7 +3188,8 @@ class G1Deploy {
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
-      ApplyTeleopOutputRamp(motor_command_tmp);
+      // Keep balance feedback and last_action consistent across source changes.
+      // Smooth teleop reference targets upstream, never the policy motor output.
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;

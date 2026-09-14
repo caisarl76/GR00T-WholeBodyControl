@@ -1,0 +1,13 @@
+{
+  "source_root": "/tmp/gr00t-sonic-mode-handoff",
+  "baseline_executable": "/tmp/sonic-output-ramp-eval/ramped-g1_deploy_onnx_ref",
+  "patched_executable": "/tmp/gr00t-sonic-mode-handoff/gear_sonic_deploy/target/release/g1_deploy_onnx_ref",
+  "sim_python": "/home/jihun/work/GR00T-WholeBodyControl/.venv_teleop/bin/python",
+  "models_dir": "/tmp/sonic-handoff-eval-20260914/models",
+  "reference_dir": "/home/jihun/work/GR00T-WholeBodyControl/gear_sonic_deploy/reference/example",
+  "robot_scene": "/tmp/gr00t-sonic-mode-handoff/gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml",
+  "pose_fixture": "/tmp/sonic-live-handoff/capture/body/pose_000000.npz",
+  "output_root": "/tmp/sonic-output-ramp-eval",
+  "cuda_visible_devices": "1",
+  "library_path": "/home/jihun/TensorRT/TensorRT-10.13.0.35/lib:/usr/local/cuda/lib64:/usr/local/lib"
+}

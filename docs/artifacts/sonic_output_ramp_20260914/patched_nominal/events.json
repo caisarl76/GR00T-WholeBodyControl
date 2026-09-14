@@ -1,0 +1,84 @@
+[
+  {
+    "wall": 267977.516033966,
+    "kind": "start"
+  },
+  {
+    "wall": 267977.516307796,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 267977.516558843,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 267980.526371609,
+    "kind": "release_band"
+  },
+  {
+    "wall": 267985.524026817,
+    "kind": "request",
+    "mode": "pose"
+  },
+  {
+    "wall": 267985.524339811,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 267990.522656628,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 267990.522968445,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 267995.52299727,
+    "kind": "request",
+    "mode": "pose"
+  },
+  {
+    "wall": 267995.523321103,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 268000.523480852,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 268000.523773346,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 268005.522234904,
+    "kind": "request",
+    "mode": "pose"
+  },
+  {
+    "wall": 268005.522573341,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 268010.519480555,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 268010.519832476,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 268015.517225849,
+    "kind": "end"
+  }
+]

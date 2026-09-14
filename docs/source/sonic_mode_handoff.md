@@ -93,3 +93,19 @@ part of this local patch.
 
 See the [C++ regression instructions](../../gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/tests/README_mode_handoff.md)
 for the hardware-free handoff test command.
+
+## Live follow-up: preserve policy balance feedback
+
+The live A+X test reproduced a separate one-second balance disturbance. Auxiliary
+VR fields in SMPL packets toggled an existing motor-output ramp, even though the
+SMPL encoder does not use those fields. That ramp blended all 29 policy targets
+with fixed measured joint positions for one second, attenuating balance
+corrections while action history retained the unmodified decoder output.
+
+The follow-up removes this global motor-output ramp. Standing initialization,
+VR entry checks and upstream reference smoothing remain intact. A compiled
+regression reproduces the old target/history mismatch; the repaired binary also
+improves root-height and tilt transients in the captured-pose comparison with VR
+fields retained. See the [live diagnosis and controlled replay](../artifacts/sonic_output_ramp_20260914/README.md).
+Live confirmation of the repaired disturbance and separate investigation of
+later sustained-POSE falls remain pending. PC2 has not been updated.
