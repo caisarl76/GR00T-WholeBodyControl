@@ -17,6 +17,7 @@ from gear_sonic.utils.teleop.pico_hand_log import HandCaptureLog, validate_captu
 from gear_sonic.utils.teleop.pico_inspire_protocol import STATUS_SCHEMA, validate_inspire_hand
 from gear_sonic.utils.teleop.pico_recording import RecorderProtocol, RecordingCommand, RecordingState
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message, unpack_pose_message
+from gear_sonic.data.pico_hand_features import join_hand_frame
 
 
 @pytest.fixture
@@ -954,3 +955,48 @@ def test_real_pose_buffer_prepares_before_manager_switch(monkeypatch, manager):
             assert any(t == tick and topic == "planner" for t, topic, _ in h.messages)
             assert not any(t == tick and topic == "pose" for t, topic, _ in h.messages)
         assert any(t == start + 5 and topic == "pose" for t, topic, _ in h.messages)
+
+
+def test_optical_dex3_vr3pt_refuses_unrecordable_start(monkeypatch, manager, capsys):
+    h = Harness(monkeypatch, manager, keys={12: "t", 18: "t", 24: "c", 28: "s"}, end=32)
+    controller = h.controller
+    h.controller = lambda side: {**controller(side), "axis_click": side == "left" and h.tick == 22}
+    monkeypatch.setattr(manager.PlannerStreamer, "check_vr3pt_entry_mismatch", lambda self: True, raising=False)
+    monkeypatch.setattr(manager.PlannerStreamer, "recalibrate_for_vr3pt", lambda self: None, raising=False)
+    monkeypatch.setattr(manager.PlannerStreamer, "start_vr3pt_ramp", lambda self, **kw: None, raising=False)
+    h.run()
+    assert h.states()[24]["stream_mode"][0] == manager.StreamMode.PLANNER_VR_3PT.value
+    assert h.actions == []
+    assert "Optical Dex3 recording requires POSE" in capsys.readouterr().out
+    for tick, topic, fields in h.messages:
+        if tick >= 22 and topic == "planner":
+            assert "left_hand_joints" not in fields and "right_hand_joints" not in fields
+
+
+@pytest.mark.parametrize("profile,hand_input", [("dex3", "controller"), ("inspire_ftp", "optical")])
+def test_supported_vr3pt_recording_generations_join_exporter(monkeypatch, manager, profile, hand_input):
+    h = Harness(monkeypatch, manager, profile=profile, keys={24: "c", 28: "s"}, end=32)
+    controller = h.controller
+    h.controller = lambda side: {**controller(side), "axis_click": side == "left" and h.tick == 22}
+    monkeypatch.setattr(manager.PlannerStreamer, "check_vr3pt_entry_mismatch", lambda self: True, raising=False)
+    monkeypatch.setattr(manager.PlannerStreamer, "recalibrate_for_vr3pt", lambda self: None, raising=False)
+    monkeypatch.setattr(manager.PlannerStreamer, "start_vr3pt_ramp", lambda self, **kw: None, raising=False)
+    h.run(hand_input=hand_input)
+    assert h.actions == ["start", "save"]
+    for tick in (26, 27):
+        packets = {topic: {**fields, "received_ns": h.now} for t, topic, fields in h.messages if t == tick}
+        inspire_status = unpack_pose_message(h.feedback_wire("inspire_hand_status"), "inspire_hand_status") if profile == "inspire_ftp" else None
+        if inspire_status is not None:
+            inspire_status["received_ns"] = h.now
+            inspire_status["ready"] = h.hands.ready(h.now)
+            # Simulate the bridge acknowledging this transmitted generation.
+            inspire_status["bridge_state"] = np.array([2], np.int32)
+            inspire_status["accepted_pv"] = packets["inspire_hand"]["pv"]
+            inspire_status["last_applied_message_seq"] = packets["inspire_hand"]["message_seq"]
+            for side in ("left", "right"):
+                inspire_status[f"{side}_applied"] = packets["inspire_hand"][f"{side}_command"]
+        joined = join_hand_frame(
+            packets["planner"], packets["hand_tracking"], profile, h.now,
+            h.protocol.manager_session_id, manager.StreamMode.PLANNER_VR_3PT.value, inspire_status,
+        )
+        assert joined["teleop.hand_sample_generation"][0] == tick

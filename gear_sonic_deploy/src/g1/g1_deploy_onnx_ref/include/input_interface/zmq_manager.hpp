@@ -263,6 +263,18 @@ class ZMQManager : public InputInterface {
               planner_transition_requested_ = true;
               std::cout << "[ZMQManager] Preparing PLANNER mode" << std::endl;
             } else {
+              if (managed_planner_state_) {
+                std::lock_guard<std::mutex> motion_lock(*managed_motion_mutex_);
+                // Cancel before another control tick can commit the abandoned
+                // inference, even when no replacement pose has arrived. A
+                // planner that already committed remains the outgoing source.
+                if (!planner_reference_committed_ && managed_planner_state_->enabled) {
+                  managed_planner_state_->enabled = false;
+                  managed_planner_state_->initialized = false;
+                  ++managed_planner_state_->generation;
+                  managed_planner_state_->preserve_heading_on_init = false;
+                }
+              }
               pose_interface_->PrepareManagedStream(pose_controls_active_);
               pose_handoff_started_ = std::chrono::steady_clock::now();
               is_planner_ready_ = false;
@@ -304,6 +316,11 @@ class ZMQManager : public InputInterface {
         operator_state.stop = true;
         return;
       }
+      // The input thread calls update()/handle_input() with the same live
+      // deployment state. Bind before enabling any managed planner generation;
+      // subscriber callbacks and destruction never access these references.
+      managed_planner_state_ = &planner_state;
+      managed_motion_mutex_ = &current_motion_mutex;
       if (vr3pt_estop_requested_) {
         std::cerr << "[ZMQManager] VR_3PT safety filter escalated -> STOP" << std::endl;
         operator_state.stop = true;
@@ -413,6 +430,7 @@ class ZMQManager : public InputInterface {
     }
 
     void OnPlannerReferenceCommitted() override {
+      planner_reference_committed_ = true;
       pose_controls_active_ = false;
     }
 
@@ -590,6 +608,7 @@ class ZMQManager : public InputInterface {
           if (!planner_state.enabled) {
             ++planner_state.generation;
             planner_state.initialized = false;
+            planner_reference_committed_ = false;
           }
           planner_state.enabled = true;
           planner_init_started_ = std::chrono::steady_clock::now();
@@ -1161,6 +1180,8 @@ class ZMQManager : public InputInterface {
     // Mode / message state
     // ------------------------------------------------------------------
     ManagedMode active_mode_;           ///< Current operational mode (PLANNER or STREAMED_MOTION).
+    PlannerState* managed_planner_state_ = nullptr;  ///< Borrowed by the input thread only.
+    std::mutex* managed_motion_mutex_ = nullptr;
     
     std::mutex command_mutex_;          ///< Guards access to latest_command_.
     CommandMessage latest_command_;     ///< Most recent (or accumulated) command message.
@@ -1187,6 +1208,8 @@ class ZMQManager : public InputInterface {
 
     /// The committed source owns hand/VR/token controls through pending reversals.
     std::atomic<bool> pose_controls_active_{false};
+    /// Reset on generation creation and set at reference commit under the motion mutex.
+    std::atomic<bool> planner_reference_committed_{false};
     Vr3PtSafetyFilter vr3pt_filter_;
     bool vr3pt_estop_requested_ = false;
 };

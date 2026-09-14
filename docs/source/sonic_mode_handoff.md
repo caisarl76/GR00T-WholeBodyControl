@@ -71,7 +71,7 @@ MuJoCo balance qualification and physical confirmation remain required before
 claiming the reported instability resolved on hardware. No PC2 installation is
 part of this local patch.
 
-## Local verification (2026-09-14)
+## Initial local verification (2026-09-14, before live follow-up)
 
 - 202 focused Python tests passed, including real `PoseStreamer` warmup,
   both transition directions, freeze, cancellation, timeout, recording and hand
@@ -86,10 +86,11 @@ part of this local patch.
 - Four isolated MuJoCo runs compared the baseline and patch with SONIC v1.1.
   Each build completed ten switches without a fall. In the stress comparison,
   paused reference ticks fell from 21 to zero. The baseline also stayed upright,
-  so the reported live PICO balance loss has not been reproduced or conclusively
-  resolved. See the [measurements and reproduction instructions](../artifacts/sonic_mode_handoff_20260914/README.md).
-- Live moving-pose transition qualification and physical G1 confirmation remain
-  pending. No PC2 installation was performed.
+  so those initial runs did not reproduce or establish a resolution of the live
+  PICO balance loss. See the [measurements and reproduction instructions](../artifacts/sonic_mode_handoff_20260914/README.md)
+  and the subsequent live follow-up below.
+- At this initial stage, live and physical confirmation were pending. No PC2
+  installation was performed.
 
 See the [C++ regression instructions](../../gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/tests/README_mode_handoff.md)
 for the hardware-free handoff test command.
@@ -108,6 +109,32 @@ regression reproduces the old target/history mismatch; the repaired binary also
 improves root-height and tilt transients in the captured-pose comparison with VR
 fields retained. See the [live diagnosis and controlled replay](../artifacts/sonic_output_ramp_20260914/README.md).
 A subsequent live MuJoCo retest completed ten switches with finger input disabled;
-the user confirmed the balance loss was gone. Full optical-hand integration,
-physical G1 confirmation, and separate investigation of later sustained-POSE
-falls remain pending. PC2 has not been updated.
+the user confirmed the balance loss was gone. The subsequent optical Dex3 retest
+recorded four PLANNER -> POSE and four POSE -> PLANNER switches, and the user
+confirmed A+X switching works. See the [optical integration confirmation](../artifacts/sonic_hand_mode_ownership_20260914/README.md)
+and its [manager log and confirmation](../artifacts/sonic_hand_mode_ownership_20260914/live_confirmation.json).
+Physical G1 qualification, formal timing/recording qualification, and the
+separate investigation of later sustained-POSE falls remain pending. PC2 has
+not been updated.
+
+## PR #11 review corrections (2026-09-14)
+
+A reverse POSE command now invalidates an uncommitted planner generation in
+`update()`, under the same motion mutex used by reference commit. It preserves
+the outgoing reference, including a planner that already committed. Regression
+tests reproduce cancellation during and after inference, both at startup and
+after POSE, before `handle_input()` or a replacement pose packet arrives. They
+also check that restarting cannot revive the abandoned result.
+
+Optical Dex3 recording is now admitted only in POSE: native-fist VR_3PT packets
+have no optical hand action fields. The manager explains the refusal and the
+recorder independently rejects START/TOGGLE-to-START from older managers. Save
+and abort remain available. Controller Dex3 and Inspire VR_3PT recording retain
+their episode fields and pass the recording join checks. See the
+[recording restriction](pico_optical_hand_tracking.md).
+
+Verification: 297 focused Python tests, 33 exporter tests, and both C++
+deployment regressions. The targeted cancellation and recording reproductions
+failed before the corrections and passed afterward. These review corrections
+were checked locally; the earlier live confirmations above do not qualify this
+new revision on physical G1 hardware.

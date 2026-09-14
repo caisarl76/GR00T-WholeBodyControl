@@ -56,7 +56,9 @@ from gear_sonic.utils.teleop.inspire_ftp import map_pico_controls
 from gear_sonic.utils.teleop.pico_controls import ControllerChords, ManagerKeyboard, read_controllers
 from gear_sonic.utils.teleop.pico_hand_log import HandCaptureLog
 from gear_sonic.utils.teleop.pico_hand_runtime import PicoHandRuntime, PicoPublisher
-from gear_sonic.utils.teleop.pico_recording import ManagerRecording, RecordingCommand, RecordingState
+from gear_sonic.utils.teleop.pico_recording import (
+    ManagerRecording, RecordingCommand, RecordingState, recording_mode_allowed,
+)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import unpack_pose_message
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
@@ -3160,6 +3162,7 @@ def run_pico_manager(
         )
         hands = PicoHandRuntime(xrt, context, hand_profile, endpoint, max_rate=hand_max_rate)
     publisher = PicoPublisher(socket, hand_input, hand_profile, hands)
+    hand_input_code = {"optical": 0, "controller": 1, "off": 2}[hand_input]
     keyboard = ManagerKeyboard()
     chords = ControllerChords()
     mode_epoch = 0
@@ -3319,13 +3322,20 @@ def run_pico_manager(
                     max(0, min(int(LocomotionMode.INJURED_WALK), int(planner_streamer.mode) + direction))
                 )
             tracking = current_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT)
+            recordable = recording_mode_allowed(current_mode.value, recorder.profile, hand_input_code)
+            if (
+                hand_profile == "dex3" and hand_input == "optical"
+                and current_mode == StreamMode.PLANNER_VR_3PT
+                and (action == "record" or "c" in keys)
+            ):
+                print("[Manager] Optical Dex3 recording requires POSE; VR_3PT uses the native planner fist")
             if action in ("record", "abort"):
                 command = RecordingCommand.TOGGLE if action == "record" else RecordingCommand.ABORT
-                recorder.enqueue(command, tick_ns, tracking=tracking and hand_input != "off")
+                recorder.enqueue(command, tick_ns, tracking=recordable)
             for key in keys:
                 if key in "cs":
                     command = RecordingCommand.START if key == "c" else RecordingCommand.STOP_AND_SAVE
-                    if not recorder.enqueue(command, tick_ns, tracking=tracking and hand_input != "off"):
+                    if not recorder.enqueue(command, tick_ns, tracking=recordable):
                         print("[Manager] Recording command unavailable; wait for recorder ACK/status")
             if hands is not None:
                 hands.poll_feedback(tick_ns)
@@ -3443,8 +3453,9 @@ def run_pico_manager(
             if by_pressed and pending_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 new_mode = current_mode
             if (
-                tracking
-                and new_mode not in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT, StreamMode.OFF)
+                recordable
+                and new_mode != StreamMode.OFF
+                and not recording_mode_allowed(new_mode.value, recorder.profile, hand_input_code)
                 and not recorder.may_exit_tracking(tick_ns)
             ):
                 print("[Manager] Stop/save recording and wait for IDLE ACK before disabling tracking")
@@ -3555,9 +3566,7 @@ def run_pico_manager(
             if new_mode == StreamMode.OFF and current_mode != StreamMode.OFF:
                 recorder.enqueue(RecordingCommand.ABORT, tick_ns, tracking=tracking)
             state_fields = recorder.fields(mode_epoch, new_mode.value)
-            state_fields["hand_input"] = np.array(
-                [{"optical": 0, "controller": 1, "off": 2}[hand_input]], dtype=np.int32
-            )
+            state_fields["hand_input"] = np.array([hand_input_code], dtype=np.int32)
             # State provenance must precede body and Inspire packets on this socket.
             socket.send(pack_pose_message(state_fields, "manager_state", version=4))
             publisher.pv = state_fields["pv"]

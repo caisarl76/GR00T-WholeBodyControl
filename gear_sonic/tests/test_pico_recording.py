@@ -257,3 +257,20 @@ def test_adopted_recording_can_stop_when_manager_enters_off(command, event):
     assert r.receive(m.fields(1, 0), 3) == event
     assert r.state == S.SAVING and not r.capture_active
     assert r.receive(m.fields(1, 0), 4) is None
+
+
+@pytest.mark.parametrize("command", [C.START, C.TOGGLE])
+def test_recorder_refuses_optical_dex3_vr3pt_start_without_wedging_sequence(command):
+    _, r = pair()
+    fields = command_packet(command, 1, mode=5, epoch=1)
+    fields["hand_input"] = np.array([0], np.int32)
+    assert r.receive(fields, 1) is None
+    assert r.state == S.IDLE and not r.capture_active
+    assert r.last_applied_command_seq == 1
+    fields = command_packet(C.START, 2, mode=1, epoch=2)
+    fields["hand_input"] = np.array([0], np.int32)
+    assert r.receive(fields, 2) == "start"
+    # Even an older manager switching into the unsupported mode can still save.
+    fields = command_packet(C.STOP_AND_SAVE, 3, mode=5, epoch=3)
+    fields["hand_input"] = np.array([0], np.int32)
+    assert r.receive(fields, 3) == "save"

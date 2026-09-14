@@ -1,6 +1,7 @@
 // Real input headers; -fno-access-control permits deterministic callback delivery
 // without a publisher, robot, or planner inference thread.
 #include "input_interface/zmq_manager.hpp"
+#include <functional>
 #include <stdexcept>
 
 void require(bool value, const char* message) {
@@ -14,13 +15,15 @@ struct Fixture {
   std::shared_ptr<const MotionSequence> current;
   int frame = 12;
   OperatorState op;
-  PlannerState planner;
+  PlannerState owned_planner;
+  PlannerState& planner;
   bool heading = false, temperature = false;
   DataBuffer<HeadingState> heading_buffer;
   DataBuffer<MovementState> movement_buffer;
   std::mutex mutex;
 
-  Fixture() {
+  Fixture(PlannerState* planner_state = nullptr, bool planner_committed = true)
+      : planner(planner_state ? *planner_state : owned_planner) {
     manager.command_subscriber_->Stop();
     manager.planner_subscriber_->Stop();
     manager.pose_interface_->subscriber_->Stop();
@@ -36,6 +39,7 @@ struct Fixture {
     current = original;
     op.start = op.play = true;
     planner.enabled = planner.initialized = true;
+    if (planner_committed) manager.OnPlannerReferenceCommitted();
     heading_buffer.SetData(HeadingState({1, 0, 0, 0}, 0.8));
     movement_buffer.SetData(MovementState(0, {0, 0, 0}, {0, 1, 0}, -1, -1));
   }
@@ -68,6 +72,10 @@ struct Fixture {
 
   void tick() {
     manager.update();
+    handle_input();
+  }
+
+  void handle_input() {
     manager.handle_input(reader, current, frame, op, heading, heading_buffer,
                          true, planner, movement_buffer, mutex, temperature);
   }
@@ -79,10 +87,12 @@ struct PlannerBackend : LocalMotionPlannerBase {
   float context[144] = {}, qpos[72] = {}, movement[3] = {}, facing[3] = {};
   int mode = 0;
   bool cancel_during_inference = false;
+  std::function<void()> during_inference;
   PlannerBackend() { qpos[3] = qpos[39] = 1; }
   bool InitializeSpecific() override { return true; }
   void RunInference() override {
     if (cancel_during_inference) ++planner_state_.generation;
+    if (during_inference) during_inference();
   }
   void UpdateInputTensors(int m, float, float, const std::array<float, 3>& move,
                          const std::array<float, 3>& face, int) override {
@@ -188,6 +198,52 @@ int main() {
       require(f.manager.HasHandJoints(),
               "rapid reversal must retain the controls of the committed pose source");
     }
+    for (const auto& [initial_start, cancel_in_flight] :
+         {std::pair{false, false}, std::pair{false, true},
+          std::pair{true, false}, std::pair{true, true}}) {
+      PlannerBackend backend;
+      Fixture f(&backend.planner_state_, !initial_start);
+      if (initial_start) {
+        f.original->name = "initial_reference";
+        f.op.start = f.op.play = false;
+        f.planner.enabled = f.planner.initialized = false;
+      } else {
+        f.pose(); f.command(false); f.tick();
+      }
+      const auto outgoing = f.current;
+      const int outgoing_frame = f.frame;
+      f.command(true); f.tick();
+      const bool outgoing_play = f.op.play, outgoing_heading = f.heading;
+      const auto abandoned_generation = f.planner.generation.load();
+      const MovementState command(static_cast<int>(LocomotionMode::WALK),
+                                  {1, 0, 0}, {0, 1, 0}, 0.3, -1);
+      // Control can accept inference output between update() and handle_input().
+      const auto reverse = [&] { f.command(false); f.manager.update(); };
+      if (cancel_in_flight) backend.during_inference = reverse;
+      require(backend.Initialize({1, 0, 0, 0}, {}, command, abandoned_generation),
+              "pending planner inference must finish");
+      if (!cancel_in_flight) reverse();
+      require(f.current == outgoing && f.frame == outgoing_frame &&
+              f.op.play == outgoing_play && f.heading == outgoing_heading,
+              "reversing pending planner must preserve the outgoing reference");
+      require(!f.planner.enabled && !f.planner.initialized &&
+              backend.motion_generation_ != f.planner.generation.load(),
+              "reversal before a new pose must reject the abandoned planner output");
+      require(f.manager.pose_interface_->ManagedHandoffPending(),
+              "reversal must invalidate planner before any replacement pose arrives");
+      f.handle_input();
+
+      backend.during_inference = {};
+      f.command(true); f.tick();
+      require(f.planner.enabled && !f.planner.initialized &&
+              backend.motion_generation_ != f.planner.generation.load(),
+              "restarting planner must not revive abandoned output");
+      require(backend.Initialize({1, 0, 0, 0}, {}, command),
+              "replacement planner inference must succeed");
+      require(f.planner.initialized &&
+              backend.motion_generation_ == f.planner.generation.load(),
+              "replacement planner output must be eligible for commit");
+    }
     {
       Fixture f;
       f.pose(); f.command(false); f.tick();
@@ -197,9 +253,13 @@ int main() {
       f.current = f.original; f.planner.initialized = true;
       f.manager.OnPlannerReferenceCommitted();  // Before the next input poll.
       require(!f.manager.HasHandJoints(), "controls must change at the actual planner commit");
+      const auto committed_generation = f.planner.generation.load();
       f.command(false); f.tick();
       require(!f.manager.HasHandJoints(),
               "reversal before readiness poll must preserve committed planner controls");
+      require(f.current == f.original && f.planner.enabled && f.planner.initialized &&
+              f.planner.generation.load() == committed_generation,
+              "reversal must preserve a planner that has already committed");
     }
     for (bool destination_planner : {false, true}) {
       Fixture f;

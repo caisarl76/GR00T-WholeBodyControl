@@ -158,6 +158,12 @@ valid optical frames before rate-limited recovery. The feedback allowance
 covers normal planner fist positions and small measured stop excursions without
 expanding commanded finger motion.
 
+Optical Dex3 recording is available only in POSE. VR_3PT uses native planner
+fists without optical hand action fields, so C or the recording chord is refused
+with an explicit message in that mode. Finish saving before leaving POSE.
+The recorder also refuses an optical Dex3 START in VR_3PT from an older manager.
+Controller-hand and Inspire recording in VR_3PT remain supported.
+
 The September 14 MuJoCo retest confirmed repeated A+X switches after these
 changes. See the [handoff and validation record](../artifacts/sonic_hand_mode_ownership_20260914/README.md).
 Physical PC2/G1 validation of this latest handoff repair remains pending.
