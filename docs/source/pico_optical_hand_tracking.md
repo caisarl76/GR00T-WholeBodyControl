@@ -143,12 +143,30 @@ be fresh.
 Dex3 admission reads the DDS `left_hand_q` / `right_hand_q` fields from
 `g1_debug`. The similarly named `*_hand_q_measured` visualization fields can
 contain commanded positions and must not supply the startup baseline. Measured
-Dex3 positions within 1e-4 rad of a joint limit are clamped to that limit.
-For measured right `index_0` only, a lower excursion up to 0.001 rad is
-admitted and projected to zero; raw capture retains the original measurement.
-This narrowly scoped allowance addresses recorded near-zero feedback rejection
-and does not widen commanded joint limits. Larger excursions still block admission. An arming refusal now prints the
-specific transport, schema, DDS or joint-limit failure.
+Dex3 positions within **0.02 rad (about 1.15 degrees)** of any nominal joint
+limit are admitted and projected into the original command range. This
+measured-only allowance applies uniformly to both hands and replaces the
+previous joint-specific exceptions. Raw feedback remains unchanged in captures.
+Larger excursions, malformed/nonfinite positions and stale feedback still block
+admission. Optical targets retain their existing 1e-4-rad numerical tolerance;
+Inspire limits are unchanged.
+
+For Dex3 optical input, fingers track only in POSE. Planner modes omit optical
+hand commands, allowing SONIC's normal fist. Returning to POSE starts from fresh
+measured hand positions, not the previous optical command, and waits for five
+valid optical frames before rate-limited recovery. The feedback allowance
+covers normal planner fist positions and small measured stop excursions without
+expanding commanded finger motion.
+
+Optical Dex3 recording is available only in POSE. VR_3PT uses native planner
+fists without optical hand action fields, so C or the recording chord is refused
+with an explicit message in that mode. Finish saving before leaving POSE.
+The recorder also refuses an optical Dex3 START in VR_3PT from an older manager.
+Controller-hand and Inspire recording in VR_3PT remain supported.
+
+The September 14 MuJoCo retest confirmed repeated A+X switches after these
+changes. See the [handoff and validation record](../artifacts/sonic_hand_mode_ownership_20260914/README.md).
+Physical PC2/G1 validation of this latest handoff repair remains pending.
 
 ## Simulation test commands on this host
 
@@ -446,3 +464,8 @@ attached-hand qualification gates.
 Keep follow-up results with the capture identifiers and exact revisions. The
 read-only viewer above can compare source articulation with robot actions
 without commanding a robot.
+
+## POSE / PLANNER transition repair
+
+See [SONIC mode handoff](sonic_mode_handoff.md) for preparation, cancellation,
+and the simulation checks required before deploying the mode-switch repair.

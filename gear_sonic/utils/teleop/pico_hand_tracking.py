@@ -128,6 +128,7 @@ class HandTracker:
         if not math.isfinite(self.max_rate) or not 0 < self.max_rate <= nominal_rate:
             raise ValueError(f"Hand rate must be positive, finite, and at most {nominal_rate} for {profile}")
         self.tolerance = 0.02 if size == 7 else 0.01
+        self.enabled = False
         self.state = TrackingState.WAITING
         self.command = None
         self.target = None
@@ -147,23 +148,14 @@ class HandTracker:
             q = np.asarray(value, dtype=np.float64)
         except (TypeError, ValueError, OverflowError):
             return None
-        # DDS float32 measurements can slightly cross a MuJoCo soft joint limit.
-        epsilon = 1e-4 if self.lower.size == 7 else 0.0
-        lower_epsilon = np.full(self.lower.shape, epsilon, dtype=np.float64)
-        if (
-            measured
-            and self.lower.size == 7
-            and getattr(self.retargeter, "side", None) == "right"
-            and self.lower[5] == 0
-        ):
-            # Dex3 order: thumb 0..2, middle 3..4, index 5..6. Real captures
-            # reach -0.000918 rad at right index_0's zero stop. Admit only
-            # this measured lower excursion; targets retain the original check.
-            lower_epsilon[5] = 1e-3
+        # Measured Dex3 positions may cross nominal stops under load. Keep
+        # this allowance separate from optical targets; admitted measurements
+        # are projected back into the nominal command range below.
+        epsilon = (0.02 if measured else 1e-4) if self.lower.size == 7 else 0.0
         if (
             q.shape != self.lower.shape
             or not np.isfinite(q).all()
-            or np.any(q < self.lower - lower_epsilon)
+            or np.any(q < self.lower - epsilon)
             or np.any(q > self.upper + epsilon)
         ):
             return None
@@ -171,6 +163,14 @@ class HandTracker:
 
     def step(self, snapshot, body_wrist, measured, now_ns, *, enabled=True):
         now_ns = int(now_ns)
+        if self.lower.size == 7 and enabled and not self.enabled:
+            # PLANNER owns Dex3 hands while optics are disabled. Both live and
+            # replay must re-enter from measured positions, not old commands.
+            # Preserve source clocks/epochs across this ownership change.
+            self.state = TrackingState.WAITING
+            self.command = self.target = None
+            self.valid_streak = self.converged_streak = 0
+        self.enabled = enabled
         advanced = False
         restart = False
         reason = HandReason.OK

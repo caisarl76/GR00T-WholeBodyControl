@@ -19,6 +19,18 @@ PROFILES = {"dex3": 0, "inspire_ftp": 1}
 AUTHORIZED_MODES = {1, 5}
 
 
+def recording_mode_allowed(mode, profile, hand_input=None):
+    """Native-fist Dex3 planner packets lack the optical episode hand fields.
+
+    Absent hand_input preserves compatibility with older controller publishers.
+    """
+    return (
+        mode in AUTHORIZED_MODES
+        and hand_input != 2
+        and not (profile == PROFILES["dex3"] and hand_input == 0 and mode == 5)
+    )
+
+
 class RecordingCommand(IntEnum):
     NONE = 0
     START = 1
@@ -273,6 +285,9 @@ class RecorderProtocol:
             command = RecordingCommand(_scalar(fields, "recording_command", np.int32))
             seq = _scalar(fields, "recording_command_seq", np.int64)
             declared_mode = _scalar(fields, "stream_mode", np.int32)
+            hand_input = _scalar(fields, "hand_input", np.int32) if "hand_input" in fields else None
+            if hand_input is not None and hand_input not in (0, 1, 2):
+                return None
             if version != 1 or profile != self.profile or declared_mode != mode or seq < 0:
                 return None
             if (command == RecordingCommand.NONE) != (seq == 0):
@@ -311,12 +326,12 @@ class RecorderProtocol:
         self.last_applied_command_seq, self._last_command = seq, command
         if self.state in (RecordingState.SAVING, RecordingState.ERROR):
             return None
-        if mode not in AUTHORIZED_MODES and command in (RecordingCommand.START, RecordingCommand.TOGGLE):
-            return None
         if command == RecordingCommand.TOGGLE:
             command = (
                 RecordingCommand.START if self.state == RecordingState.IDLE else RecordingCommand.STOP_AND_SAVE
             )
+        if command == RecordingCommand.START and not recording_mode_allowed(mode, profile, hand_input):
+            return None
         if command == RecordingCommand.START and self.state == RecordingState.IDLE:
             self.state = RecordingState.RECORDING
             return "start"

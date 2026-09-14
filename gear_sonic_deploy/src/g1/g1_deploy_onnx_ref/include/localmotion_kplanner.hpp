@@ -36,6 +36,8 @@
 #include <cmath>
 #include <algorithm>
 #include <mutex>
+#include <atomic>
+#include <optional>
 
 // Motion data structures
 #include "motion_data_reader.hpp"
@@ -44,11 +46,23 @@
 #include "math_utils.hpp"
 #include "utils.hpp"
 #include "cnpy.h"
+#include "reference_heading_handoff.hpp"
 
 /// Planner lifecycle flags (set by input interfaces, read by planner thread).
 struct PlannerState {
-    bool enabled = false;       ///< True when the planner should be running.
-    bool initialized = false;   ///< True after the first successful inference.
+    std::atomic<bool> enabled{false};       ///< True when the planner should be running.
+    std::atomic<bool> initialized{false};   ///< True after the first successful inference.
+    bool preserve_heading_on_init = false;  ///< Guarded by the current-motion mutex.
+    std::atomic<uint64_t> generation{0};  ///< Invalidates inference across managed handoffs.
+    std::optional<ReferenceHeadingHandoff> heading_handoff;  ///< Guarded by current-motion mutex.
+
+    void QueueHeadingHandoff(const std::array<double, 4>& outgoing,
+                             const std::array<double, 4>& incoming) {
+        // If control has not observed an intermediate source, preserve the
+        // original outgoing yaw and use the most recent destination origin.
+        if (heading_handoff) heading_handoff->incoming_root = incoming;
+        else heading_handoff = ReferenceHeadingHandoff{outgoing, incoming};
+    }
 };
 
 /**
@@ -268,6 +282,8 @@ public:
     MotionSequence planner_motion_50hz_;
     int gen_frame_;
     bool motion_available_ = false;
+    uint64_t motion_generation_ = 0;  // Guarded by planner_motion_mutex_.
+    uint64_t inference_generation_ = 0;  // Owned by the single planner thread.
 
 protected:
     // Common configuration
@@ -331,8 +347,11 @@ public:
      */
     bool Initialize(
         const std::array<double, 4>& base_quat,
-        const std::array<double, 29>& joint_positions) {
+        const std::array<double, 29>& joint_positions,
+        const MovementState& initial_movement = MovementState(0, {0, 0, 0}, {1, 0, 0}, -1, -1),
+        std::optional<uint64_t> request_generation = std::nullopt) {
 
+        inference_generation_ = request_generation.value_or(planner_state_.generation.load());
         // Reset initialization flag only; preserve enabled state set by external controller
         planner_state_.initialized = false;
 
@@ -343,11 +362,11 @@ public:
         // ==== BEGIN FRESH INITIALIZATION ====
         // Initialize input vectors with defaults aligned to robot's current orientation
         // Extract yaw from robot's base quaternion to set proper facing direction
-        UpdateInputTensors(static_cast<int>(LocomotionMode::IDLE),
-            -1.0,
-            -1.0,
-            {0.0f, 0.0f, 0.0f},  // No movement
-            {1.0f, 0.0f, 0.0f},  // Face in robot's current yaw direction
+        UpdateInputTensors(initial_movement.locomotion_mode,
+            initial_movement.movement_speed,
+            initial_movement.height,
+            double_to_float(initial_movement.movement_direction),
+            double_to_float(initial_movement.facing_direction),
             current_random_seed_
         );
 
@@ -379,7 +398,8 @@ public:
                     << ", Extract: " << extract_duration.count() << "us" << std::endl;
 
             // Mark as fully initialized only after all setup is complete
-            planner_state_.initialized = true;
+            planner_state_.initialized = planner_state_.enabled &&
+                inference_generation_ == planner_state_.generation.load();
 
             std::cout << "Planner initialized" << std::endl;
 
@@ -514,6 +534,7 @@ public:
         {
             planner_motion_50hz_.JointVelocities(planner_motion_50hz_.timesteps-1)[joint] = planner_motion_50hz_.JointVelocities(planner_motion_50hz_.timesteps-2)[joint];
         }
+        motion_generation_ = inference_generation_;
         motion_available_ = true;
         return true;
     }
@@ -538,9 +559,11 @@ public:
         float target_height,
         const std::array<float, 3>& movement_direction,
         const std::array<float, 3>& facing_direction,
-        int random_seed = -1)
+        int random_seed = -1,
+        std::optional<uint64_t> request_generation = std::nullopt)
     {
 
+        inference_generation_ = request_generation.value_or(planner_state_.generation.load());
         auto total_start_time = std::chrono::steady_clock::now();
 
         if (!ValidatePlanningInputs()) {

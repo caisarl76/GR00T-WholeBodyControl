@@ -56,7 +56,9 @@ from gear_sonic.utils.teleop.inspire_ftp import map_pico_controls
 from gear_sonic.utils.teleop.pico_controls import ControllerChords, ManagerKeyboard, read_controllers
 from gear_sonic.utils.teleop.pico_hand_log import HandCaptureLog
 from gear_sonic.utils.teleop.pico_hand_runtime import PicoHandRuntime, PicoPublisher
-from gear_sonic.utils.teleop.pico_recording import ManagerRecording, RecordingCommand, RecordingState
+from gear_sonic.utils.teleop.pico_recording import (
+    ManagerRecording, RecordingCommand, RecordingState, recording_mode_allowed,
+)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import unpack_pose_message
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
@@ -3160,6 +3162,7 @@ def run_pico_manager(
         )
         hands = PicoHandRuntime(xrt, context, hand_profile, endpoint, max_rate=hand_max_rate)
     publisher = PicoPublisher(socket, hand_input, hand_profile, hands)
+    hand_input_code = {"optical": 0, "controller": 1, "off": 2}[hand_input]
     keyboard = ManagerKeyboard()
     chords = ControllerChords()
     mode_epoch = 0
@@ -3263,6 +3266,8 @@ def run_pico_manager(
         print("Manager controls: A+X=toggle mode, B+Y=freeze upper body, A+B+X+Y=start/stop policy")
     print("Controller chords: release all buttons and grips first, then hold the chord for at least 0.3 s.")
     current_mode = StreamMode.OFF
+    pending_mode = None
+    pending_since_ns = None
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
@@ -3317,13 +3322,20 @@ def run_pico_manager(
                     max(0, min(int(LocomotionMode.INJURED_WALK), int(planner_streamer.mode) + direction))
                 )
             tracking = current_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT)
+            recordable = recording_mode_allowed(current_mode.value, recorder.profile, hand_input_code)
+            if (
+                hand_profile == "dex3" and hand_input == "optical"
+                and current_mode == StreamMode.PLANNER_VR_3PT
+                and (action == "record" or "c" in keys)
+            ):
+                print("[Manager] Optical Dex3 recording requires POSE; VR_3PT uses the native planner fist")
             if action in ("record", "abort"):
                 command = RecordingCommand.TOGGLE if action == "record" else RecordingCommand.ABORT
-                recorder.enqueue(command, tick_ns, tracking=tracking and hand_input != "off")
+                recorder.enqueue(command, tick_ns, tracking=recordable)
             for key in keys:
                 if key in "cs":
                     command = RecordingCommand.START if key == "c" else RecordingCommand.STOP_AND_SAVE
-                    if not recorder.enqueue(command, tick_ns, tracking=tracking and hand_input != "off"):
+                    if not recorder.enqueue(command, tick_ns, tracking=recordable):
                         print("[Manager] Recording command unavailable; wait for recorder ACK/status")
             if hands is not None:
                 hands.poll_feedback(tick_ns)
@@ -3357,7 +3369,7 @@ def run_pico_manager(
                         planner_streamer.feedback_reader.full_body_q_measured,
                     )
 
-            new_mode = current_mode
+            new_mode = pending_mode if pending_mode is not None else current_mode
             if current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.PLANNER
@@ -3431,26 +3443,75 @@ def run_pico_manager(
 
             # T/A+X is a full-body tracking toggle regardless of the planner chain.
             if ax_pressed and not start_combo and current_mode != StreamMode.OFF:
-                new_mode = StreamMode.PLANNER if tracking else StreamMode.POSE
+                new_mode = (
+                    current_mode
+                    if pending_mode is not None
+                    else StreamMode.PLANNER
+                    if tracking
+                    else StreamMode.POSE
+                )
+            if by_pressed and pending_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                new_mode = current_mode
             if (
-                tracking
-                and new_mode not in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT, StreamMode.OFF)
+                recordable
+                and new_mode != StreamMode.OFF
+                and not recording_mode_allowed(new_mode.value, recorder.profile, hand_input_code)
                 and not recorder.may_exit_tracking(tick_ns)
             ):
                 print("[Manager] Stop/save recording and wait for IDLE ACK before disabling tracking")
                 new_mode = current_mode
-            if (
-                hands is not None
-                and new_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT)
-                and not tracking
-                and not hands.ready(tick_ns)
-            ):
+            entering_optical = (
+                new_mode == StreamMode.POSE and current_mode != StreamMode.POSE
+                if hand_profile == "dex3"
+                else new_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT) and not tracking
+            )
+            if hands is not None and entering_optical and not hands.ready(tick_ns):
                 print("[Manager] Waiting for fresh measured hand feedback before optical tracking")
                 for blocker in hands.feedback_blockers(tick_ns):
                     print(f"[Manager]   {blocker}")
                 new_mode = current_mode
 
-            # Handle mode transitions before running loop
+            # Prepare the destination without publishing it under the old mode's
+            # provenance. Continue the current streamer while its peer warms up.
+            prepared_body = None
+            if pending_mode is not None and new_mode != pending_mode:
+                if pending_mode == StreamMode.POSE:
+                    pose_streamer.on_mode_exit()
+                pending_mode = None
+                pending_since_ns = None
+            prepare_transition = not controller_3pt and (
+                new_mode == StreamMode.POSE
+                and current_mode
+                in (StreamMode.PLANNER, StreamMode.PLANNER_FROZEN_UPPER_BODY, StreamMode.PLANNER_VR_3PT)
+                or current_mode == StreamMode.POSE
+                and new_mode in (StreamMode.PLANNER, StreamMode.PLANNER_FROZEN_UPPER_BODY)
+            )
+            if prepare_transition:
+                destination = pose_streamer if new_mode == StreamMode.POSE else planner_streamer
+                if pending_mode is None:
+                    pending_mode, pending_since_ns = new_mode, tick_ns
+                    destination.reset_yaw()
+                    if new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                        planner_streamer.save_upper_body_position_target()
+                    print(f"[Manager] Preparing {new_mode.name}; continuing {current_mode.name}")
+                if tick_ns - pending_since_ns >= 1_000_000_000:
+                    print(f"[Manager] {new_mode.name} preparation timed out; continuing {current_mode.name}")
+                    if pending_mode == StreamMode.POSE:
+                        pose_streamer.on_mode_exit()
+                    pending_mode = pending_since_ns = None
+                    new_mode = current_mode
+                else:
+                    prepared_body = publisher.prepare_body(
+                        destination.run_once
+                        if new_mode == StreamMode.POSE
+                        else lambda: destination.run_once(new_mode)
+                    )
+                    if prepared_body is None:
+                        new_mode = current_mode
+                    else:
+                        pending_mode = pending_since_ns = None
+
+            # Handle mode transitions before publishing the prepared packet.
             if new_mode != current_mode:
                 if controller_3pt and new_mode == StreamMode.POSE:
                     if current_mode == StreamMode.PLANNER_VR_3PT:
@@ -3476,19 +3537,19 @@ def run_pico_manager(
                         print(f"[Manager] VR_3PT parent: {vr3pt_parent_mode.name}")
 
                     if new_mode == StreamMode.POSE:
-                        pose_streamer.reset_yaw()
+                        if prepared_body is None:
+                            pose_streamer.reset_yaw()
                     elif new_mode == StreamMode.PLANNER and current_mode != StreamMode.PLANNER_VR_3PT:
                         # Only reset yaw when freshly entering PLANNER from POSE,
                         # not when returning from VR_3PT sub-mode
-                        planner_streamer.reset_yaw()
-                    elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                        if current_mode != StreamMode.PLANNER_VR_3PT:
-                            # Freshly entering from POSE: reset yaw and grab initial targets
+                        if prepared_body is None:
                             planner_streamer.reset_yaw()
-                        # Always re-grab the latest robot state as frozen targets,
-                        # whether entering from POSE or returning from VR_3PT
-                        # (the old targets are stale after VR_3PT moved the arms)
-                        planner_streamer.save_upper_body_position_target()
+                    elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                        if prepared_body is None:
+                            if current_mode != StreamMode.PLANNER_VR_3PT:
+                                planner_streamer.reset_yaw()
+                            # VR_3PT may have moved the arms since the last freeze.
+                            planner_streamer.save_upper_body_position_target()
                     elif new_mode == StreamMode.PLANNER_VR_3PT:
                         # Recalibrate VR tracking against the robot's actual current pose
                         # (read via g1_debug feedback + FK) to prevent sudden jumps
@@ -3505,22 +3566,28 @@ def run_pico_manager(
             if new_mode == StreamMode.OFF and current_mode != StreamMode.OFF:
                 recorder.enqueue(RecordingCommand.ABORT, tick_ns, tracking=tracking)
             state_fields = recorder.fields(mode_epoch, new_mode.value)
-            state_fields["hand_input"] = np.array(
-                [{"optical": 0, "controller": 1, "off": 2}[hand_input]], dtype=np.int32
-            )
+            state_fields["hand_input"] = np.array([hand_input_code], dtype=np.int32)
             # State provenance must precede body and Inspire packets on this socket.
             socket.send(pack_pose_message(state_fields, "manager_state", version=4))
             publisher.pv = state_fields["pv"]
             publisher.generation = sample_generation
             publisher.body_sent = False
+            optical_enabled = new_mode == StreamMode.POSE or (
+                hand_profile != "dex3" and new_mode == StreamMode.PLANNER_VR_3PT
+            )
             # Advance each optical hand once per tick, independent of body arrivals.
             if hands is not None:
                 hands.step(
-                    reader.get_latest(), tick_ns, enabled=new_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT)
+                    reader.get_latest(), tick_ns, enabled=optical_enabled,
+                    # Use the same feedback snapshot admitted above. Polling
+                    # again could invalidate the first POSE hand baseline.
+                    poll_feedback=False,
                 )
 
             # Run one iteration of the new mode
-            if new_mode == StreamMode.POSE:
+            if prepared_body is not None:
+                publisher.send(prepared_body)
+            elif new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
             elif (
                 new_mode == StreamMode.PLANNER
@@ -3529,7 +3596,8 @@ def run_pico_manager(
             ):
                 planner_streamer.run_once(new_mode)
 
-            # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
+            # Commit only after the prepared body packet and its provenance were sent.
+            # Deployment must also handle cross-subscriber delivery order.
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
@@ -3594,7 +3662,7 @@ def run_pico_manager(
                         hands.body_wrists,
                         hands.measured_inputs,
                         hands.outputs,
-                        enabled=current_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT),
+                        enabled=optical_enabled,
                         body_sent=publisher.body_sent,
                         hand_sent=hand_sent,
                         pv=state_fields["pv"],

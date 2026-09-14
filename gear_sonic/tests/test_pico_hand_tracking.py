@@ -269,8 +269,14 @@ def test_startup_invalid_or_disabled_optical_uses_latest_measured_baseline(profi
     assert output.state == TrackingState.HOLDING
     np.testing.assert_array_equal(output.command, held)
     output = tracker.step(None, np.zeros(3), np.full(size, 0.2), 160_000_000)
-    assert output.state == TrackingState.HOLDING
-    np.testing.assert_array_equal(output.command, held)
+    if profile == "dex3":
+        # Re-entry transfers ownership back from the planner: seed its measured
+        # pose even when optics are unavailable, and wait before recovery.
+        assert output.state == TrackingState.WAITING
+        np.testing.assert_allclose(output.command, 0.2)
+    else:
+        assert output.state == TrackingState.HOLDING
+        np.testing.assert_array_equal(output.command, held)
 
 
 

@@ -17,6 +17,7 @@ from gear_sonic.utils.teleop.pico_hand_log import HandCaptureLog, validate_captu
 from gear_sonic.utils.teleop.pico_inspire_protocol import STATUS_SCHEMA, validate_inspire_hand
 from gear_sonic.utils.teleop.pico_recording import RecorderProtocol, RecordingCommand, RecordingState
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message, unpack_pose_message
+from gear_sonic.data.pico_hand_features import join_hand_frame
 
 
 @pytest.fixture
@@ -85,6 +86,8 @@ class Harness:
         pending_start=False,
         finish_save=True,
         skip_body_ticks=(),
+        skip_pose_ticks=(),
+        skip_planner_ticks=(),
         suppress_ack_ticks=(),
         malformed_shutdown_ack=False,
     ):
@@ -93,6 +96,8 @@ class Harness:
         self.feedback_from, self.lost_left_from = feedback_from, lost_left_from
         self.pending_start, self.finish_save = pending_start, finish_save
         self.skip_body_ticks = set(skip_body_ticks)
+        self.skip_pose_ticks = set(skip_pose_ticks)
+        self.skip_planner_ticks = set(skip_planner_ticks)
         self.suppress_ack_ticks = set(suppress_ack_ticks)
         self.malformed_shutdown_ack = malformed_shutdown_ack
         self.hand_snapshot_reads, self.hand_outputs = [], {}
@@ -249,6 +254,8 @@ class Harness:
                 if owner.tick in owner.skip_body_ticks:
                     return
                 topic = "pose" if mode is None else "planner"
+                if owner.tick in (owner.skip_pose_ticks if mode is None else owner.skip_planner_ticks):
+                    return
                 fields = {
                     "body_q": np.zeros(29, np.float32),
                     "left_hand_joints": np.full(7, 0.9, np.float32),
@@ -275,9 +282,9 @@ class Harness:
                 super().__init__(*args, **kwargs)
                 owner.hands = self
 
-            def step(self, sample, now_ns, *, enabled):
+            def step(self, sample, now_ns, *, enabled, **kwargs):
                 owner.steps.append((owner.tick, now_ns, enabled))
-                result = super().step(sample, now_ns, enabled=enabled)
+                result = super().step(sample, now_ns, enabled=enabled, **kwargs)
                 owner.hand_outputs[owner.tick] = tuple(self.outputs)
                 return result
 
@@ -399,8 +406,10 @@ def test_manager_orders_state_body_and_optical_generation_once_per_tick(monkeypa
             validate_inspire_hand(inspire)
             assert inspire["sample_generation"][0] == tick
             assert [topic for topic, _ in messages].index("inspire_hand") > 1
-        else:
+        elif states[tick]["stream_mode"][0] == manager.StreamMode.POSE.value:
             np.testing.assert_array_equal(body["left_hand_joints"], diagnostics["left_command"])
+        else:
+            assert "left_hand_joints" not in body and "right_hand_joints" not in body
     assert len(h.steps) == 18 and len({tick for tick, _, _ in h.steps}) == 18
     assert all(seconds == pytest.approx(0.02) for tick, seconds in h.sleeps if tick >= 0)
     assert not any(fields["stop"][0] for _, topic, fields in h.messages if topic == "command")
@@ -499,8 +508,49 @@ def test_actual_planner_abxy_startup_sends_only_neutral_planner_and_one_start(mo
         assert fields["speed"].tolist() == fields["height"].tolist() == [-1.0]
         assert not any(name.startswith(("upper_body_", "vr_")) or name == "body_q" for name in fields)
         for side in ("left", "right"):
-            np.testing.assert_array_equal(fields[f"{side}_hand_joints"], np.zeros(7))
+            assert f"{side}_hand_joints" not in fields
     assert all(not enabled for _, _, enabled in h.steps)
+
+
+@pytest.mark.parametrize("knuckle", [1.57, 1.5710546970367432])
+def test_dex3_pose_planner_pose_uses_native_fist_and_fresh_optical_baseline(monkeypatch, manager, knuckle):
+    h = Harness(monkeypatch, manager, keys={9: "t", 17: "t", 25: "t"}, end=32)
+
+    def retargeter(profile, side):
+        lower = np.array([-1.04719755, -1.04719755, -1.74532925, 0, 0, 0, 0])
+        upper = np.array([1.04719755, 0.72431163, 0, 1.57079632, 1.74532925, 1.57079632, 1.74532925])
+        if side == "left":
+            lower, upper = -upper, -lower
+        return SimpleNamespace(side=side, lower=lower, upper=upper, retarget=lambda points: (lower + upper) / 2)
+
+    monkeypatch.setattr(hr, "HandRetargeter", retargeter)
+    original_feedback = h.feedback_wire
+
+    def feedback(topic):
+        raw = original_feedback(topic)
+        if h.tick < 17 or topic != "g1_debug":
+            return raw
+        fields = msgpack.unpackb(raw[len(topic):], raw=False)
+        for side, sign in (("left", -1), ("right", 1)):
+            fields[f"{side}_hand_q"] = (sign * np.array([0, 0, -1.75, knuckle, 1.75, knuckle, 1.75])).tolist()
+        return topic.encode() + msgpack.packb(fields)
+
+    h.feedback_wire = feedback
+    h.run()
+    states = h.states()
+    assert states[9]["stream_mode"][0] == states[25]["stream_mode"][0] == manager.StreamMode.POSE.value
+    assert states[17]["stream_mode"][0] == manager.StreamMode.PLANNER.value
+    for tick, topic, fields in h.messages:
+        if topic == "planner":
+            assert "left_hand_joints" not in fields and "right_hand_joints" not in fields
+        if topic == "pose":
+            assert "left_hand_joints" in fields and "right_hand_joints" in fields
+            if 25 <= tick <= 29:
+                for side, sign in (("left", -1), ("right", 1)):
+                    bounded_knuckle = min(knuckle, 1.57079632)
+                    expected = sign * np.array([0, 0, -1.74532925, bounded_knuckle, 1.74532925, bounded_knuckle, 1.74532925])
+                    np.testing.assert_allclose(fields[f"{side}_hand_joints"], expected)
+    assert all(not enabled for tick, _, enabled in h.steps if 17 <= tick < 25)
 
 
 @pytest.mark.parametrize("kind", ["pose", "planner"])
@@ -760,3 +810,193 @@ def test_optical_rejects_isaac_input_before_initialization(monkeypatch, manager)
     monkeypatch.setattr(manager, "_init_input_source", unexpected)
     with pytest.raises(ValueError, match="Optical hands require"):
         manager.run_pico_manager(hand_input="optical", input_source="isaac-teleop")
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mode_handoff_keeps_source_until_destination_packet(monkeypatch, manager, reverse):
+    keys = {9: "t", 12: "t"} if reverse else {9: "t"}
+    start, ready = (12, 18) if reverse else (9, 15)
+    kwargs = {"skip_planner_ticks" if reverse else "skip_pose_ticks": range(start, ready)}
+    h = Harness(monkeypatch, manager, keys=keys, end=ready + 2, **kwargs).run()
+    old_topic, new_topic = ("pose", "planner") if reverse else ("planner", "pose")
+    for tick in range(start, ready):
+        assert any(t == tick and topic == old_topic for t, topic, _ in h.messages)
+        assert not any(t == tick and topic == "command" for t, topic, _ in h.messages)
+    at_commit = [(topic, fields) for tick, topic, fields in h.messages if tick == ready]
+    topics = [topic for topic, _ in at_commit]
+    assert topics.index("manager_state") < topics.index(new_topic) < topics.index("command")
+    state = next(fields for topic, fields in at_commit if topic == "manager_state")
+    body = next(fields for topic, fields in at_commit if topic == new_topic)
+    np.testing.assert_array_equal(state["pv"], body["pv"])
+    assert not any(fields["stop"][0] for _, topic, fields in h.messages if topic == "command")
+
+
+def test_tracking_toggle_cancels_pending_pose(monkeypatch, manager):
+    h = Harness(monkeypatch, manager, keys={9: "t", 12: "t"}, skip_pose_ticks=range(9, 15), end=18).run()
+    assert not any(topic == "pose" for _, topic, _ in h.messages)
+    commands = [fields for _, topic, fields in h.messages if topic == "command"]
+    assert len(commands) == 1 and commands[0]["planner"][0]
+
+
+def test_stop_preempts_pending_pose(monkeypatch, manager):
+    h = Harness(monkeypatch, manager, keys={9: "t"}, stop_tick=11, skip_pose_ticks=range(9, 30), end=20).run()
+    commands = [(tick, fields) for tick, topic, fields in h.messages if topic == "command"]
+    assert commands[-1][0] == 13
+    assert commands[-1][1]["stop"][0]
+    assert not any(topic == "pose" for _, topic, _ in h.messages)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_destination_timeout_keeps_active_source(monkeypatch, manager, reverse):
+    keys = {9: "t", 12: "t"} if reverse else {9: "t"}
+    start = 12 if reverse else 9
+    kwargs = {"skip_planner_ticks" if reverse else "skip_pose_ticks": range(start, 100)}
+    h = Harness(monkeypatch, manager, keys=keys, end=75, **kwargs).run()
+    assert not any(tick >= start and topic == "command" for tick, topic, _ in h.messages)
+    expected = manager.StreamMode.POSE if reverse else manager.StreamMode.PLANNER
+    assert all(state["stream_mode"][0] == expected.value for tick, state in h.states().items() if tick >= start)
+
+
+@pytest.mark.parametrize("outcome", ["ready", "tracking_cancel", "freeze_cancel", "timeout"])
+def test_frozen_planner_handoff_waits_for_body_and_can_cancel(monkeypatch, manager, outcome):
+    keys = {9: "t", 15: "t"} if outcome == "tracking_cancel" else {9: "t"}
+    h = Harness(
+        monkeypatch,
+        manager,
+        keys=keys,
+        skip_planner_ticks=range(12, 100 if outcome == "timeout" else 18),
+        end=70 if outcome == "timeout" else 21,
+    )
+    original_chords = manager.ControllerChords
+
+    class Chords(original_chords):
+        def poll(self, *args, **kwargs):
+            action = super().poll(*args, **kwargs)
+            if h.tick == 12 or outcome == "freeze_cancel" and h.tick == 15:
+                return "freeze"
+            return action
+
+    snapshots = []
+    monkeypatch.setattr(manager, "ControllerChords", Chords)
+    monkeypatch.setattr(
+        manager.PlannerStreamer,
+        "save_upper_body_position_target",
+        lambda self: snapshots.append(h.tick),
+        raising=False,
+    )
+    h.run()
+    assert snapshots == [12]
+    until = 18 if outcome == "ready" else h.end
+    for tick in range(12, until):
+        assert h.states()[tick]["stream_mode"][0] == manager.StreamMode.POSE.value
+        assert any(t == tick and topic == "pose" for t, topic, _ in h.messages)
+        assert not any(t == tick and topic == "command" for t, topic, _ in h.messages)
+    if outcome == "ready":
+        messages = [(topic, fields) for tick, topic, fields in h.messages if tick == 18]
+        topics = [topic for topic, _ in messages]
+        assert topics.index("manager_state") < topics.index("planner") < topics.index("command")
+        state = next(fields for topic, fields in messages if topic == "manager_state")
+        body = next(fields for topic, fields in messages if topic == "planner")
+        assert state["stream_mode"][0] == manager.StreamMode.PLANNER_FROZEN_UPPER_BODY.value
+        np.testing.assert_array_equal(state["pv"], body["pv"])
+
+
+def test_real_pose_buffer_prepares_before_manager_switch(monkeypatch, manager):
+    pose_class = manager.PoseStreamer
+    h = Harness(monkeypatch, manager, keys={9: "t", 18: "t", 21: "t"}, end=29)
+    monkeypatch.setattr(manager, "PoseStreamer", pose_class)
+    monkeypatch.setattr(manager.torch, "device", lambda name: name, raising=False)
+    monkeypatch.setattr(manager.torch, "cuda", SimpleNamespace(is_available=lambda: False), raising=False)
+
+    class Tensor:
+        def __init__(self, value):
+            self.value = value
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.value
+
+    identity = np.array([[1.0, 0, 0, 0]])
+    monkeypatch.setattr(
+        manager,
+        "compute_from_body_poses",
+        lambda *args: {
+            "smpl_pose": Tensor(np.zeros((1, 63))),
+            "smpl_joints_local": Tensor(np.zeros((1, 24, 3))),
+            "global_orient_quat": Tensor(identity),
+        },
+    )
+    monkeypatch.setattr(manager, "decompose_rotation_aa", lambda *args: (identity, identity))
+    monkeypatch.setattr(
+        manager.PicoReader,
+        "get_latest",
+        lambda self: {
+            "timestamp_ns": h.now,
+            "body_poses_np": np.zeros((24, 7)),
+        },
+    )
+    monkeypatch.setattr(manager.ThreePointPose, "enable_smpl_vis", False, raising=False)
+    monkeypatch.setattr(
+        manager.ThreePointPose,
+        "process_smpl_pose",
+        lambda *args, **kwargs: np.tile([0.0, 0, 0, 1, 0, 0, 0], (3, 1)),
+        raising=False,
+    )
+    h.run(num_frames_to_send=5)
+    commands = [(tick, bool(fields["planner"][0])) for tick, topic, fields in h.messages if topic == "command"]
+    assert commands == [(5, True), (14, False), (18, True), (26, False)]
+    for start in (9, 21):
+        for tick in range(start, start + 5):
+            assert any(t == tick and topic == "planner" for t, topic, _ in h.messages)
+            assert not any(t == tick and topic == "pose" for t, topic, _ in h.messages)
+        assert any(t == start + 5 and topic == "pose" for t, topic, _ in h.messages)
+
+
+def test_optical_dex3_vr3pt_refuses_unrecordable_start(monkeypatch, manager, capsys):
+    h = Harness(monkeypatch, manager, keys={12: "t", 18: "t", 24: "c", 28: "s"}, end=32)
+    controller = h.controller
+    h.controller = lambda side: {**controller(side), "axis_click": side == "left" and h.tick == 22}
+    monkeypatch.setattr(manager.PlannerStreamer, "check_vr3pt_entry_mismatch", lambda self: True, raising=False)
+    monkeypatch.setattr(manager.PlannerStreamer, "recalibrate_for_vr3pt", lambda self: None, raising=False)
+    monkeypatch.setattr(manager.PlannerStreamer, "start_vr3pt_ramp", lambda self, **kw: None, raising=False)
+    h.run()
+    assert h.states()[24]["stream_mode"][0] == manager.StreamMode.PLANNER_VR_3PT.value
+    assert h.actions == []
+    assert "Optical Dex3 recording requires POSE" in capsys.readouterr().out
+    for tick, topic, fields in h.messages:
+        if tick >= 22 and topic == "planner":
+            assert "left_hand_joints" not in fields and "right_hand_joints" not in fields
+
+
+@pytest.mark.parametrize("profile,hand_input", [("dex3", "controller"), ("inspire_ftp", "optical")])
+def test_supported_vr3pt_recording_generations_join_exporter(monkeypatch, manager, profile, hand_input):
+    h = Harness(monkeypatch, manager, profile=profile, keys={24: "c", 28: "s"}, end=32)
+    controller = h.controller
+    h.controller = lambda side: {**controller(side), "axis_click": side == "left" and h.tick == 22}
+    monkeypatch.setattr(manager.PlannerStreamer, "check_vr3pt_entry_mismatch", lambda self: True, raising=False)
+    monkeypatch.setattr(manager.PlannerStreamer, "recalibrate_for_vr3pt", lambda self: None, raising=False)
+    monkeypatch.setattr(manager.PlannerStreamer, "start_vr3pt_ramp", lambda self, **kw: None, raising=False)
+    h.run(hand_input=hand_input)
+    assert h.actions == ["start", "save"]
+    for tick in (26, 27):
+        packets = {topic: {**fields, "received_ns": h.now} for t, topic, fields in h.messages if t == tick}
+        inspire_status = unpack_pose_message(h.feedback_wire("inspire_hand_status"), "inspire_hand_status") if profile == "inspire_ftp" else None
+        if inspire_status is not None:
+            inspire_status["received_ns"] = h.now
+            inspire_status["ready"] = h.hands.ready(h.now)
+            # Simulate the bridge acknowledging this transmitted generation.
+            inspire_status["bridge_state"] = np.array([2], np.int32)
+            inspire_status["accepted_pv"] = packets["inspire_hand"]["pv"]
+            inspire_status["last_applied_message_seq"] = packets["inspire_hand"]["message_seq"]
+            for side in ("left", "right"):
+                inspire_status[f"{side}_applied"] = packets["inspire_hand"][f"{side}_command"]
+        joined = join_hand_frame(
+            packets["planner"], packets["hand_tracking"], profile, h.now,
+            h.protocol.manager_session_id, manager.StreamMode.PLANNER_VR_3PT.value, inspire_status,
+        )
+        assert joined["teleop.hand_sample_generation"][0] == tick

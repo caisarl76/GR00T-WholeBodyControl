@@ -106,6 +106,9 @@ public:
                             std::mutex& current_motion_mutex,
                             bool& report_temperature) = 0;
 
+    // Called under the current-motion mutex at the actual planner reference commit.
+    virtual void OnPlannerReferenceCommitted() {}
+
     // ------------------------------------------------------------------
     // Capability queries – overridden by sub-classes as needed
     // ------------------------------------------------------------------

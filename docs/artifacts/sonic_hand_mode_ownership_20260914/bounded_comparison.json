@@ -1,0 +1,26 @@
+{
+  "left": {
+    "enabled": {
+      "samples": 2490,
+      "prior_rejected": 0,
+      "current_rejected": 0
+    },
+    "after_exit": {
+      "samples": 2077,
+      "prior_rejected": 0,
+      "current_rejected": 0
+    }
+  },
+  "right": {
+    "enabled": {
+      "samples": 2490,
+      "prior_rejected": 697,
+      "current_rejected": 0
+    },
+    "after_exit": {
+      "samples": 2077,
+      "prior_rejected": 2077,
+      "current_rejected": 0
+    }
+  }
+}

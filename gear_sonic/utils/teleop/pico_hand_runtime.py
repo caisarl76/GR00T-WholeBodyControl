@@ -21,11 +21,29 @@ class PicoPublisher:
         self.generation = 0
         self.body_sent = False
         self.last_commands = None
+        self._preparing = False
+        self._prepared_body = None
+
+    def prepare_body(self, run_once):
+        """Compute one destination packet without publishing or changing provenance."""
+        self._prepared_body = None
+        self._preparing = True
+        try:
+            run_once()
+            return self._prepared_body
+        finally:
+            self._preparing = False
+            self._prepared_body = None
 
     def send(self, message):
         topic = "pose" if message.startswith(b"pose") else "planner" if message.startswith(b"planner") else None
         if topic is None:
             self.socket.send(message)
+            return
+        if self._preparing:
+            if self._prepared_body is not None:
+                raise RuntimeError("A streamer must prepare at most one body packet per tick")
+            self._prepared_body = message
             return
         data = unpack_pose_message(message, topic)
         version = data.pop("version")
@@ -48,7 +66,7 @@ class PicoPublisher:
         if self.hand_input != "controller":
             for side in ("left", "right"):
                 data.pop(f"{side}_hand_joints", None)
-            if self.hands is not None and self.hand_profile == "dex3":
+            if self.hands is not None and self.hand_profile == "dex3" and topic == "pose":
                 for side, command in zip(("left", "right"), self.hands.commands()):
                     if command is not None:
                         data[f"{side}_hand_joints"] = command
@@ -169,8 +187,9 @@ class PicoHandRuntime:
                 measured.append(None)
         return measured
 
-    def step(self, sample, now_ns, *, enabled):
-        self.poll_feedback(now_ns)
+    def step(self, sample, now_ns, *, enabled, poll_feedback=True):
+        if poll_feedback:
+            self.poll_feedback(now_ns)
         measured = self.measured(now_ns)
         body = None
         try:

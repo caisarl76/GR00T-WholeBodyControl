@@ -1,0 +1,27 @@
+{
+  "ramped_binary": {
+    "path": "/tmp/sonic-output-ramp-eval/ramped-g1_deploy_onnx_ref",
+    "sha256": "772f33216c8471fe74f005499d408561be5591885fc1fa4bc27e7e0b43702f5d",
+    "bytes": 5519352
+  },
+  "fixed_binary": {
+    "path": "/tmp/gr00t-sonic-mode-handoff/gear_sonic_deploy/target/release/g1_deploy_onnx_ref",
+    "sha256": "ee2ff25ecf0bb17fb52ca57fd8259c3bfd8b08b44dbeb6c8ec56be349a61f827",
+    "bytes": 5519368
+  },
+  "fixed_cpp": {
+    "path": "/tmp/gr00t-sonic-mode-handoff/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp",
+    "sha256": "cf8ac8d8ac1274164e8a301db6a728aaca739b02c0df38567c037a17ec5d6fd9",
+    "bytes": 235970
+  },
+  "original_fixture": {
+    "path": "/tmp/sonic-live-handoff/capture/body/pose_000000.npz",
+    "sha256": "2457be220ab1493b8a1fabc024f0426e8625139efbc3658d19dbd38d820ce956",
+    "bytes": 7292
+  },
+  "packaged_fixture": {
+    "path": "/tmp/gr00t-sonic-mode-handoff/docs/artifacts/sonic_output_ramp_20260914/pose_fixture.npz",
+    "sha256": "c654a6b4468a201a9fd38e38e366d9804e72527ec0aad7fba2a41734111205b5",
+    "bytes": 4636
+  }
+}
