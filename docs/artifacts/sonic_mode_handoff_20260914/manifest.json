@@ -1,0 +1,37 @@
+{
+  "decoder": {
+    "path": "/tmp/sonic-handoff-eval-20260914/models/model_decoder.onnx",
+    "sha256": "34bae8570d4a4421a5391a5c2befd745d4a02d182ec539e5f9da44c091c67509",
+    "bytes": 149778638
+  },
+  "encoder": {
+    "path": "/tmp/sonic-handoff-eval-20260914/models/model_encoder.onnx",
+    "sha256": "fb97de22819b2057b41459802128d91723d91a25f0ad73e7bfc41a9cf8365bae",
+    "bytes": 50117796
+  },
+  "planner": {
+    "path": "/tmp/sonic-handoff-eval-20260914/models/V2/planner_sonic.onnx",
+    "sha256": "39b553e197f62f077975ba38512bc04781a3fc37c2af7c6756e04629f760edea",
+    "bytes": 773952989
+  },
+  "observation_config": {
+    "path": "/tmp/sonic-handoff-eval-20260914/models/observation_config.yaml",
+    "sha256": "4a67713b310932e50aca81f19188c8d76013148e98b15c8b5bbea995f12e59f0",
+    "bytes": 2475
+  },
+  "fixture": {
+    "path": "/home/jihun/work/GR00T-WholeBodyControl-hand-tracking-watchdog/outputs/pico_dex3_real_20260909_175211/body/pose_000816.npz",
+    "sha256": "a735877353d98ce3b241ee959c97c47b4b784e4a97ead22e11648d35280b4e07",
+    "bytes": 7266
+  },
+  "baseline_executable": {
+    "path": "/tmp/gr00t-pico-optical-main/gear_sonic_deploy/target/release/g1_deploy_onnx_ref",
+    "sha256": "50d80331a2ea0dfb5a9f63c4d1f801cede7fec31af69b9b23144f0e395e2ad4a",
+    "bytes": 5519072
+  },
+  "patched_executable": {
+    "path": "/tmp/gr00t-sonic-mode-handoff/gear_sonic_deploy/target/release/g1_deploy_onnx_ref",
+    "sha256": "772f33216c8471fe74f005499d408561be5591885fc1fa4bc27e7e0b43702f5d",
+    "bytes": 5519352
+  }
+}

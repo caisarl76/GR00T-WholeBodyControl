@@ -83,8 +83,13 @@ part of this local patch.
   outside the sandbox's tracing restrictions; the rerun retained sanitizer checks.
 - Independent review findings on reference/control ownership, encoder selection,
   generation capture, world-heading continuity and legacy startup were resolved.
-- No MuJoCo control run, physical G1 run, or PC2 installation was performed for
-  this repair. Those transition-quality checks remain pending.
+- Four isolated MuJoCo runs compared the baseline and patch with SONIC v1.1.
+  Each build completed ten switches without a fall. In the stress comparison,
+  paused reference ticks fell from 21 to zero. The baseline also stayed upright,
+  so the reported live PICO balance loss has not been reproduced or conclusively
+  resolved. See the [measurements and reproduction instructions](../artifacts/sonic_mode_handoff_20260914/README.md).
+- Live moving-pose transition qualification and physical G1 confirmation remain
+  pending. No PC2 installation was performed.
 
 See the [C++ regression instructions](../../gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/tests/README_mode_handoff.md)
 for the hardware-free handoff test command.
