@@ -1,15 +1,21 @@
 """
 Post-process a LeRobot dataset recorded by the data exporter.
 
-Removes discarded episodes (flagged during collection) and stale SMPL frames
-(all-zero teleop.smpl_pose and frozen lead-in frames that precede them) which
-occur during teleop pauses or ZMQ frame drops.  Can also merge multiple
-recording sessions into a single dataset.
+Removes missing/stale SMPL samples in POSE mode while preserving planner
+locomotion, intentional holds, and paused modes. Constant movement or token
+values do not prove staleness. New recordings include receive ages for
+mode-specific freshness filtering; older recordings without these fields
+retain their planner intervals because planner freshness is unknown.
+Can also merge multiple recording sessions into a single dataset.
 
 The script operates directly on the LeRobot v2.1 on-disk format
 (parquet + mp4) without any external training framework dependencies.
 
 Usage:
+
+    # Preview removal counts without changing any files
+    python gear_sonic/scripts/process_dataset.py \\
+        --dataset-path outputs/my_dataset --dry-run
 
     # Clean a single dataset in-place
     python gear_sonic/scripts/process_dataset.py \\
@@ -35,19 +41,13 @@ Usage:
         --dataset-path outputs/session1 outputs/session2 \\
         --output-path outputs/merged \\
         --no-remove-stale-smpl
-
-    # Remove discarded episodes (flagged during collection via 'x' key)
-    python gear_sonic/scripts/process_dataset.py \\
-        --dataset-path outputs/my_dataset \\
-        --output-path outputs/my_dataset_cleaned \\
-        --remove-discarded
 """
 
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import shutil
-from typing import Optional
+from typing import Literal, Optional
 
 import av
 import numpy as np
@@ -55,22 +55,40 @@ import pandas as pd
 import tyro
 
 SMPL_POSE_COLUMN = "teleop.smpl_pose"
+STREAM_MODE_COLUMN = "teleop.stream_mode"
+POSE_AGE_COLUMN = "teleop.pose_receive_age_ms"
+PLANNER_AGE_COLUMN = "teleop.planner_receive_age_ms"
 
 
 # ---------------------------------------------------------------------------
 # Stale SMPL frame detection
 # ---------------------------------------------------------------------------
 
-def build_stale_mask(smpl_arr: np.ndarray) -> np.ndarray:
+def build_stale_mask(
+    smpl_arr: np.ndarray, stream_modes: np.ndarray | None = None,
+) -> np.ndarray:
     """Return a boolean mask where True = frame should be removed.
 
-    Marks all-zero rows AND any consecutive frozen (identical-to-next) rows
+    With mode labels, only all-zero POSE (1) samples are removed. PLANNER
+    (2/3/5), POSE_PAUSE (4), OFF, and unknown modes are preserved. A held
+    nonzero pose is not evidence of stale data, even before missing samples.
+
+    Without mode labels, uses the legacy heuristic: all-zero rows AND
+    consecutive frozen (identical-to-next) rows
     that immediately precede a zero row.  Frozen runs that do NOT lead into
     a zero row are left untouched — those occur naturally when the SMPL
     stream publishes at a slightly lower rate than the collection loop.
     """
     n = len(smpl_arr)
     is_zero = np.all(smpl_arr == 0, axis=1)
+    if stream_modes is not None:
+        modes = np.asarray(stream_modes)
+        if modes.shape not in ((n,), (n, 1)):
+            raise ValueError("teleop.stream_mode must contain one mode per frame")
+        modes = modes.reshape(n)
+        if not np.all(np.isfinite(modes)) or not np.all(modes == np.floor(modes)):
+            raise ValueError("teleop.stream_mode must contain finite integer modes")
+        return is_zero & (modes == 1)
     remove = is_zero.copy()
 
     diffs = np.zeros(n)
@@ -83,6 +101,54 @@ def build_stale_mask(smpl_arr: np.ndarray) -> np.ndarray:
                 remove[j] = True
                 j -= 1
 
+    return remove
+
+
+def _age_values(df: pd.DataFrame, column: str, n: int) -> np.ndarray:
+    values = []
+    for value in df[column].to_numpy():
+        arr = np.asarray(value)
+        if arr.shape not in ((), (1,)):
+            raise ValueError(f"{column} must contain scalar or shape (1,) ages")
+        item = arr.reshape(-1)[0]
+        values.append(np.nan if item is None else float(item))
+    return np.asarray(values, dtype=np.float64).reshape(n)
+
+
+def build_stale_input_mask(
+    df: pd.DataFrame, remove_stale_input: bool, pose_max_age_ms: float,
+    planner_max_age_ms: float,
+) -> np.ndarray:
+    """Return frames with invalid or over-age input, preserving intentional holds."""
+    n = len(df)
+    remove = np.zeros(n, dtype=bool)
+    if n == 0:
+        return remove
+    age_columns = {POSE_AGE_COLUMN, PLANNER_AGE_COLUMN} & set(df.columns)
+    if not remove_stale_input:
+        return remove
+    if not age_columns:
+        print("  NOTICE: Freshness columns are missing; preserving frames under freshness rule")
+        return remove
+    if STREAM_MODE_COLUMN not in df.columns:
+        raise ValueError(
+            f"{STREAM_MODE_COLUMN} is required when freshness columns are present and enabled"
+        )
+    raw_modes = np.stack(df[STREAM_MODE_COLUMN].to_numpy())
+    if raw_modes.shape not in ((n,), (n, 1)):
+        raise ValueError("teleop.stream_mode must contain one mode per frame")
+    modes = raw_modes.reshape(n)
+    if not np.all(np.isfinite(modes)) or not np.all(modes == np.floor(modes)):
+        raise ValueError("teleop.stream_mode must contain finite integer modes")
+    for column, relevant, threshold in (
+        (POSE_AGE_COLUMN, modes == 1, pose_max_age_ms),
+        (PLANNER_AGE_COLUMN, np.isin(modes, [2, 3, 5]), planner_max_age_ms),
+    ):
+        if column not in df.columns:
+            print(f"  NOTICE: Missing {column}; preserving frames under freshness rule")
+            continue
+        ages = _age_values(df, column, n)
+        remove |= relevant & ((~np.isfinite(ages)) | (ages < 0) | (ages > threshold))
     return remove
 
 
@@ -197,17 +263,26 @@ def filter_video_frames(video_path: Path, valid_indices: np.ndarray, fps: int):
 # ---------------------------------------------------------------------------
 
 def validate_script_configs(dataset_paths: list[Path]) -> dict | None:
-    """Check that all datasets share the same script_config.
+    """Check that all datasets share the same features and script_config.
 
     Returns the common config if they match, or raises an error with
     details about which datasets differ.
     """
     configs = {}
-    for ds_path in dataset_paths:
+    feature_schema = None
+    for index, ds_path in enumerate(dataset_paths):
         info = load_info(ds_path)
+        features = info.get("features", {})
+        if index == 0:
+            feature_schema = features
+        elif features != feature_schema:
+            raise ValueError(
+                "Cannot merge datasets with different feature schemas "
+                "(including recordings with and without receive-age fields)"
+            )
         sc = info.get("script_config")
         if sc is not None:
-            configs[ds_path.name] = sc
+            configs[str(ds_path.resolve())] = sc
 
     if not configs:
         return None
@@ -243,12 +318,21 @@ def process_single_dataset(
     remove_stale_smpl: bool,
     remove_discarded: bool = False,
     episode_index_offset: int = 0,
+    stale_smpl_policy: Literal["mode-aware", "legacy"] = "mode-aware",
+    remove_stale_input: bool = True,
+    pose_max_age_ms: float = 100.0,
+    planner_max_age_ms: float = 200.0,
 ) -> dict:
     """Process one dataset: optionally clean stale SMPL frames.
 
     Returns stats dict and the list of (parquet_df, video_paths, episode_meta)
     tuples for merging.
     """
+    if stale_smpl_policy not in ("mode-aware", "legacy"):
+        raise ValueError(f"Unknown stale SMPL policy: {stale_smpl_policy}")
+    for name, value in (("pose_max_age_ms", pose_max_age_ms), ("planner_max_age_ms", planner_max_age_ms)):
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
     info = load_info(dataset_path)
     episodes_meta = load_episodes_meta(dataset_path)
     fps = info.get("fps", 50)
@@ -264,6 +348,7 @@ def process_single_dataset(
         "frozen_leadin_frames": 0,
         "episodes_dropped": 0,
         "episodes_discarded": 0,
+        "stale_input_frames": 0,
     }
     processed_episodes = []
 
@@ -274,7 +359,6 @@ def process_single_dataset(
             stats["episodes_discarded"] += 1
             print(f"  Episode {ep_idx}: discarded during collection — removing")
             continue
-
         parquet_path = get_parquet_path(dataset_path, info, ep_idx)
         video_paths = get_video_paths(dataset_path, info, ep_idx)
 
@@ -288,14 +372,31 @@ def process_single_dataset(
 
         valid_indices = None
 
-        if remove_stale_smpl and SMPL_POSE_COLUMN in df.columns:
+        smpl_mask = np.zeros(ep_len, dtype=bool)
+        smpl_zero_mask = np.zeros(ep_len, dtype=bool)
+        if remove_stale_smpl and SMPL_POSE_COLUMN in df.columns and ep_len:
             smpl_arr = np.vstack(
                 [np.asarray(x, dtype=np.float32) for x in df[SMPL_POSE_COLUMN]]
             )
-            mask = build_stale_mask(smpl_arr)
+            smpl_zero_mask = np.all(smpl_arr == 0, axis=1)
+            stream_modes = None
+            if stale_smpl_policy == "mode-aware":
+                if STREAM_MODE_COLUMN not in df.columns:
+                    raise ValueError(
+                        f"Episode {ep_idx} has no {STREAM_MODE_COLUMN}; cannot distinguish "
+                        "planner locomotion from missing POSE data. Use --no-remove-stale-smpl "
+                        "to preserve frames or explicitly select --stale-smpl-policy legacy."
+                    )
+                stream_modes = np.stack(df[STREAM_MODE_COLUMN].to_numpy())
+            smpl_mask = build_stale_mask(smpl_arr, stream_modes)
+        input_mask = build_stale_input_mask(df, remove_stale_input, pose_max_age_ms, planner_max_age_ms)
+        mask = smpl_mask | input_mask
+        if mask.any():
             n_remove = int(mask.sum())
-            n_zero = int(np.all(smpl_arr == 0, axis=1).sum())
-            n_frozen = n_remove - n_zero
+            n_zero = int((smpl_mask & smpl_zero_mask).sum())
+            n_frozen = int((smpl_mask & ~smpl_zero_mask).sum())
+            n_input = int((input_mask & ~smpl_mask).sum())
+            stats["stale_input_frames"] += n_input
 
             if n_remove > 0:
                 stats["episodes_with_stale"] += 1
@@ -305,7 +406,7 @@ def process_single_dataset(
                 pct = 100.0 * n_remove / ep_len
                 print(
                     f"  Episode {ep_idx}: removing {n_remove}/{ep_len} frames "
-                    f"({pct:.1f}%) — {n_zero} zero + {n_frozen} frozen lead-in"
+                    f"({pct:.1f}%) — {n_zero} zero + {n_frozen} frozen lead-in + {n_input} stale input"
                 )
 
                 if n_remove == ep_len:
@@ -474,12 +575,28 @@ class ProcessDatasetConfig:
     single dataset is given, the dataset is modified in-place."""
 
     remove_stale_smpl: bool = True
-    """Remove frames where teleop.smpl_pose is all zeros (stale/dropped
-    SMPL data) and frozen lead-in frames that precede them."""
+    """Remove zero SMPL samples according to stale_smpl_policy."""
+
+    stale_smpl_policy: Literal["mode-aware", "legacy"] = "mode-aware"
+    """mode-aware removes zero SMPL only in POSE (1), preserving planner and
+    paused modes and nonzero holds. Requires teleop.stream_mode. legacy removes
+    all zero SMPL and frozen lead-ins regardless of mode (including locomotion)."""
 
     remove_discarded: bool = True
-    """Remove episodes that were flagged as discarded during data collection
-    (stored in meta/info.json under discarded_episode_indices)."""
+    """Remove episodes flagged as discarded during data collection."""
+
+    dry_run: bool = False
+    """Report removal counts without writing parquet, videos, or metadata."""
+
+    remove_stale_input: bool = True
+    """Remove missing/invalid or over-age POSE/planner input where receive-age
+    columns exist. Preserve intentional pauses and legacy rows without ages."""
+
+    pose_max_age_ms: float = 100.0
+    """Maximum accepted POSE input receive age in milliseconds."""
+
+    planner_max_age_ms: float = 200.0
+    """Maximum accepted planner input receive age in milliseconds."""
 
 
 def main(cfg: ProcessDatasetConfig):
@@ -508,7 +625,7 @@ def main(cfg: ProcessDatasetConfig):
     merging = len(dataset_paths) > 1
     in_place = cfg.output_path is None
 
-    if merging and in_place:
+    if merging and in_place and not cfg.dry_run:
         print("ERROR: --output-path is required when merging multiple datasets.")
         raise SystemExit(1)
 
@@ -522,7 +639,13 @@ def main(cfg: ProcessDatasetConfig):
         print(f"    - {ds}")
     print(f"  Output:               {output_path}{'  (in-place)' if in_place else ''}")
     print(f"  Remove stale SMPL:    {cfg.remove_stale_smpl}")
+    print(f"  Stale SMPL policy:    {cfg.stale_smpl_policy}")
+    print(f"  Remove stale input:   {cfg.remove_stale_input}")
+    print(f"  Max receive age ms:   POSE={cfg.pose_max_age_ms}, PLANNER={cfg.planner_max_age_ms}")
     print(f"  Remove discarded:     {cfg.remove_discarded}")
+    print(f"  Dry run:              {cfg.dry_run}")
+    if cfg.remove_stale_smpl and cfg.stale_smpl_policy == "mode-aware":
+        print("  Zero SMPL is removed only in POSE; receive ages identify stale input when available.")
     print("=" * 70)
 
     # Validate script configs match across all datasets
@@ -555,6 +678,7 @@ def main(cfg: ProcessDatasetConfig):
         "frozen_leadin_frames": 0,
         "episodes_dropped": 0,
         "episodes_discarded": 0,
+        "stale_input_frames": 0,
     }
     reference_info = None
 
@@ -565,6 +689,10 @@ def main(cfg: ProcessDatasetConfig):
             remove_stale_smpl=cfg.remove_stale_smpl,
             remove_discarded=cfg.remove_discarded,
             episode_index_offset=len(all_episodes),
+            stale_smpl_policy=cfg.stale_smpl_policy,
+            remove_stale_input=cfg.remove_stale_input,
+            pose_max_age_ms=cfg.pose_max_age_ms,
+            planner_max_age_ms=cfg.planner_max_age_ms,
         )
 
         if reference_info is None:
@@ -579,7 +707,9 @@ def main(cfg: ProcessDatasetConfig):
         raise SystemExit(1)
 
     # Write output
-    if in_place:
+    if cfg.dry_run:
+        print("\nDry run: no files changed.")
+    elif in_place:
         # In-place: rewrite parquet files and re-encode videos
         print(f"\nRewriting dataset in-place at {output_path}...")
         ds_info = load_info(output_path)
@@ -634,7 +764,9 @@ def main(cfg: ProcessDatasetConfig):
 
     # Print summary
     kept = total_stats["total_frames"] - total_stats["frames_removed"]
-    kept_episodes = total_stats["total_episodes"] - total_stats["episodes_dropped"] - total_stats["episodes_discarded"]
+    kept_episodes = (
+        total_stats["total_episodes"] - total_stats["episodes_dropped"] - total_stats["episodes_discarded"]
+    )
 
     print("\n" + "=" * 70)
     print("  Processing complete!")
@@ -646,6 +778,7 @@ def main(cfg: ProcessDatasetConfig):
     if total_stats["frames_removed"] > 0:
         print(f"    Zero SMPL:       {total_stats['zero_frames']}")
         print(f"    Frozen lead-in:  {total_stats['frozen_leadin_frames']}")
+        print(f"    Stale input:     {total_stats['stale_input_frames']}")
         print(f"    Episodes affected: {total_stats['episodes_with_stale']}")
     print(f"  Output:    {output_path}")
     print("=" * 70)

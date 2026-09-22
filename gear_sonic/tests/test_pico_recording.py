@@ -13,6 +13,7 @@ from gear_sonic.utils.teleop.pico_recording import (
     RecordingState as S,
     make_pv,
     parse_pv,
+    recording_mode_allowed,
 )
 
 SID = b"m" * 16
@@ -260,9 +261,10 @@ def test_adopted_recording_can_stop_when_manager_enters_off(command, event):
 
 
 @pytest.mark.parametrize("command", [C.START, C.TOGGLE])
-def test_recorder_refuses_optical_dex3_vr3pt_start_without_wedging_sequence(command):
+@pytest.mark.parametrize("mode", [3, 5])
+def test_recorder_refuses_optical_dex3_planner_start_without_wedging_sequence(command, mode):
     _, r = pair()
-    fields = command_packet(command, 1, mode=5, epoch=1)
+    fields = command_packet(command, 1, mode=mode, epoch=1)
     fields["hand_input"] = np.array([0], np.int32)
     assert r.receive(fields, 1) is None
     assert r.state == S.IDLE and not r.capture_active
@@ -271,6 +273,29 @@ def test_recorder_refuses_optical_dex3_vr3pt_start_without_wedging_sequence(comm
     fields["hand_input"] = np.array([0], np.int32)
     assert r.receive(fields, 2) == "start"
     # Even an older manager switching into the unsupported mode can still save.
-    fields = command_packet(C.STOP_AND_SAVE, 3, mode=5, epoch=3)
+    fields = command_packet(C.STOP_AND_SAVE, 3, mode=mode, epoch=3)
     fields["hand_input"] = np.array([0], np.int32)
     assert r.receive(fields, 3) == "save"
+
+
+@pytest.mark.parametrize("hand_input", [None, 1])
+def test_controller_recording_can_start_and_save_with_frozen_upper_body(hand_input):
+    m, r = pair()
+    allowed = recording_mode_allowed(3, m.profile, hand_input)
+    assert m.enqueue(C.START, 1, tracking=allowed)
+    fields = m.fields(1, 3)
+    if hand_input is not None:
+        fields["hand_input"] = np.array([hand_input], np.int32)
+    assert r.receive(fields, 1) == "start"
+    assert m.receive_status(r.status_fields(0), 2)
+    assert not m.may_exit_tracking(2)
+    assert not recording_mode_allowed(2, m.profile, hand_input)
+    assert m.enqueue(C.STOP_AND_SAVE, 3, tracking=allowed)
+    assert r.receive(m.fields(1, 3), 3) == "save"
+    r.finish_save(True)
+    assert m.receive_status(r.status_fields(1), 4)
+    assert m.may_exit_tracking(4)
+
+
+def test_hand_off_cannot_start_recording_with_frozen_upper_body():
+    assert not recording_mode_allowed(3, 0, 2)

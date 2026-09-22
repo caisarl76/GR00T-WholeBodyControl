@@ -125,8 +125,12 @@ class HandTracker:
             raise ValueError("Invalid retargeter limits")
         nominal_rate = 2.0 if size == 7 else 1.0
         self.max_rate = float(max_rate if max_rate is not None else nominal_rate)
-        if not math.isfinite(self.max_rate) or not 0 < self.max_rate <= nominal_rate:
-            raise ValueError(f"Hand rate must be positive, finite, and at most {nominal_rate} for {profile}")
+        rate_disabled = self.max_rate == 0
+        if not rate_disabled and (not math.isfinite(self.max_rate) or not 0 < self.max_rate <= nominal_rate):
+            raise ValueError(
+                f"Hand rate must be positive, finite, and at most {nominal_rate} for {profile}; "
+                "zero disables the manager rate limit"
+            )
         self.tolerance = 0.02 if size == 7 else 0.01
         self.enabled = False
         self.state = TrackingState.WAITING
@@ -163,9 +167,9 @@ class HandTracker:
 
     def step(self, snapshot, body_wrist, measured, now_ns, *, enabled=True):
         now_ns = int(now_ns)
-        if self.lower.size == 7 and enabled and not self.enabled:
-            # PLANNER owns Dex3 hands while optics are disabled. Both live and
-            # replay must re-enter from measured positions, not old commands.
+        if enabled and not self.enabled:
+            # Re-enter both hand backends from measured positions after disabled
+            # planner holds. Live and replay share this admission boundary.
             # Preserve source clocks/epochs across this ownership change.
             self.state = TrackingState.WAITING
             self.command = self.target = None
@@ -244,7 +248,9 @@ class HandTracker:
                     self.target = target
                     dt = max(0.0, min((now_ns - self.previous_tick_ns) * 1e-9, 0.040))
                     delta = -math.expm1(-dt / 0.060) * (target - self.command)
-                    self.command = self.command + np.clip(delta, -self.max_rate * dt, self.max_rate * dt)
+                    if self.max_rate > 0:
+                        delta = np.clip(delta, -self.max_rate * dt, self.max_rate * dt)
+                    self.command = self.command + delta
                     if np.max(np.abs(self.command - target)) <= self.tolerance:
                         self.converged_streak += 1
                     else:

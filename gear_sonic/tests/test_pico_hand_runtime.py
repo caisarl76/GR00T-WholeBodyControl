@@ -175,6 +175,47 @@ def test_feedback_blockers_explain_inspire_readmission(make_runtime):
     assert "PC2 feedback not admitted; healthy_streak=1" in r.feedback_blockers(BASE)[0]
 
 
+def test_real_bridge_ready_error_blocks_then_readmits_manager(make_runtime):
+    from gear_sonic.scripts.run_pico_inspire_bridge import InspireStatusPublisher
+    from gear_sonic.tests.test_pico_inspire_bridge import (
+        OPEN,
+        PERIOD,
+        Socket as PublisherSocket,
+        command,
+        feedback,
+        ready,
+    )
+    from gear_sonic.utils.teleop.inspire_ftp_real_bridge import BridgeState, ValidatedHandState
+
+    c = ready()
+    r = make_runtime("inspire_ftp")
+    publisher = InspireStatusPublisher(socket=PublisherSocket())
+
+    def deliver(now):
+        publisher.publish(c, now)
+        r.socket.packets.append(publisher.socket.sent[-1])
+        r.poll_feedback(now)
+
+    now = BASE + 10 * PERIOD
+    feedback(c, now)
+    c.accept_hand_state(ValidatedHandState("left", OPEN, (0, 84, 0, 0, 0, 0), now))
+    d = c.tick(now)
+    assert not d.publish
+    fields = publisher.fields(c, now)
+    assert not fields["feedback_healthy"][0]
+    assert fields["left_err"].tolist() == [0, 84, 0, 0, 0, 0]
+    deliver(now)
+    assert not r.ready(now)
+    for tick in range(11, 21):
+        now = BASE + tick * PERIOD
+        feedback(c, now)
+        c.tick(now)
+        deliver(now)
+        assert r.ready(now) == (tick == 20)
+    assert r.feedback_blockers(now) == []
+    assert command(c, 21, 0)[1].state is BridgeState.ACTIVE
+
+
 def test_dex3_combines_local_and_dds_age_per_side(make_runtime):
     r = make_runtime()
     r.socket.packets.append(dex_feedback(left_hand_feedback_age_ns=80_000_000))
@@ -377,11 +418,17 @@ def test_right_index_near_zero_admission_preserves_raw_feedback_and_slew(make_ru
     assert not r.ready(BASE + 200_000_000)
 
 
-@pytest.mark.parametrize("side,joint,value", [
-    ("right", 5, -0.020000001), ("right", 5, -0.05),
-    ("left", 5, -0.0201), ("right", 4, -0.0201), ("right", 5, 1.0201),
-    ("right", 5, float("nan")),
-])
+@pytest.mark.parametrize(
+    "side,joint,value",
+    [
+        ("right", 5, -0.020000001),
+        ("right", 5, -0.05),
+        ("left", 5, -0.0201),
+        ("right", 4, -0.0201),
+        ("right", 5, 1.0201),
+        ("right", 5, float("nan")),
+    ],
+)
 def test_near_zero_allowance_does_not_hide_other_feedback_errors(make_runtime, side, joint, value):
     r = make_runtime()
     measured = np.zeros(7)
@@ -394,12 +441,29 @@ def test_near_zero_allowance_does_not_hide_other_feedback_errors(make_runtime, s
     assert r.outputs[("left", "right").index(side)].reason == HandReason.FEEDBACK_UNAVAILABLE
 
 
-@pytest.mark.parametrize("measured", [
-    [-0.8329587578773499, -0.5226656794548035, -0.9470111131668091,
-     1.3914557695388794, 1.7438240051269531, 1.3232935667037964, 1.7463444471359253],
-    [0.0014184658648446202, -0.013307612389326096, -1.742186188697815,
-     1.5447142124176025, 1.742560625076294, 1.5710546970367432, 1.7458572387695312],
-])
+@pytest.mark.parametrize(
+    "measured",
+    [
+        [
+            -0.8329587578773499,
+            -0.5226656794548035,
+            -0.9470111131668091,
+            1.3914557695388794,
+            1.7438240051269531,
+            1.3232935667037964,
+            1.7463444471359253,
+        ],
+        [
+            0.0014184658648446202,
+            -0.013307612389326096,
+            -1.742186188697815,
+            1.5447142124176025,
+            1.742560625076294,
+            1.5710546970367432,
+            1.7458572387695312,
+        ],
+    ],
+)
 def test_pose_reentry_with_captured_right_index_stop_feedback(make_runtime, measured):
     """Sep14 optical MuJoCo run: A+X was recognized but ready() blocked re-entry."""
     r = make_runtime()
@@ -464,7 +528,9 @@ def test_native_planner_fist_can_seed_bounded_pose_entry(make_runtime, side):
 
 @pytest.mark.parametrize("side", ["left", "right"])
 @pytest.mark.parametrize("joint", [3, 5])
-@pytest.mark.parametrize("excursion,accepted", [(0.00025833, True), (0.0127, True), (0.02, True), (0.02000001, False)])
+@pytest.mark.parametrize(
+    "excursion,accepted", [(0.00025833, True), (0.0127, True), (0.02, True), (0.02000001, False)]
+)
 def test_fist_knuckle_soft_stop_feedback_is_measured_only(make_runtime, side, joint, excursion, accepted):
     r = make_runtime()
     tracker = r.trackers[("left", "right").index(side)]
@@ -516,7 +582,9 @@ def test_pose_reentry_reseeds_from_planner_feedback_without_resetting_source_clo
 @pytest.mark.parametrize("side", ["left", "right"])
 @pytest.mark.parametrize("joint", range(7))
 @pytest.mark.parametrize("value,bounded", [(-0.02, 0.0), (1.02, 1.0)])
-def test_uniform_dex3_feedback_tolerance_preserves_raw_and_target_limits(make_runtime, side, joint, value, bounded):
+def test_uniform_dex3_feedback_tolerance_preserves_raw_and_target_limits(
+    make_runtime, side, joint, value, bounded
+):
     r = make_runtime()
     index = ("left", "right").index(side)
     q = np.full(7, 0.5)
@@ -549,10 +617,13 @@ def test_offline_replay_matches_runtime_across_planner_fist_reentry(make_runtime
     for frame, now in enumerate(arrays["tick_ns"]):
         r.sdk.get_left_hand_snapshot = lambda: snapshot_at(arrays, frame, 0)
         r.sdk.get_right_hand_snapshot = lambda: snapshot_at(arrays, frame, 1)
-        r.socket.packets.append(dex_feedback(
-            frame + 1, left_hand_q=arrays["measured"][frame, 0].tolist(),
-            right_hand_q=arrays["measured"][frame, 1].tolist(),
-        ))
+        r.socket.packets.append(
+            dex_feedback(
+                frame + 1,
+                left_hand_q=arrays["measured"][frame, 0].tolist(),
+                right_hand_q=arrays["measured"][frame, 1].tolist(),
+            )
+        )
         r.step(body(now), int(now), enabled=bool(arrays["enabled"][frame]))
         commands.append(np.stack(r.commands()))
         states.append([out.state for out in r.outputs])
@@ -561,3 +632,19 @@ def test_offline_replay_matches_runtime_across_planner_fist_reentry(make_runtime
     np.testing.assert_array_equal(result["state"], states)
     np.testing.assert_allclose(result["emitted"][15], 0.9)
     assert report["replay_safety_checks_pass"]
+
+
+def test_inspire_physical_sample_age_survives_fresh_status_receipts(make_runtime):
+    r = make_runtime("inspire_ftp")
+    for seq in range(10):
+        fields = unpack_pose_message(status(seq), "inspire_hand_status")
+        fields.pop("version")
+        fields.pop("endian")
+        fields["left_feedback_age_ns"] = np.array([490_000_000], np.int64)
+        fields["right_feedback_age_ns"] = np.array([0], np.int64)
+        r.socket.packets.append(pack_pose_message(fields, "inspire_hand_status", 1))
+        r.poll_feedback(BASE)
+    assert r.measured(BASE)[0] is not None
+    left, right = r.measured(BASE + 20_000_000)
+    assert left is None
+    assert right is not None

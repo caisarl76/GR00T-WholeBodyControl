@@ -61,9 +61,7 @@ def test_optical_packet_drives_real_mujoco_and_reports_measured_feedback():
     model.geom_contype[:] = model.geom_conaffinity[:] = 0
     data = mujoco.MjData(model)
     command, status = Socket(), Socket()
-    sim = PicoInspireSim(
-        InspireFtpMujocoPlant.resolve(model, data), command_socket=command, status_socket=status
-    )
+    sim = PicoInspireSim(InspireFtpMujocoPlant.resolve(model, data), command_socket=command, status_socket=status)
     pv = make_pv(b"a" * 16, 0, 1)
     command.packets.extend([manager(pv), hand(pv, value=0.4)])
     sim.step(now=1)
@@ -173,3 +171,56 @@ def test_bad_measurements_cannot_bootstrap_and_reset_reseeds_session():
 def test_remote_host_rejected_before_socket_creation():
     with pytest.raises(ValueError, match="loopback"):
         PicoInspireSim(Plant(), host="192.168.123.164")
+
+
+@pytest.mark.parametrize("mode", [2, 3])
+def test_planner_hold_targets_have_current_applied_provenance(mode):
+    sim, command, status, plant = setup_sim()
+    pose_pv = make_pv(b"a" * 16, 0, 1)
+    command.packets.extend([manager(pose_pv), hand(pose_pv, value=0.4)])
+    sim.step(now=1)
+    planner_pv = make_pv(b"a" * 16, 1, mode)
+    command.packets.extend([manager(planner_pv), hand(planner_pv, value=0.4)])
+    sim.step(now=1.1)
+    fields = status_fields(status)
+    assert fields["bridge_state"][0] == 2
+    assert fields["last_applied_message_seq"][0] == 0
+    np.testing.assert_array_equal(fields["accepted_pv"], planner_pv)
+    np.testing.assert_allclose(plant.targets[0], 0.4)
+    assert fields["left_feedback_age_ns"][0] == 0
+
+
+def test_all_twelve_native_motors_move_independently_in_mujoco():
+    import mujoco
+
+    from gear_sonic.utils.mujoco_sim.inspire_ftp_hand import InspireFtpMujocoPlant
+
+    root = Path(__file__).resolve().parents[2]
+    model = mujoco.MjModel.from_xml_path(
+        str(root / "gear_sonic/data/robot_model/model_data/g1/scene_41dof_inspire_ftp.xml")
+    )
+    model.opt.gravity[:] = 0
+    model.geom_contype[:] = model.geom_conaffinity[:] = 0
+    data = mujoco.MjData(model)
+    command, status = Socket(), Socket()
+    sim = PicoInspireSim(InspireFtpMujocoPlant.resolve(model, data), command_socket=command, status_socket=status)
+    pv = make_pv(b"a" * 16, 0, 1)
+    for seq in range(12):
+        fields = unpack_pose_message(hand(pv, seq), "inspire_hand")
+        fields.pop("version")
+        fields.pop("endian")
+        fields["left_command"][:] = 0.9
+        fields["right_command"][:] = 0.9
+        side = "left" if seq < 6 else "right"
+        fields[f"{side}_command"][seq % 6] = 0.3
+        command.packets.extend([manager(pv), pack_pose_message(fields, "inspire_hand", 1)])
+        sim.step(now=1 + seq)
+        mujoco.mj_step(model, data, nstep=1000)
+        sim.step(now=1.1 + seq)
+        feedback = status_fields(status)
+        for hand_side in ("left", "right"):
+            np.testing.assert_allclose(
+                feedback[f"{hand_side}_angle_act"], fields[f"{hand_side}_command"] * 1000, atol=4
+            )
+        assert feedback["last_applied_message_seq"][0] == seq
+    sim.close()
