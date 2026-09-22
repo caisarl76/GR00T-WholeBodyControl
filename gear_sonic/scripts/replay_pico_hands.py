@@ -123,7 +123,8 @@ def _checks(arrays, result, limits, max_rate, processing_ns, *, synthetic, sourc
                 # WAITING follows measured feedback, not a published retarget command.
                 if previous_state != TrackingState.WAITING and state != TrackingState.WAITING:
                     dt = min((int(tick[index]) - int(tick[index - 1])) / 1e9, 0.04)
-                    rate_violations += int(delta > max_rate * dt + 1e-6)
+                    if max_rate > 0:
+                        rate_violations += int(delta > max_rate * dt + 1e-6)
                     max_observed_rate = max(max_observed_rate, delta / dt)
     freeze_failures = sum(not event["holding"] or event["age_ns"] > 120_000_000 for event in freeze_events)
     labels = Counter(str(value) for value in arrays.get("pose_label", []))
@@ -180,6 +181,8 @@ def _checks(arrays, result, limits, max_rate, processing_ns, *, synthetic, sourc
             "Offline processing timing is not proof of the live deployment-host timing gate.",
         ]
     )
+    if max_rate == 0:
+        missing.append("Manager rate limit disabled; velocity-cap qualification is not assessed.")
     counts = {
         "nonfinite_emitted": nonfinite,
         "out_of_bounds_emitted": out_of_bounds,
@@ -204,6 +207,7 @@ def _checks(arrays, result, limits, max_rate, processing_ns, *, synthetic, sourc
         "frames": count,
         "duration_s": duration,
         "max_rate": max_rate,
+        "rate_limit_enabled": max_rate > 0,
         "max_observed_rate": max_observed_rate,
         "counts": counts,
         "reason_codes": {reason.name: int(reason) for reason in HandReason},
@@ -359,7 +363,9 @@ def main(argv=None):
     parser.add_argument("--profile", required=True, choices=("dex3", "inspire_ftp"))
     parser.add_argument("--input", nargs="+", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--max-rate", type=float, default=None)
+    parser.add_argument(
+        "--max-rate", type=float, default=None, help="0 disables the manager rate cap for either hand profile"
+    )
     args = parser.parse_args(argv)
     arrays, kind = load_captures(args.input, args.profile)
     result, report = replay(arrays, args.profile, max_rate=args.max_rate, source_kind=kind)

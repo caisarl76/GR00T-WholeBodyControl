@@ -97,6 +97,8 @@ Documentation
    tutorials/manager
    tutorials/isaac_teleop_publisher_setup
    pico_optical_hand_tracking
+   inspire_optical_integration
+   inspire_optical_real_test
    pico_hand_followups
    sonic_mode_handoff
    tutorials/vr_wholebody_teleop

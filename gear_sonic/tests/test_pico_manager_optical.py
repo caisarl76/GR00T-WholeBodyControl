@@ -12,12 +12,13 @@ import numpy as np
 import pytest
 import zmq
 
+from gear_sonic.data.pico_hand_features import join_hand_frame
 from gear_sonic.utils.teleop import pico_hand_runtime as hr
 from gear_sonic.utils.teleop.pico_hand_log import HandCaptureLog, validate_capture
+from gear_sonic.utils.teleop.pico_hand_tracking import TrackingState
 from gear_sonic.utils.teleop.pico_inspire_protocol import STATUS_SCHEMA, validate_inspire_hand
 from gear_sonic.utils.teleop.pico_recording import RecorderProtocol, RecordingCommand, RecordingState
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import pack_pose_message, unpack_pose_message
-from gear_sonic.data.pico_hand_features import join_hand_frame
 
 
 @pytest.fixture
@@ -387,8 +388,11 @@ class Harness:
 
 
 @pytest.mark.parametrize("profile", ["dex3", "inspire_ftp"])
-def test_manager_orders_state_body_and_optical_generation_once_per_tick(monkeypatch, manager, profile):
-    h = Harness(monkeypatch, manager, profile=profile, keys={9: "t", 12: "o"}, end=18).run()
+@pytest.mark.parametrize("max_rate", [None, 0.0])
+def test_manager_orders_state_body_and_optical_generation_once_per_tick(monkeypatch, manager, profile, max_rate):
+    h = Harness(monkeypatch, manager, profile=profile, keys={9: "t", 12: "o"}, end=18).run(
+        hand_max_rate=max_rate
+    )
     states = h.states()
     assert states[9]["stream_mode"][0] == 1
     for tick in range(9 if profile == "inspire_ftp" else 5, 18):
@@ -426,6 +430,56 @@ def test_feedback_gates_entry_and_one_missing_hand_does_not_stop_body(monkeypatc
         assert diagnostics[tick]["body_sent"][0]
         np.testing.assert_array_equal(diagnostics[tick]["left_command"], diagnostics[18]["left_command"])
     assert np.any(diagnostics[27]["right_command"] != diagnostics[18]["right_command"])
+
+
+@pytest.mark.parametrize("bridge_state", [None, 0, 3, 4])
+def test_inspire_hand_unavailability_does_not_block_body_mode_switches(monkeypatch, manager, bridge_state):
+    h = Harness(
+        monkeypatch, manager, profile="inspire_ftp", keys={9: "t", 13: "t", 17: "t"}, end=22,
+        feedback_from=100 if bridge_state is None else 0,
+    )
+    original_feedback = h.feedback_wire
+
+    def feedback(topic):
+        fields = unpack_pose_message(original_feedback(topic), topic)
+        fields.pop("version")
+        fields.pop("endian")
+        fields["bridge_state"][0] = bridge_state
+        return pack_pose_message(fields, topic, 1)
+
+    h.feedback_wire = feedback
+    h.run()
+    for tick, expected_mode in ((9, 1), (13, 2), (17, 1)):
+        assert h.states()[tick]["stream_mode"][0] == expected_mode
+        assert any(t == tick and topic == ("pose" if expected_mode == 1 else "planner")
+                   for t, topic, _ in h.messages)
+    # Body packets continue, but unavailable feedback must never seed fingers.
+    assert not any(topic == "inspire_hand" for _, topic, _ in h.messages)
+    assert all(not out.valid and out.command is None for pair in h.hand_outputs.values() for out in pair)
+
+
+def test_inspire_hand_readmission_in_pose_seeds_from_fresh_feedback(monkeypatch, manager):
+    h = Harness(monkeypatch, manager, profile="inspire_ftp", keys={9: "t"}, end=30)
+    original_feedback = h.feedback_wire
+
+    def feedback(topic):
+        fields = unpack_pose_message(original_feedback(topic), topic)
+        fields.pop("version")
+        fields.pop("endian")
+        fields["bridge_state"][0] = 4 if h.tick < 18 else 1
+        for side in ("left", "right"):
+            fields[f"{side}_angle_act"][:] = 750
+        return pack_pose_message(fields, topic, 1)
+
+    h.feedback_wire = feedback
+    h.run()
+    assert all(h.states()[tick]["stream_mode"][0] == 1 for tick in range(9, 30))
+    assert not any(t < 18 and topic == "inspire_hand" for t, topic, _ in h.messages)
+    for out in h.hand_outputs[18]:
+        np.testing.assert_allclose(out.command, 0.75)
+        assert out.state == TrackingState.WAITING
+    assert all(out.valid for out in h.hand_outputs[29])
+    assert all(np.all(out.command < 0.75) for out in h.hand_outputs[29])
 
 
 def test_c_s_controls_and_tracking_exit_wait_for_recording_and_saving(monkeypatch, manager):
@@ -530,7 +584,7 @@ def test_dex3_pose_planner_pose_uses_native_fist_and_fresh_optical_baseline(monk
         raw = original_feedback(topic)
         if h.tick < 17 or topic != "g1_debug":
             return raw
-        fields = msgpack.unpackb(raw[len(topic):], raw=False)
+        fields = msgpack.unpackb(raw[len(topic) :], raw=False)
         for side, sign in (("left", -1), ("right", 1)):
             fields[f"{side}_hand_q"] = (sign * np.array([0, 0, -1.75, knuckle, 1.75, knuckle, 1.75])).tolist()
         return topic.encode() + msgpack.packb(fields)
@@ -548,7 +602,9 @@ def test_dex3_pose_planner_pose_uses_native_fist_and_fresh_optical_baseline(monk
             if 25 <= tick <= 29:
                 for side, sign in (("left", -1), ("right", 1)):
                     bounded_knuckle = min(knuckle, 1.57079632)
-                    expected = sign * np.array([0, 0, -1.74532925, bounded_knuckle, 1.74532925, bounded_knuckle, 1.74532925])
+                    expected = sign * np.array(
+                        [0, 0, -1.74532925, bounded_knuckle, 1.74532925, bounded_knuckle, 1.74532925]
+                    )
                     np.testing.assert_allclose(fields[f"{side}_hand_joints"], expected)
     assert all(not enabled for tick, _, enabled in h.steps if 17 <= tick < 25)
 
@@ -901,6 +957,101 @@ def test_frozen_planner_handoff_waits_for_body_and_can_cancel(monkeypatch, manag
         np.testing.assert_array_equal(state["pv"], body["pv"])
 
 
+@pytest.mark.parametrize("start_tick", [10, 16])
+def test_controller_freeze_recording_while_upper_body_is_frozen(monkeypatch, manager, start_tick, capsys):
+    h = Harness(
+        monkeypatch,
+        manager,
+        keys={9: "t", start_tick: "c", 20: "s"},
+        end=27,
+    )
+    original_chords = manager.ControllerChords
+
+    class Chords(original_chords):
+        def poll(self, *args, **kwargs):
+            action = super().poll(*args, **kwargs)
+            if h.tick in (14, 22):
+                return "freeze"
+            return action
+
+    snapshots = []
+    monkeypatch.setattr(manager, "ControllerChords", Chords)
+    monkeypatch.setattr(
+        manager.PlannerStreamer,
+        "save_upper_body_position_target",
+        lambda self: snapshots.append(h.tick),
+        raising=False,
+    )
+    h.run(hand_input="controller")
+
+    assert h.actions == ["start", "save"]
+    assert snapshots == [14]
+    states = h.states()
+    assert states[16]["stream_mode"][0] == manager.StreamMode.PLANNER_FROZEN_UPPER_BODY.value
+    assert states[22]["stream_mode"][0] == manager.StreamMode.POSE.value
+    frozen_diagnostics = {
+        tick: fields for tick, topic, fields in h.messages if topic == "hand_tracking" and 14 <= tick < 22
+    }
+    assert frozen_diagnostics and all(fields["left_state"][0] == 1 for fields in frozen_diagnostics.values())
+    assert "Stop/save recording and wait" not in capsys.readouterr().out
+
+    tick = 16 if start_tick == 16 else 18
+    packets = {
+        topic: {**fields, "received_ns": h.now}
+        for t, topic, fields in h.messages
+        if t == tick
+    }
+    joined = join_hand_frame(
+        packets["planner"],
+        packets["hand_tracking"],
+        "dex3",
+        h.now,
+        h.protocol.manager_session_id,
+        manager.StreamMode.PLANNER_FROZEN_UPPER_BODY.value,
+    )
+    assert joined["teleop.hand_sample_generation"][0] == tick
+
+
+def test_controller_freeze_recording_global_stop_aborts_before_policy_stop(monkeypatch, manager, capsys):
+    h = Harness(monkeypatch, manager, keys={9: "t", 10: "c"}, end=25)
+    original_chords = manager.ControllerChords
+
+    class Chords(original_chords):
+        def poll(self, *args, **kwargs):
+            action = super().poll(*args, **kwargs)
+            if h.tick == 14:
+                return "freeze"
+            if h.tick == 18:
+                return "sonic"
+            return action
+
+    monkeypatch.setattr(manager, "ControllerChords", Chords)
+    monkeypatch.setattr(
+        manager.PlannerStreamer, "save_upper_body_position_target", lambda self: None, raising=False
+    )
+    h.run(hand_input="controller")
+
+    assert h.actions == ["start", "abort"]
+    stop_messages = [
+        (tick, fields) for tick, topic, fields in h.messages if topic == "command" and fields["stop"][0]
+    ]
+    assert len(stop_messages) == 1
+    stop_tick = stop_messages[0][0]
+    assert stop_tick == 18
+    abort_indexes = [
+        index
+        for index, (_, topic, fields) in enumerate(h.messages)
+        if topic == "manager_state" and fields["recording_command"][0] == RecordingCommand.ABORT
+    ]
+    stop_index = next(
+        index
+        for index, (_, topic, fields) in enumerate(h.messages)
+        if topic == "command" and fields["stop"][0]
+    )
+    assert abort_indexes and abort_indexes[-1] < stop_index
+    assert "Stop/save recording and wait" not in capsys.readouterr().out
+
+
 def test_real_pose_buffer_prepares_before_manager_switch(monkeypatch, manager):
     pose_class = manager.PoseStreamer
     h = Harness(monkeypatch, manager, keys={9: "t", 18: "t", 21: "t"}, end=29)
@@ -985,7 +1136,11 @@ def test_supported_vr3pt_recording_generations_join_exporter(monkeypatch, manage
     assert h.actions == ["start", "save"]
     for tick in (26, 27):
         packets = {topic: {**fields, "received_ns": h.now} for t, topic, fields in h.messages if t == tick}
-        inspire_status = unpack_pose_message(h.feedback_wire("inspire_hand_status"), "inspire_hand_status") if profile == "inspire_ftp" else None
+        inspire_status = (
+            unpack_pose_message(h.feedback_wire("inspire_hand_status"), "inspire_hand_status")
+            if profile == "inspire_ftp"
+            else None
+        )
         if inspire_status is not None:
             inspire_status["received_ns"] = h.now
             inspire_status["ready"] = h.hands.ready(h.now)
@@ -996,7 +1151,51 @@ def test_supported_vr3pt_recording_generations_join_exporter(monkeypatch, manage
             for side in ("left", "right"):
                 inspire_status[f"{side}_applied"] = packets["inspire_hand"][f"{side}_command"]
         joined = join_hand_frame(
-            packets["planner"], packets["hand_tracking"], profile, h.now,
-            h.protocol.manager_session_id, manager.StreamMode.PLANNER_VR_3PT.value, inspire_status,
+            packets["planner"],
+            packets["hand_tracking"],
+            profile,
+            h.now,
+            h.protocol.manager_session_id,
+            manager.StreamMode.PLANNER_VR_3PT.value,
+            inspire_status,
         )
         assert joined["teleop.hand_sample_generation"][0] == tick
+
+
+def test_inspire_recording_keeps_planner_holds_and_repeated_mode_handoffs(monkeypatch, manager):
+    h = Harness(
+        monkeypatch, manager, profile="inspire_ftp", keys={12: "t", 16: "c", 20: "t", 26: "t", 29: "s"}, end=33
+    )
+    h.run()
+    assert h.actions == ["start", "save"]
+    assert h.states()[22]["stream_mode"][0] == 2
+    assert h.states()[28]["stream_mode"][0] == 1
+    packets = {topic: {**fields, "received_ns": h.now} for t, topic, fields in h.messages if t == 23}
+    assert packets["hand_tracking"]["left_state"][0] == 1
+    feedback = unpack_pose_message(h.feedback_wire("inspire_hand_status"), "inspire_hand_status")
+    feedback.update(received_ns=h.now, ready=True)
+    feedback["bridge_state"] = np.array([2], np.int32)
+    feedback["accepted_pv"] = packets["inspire_hand"]["pv"]
+    feedback["last_applied_message_seq"] = packets["inspire_hand"]["message_seq"]
+    joined = join_hand_frame(
+        packets["planner"],
+        packets["hand_tracking"],
+        "inspire_ftp",
+        h.now,
+        h.protocol.manager_session_id,
+        2,
+        feedback,
+    )
+    assert joined["teleop.left_hand_held"][0]
+    assert joined["teleop.left_inspire_feedback_age_ns"][0] == 0
+    feedback["left_feedback_age_ns"][0] = 500_000_000
+    with pytest.raises(ValueError, match="physical feedback"):
+        join_hand_frame(
+            packets["planner"],
+            packets["hand_tracking"],
+            "inspire_ftp",
+            h.now,
+            h.protocol.manager_session_id,
+            2,
+            feedback,
+        )

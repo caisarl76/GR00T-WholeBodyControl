@@ -42,7 +42,6 @@ from scipy.spatial.transform import Rotation as R, Rotation as sRot
 import torch
 import zmq
 
-from gear_sonic.utils.teleop import input_readers
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -52,12 +51,16 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_angle_axis,
     quaternion_to_rotation_matrix,
 )
+from gear_sonic.utils.teleop import input_readers
 from gear_sonic.utils.teleop.inspire_ftp import map_pico_controls
 from gear_sonic.utils.teleop.pico_controls import ControllerChords, ManagerKeyboard, read_controllers
 from gear_sonic.utils.teleop.pico_hand_log import HandCaptureLog
 from gear_sonic.utils.teleop.pico_hand_runtime import PicoHandRuntime, PicoPublisher
 from gear_sonic.utils.teleop.pico_recording import (
-    ManagerRecording, RecordingCommand, RecordingState, recording_mode_allowed,
+    ManagerRecording,
+    RecordingCommand,
+    RecordingState,
+    recording_mode_allowed,
 )
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import unpack_pose_message
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
@@ -2179,7 +2182,9 @@ class PoseStreamer:
             self.buffer_cleared = False
 
         # Get joystick axes for yaw accumulation
-        _, _, rx, _ = get_controller_axes(self.reader) if self.control_frame is None else self.control_frame["axes"]
+        _, _, rx, _ = (
+            get_controller_axes(self.reader) if self.control_frame is None else self.control_frame["axes"]
+        )
         self.yaw_accumulator.update(rx, self.frame_time)
 
         # Only send if buffer is full and we're not waiting for fresh data
@@ -2930,7 +2935,9 @@ class PlannerStreamer:
             self.prev_xy = xy_now
 
             # Read axes/joysticks to control movement, facing, speed and mode
-            lx, ly, rx, ry = get_controller_axes(self.reader) if self.control_frame is None else self.control_frame["axes"]
+            lx, ly, rx, ry = (
+                get_controller_axes(self.reader) if self.control_frame is None else self.control_frame["axes"]
+            )
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
             facing = self.yaw_accumulator.update(rx, self.dt)
@@ -3014,7 +3021,11 @@ class PlannerStreamer:
                     right_trigger,
                     left_grip,
                     right_grip,
-                ) = get_controller_inputs(self.reader) if self.control_frame is None else self.control_frame["inputs"]
+                ) = (
+                    get_controller_inputs(self.reader)
+                    if self.control_frame is None
+                    else self.control_frame["inputs"]
+                )
                 lh_joints, rh_joints = self.compute_hand_joints(
                     left_trigger, left_grip, right_trigger, right_grip
                 )
@@ -3161,6 +3172,13 @@ def run_pico_manager(
             else f"tcp://{inspire_status_host}:{inspire_status_port}"
         )
         hands = PicoHandRuntime(xrt, context, hand_profile, endpoint, max_rate=hand_max_rate)
+        if hand_max_rate == 0:
+            print(
+                f"[Hands] {hand_profile} manager rate limit disabled (including recovery); "
+                "60 ms smoothing remains enabled"
+            )
+            if hand_profile == "inspire_ftp":
+                print("[Hands] PC2 bridge rate limiting is independent; --hand-max-rate does not change it")
     publisher = PicoPublisher(socket, hand_input, hand_profile, hands)
     hand_input_code = {"optical": 0, "controller": 1, "off": 2}[hand_input]
     keyboard = ManagerKeyboard()
@@ -3460,10 +3478,12 @@ def run_pico_manager(
             ):
                 print("[Manager] Stop/save recording and wait for IDLE ACK before disabling tracking")
                 new_mode = current_mode
+            # Inspire finger admission belongs to the independent hand runtime
+            # and PC2 bridge. A hand fault must not block body mode transitions.
             entering_optical = (
-                new_mode == StreamMode.POSE and current_mode != StreamMode.POSE
-                if hand_profile == "dex3"
-                else new_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT) and not tracking
+                hand_profile == "dex3"
+                and new_mode == StreamMode.POSE
+                and current_mode != StreamMode.POSE
             )
             if hands is not None and entering_optical and not hands.ready(tick_ns):
                 print("[Manager] Waiting for fresh measured hand feedback before optical tracking")
@@ -3564,7 +3584,7 @@ def run_pico_manager(
                     raise RuntimeError("Manager mode epoch exhausted")
                 mode_epoch += 1
             if new_mode == StreamMode.OFF and current_mode != StreamMode.OFF:
-                recorder.enqueue(RecordingCommand.ABORT, tick_ns, tracking=tracking)
+                recorder.enqueue(RecordingCommand.ABORT, tick_ns, tracking=recordable)
             state_fields = recorder.fields(mode_epoch, new_mode.value)
             state_fields["hand_input"] = np.array([hand_input_code], dtype=np.int32)
             # State provenance must precede body and Inspire packets on this socket.
@@ -3641,7 +3661,10 @@ def run_pico_manager(
                 for side, q in zip(("left", "right"), publisher.last_commands):
                     diagnostics.update(
                         {
-                            f"{side}_state": np.array([3], dtype=np.int32),
+                            f"{side}_state": np.array(
+                                [1 if current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY else 3],
+                                dtype=np.int32,
+                            ),
                             f"{side}_source_epoch": np.array([0], dtype=np.int64),
                             f"{side}_source_timestamp_ns": np.array([tick_ns], dtype=np.int64),
                             f"{side}_valid": np.array([control_frame["fresh"]], dtype=bool),
@@ -3960,7 +3983,7 @@ if __name__ == "__main__":
         "--hand-max-rate",
         type=float,
         default=None,
-        help="Optical joint rate limit (rad/s Dex3, normalized units/s Inspire)",
+        help="Optical joint rate limit (rad/s Dex3, normalized units/s Inspire); 0 disables the manager cap",
     )
     parser.add_argument("--hand-log-dir", default="", help="New directory for exact optical capture/replay inputs")
     parser.add_argument("--recording-status-host", default="127.0.0.1")
