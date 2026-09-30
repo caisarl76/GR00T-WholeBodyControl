@@ -7,10 +7,11 @@ opens Unitree DDS channels and never writes body ``LowCmd``.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
+import math
 from pathlib import Path
 import time
 from typing import Any
@@ -18,6 +19,11 @@ from uuid import uuid4
 
 import numpy as np
 
+from gear_sonic.utils.teleop.bridge_planner_publisher import (
+    BridgePlannerPublisher,
+    PlannerCommand,
+    PlannerPreparationError,
+)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     HEADER_SIZE,
     build_command_message,
@@ -33,6 +39,21 @@ G1_UPPER_BODY_JOINT_INDICES = [12, 13, 14, 15, 22, 16, 23, 17, 24, 18, 25, 19, 2
 G1_CALIB_FULL_UPPER_BODY = np.zeros(UPPER_BODY_DOF, dtype=np.float32)
 G1_STANDING_UPPER_BODY = np.asarray(
     [0.0, 0.0, 0.0, 0.2, 0.2, 0.2, -0.2, 0.0, 0.0, 0.6, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    dtype=np.float32,
+)
+STOP_UPPER_BODY_PRESETS = {
+    "straight": G1_STANDING_UPPER_BODY,
+    "deploy-standing": G1_STANDING_UPPER_BODY,
+    "calib-full": G1_CALIB_FULL_UPPER_BODY,
+}
+STOP_RELEASE_RAMP_PHASES = {"out", "hold"}
+DEX3_OPEN_HAND = np.zeros(HAND_DOF, dtype=np.float32)
+DEX3_LEFT_STOP_HAND_TUCKED = np.asarray(
+    [0.0, 0.7, 1.2, -0.3, -0.3, -0.3, -0.3],
+    dtype=np.float32,
+)
+DEX3_RIGHT_STOP_HAND_TUCKED = np.asarray(
+    [0.0, -0.7, -1.2, 0.3, 0.3, 0.3, 0.3],
     dtype=np.float32,
 )
 
@@ -67,15 +88,82 @@ class BridgeConfig:
     max_joint_step: float = 0.03
 
 
+@dataclass
+class StopReleaseSchedule:
+    """Timing state for stop-release ramp and exact final-pose hold frames."""
+
+    frame: UpperBodyFrame
+    release_started_at: float
+    release_until: float
+    final_hold_until: float
+    last_publish_time: float = 0.0
+    final_frame_sent: bool = False
+    active: bool = True
+
+    @classmethod
+    def start(
+        cls,
+        frame: UpperBodyFrame,
+        *,
+        now: float,
+        release_s: float,
+        final_hold_s: float,
+    ) -> "StopReleaseSchedule":
+        release_duration = max(float(release_s), 0.0)
+        final_hold_duration = max(float(final_hold_s), 0.0)
+        release_until = now + release_duration
+        return cls(
+            frame=frame,
+            release_started_at=now,
+            release_until=release_until,
+            final_hold_until=release_until + final_hold_duration,
+        )
+
+    def next_alpha(self, *, now: float, hz: float) -> float | None:
+        """Return the next stop-release alpha to publish, or ``None``."""
+
+        if not self.active:
+            return None
+        period = 1.0 / max(float(hz), 1e-6)
+        if self.last_publish_time > 0.0 and now - self.last_publish_time < period:
+            return None
+
+        release_duration = self.release_until - self.release_started_at
+        if release_duration > 0.0 and now < self.release_until:
+            alpha = 1.0 - max(0.0, self.release_until - now) / release_duration
+        elif not self.final_frame_sent:
+            alpha = 1.0
+            self.final_frame_sent = True
+        elif now < self.final_hold_until:
+            alpha = 1.0
+        else:
+            self.active = False
+            return None
+
+        self.last_publish_time = now
+        return float(np.clip(alpha, 0.0, 1.0))
+
+
+@dataclass(frozen=True)
+class FeedbackPrime:
+    """Deploy feedback used to seed bridge startup state."""
+
+    upper_body: np.ndarray | None = None
+    heading_yaw: float | None = None
+
+
 class UpperBodyFilter:
     """Clip joint targets and limit per-frame target jumps."""
 
     def __init__(self, config: BridgeConfig):
         self._config = config
         self._last_position: np.ndarray | None = None
+        self._entry_ramp_origin: np.ndarray | None = None
+        self._entry_ramp_phase: str | None = None
 
     def reset(self) -> None:
         self._last_position = None
+        self._clear_entry_ramp()
 
     def seed(self, position: Sequence[float]) -> None:
         """Initialize rate limiting from the robot's current measured position."""
@@ -85,8 +173,35 @@ class UpperBodyFilter:
             -self._config.max_abs_joint,
             self._config.max_abs_joint,
         )
+        self._clear_entry_ramp()
 
-    def apply(self, position: np.ndarray) -> np.ndarray:
+    def snapshot(
+        self,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, str | None]:
+        """Capture mutable filter state before planner preparation."""
+
+        return (
+            None if self._last_position is None else self._last_position.copy(),
+            None if self._entry_ramp_origin is None else self._entry_ramp_origin.copy(),
+            self._entry_ramp_phase,
+        )
+
+    def restore(
+        self,
+        snapshot: tuple[np.ndarray | None, np.ndarray | None, str | None],
+    ) -> None:
+        """Restore a snapshot after a planner frame is rejected."""
+
+        last_position, entry_ramp_origin, entry_ramp_phase = snapshot
+        self._last_position = None if last_position is None else last_position.copy()
+        self._entry_ramp_origin = None if entry_ramp_origin is None else entry_ramp_origin.copy()
+        self._entry_ramp_phase = entry_ramp_phase
+
+    def _clear_entry_ramp(self) -> None:
+        self._entry_ramp_origin = None
+        self._entry_ramp_phase = None
+
+    def _limit_from_last(self, position: np.ndarray) -> np.ndarray:
         clipped = np.clip(
             np.asarray(position, dtype=np.float32),
             -self._config.max_abs_joint,
@@ -106,6 +221,17 @@ class UpperBodyFilter:
         self._last_position = limited
         return limited.copy()
 
+    def current_position(self) -> np.ndarray | None:
+        """Return the last upper-body command emitted by this filter."""
+
+        if self._last_position is None:
+            return None
+        return self._last_position.copy()
+
+    def apply(self, position: np.ndarray) -> np.ndarray:
+        self._clear_entry_ramp()
+        return self._limit_from_last(position)
+
     def apply_ramped(self, position: np.ndarray, *, ramp_phase: str, ramp_alpha: float) -> np.ndarray:
         clipped = np.clip(
             np.asarray(position, dtype=np.float32),
@@ -117,13 +243,17 @@ class UpperBodyFilter:
             # Applying the bridge's fixed per-frame limiter here can leave the
             # streamed target behind the source ramp; when the source exits, the
             # downstream controller can then jump to its idle/CALIB posture.
+            self._clear_entry_ramp()
             self._last_position = clipped
             return clipped.copy()
         if ramp_phase in {"start", "in", "resume"} and self._last_position is not None:
             alpha = float(np.clip(ramp_alpha, 0.0, 1.0))
-            ramped = (1.0 - alpha) * self._last_position + alpha * clipped
-            self._last_position = np.asarray(ramped, dtype=np.float32)
-            return self._last_position.copy()
+            entry_phase = "resume" if ramp_phase == "resume" else "start"
+            if self._entry_ramp_origin is None or self._entry_ramp_phase != entry_phase:
+                self._entry_ramp_origin = self._last_position.copy()
+                self._entry_ramp_phase = entry_phase
+            ramped = (1.0 - alpha) * self._entry_ramp_origin + alpha * clipped
+            return self._limit_from_last(ramped)
         return self.apply(clipped)
 
 
@@ -137,46 +267,172 @@ def _upper_body_from_feedback_payload(payload: dict[str, Any]) -> np.ndarray | N
     return body_q_array[G1_UPPER_BODY_JOINT_INDICES].astype(np.float32)
 
 
-def _read_feedback_upper_body(
+def _heading_yaw_from_quat_wxyz(quat: Sequence[float] | np.ndarray) -> float | None:
+    quat_array = np.asarray(quat, dtype=np.float64).reshape(-1)
+    if quat_array.shape != (4,) or not np.all(np.isfinite(quat_array)):
+        return None
+    norm = float(np.linalg.norm(quat_array))
+    if norm <= 1e-9:
+        return None
+    w, x, y, z = quat_array / norm
+    return float(math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+
+def feedback_payload_heading_yaw(payload: dict[str, Any]) -> float | None:
+    """Extract current robot yaw from deploy feedback quaternions."""
+
+    for key in ("base_quat", "base_quat_measured"):
+        quat = payload.get(key)
+        if quat is None:
+            continue
+        yaw = _heading_yaw_from_quat_wxyz(quat)
+        if yaw is not None:
+            return yaw
+    return None
+
+
+def _feedback_prime_from_payload(payload: dict[str, Any]) -> FeedbackPrime:
+    return FeedbackPrime(
+        upper_body=_upper_body_from_feedback_payload(payload),
+        heading_yaw=feedback_payload_heading_yaw(payload),
+    )
+
+
+def _facing_from_yaw(yaw: float) -> tuple[float, float, float]:
+    return (float(math.cos(yaw)), float(math.sin(yaw)), 0.0)
+
+
+def _rotate_xy(values: Sequence[float], yaw: float) -> tuple[float, float, float]:
+    x, y, z = np.asarray(values, dtype=np.float64).reshape(3)
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    return (float(c * x - s * y), float(s * x + c * y), float(z))
+
+
+def _normalize_xy_or_heading(values: Sequence[float], fallback_yaw: float) -> tuple[float, float, float]:
+    x, y, z = np.asarray(values, dtype=np.float64).reshape(3)
+    norm = float(math.hypot(x, y))
+    if norm <= 1e-9:
+        return _facing_from_yaw(fallback_yaw)
+    return (float(x / norm), float(y / norm), float(z))
+
+
+def anchor_frame_planner_heading(frame: UpperBodyFrame, heading_yaw: float) -> UpperBodyFrame:
+    """Rotate Unitree-local planner vectors into the robot's startup heading frame."""
+
+    rotated_facing = _rotate_xy(frame.facing, heading_yaw)
+    return replace(
+        frame,
+        movement=_rotate_xy(frame.movement, heading_yaw),
+        facing=_normalize_xy_or_heading(rotated_facing, heading_yaw),
+    )
+
+
+def build_heading_hold_planner_message(
+    heading_yaw: float | None,
+    *,
+    upper_body_position: Sequence[float] | np.ndarray | None = None,
+) -> bytes:
+    """Build an idle planner command that preserves startup heading and arms."""
+
+    upper_body = None
+    upper_body_velocity = None
+    if upper_body_position is not None:
+        upper_body = np.asarray(upper_body_position, dtype=np.float32).reshape(UPPER_BODY_DOF)
+        upper_body_velocity = np.zeros(UPPER_BODY_DOF, dtype=np.float32)
+    yaw = 0.0 if heading_yaw is None else float(heading_yaw)
+
+    return build_planner_message(
+        0,
+        (0.0, 0.0, 0.0),
+        _facing_from_yaw(yaw),
+        speed=0.0,
+        height=-1.0,
+        upper_body_position=None if upper_body is None else upper_body.tolist(),
+        upper_body_velocity=None if upper_body_velocity is None else upper_body_velocity.tolist(),
+    )
+
+
+def build_start_control_messages(
+    *,
+    heading_yaw: float | None,
+    upper_body_position: Sequence[float] | np.ndarray | None,
+) -> list[bytes]:
+    """Build startup messages in safe order: hold target first, then start."""
+
+    messages: list[bytes] = []
+    if heading_yaw is not None or upper_body_position is not None:
+        messages.append(
+            build_heading_hold_planner_message(
+                heading_yaw,
+                upper_body_position=upper_body_position,
+            )
+        )
+    messages.append(build_command_message(start=True, stop=False, planner=True))
+    return messages
+
+
+def _read_feedback_prime(
     *,
     context: Any,
     host: str,
     port: int,
     topic: str,
     timeout_s: float,
-) -> np.ndarray | None:
+) -> FeedbackPrime:
     if timeout_s <= 0.0:
-        return None
+        return FeedbackPrime()
     try:
         import msgpack
         import zmq
     except ImportError:
-        return None
+        return FeedbackPrime()
 
     sub = context.socket(zmq.SUB)
     sub.setsockopt_string(zmq.SUBSCRIBE, topic)
     sub.setsockopt(zmq.RCVTIMEO, min(100, max(1, int(timeout_s * 1000))))
     sub.connect(f"tcp://{host}:{port}")
-    deadline = time.monotonic() + timeout_s
-    latest_upper: np.ndarray | None = None
     try:
-        while time.monotonic() < deadline:
-            try:
-                raw = sub.recv()
-            except zmq.Again:
-                continue
-            payload_bytes = raw[len(topic) :] if raw.startswith(topic.encode()) else raw
-            try:
-                payload = msgpack.unpackb(payload_bytes, raw=False)
-            except Exception:
-                continue
-            if isinstance(payload, dict):
-                upper = _upper_body_from_feedback_payload(payload)
-                if upper is not None:
-                    latest_upper = upper
+        latest = _read_feedback_prime_from_sub(
+            sub=sub,
+            msgpack_module=msgpack,
+            zmq_module=zmq,
+            topic=topic,
+            timeout_s=timeout_s,
+        )
     finally:
         sub.close(linger=0)
-    return latest_upper
+    return latest
+
+
+def _read_feedback_prime_from_sub(
+    *,
+    sub: Any,
+    msgpack_module: Any,
+    zmq_module: Any,
+    topic: str,
+    timeout_s: float,
+) -> FeedbackPrime:
+    deadline = time.monotonic() + timeout_s
+    latest = FeedbackPrime()
+    topic_bytes = topic.encode()
+    while time.monotonic() < deadline:
+        try:
+            raw = sub.recv()
+        except zmq_module.Again:
+            continue
+        payload_bytes = raw[len(topic) :] if raw.startswith(topic_bytes) else raw
+        try:
+            payload = msgpack_module.unpackb(payload_bytes, raw=False)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            prime = _feedback_prime_from_payload(payload)
+            latest = FeedbackPrime(
+                upper_body=prime.upper_body if prime.upper_body is not None else latest.upper_body,
+                heading_yaw=prime.heading_yaw if prime.heading_yaw is not None else latest.heading_yaw,
+            )
+    return latest
 
 
 def _as_vector(value: Any, *, name: str, size: int, default: float | None = None) -> np.ndarray:
@@ -205,6 +461,16 @@ def _as_xyz(value: Any, *, name: str, default: Sequence[float]) -> tuple[float, 
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{name} contains non-finite values")
     return (float(array[0]), float(array[1]), float(array[2]))
+
+
+def _as_finite_float(value: Any, *, name: str) -> float:
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if not math.isfinite(scalar):
+        raise ValueError(f"{name} must be a finite number")
+    return scalar
 
 
 def _debug_range(values: Sequence[float] | np.ndarray | None) -> str:
@@ -312,9 +578,7 @@ def frame_from_mapping(data: dict[str, Any]) -> UpperBodyFrame:
 
     left_hand_joints = data.get("left_hand_joints")
     right_hand_joints = data.get("right_hand_joints")
-    if (left_hand_joints is None or right_hand_joints is None) and data.get(
-        "dual_hand_joints"
-    ) is not None:
+    if (left_hand_joints is None or right_hand_joints is None) and data.get("dual_hand_joints") is not None:
         split_left, split_right = split_xr_dex3_dual_hand_joints(data["dual_hand_joints"])
         if left_hand_joints is None:
             left_hand_joints = split_left
@@ -322,10 +586,10 @@ def frame_from_mapping(data: dict[str, Any]) -> UpperBodyFrame:
             right_hand_joints = split_right
 
     return UpperBodyFrame(
-        timestamp=None if data.get("timestamp") is None else float(data["timestamp"]),
-        upper_body_position=_as_vector(
-            upper_body_position, name="upper_body_position", size=UPPER_BODY_DOF
+        timestamp=(
+            None if data.get("timestamp") is None else _as_finite_float(data["timestamp"], name="timestamp")
         ),
+        upper_body_position=_as_vector(upper_body_position, name="upper_body_position", size=UPPER_BODY_DOF),
         upper_body_velocity=_as_vector(
             upper_body_velocity,
             name="upper_body_velocity",
@@ -333,22 +597,18 @@ def frame_from_mapping(data: dict[str, Any]) -> UpperBodyFrame:
             default=0.0,
         ),
         velocity_provided=upper_body_velocity is not None,
-        left_hand_joints=_optional_vector(
-            left_hand_joints, name="left_hand_joints", size=HAND_DOF
-        ),
-        right_hand_joints=_optional_vector(
-            right_hand_joints, name="right_hand_joints", size=HAND_DOF
-        ),
+        left_hand_joints=_optional_vector(left_hand_joints, name="left_hand_joints", size=HAND_DOF),
+        right_hand_joints=_optional_vector(right_hand_joints, name="right_hand_joints", size=HAND_DOF),
         mode=int(data.get("mode", 0)),
         movement=_as_xyz(data.get("movement"), name="movement", default=(0.0, 0.0, 0.0)),
         facing=_as_xyz(data.get("facing"), name="facing", default=(1.0, 0.0, 0.0)),
-        speed=float(data.get("speed", -1.0)),
-        height=float(data.get("height", -1.0)),
+        speed=_as_finite_float(data.get("speed", -1.0), name="speed"),
+        height=_as_finite_float(data.get("height", -1.0), name="height"),
         toggle_data_collection=bool(data.get("toggle_data_collection", False)),
         toggle_data_abort=bool(data.get("toggle_data_abort", False)),
         stop=bool(data.get("stop", False)),
         ramp_phase=str(data.get("ramp_phase", "track")),
-        ramp_alpha=float(data.get("ramp_alpha", 1.0)),
+        ramp_alpha=_as_finite_float(data.get("ramp_alpha", 1.0), name="ramp_alpha"),
     )
 
 
@@ -385,9 +645,7 @@ def load_npz_frames(path: Path) -> list[UpperBodyFrame]:
         else:
             raise ValueError(f"{path} missing upper_body_position or dual_arm_position")
         if positions.ndim != 2 or positions.shape[1] != expected_width:
-            raise ValueError(
-                f"position data must have shape (N, {expected_width}), got {positions.shape}"
-            )
+            raise ValueError(f"position data must have shape (N, {expected_width}), got {positions.shape}")
         count = positions.shape[0]
         velocities = data["upper_body_velocity"] if "upper_body_velocity" in data else None
         dual_arm_velocities = data["dual_arm_velocity"] if "dual_arm_velocity" in data else None
@@ -505,9 +763,7 @@ def collect_range_warnings(
             continue
         max_hand = float(np.max(np.abs(np.stack(values))))
         if max_hand > hand_warn_rad:
-            warnings.append(
-                f"{name} max abs {max_hand:.3f} rad exceeds {hand_warn_rad:.3f}; check units/order"
-            )
+            warnings.append(f"{name} max abs {max_hand:.3f} rad exceeds {hand_warn_rad:.3f}; check units/order")
     return warnings
 
 
@@ -540,21 +796,20 @@ def build_inspection_report(
         _range_line("right_hand_joints", np.stack(right_values) if right_values else None),
         f"first upper_body_position[17]: {first}",
     ]
-    warnings = collect_range_warnings(
-        frames, arm_warn_rad=arm_warn_rad, hand_warn_rad=hand_warn_rad
-    )
+    warnings = collect_range_warnings(frames, arm_warn_rad=arm_warn_rad, hand_warn_rad=hand_warn_rad)
     if warnings:
         lines.append("warnings:")
         lines.extend(f"- {warning}" for warning in warnings)
     return "\n".join(lines)
 
 
-def build_frame_planner_message(
+def build_frame_planner_command(
     frame: UpperBodyFrame,
     config: BridgeConfig,
     filt: UpperBodyFilter | None = None,
-) -> bytes:
-    """Convert one frame to the existing GEAR-SONIC planner ZMQ message."""
+    stop_hand_preset: str | None = None,
+) -> PlannerCommand:
+    """Convert one frame to a planner command before hand limiting/encoding."""
 
     filtered_position = (
         filt.apply_ramped(
@@ -565,42 +820,178 @@ def build_frame_planner_message(
         if filt is not None
         else np.clip(frame.upper_body_position, -config.max_abs_joint, config.max_abs_joint)
     )
-    return build_planner_message(
-        frame.mode,
-        frame.movement,
-        frame.facing,
+    left_hand_position = None if frame.left_hand_joints is None else frame.left_hand_joints.tolist()
+    right_hand_position = None if frame.right_hand_joints is None else frame.right_hand_joints.tolist()
+    if (
+        stop_hand_preset is not None
+        and stop_hand_preset != "none"
+        and (frame.stop or frame.ramp_phase in {"out", "hold"})
+    ):
+        left_hand_position, right_hand_position = _stop_hand_targets(
+            frame,
+            float(np.clip(frame.ramp_alpha, 0.0, 1.0)),
+            stop_hand_preset,
+        )
+    return PlannerCommand(
+        mode=frame.mode,
+        movement=frame.movement,
+        facing=frame.facing,
         speed=frame.speed,
         height=frame.height,
         upper_body_position=filtered_position.tolist(),
         upper_body_velocity=frame.upper_body_velocity.tolist(),
-        left_hand_position=None
-        if frame.left_hand_joints is None
-        else frame.left_hand_joints.tolist(),
-        right_hand_position=None
-        if frame.right_hand_joints is None
-        else frame.right_hand_joints.tolist(),
+        left_hand_position=left_hand_position,
+        right_hand_position=right_hand_position,
     )
 
 
-def build_stop_standing_message(frame: UpperBodyFrame, alpha: float = 1.0) -> bytes:
-    """Build an idle planner frame that ramps upper-body targets to standing."""
+def build_frame_planner_message(*args, **kwargs) -> bytes:
+    """Compatibility wrapper returning the encoded planner message."""
+
+    return build_frame_planner_command(*args, **kwargs).encode()
+
+
+def _blend_hand_target(
+    source: np.ndarray | None,
+    target: np.ndarray,
+    alpha: float,
+) -> list[float]:
+    start = target if source is None else np.asarray(source, dtype=np.float32)
+    hand = (1.0 - alpha) * start + alpha * target
+    return hand.astype(np.float32).tolist()
+
+
+def _stop_hand_targets(
+    frame: UpperBodyFrame,
+    alpha: float,
+    hand_preset: str,
+) -> tuple[list[float] | None, list[float] | None]:
+    if hand_preset == "none":
+        return None, None
+    if hand_preset == "source":
+        return (
+            None if frame.left_hand_joints is None else frame.left_hand_joints.tolist(),
+            None if frame.right_hand_joints is None else frame.right_hand_joints.tolist(),
+        )
+    if hand_preset == "open":
+        return (
+            _blend_hand_target(frame.left_hand_joints, DEX3_OPEN_HAND, alpha),
+            _blend_hand_target(frame.right_hand_joints, DEX3_OPEN_HAND, alpha),
+        )
+    if hand_preset == "tucked-thumb":
+        return (
+            _blend_hand_target(frame.left_hand_joints, DEX3_LEFT_STOP_HAND_TUCKED, alpha),
+            _blend_hand_target(frame.right_hand_joints, DEX3_RIGHT_STOP_HAND_TUCKED, alpha),
+        )
+    raise ValueError(f"unsupported stop hand preset: {hand_preset}")
+
+
+def _stop_upper_body_target(upper_body_preset: str) -> np.ndarray:
+    try:
+        return STOP_UPPER_BODY_PRESETS[upper_body_preset]
+    except KeyError as exc:
+        raise ValueError(f"unsupported stop upper-body preset: {upper_body_preset}") from exc
+
+
+def build_stop_standing_command(
+    frame: UpperBodyFrame,
+    alpha: float = 1.0,
+    hand_preset: str = "tucked-thumb",
+    upper_body_preset: str = "straight",
+) -> PlannerCommand:
+    """Build an idle planner command ramped to the configured exit pose."""
 
     alpha = float(np.clip(alpha, 0.0, 1.0))
     alpha = alpha * alpha * (3.0 - 2.0 * alpha)
     start = np.asarray(frame.upper_body_position, dtype=np.float32)
-    upper_body_position = (1.0 - alpha) * start + alpha * G1_STANDING_UPPER_BODY
+    target = _stop_upper_body_target(upper_body_preset)
+    upper_body_position = (1.0 - alpha) * start + alpha * target
+    left_hand_position, right_hand_position = _stop_hand_targets(frame, alpha, hand_preset)
 
-    return build_planner_message(
-        0,
-        [0.0, 0.0, 0.0],
-        frame.facing,
+    return PlannerCommand(
+        mode=0,
+        movement=(0.0, 0.0, 0.0),
+        facing=frame.facing,
         speed=0.0,
         height=-1.0,
         upper_body_position=upper_body_position.tolist(),
-        upper_body_velocity=[0.0] * UPPER_BODY_DOF,
-        left_hand_position=None,
-        right_hand_position=None,
+        upper_body_velocity=(0.0,) * UPPER_BODY_DOF,
+        left_hand_position=left_hand_position,
+        right_hand_position=right_hand_position,
     )
+
+
+def build_stop_standing_message(*args, **kwargs) -> bytes:
+    """Compatibility wrapper returning the encoded stop planner message."""
+
+    return build_stop_standing_command(*args, **kwargs).encode()
+
+
+def frame_requests_stop_release(frame: UpperBodyFrame) -> bool:
+    return bool(frame.stop) or frame.ramp_phase in STOP_RELEASE_RAMP_PHASES
+
+
+def frame_with_current_upper_body_position(
+    frame: UpperBodyFrame,
+    filt: UpperBodyFilter,
+) -> UpperBodyFrame:
+    """Snapshot the filtered command that was just sent downstream."""
+
+    current_position = filt.current_position()
+    if current_position is None:
+        return frame
+    return replace(frame, upper_body_position=current_position)
+
+
+def start_stop_release_schedule(
+    frame: UpperBodyFrame,
+    *,
+    last_tracking_frame: UpperBodyFrame | None,
+    now: float,
+    release_s: float,
+    final_hold_s: float,
+) -> StopReleaseSchedule:
+    return StopReleaseSchedule.start(
+        last_tracking_frame if last_tracking_frame is not None else frame,
+        now=now,
+        release_s=release_s,
+        final_hold_s=final_hold_s,
+    )
+
+
+def build_due_stop_release_commands(
+    schedule: StopReleaseSchedule,
+    *,
+    now: float,
+    hz: float,
+    stream_mode: int,
+    hand_preset: str,
+    upper_body_preset: str,
+) -> tuple[PlannerCommand, bytes, str] | None:
+    alpha = schedule.next_alpha(now=now, hz=hz)
+    if alpha is None:
+        return None
+    phase = "final-hold" if schedule.final_frame_sent else "stop-release"
+    return (
+        build_stop_standing_command(
+            schedule.frame,
+            alpha=alpha,
+            hand_preset=hand_preset,
+            upper_body_preset=upper_body_preset,
+        ),
+        build_manager_state_message(stream_mode=stream_mode),
+        phase,
+    )
+
+
+def build_due_stop_release_messages(*args, **kwargs) -> tuple[bytes, bytes] | None:
+    """Compatibility wrapper returning encoded stop-release messages."""
+
+    commands = build_due_stop_release_commands(*args, **kwargs)
+    if commands is None:
+        return None
+    planner_command, manager_message, _phase = commands
+    return planner_command.encode(), manager_message
 
 
 def build_manager_state_message(
@@ -643,22 +1034,29 @@ def _send_loop(args: argparse.Namespace, frames: list[UpperBodyFrame]) -> int:
         socket.bind(f"tcp://{args.bind_host}:{args.port}")
         time.sleep(args.pub_warmup_s)
         socket.send(build_command_message(start=args.start_control, stop=False, planner=True))
+    planner_publisher = None if socket is None else BridgePlannerPublisher(socket)
 
     try:
-        while True:
+        finished = False
+        while not finished:
             for frame in frames:
-                message = build_frame_planner_message(frame, config, filt)
-                if socket is not None:
-                    socket.send(message)
+                command = build_frame_planner_command(frame, config, filt)
+                if planner_publisher is not None:
+                    prepared = planner_publisher.prepare(
+                        command,
+                        ramp_phase=frame.ramp_phase,
+                    )
+                    planner_publisher.send(prepared)
                     socket.send(build_manager_state_message(stream_mode=args.stream_mode))
+                else:
+                    command.encode()
                 published += 1
                 if args.once:
-                    raise StopIteration
+                    finished = True
+                    break
                 time.sleep(dt)
             if not args.loop:
                 break
-    except StopIteration:
-        pass
     finally:
         if socket is not None and args.send_stop_on_exit:
             socket.send(build_command_message(start=False, stop=True, planner=True))
@@ -687,85 +1085,301 @@ def _send_zmq_json_loop(args: argparse.Namespace) -> int:
     pub = context.socket(zmq.PUB)
     pub.bind(f"tcp://{args.bind_host}:{args.port}")
     time.sleep(args.pub_warmup_s)
+    planner_publisher = BridgePlannerPublisher(pub)
 
-    start_command_deadline = 0.0
-    last_start_command_time = 0.0
-    if args.start_control:
-        start_command_deadline = time.monotonic() + max(args.start_command_repeat_s, 0.0)
-        pub.send(build_command_message(start=True, stop=False, planner=True))
-        last_start_command_time = time.monotonic()
-        print(
-            "[xr_upperbody_bridge] sent start=true command; "
-            f"repeating for {max(args.start_command_repeat_s, 0.0):.1f}s"
-        )
-
+    planner_heading_yaw: float | None = None
+    late_feedback_sub = None
+    late_feedback_msgpack = None
+    late_feedback_poll_s = min(max(recv_timeout_s, 0.001), 0.005)
+    feedback_prime = FeedbackPrime()
     if not args.no_feedback_prime:
-        feedback_upper = _read_feedback_upper_body(
+        feedback_prime = _read_feedback_prime(
             context=context,
             host=args.feedback_host,
             port=args.feedback_port,
             topic=args.feedback_topic,
             timeout_s=args.feedback_prime_timeout_s,
         )
-        if feedback_upper is not None:
-            filt.seed(feedback_upper)
+        if feedback_prime.upper_body is not None:
+            filt.seed(feedback_prime.upper_body)
             print(
                 "[xr_upperbody_bridge] seeded upper-body ramp from feedback "
-                f"({_debug_range(feedback_upper)})"
+                f"({_debug_range(feedback_prime.upper_body)})"
             )
         else:
             print(
                 "[xr_upperbody_bridge] feedback seed unavailable; first upper-body "
                 "target cannot be rate-limited from measured robot pose"
             )
+        if args.anchor_planner_heading and feedback_prime.heading_yaw is not None:
+            planner_heading_yaw = feedback_prime.heading_yaw
+            print(f"[xr_upperbody_bridge] anchored planner heading to feedback yaw {planner_heading_yaw:+.3f} rad")
+        elif args.anchor_planner_heading:
+            print("[xr_upperbody_bridge] feedback heading unavailable; planner facing will use source coordinates")
+    late_feedback_pending = (
+        args.start_control and not args.allow_unseeded_start_control and feedback_prime.upper_body is None
+    )
+    if late_feedback_pending and args.no_feedback_prime:
+        print(
+            "[xr_upperbody_bridge] ERROR: --start-control requires measured "
+            "upper-body feedback before live upper-body planner frames, but "
+            "--no-feedback-prime disables feedback seeding. Pass "
+            "--allow-unseeded-start-control only for debugging.",
+            flush=True,
+        )
+        sub.close(linger=0)
+        pub.close(linger=0)
+        context.term()
+        return 2
+    if late_feedback_pending:
+        try:
+            import msgpack
+        except ImportError:
+            print(
+                "[xr_upperbody_bridge] ERROR: msgpack is required to wait for "
+                "late deploy feedback before live upper-body planner frames.",
+                flush=True,
+            )
+            sub.close(linger=0)
+            pub.close(linger=0)
+            context.term()
+            return 2
+        late_feedback_msgpack = msgpack
+        late_feedback_sub = context.socket(zmq.SUB)
+        late_feedback_sub.setsockopt_string(zmq.SUBSCRIBE, args.feedback_topic)
+        late_feedback_sub.setsockopt(zmq.RCVTIMEO, max(1, int(late_feedback_poll_s * 1000)))
+        late_feedback_sub.connect(f"tcp://{args.feedback_host}:{args.feedback_port}")
+        print(
+            "[xr_upperbody_bridge] feedback seed unavailable before start; "
+            "sending command-only start and holding live upper-body planner "
+            "frames until measured g1_debug feedback arrives",
+            flush=True,
+        )
+
+    def send_start_command() -> None:
+        for message in build_start_control_messages(
+            heading_yaw=planner_heading_yaw,
+            upper_body_position=filt.current_position(),
+        ):
+            pub.send(message)
+
+    def poll_late_feedback() -> bool:
+        nonlocal late_feedback_pending, planner_heading_yaw
+        if not late_feedback_pending:
+            return True
+        if late_feedback_sub is None or late_feedback_msgpack is None:
+            return False
+        prime = _read_feedback_prime_from_sub(
+            sub=late_feedback_sub,
+            msgpack_module=late_feedback_msgpack,
+            zmq_module=zmq,
+            topic=args.feedback_topic,
+            timeout_s=late_feedback_poll_s,
+        )
+        if args.anchor_planner_heading and planner_heading_yaw is None and prime.heading_yaw is not None:
+            planner_heading_yaw = prime.heading_yaw
+            print(
+                "[xr_upperbody_bridge] anchored planner heading to late feedback yaw "
+                f"{planner_heading_yaw:+.3f} rad"
+            )
+        if prime.upper_body is None:
+            return False
+        filt.seed(prime.upper_body)
+        late_feedback_pending = False
+        print(
+            f"[xr_upperbody_bridge] seeded upper-body ramp from late feedback ({_debug_range(prime.upper_body)})"
+        )
+        return True
+
+    start_command_deadline = 0.0
+    last_start_command_time = 0.0
+    if args.start_control:
+        start_command_deadline = time.monotonic() + max(args.start_command_repeat_s, 0.0)
+        send_start_command()
+        last_start_command_time = time.monotonic()
+        print(
+            "[xr_upperbody_bridge] sent start=true command; "
+            f"repeating for {max(args.start_command_repeat_s, 0.0):.1f}s"
+        )
 
     previous_frame: UpperBodyFrame | None = None
-    release_frame: UpperBodyFrame | None = None
-    release_until = 0.0
-    last_release_time = 0.0
+    last_tracking_frame: UpperBodyFrame | None = None
+    stop_release: StopReleaseSchedule | None = None
+    stop_release_completed = False
     published = 0
     last_warn_time = 0.0
     last_debug_time = 0.0
+    last_invalid_frame_warn_time = -math.inf
+
+    def warn_invalid_frame(context: str, exc: Exception) -> None:
+        nonlocal last_invalid_frame_warn_time
+        now = time.monotonic()
+        if now - last_invalid_frame_warn_time >= 1.0:
+            print(f"[xr_upperbody_bridge] {context} skipped: {exc}", flush=True)
+            last_invalid_frame_warn_time = now
+
     try:
         while True:
             if args.start_control and time.monotonic() < start_command_deadline:
                 now = time.monotonic()
                 if now - last_start_command_time >= args.start_command_interval_s:
-                    pub.send(build_command_message(start=True, stop=False, planner=True))
+                    send_start_command()
                     last_start_command_time = now
+            if late_feedback_pending:
+                poll_late_feedback()
             try:
                 raw = sub.recv()
             except zmq.Again:
                 now = time.monotonic()
-                if release_frame is not None and now < release_until:
-                    if now - last_release_time >= (1.0 / args.hz):
-                        duration = max(args.stop_release_s, 1e-6)
-                        alpha = 1.0 - max(0.0, release_until - now) / duration
-                        pub.send(build_stop_standing_message(release_frame, alpha=alpha))
-                        pub.send(build_manager_state_message(stream_mode=args.stream_mode))
-                        last_release_time = now
+                if stop_release is not None:
+                    commands = build_due_stop_release_commands(
+                        stop_release,
+                        now=now,
+                        hz=args.hz,
+                        stream_mode=args.stream_mode,
+                        hand_preset=args.stop_hand_preset,
+                        upper_body_preset=args.stop_upper_body_preset,
+                    )
+                    if commands is not None:
+                        planner_command, manager_state_message, stop_phase = commands
+                        try:
+                            prepared = planner_publisher.prepare(
+                                planner_command,
+                                ramp_phase=stop_phase,
+                            )
+                        except PlannerPreparationError as exc:
+                            warn_invalid_frame("invalid stop planner command", exc)
+                            continue
+                        planner_publisher.send(prepared)
+                        pub.send(manager_state_message)
                         published += 1
                     if args.once:
                         break
-                    continue
-                release_frame = None
+                    if stop_release.active:
+                        continue
+                    stop_release = None
+                    stop_release_completed = True
                 if now - last_warn_time > 1.0:
-                    print("[xr_upperbody_bridge] waiting for live XR JSON source...")
+                    if late_feedback_pending:
+                        print(
+                            "[xr_upperbody_bridge] waiting for measured g1_debug "
+                            "feedback before live upper-body planner frames..."
+                        )
+                    else:
+                        print("[xr_upperbody_bridge] waiting for live XR JSON source...")
                     last_warn_time = now
+                if args.once and not late_feedback_pending:
+                    break
+                continue
+
+            if late_feedback_pending and not poll_late_feedback():
+                now = time.monotonic()
+                if now - last_warn_time > 1.0:
+                    print(
+                        "[xr_upperbody_bridge] holding live XR frame until "
+                        "measured g1_debug feedback seeds the upper-body ramp..."
+                    )
+                    last_warn_time = now
+                continue
+
+            try:
+                payload_bytes = (
+                    raw[len(args.source_topic) :] if raw.startswith(args.source_topic.encode()) else raw
+                )
+                payload = json.loads(payload_bytes.decode("utf-8"))
+                if not isinstance(payload, Mapping):
+                    raise ValueError("live payload must be a JSON object")
+                frame = normalize_live_source_payload(payload)
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+                OverflowError,
+            ) as exc:
+                warn_invalid_frame("invalid live frame", exc)
+                continue
+            if planner_heading_yaw is not None:
+                frame = anchor_frame_planner_heading(frame, planner_heading_yaw)
+            if not frame.velocity_provided and previous_frame is not None:
+                frame = synthesize_missing_velocities([previous_frame, frame], default_hz=args.hz)[-1]
+
+            now = time.monotonic()
+            stop_release_enabled = args.stop_release_s > 0.0 or args.stop_final_hold_s > 0.0
+            if frame_requests_stop_release(frame) and stop_release_enabled:
+                if stop_release is None and not stop_release_completed:
+                    stop_release = start_stop_release_schedule(
+                        frame,
+                        last_tracking_frame=last_tracking_frame,
+                        now=now,
+                        release_s=args.stop_release_s,
+                        final_hold_s=args.stop_final_hold_s,
+                    )
+                    if args.debug_live:
+                        print(
+                            "[xr_upperbody_bridge] exit ramp frame received; "
+                            f"publishing bridge-managed {args.stop_release_s:.2f}s "
+                            f"release ramp and {args.stop_final_hold_s:.2f}s exact final hold",
+                            flush=True,
+                        )
+                if stop_release is not None:
+                    commands = build_due_stop_release_commands(
+                        stop_release,
+                        now=now,
+                        hz=args.hz,
+                        stream_mode=args.stream_mode,
+                        hand_preset=args.stop_hand_preset,
+                        upper_body_preset=args.stop_upper_body_preset,
+                    )
+                    if commands is not None:
+                        planner_command, manager_state_message, stop_phase = commands
+                        try:
+                            prepared = planner_publisher.prepare(
+                                planner_command,
+                                ramp_phase=stop_phase,
+                            )
+                        except PlannerPreparationError as exc:
+                            warn_invalid_frame("invalid stop planner command", exc)
+                            continue
+                        planner_publisher.send(prepared)
+                        previous_frame = frame
+                        pub.send(manager_state_message)
+                        published += 1
+                    if not stop_release.active:
+                        stop_release = None
+                        stop_release_completed = True
+                    if args.once:
+                        break
+                    continue
                 if args.once:
                     break
                 continue
 
-            payload_bytes = raw[len(args.source_topic) :] if raw.startswith(args.source_topic.encode()) else raw
-            payload = json.loads(payload_bytes.decode("utf-8"))
-            frame = normalize_live_source_payload(payload)
-            if not frame.velocity_provided and previous_frame is not None:
-                frame = synthesize_missing_velocities(
-                    [previous_frame, frame], default_hz=args.hz
-                )[-1]
-            previous_frame = frame
+            stop_release_completed = False
+            filter_snapshot = filt.snapshot()
+            planner_command = build_frame_planner_command(
+                frame,
+                config,
+                filt,
+                stop_hand_preset=args.stop_hand_preset,
+            )
+            try:
+                prepared = planner_publisher.prepare(
+                    planner_command,
+                    ramp_phase=frame.ramp_phase,
+                )
+            except PlannerPreparationError as exc:
+                filt.restore(filter_snapshot)
+                warn_invalid_frame("invalid planner frame", exc)
+                continue
 
-            pub.send(build_frame_planner_message(frame, config, filt))
+            try:
+                planner_publisher.send(prepared)
+            except Exception:
+                filt.restore(filter_snapshot)
+                raise
+            previous_frame = frame
+            last_tracking_frame = frame_with_current_upper_body_position(frame, filt)
             pub.send(
                 build_manager_state_message(
                     stream_mode=args.stream_mode,
@@ -774,16 +1388,6 @@ def _send_zmq_json_loop(args: argparse.Namespace) -> int:
                 )
             )
             published += 1
-            if frame.stop and args.stop_release_s > 0.0:
-                release_frame = frame
-                release_until = time.monotonic() + args.stop_release_s
-                last_release_time = 0.0
-                if args.debug_live:
-                    print(
-                        "[xr_upperbody_bridge] stop=true received; publishing "
-                        f"{args.stop_release_s:.2f}s standing upper-body ramp frames",
-                        flush=True,
-                    )
             if args.debug_live:
                 now = time.monotonic()
                 if now - last_debug_time >= args.debug_interval:
@@ -810,6 +1414,8 @@ def _send_zmq_json_loop(args: argparse.Namespace) -> int:
     finally:
         if args.send_stop_on_exit:
             pub.send(build_command_message(start=False, stop=True, planner=True))
+        if late_feedback_sub is not None:
+            late_feedback_sub.close(linger=0)
         sub.close(linger=0)
         pub.close(linger=0)
         context.term()
@@ -845,7 +1451,11 @@ def run_local_zmq_smoke(
     sub.connect(endpoint)
     time.sleep(0.1)
 
-    pub.send(build_frame_planner_message(frames[0], config))
+    planner_publisher = BridgePlannerPublisher(pub)
+    planner_publisher.publish(
+        build_frame_planner_command(frames[0], config),
+        ramp_phase=frames[0].ramp_phase,
+    )
     pub.send(build_manager_state_message())
 
     decoded: dict[str, dict[str, np.ndarray]] = {}
@@ -945,8 +1555,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1.2,
         help=(
             "After a live XR frame with stop=true, keep publishing idle planner "
-            "frames that ramp upper_body_position from CALIB/idle to the G1 "
-            "standing upper-body target before the XR source disappears."
+            "frames that ramp upper_body_position to --stop-upper-body-preset "
+            "before the XR source disappears."
+        ),
+    )
+    parser.add_argument(
+        "--stop-final-hold-s",
+        type=float,
+        default=1.0,
+        help=(
+            "After --stop-release-s reaches the standing target, keep publishing "
+            "the exact final planner frame for this many seconds."
+        ),
+    )
+    parser.add_argument(
+        "--stop-upper-body-preset",
+        choices=tuple(STOP_UPPER_BODY_PRESETS),
+        default="straight",
+        help=(
+            "Upper-body target used by stop-release/final-hold frames. "
+            "'straight' and 'deploy-standing' use the GEAR-SONIC final standing "
+            "target; 'calib-full' is the all-zero upper-body calibration pose."
+        ),
+    )
+    parser.add_argument(
+        "--stop-hand-preset",
+        choices=("tucked-thumb", "source", "open", "none"),
+        default="tucked-thumb",
+        help=(
+            "Hand command used during --stop-release-s live stop frames. "
+            "'tucked-thumb' keeps the Dex3 thumbs near the palms while the "
+            "upper body returns to standing."
         ),
     )
     parser.add_argument(
@@ -977,9 +1616,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for measured upper-body feedback before live streaming.",
     )
     parser.add_argument(
+        "--anchor-planner-heading",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Rotate live-source planner movement/facing by the measured startup "
+            "base yaw from feedback. This makes Unitree controller yaw local to "
+            "the robot's initial heading; use --no-anchor-planner-heading for "
+            "sources that already publish absolute world-frame planner vectors."
+        ),
+    )
+    parser.add_argument(
         "--no-feedback-prime",
         action="store_true",
         help="Do not seed the upper-body rate limiter from measured robot feedback.",
+    )
+    parser.add_argument(
+        "--allow-unseeded-start-control",
+        action="store_true",
+        help=(
+            "Allow --start-control even when no measured upper-body feedback was "
+            "received. Unsafe for normal robot runs because startup can fall back "
+            "to CALIB_FULL/all-zero upper-body targets."
+        ),
     )
     parser.add_argument(
         "--debug-live",
@@ -995,6 +1654,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.hz <= 0:
         parser.error("--hz must be positive")
+    if args.stop_release_s < 0:
+        parser.error("--stop-release-s must be non-negative")
+    if args.stop_final_hold_s < 0:
+        parser.error("--stop-final-hold-s must be non-negative")
     if args.source == "zmq-json":
         if args.inspect:
             parser.error("--inspect is only supported with --source file")

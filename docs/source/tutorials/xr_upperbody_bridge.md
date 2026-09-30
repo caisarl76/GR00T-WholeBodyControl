@@ -155,6 +155,9 @@ python teleop/teleop_hand_and_arm.py \
   --gear-sonic-export \
   --gear-sonic-export-port 5560 \
   --gear-sonic-export-topic xr_teleop \
+   --gear-sonic-ramp-in-s 2.0 \
+  --gear-sonic-ramp-out-s 2.0 \
+  --gear-sonic-exit-hold-s 2.0 \
   --gear-sonic-debug
 ```
 
@@ -226,6 +229,123 @@ python gear_sonic/scripts/xr_upperbody_bridge.py \
 ```
 
 This keeps Unitree/XR as the upper-body source only. Do not let `xr_teleoperate` write body arm commands while this bridge is controlling GEAR-SONIC; publish `sol_q`/hand actions and let GEAR-SONIC be the only body command writer.
+
+## Full Simulation XR Teleop Setup
+
+Use this four-terminal flow to test the Unitree `xr_teleoperate` export path against GEAR-SONIC in MuJoCo. Do not run `pico_manager_thread_server.py` at the same time; both it and this bridge publish to the GEAR-SONIC ZMQ manager port.
+
+**Terminal 1 -- MuJoCo sim:**
+
+```bash
+cd /home/jihun/work/GR00T-WholeBodyControl
+source .venv_sim/bin/activate
+python gear_sonic/scripts/run_sim_loop.py
+```
+
+**Terminal 2 -- GEAR-SONIC deployment:**
+
+```bash
+cd /home/jihun/work/GR00T-WholeBodyControl/gear_sonic_deploy
+source scripts/setup_env.sh
+./deploy.sh --input-type zmq_manager sim
+```
+
+**Terminal 3 -- Unitree-to-GEAR-SONIC bridge:**
+
+```bash
+cd /home/jihun/work/GR00T-WholeBodyControl
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/xr_upperbody_bridge.py \
+  --source zmq-json \
+  --source-host 127.0.0.1 \
+  --source-port 5560 \
+  --source-topic xr_teleop \
+  --bind-host 0.0.0.0 \
+  --port 5556 \
+  --hz 50 \
+  --start-control \
+  --start-command-repeat-s 5.0 \
+  --start-command-interval-s 0.2 \
+  --feedback-host 127.0.0.1 \
+  --feedback-port 5557 \
+  --feedback-topic g1_debug \
+  --feedback-prime-timeout-s 2.0 \
+  --anchor-planner-heading \
+  --max-joint-step 0.03 \
+  --stop-release-s 2.0 \
+  --stop-final-hold-s 2.0 \
+  --stop-upper-body-preset straight \
+  --stop-hand-preset tucked-thumb \
+  --debug-live
+```
+
+Before enabling XR tracking, wait for one of these bridge messages:
+
+```text
+seeded upper-body ramp from feedback
+seeded upper-body ramp from late feedback
+```
+
+The bridge rejects unseeded live arm control by default. Do not use
+`--allow-unseeded-start-control` on the robot.
+
+When Unitree XR enters exit ramp-out, exit hold, or sends `stop=true`, the
+bridge owns the exit ramp instead of forwarding raw Unitree exit frames. It
+ramps the upper body to `--stop-upper-body-preset`, commands a partial Dex3
+thumb tuck, then publishes the exact final frame for `--stop-final-hold-s`
+seconds so the controller can settle at the final pose. `straight` and
+`deploy-standing` both use the normal final standing target. Use
+`--stop-upper-body-preset calib-full` only when you explicitly want the all-zero
+calibration pose. Use `--stop-hand-preset none` to restore the old hand
+behavior, `source` to hold the last XR hand command, or `open` for the all-zero
+open hand target.
+
+By default the live bridge also anchors Unitree controller locomotion heading to
+the robot's measured startup yaw from `g1_debug`. This prevents the initial
+Unitree planner default `facing=[1, 0, 0]` from rotating the robot toward world
++X when teleop starts. Use `--no-anchor-planner-heading` only for sources that
+already publish absolute world-frame `movement` and `facing` vectors.
+
+**Terminal 4 -- Unitree XR export in simulation mode:**
+
+```bash
+cd /home/jihun/work/unitree_official/xr_teleoperate
+conda activate tv
+python teleop/teleop_hand_and_arm.py \
+  --arm G1_29 \
+  --ee dex3 \
+  --input-mode controller \
+  --sim \
+  --img-server-ip 127.0.0.1 \
+  --gear-sonic-export \
+  --gear-sonic-export-port 5560 \
+  --gear-sonic-export-topic xr_teleop \
+  --gear-sonic-ramp-in-s 2.0 \
+  --gear-sonic-ramp-out-s 2.0 \
+  --gear-sonic-exit-hold-s 2.0 \
+  --gear-sonic-debug
+```
+
+Data flow:
+
+```text
+Quest/Pico browser -> Unitree xr_teleoperate -> tcp://*:5560 topic xr_teleop
+  -> xr_upperbody_bridge -> tcp://*:5556 command/planner/manager_state
+  -> gear_sonic_deploy --input-type zmq_manager sim -> MuJoCo
+```
+
+Optional read-only dashboard:
+
+```bash
+cd /home/jihun/work/GR00T-WholeBodyControl
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/xr_teleop_dashboard.py \
+  --host 127.0.0.1 \
+  --port 8088 \
+  --no-camera
+```
+
+Then open `http://127.0.0.1:8088`.
 
 ## Data Collection
 

@@ -21,7 +21,7 @@
  * ## `{user_topic}` (e.g. `g1_debug`) — published every tick
  * ---------------------------------------------------------------------------
  *
- * A single msgpack map with up to 35 keys (33 always-present + 2 conditional).
+ * A single msgpack map with up to 37 keys (35 always-present + 2 conditional).
  * All joints are in **MuJoCo order** (remapped from IsaacLab via
  * `isaaclab_to_mujoco`).
  *
@@ -78,6 +78,8 @@
  *  28  | vr_3point_position     | double[9]    | VR positions (3×xyz, target body frame).
  *  29  | vr_3point_orientation  | double[12]   | VR orientations (3×quat wxyz).
  *  30  | vr_3point_compliance   | double[3]    | VR compliance (left arm, right arm, head).
+ *  31  | reference_heading_quat  | double[4]    | Applied heading correction quaternion (empty if unavailable).
+ *  32  | planner_reference_active| double[1]    | 1.0 when a valid planner_motion frame is active, else 0.0.
  *
  * ---------------------------------------------------------------------------
  * ## `robot_config` — re-published every ~2 s
@@ -298,7 +300,7 @@ public:
         msgpack::packer<msgpack::sbuffer> pk(&buffer);
         const bool has_heading_state = heading != nullptr;
         // State-logger fields: 22 base + 2 optional heading
-        // Visualisation fields: output_data_map_.size() (typically 11)
+        // Visualisation fields: visualization.size() (typically 13)
         int num_state_fields = has_heading_state ? 24 : 22;
         int num_viz_fields = static_cast<int>(visualization.size());
         pk.pack_map(num_state_fields + num_viz_fields);
@@ -436,7 +438,8 @@ public:
         // Adds: base_trans_target, base_quat_target, body_q_target,
         //       base_trans_measured, base_quat_measured, body_q_measured,
         //       left_hand_q_measured, right_hand_q_measured,
-        //       vr_3point_position, vr_3point_orientation, vr_3point_compliance
+        //       vr_3point_position, vr_3point_orientation, vr_3point_compliance,
+        //       reference_heading_quat, planner_reference_active
         for (const auto& [key, values] : visualization) {
             pk.pack(key);
             pk.pack_array(values.size());

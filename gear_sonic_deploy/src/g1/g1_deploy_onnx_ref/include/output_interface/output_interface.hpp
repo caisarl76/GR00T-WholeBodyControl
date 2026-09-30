@@ -128,6 +128,8 @@ protected:
      *   vr_3point_position     |  9   | VR positions rotated into target body frame.
      *   vr_3point_orientation  | 12   | VR orientations (passed through).
      *   vr_3point_compliance   |  3   | VR compliance values (passed through).
+     *   reference_heading_quat  |  4   | Applied heading correction quaternion (empty if unavailable).
+     *   planner_reference_active|  1   | 1.0 when a valid planner_motion frame is active, else 0.0.
      *
      * Joint ordering uses `isaaclab_to_mujoco` remapping and `default_angles`
      * offsets from policy_parameters.hpp.
@@ -156,6 +158,8 @@ protected:
         static const std::string kVr3pointPosition = "vr_3point_position";
         static const std::string kVr3pointOrientation = "vr_3point_orientation";
         static const std::string kVr3pointCompliance = "vr_3point_compliance";
+        static const std::string kReferenceHeadingQuat = "reference_heading_quat";
+        static const std::string kPlannerReferenceActive = "planner_reference_active";
 
         std::vector<StateLogger::Entry> entries = state_logger_.GetLatest(1);
         const StateLogger::Entry& state = entries[0];
@@ -176,6 +180,7 @@ protected:
         body_q_target.fill(0.0);
         std::array<double, 3> base_trans_target = {0.0, 0.0, 0.0};
         std::array<double, 4> base_quat_target = {1.0, 0.0, 0.0, 0.0};  // Identity quaternion
+        std::array<double, 4> apply_delta_heading = {1.0, 0.0, 0.0, 0.0};
         
         // ---- Populate measured values from robot state (always available) ----
         // Remap from IsaacLab joint ordering to MuJoCo ordering and add default offsets.
@@ -208,7 +213,7 @@ protected:
           auto data_heading_inv = calc_heading_quat_inv_d(init_ref_data_root_rot_array);
           
           // Apply delta heading calculation
-          auto apply_delta_heading = quat_mul_d(init_heading, data_heading_inv);
+          apply_delta_heading = quat_mul_d(init_heading, data_heading_inv);
           
           // Apply additional delta heading if specified
           auto delta_quat = euler_z_to_quat_d(heading_state.delta_heading);
@@ -230,7 +235,7 @@ protected:
           
           auto init_heading = calc_heading_quat_d(heading_state.init_base_quat);
           auto data_heading_inv = calc_heading_quat_inv_d(init_ref_data_root_rot_array);
-          auto apply_delta_heading = quat_mul_d(init_heading, data_heading_inv);
+          apply_delta_heading = quat_mul_d(init_heading, data_heading_inv);
           auto delta_quat = euler_z_to_quat_d(heading_state.delta_heading);
           apply_delta_heading = quat_mul_d(delta_quat, apply_delta_heading);
             
@@ -269,6 +274,15 @@ protected:
         output_data_map_[kVr3pointPosition].assign(vr_3point_position_sent.begin(), vr_3point_position_sent.end());
         output_data_map_[kVr3pointOrientation].assign(vr_3point_orientation.begin(), vr_3point_orientation.end());
         output_data_map_[kVr3pointCompliance].assign(vr_3point_compliance.begin(), vr_3point_compliance.end());
+
+        if (has_body_quaternions) {
+          output_data_map_[kReferenceHeadingQuat].assign(apply_delta_heading.begin(), apply_delta_heading.end());
+        } else {
+          output_data_map_[kReferenceHeadingQuat].clear();
+        }
+        output_data_map_[kPlannerReferenceActive] = {
+          motion_frame_valid && current_motion->name == "planner_motion" ? 1.0 : 0.0
+        };
     }
 
     /// Protected constructor – sub-classes must provide a StateLogger reference.
@@ -293,4 +307,3 @@ protected:
 };
 
 #endif // OUTPUT_INTERFACE_HPP
-

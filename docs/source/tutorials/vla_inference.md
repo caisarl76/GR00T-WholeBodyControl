@@ -183,6 +183,13 @@ python gear_sonic/scripts/launch_inference.py \
     --prompt "pick up the apple"
 ```
 
+The launcher defaults to `--initial-pose calib_full`. In that mode, `i` ramps
+to the configured SONIC initial pose and holds PLANNER mode. Pressing `p`
+resumes inference; the first policy action switches to POSE mode. The
+feedback-paced straight-standing workflow below applies when you explicitly
+launch with `--initial-pose planner_standing` (the PnP evaluation presets use
+that mode).
+
 The launcher creates a tmux session with four panes:
 
 | Pane | Component | Description |
@@ -199,14 +206,14 @@ Type these keys in the **Keyboard Publisher** pane (pane 1):
 | Key | Action |
 |-----|--------|
 | `k` | Start / stop the C++ control loop |
-| `i` | Blend smoothly to initial pose and switch to POSE mode |
+| `i` | Reset according to `--initial-pose`: ramp to CALIB_FULL by default, or return to planner standing in `planner_standing` mode |
+| `m` | Enter manual planner repositioning / stop movement and hold PLANNER mode |
 | `p` | Pause / resume policy inference |
 | `[` | Toggle left hand open/closed (initial pose) |
 | `]` | Toggle right hand open/closed (initial pose) |
 | `t <text>` | Change the inference prompt (e.g., `t pick up the cup`) |
-| `c` | Start recording an episode (data exporter) |
-| `s` | Stop recording — success (data exporter) |
-| `f` | Stop recording — failure / discard (data exporter) |
+| `c` | Start recording; press again to finish and save (data exporter) |
+| `x` | Discard an active recording (data exporter) |
 
 ### Typical Workflow
 
@@ -214,13 +221,79 @@ Type these keys in the **Keyboard Publisher** pane (pane 1):
 2. Click on **pane 0** (C++ Deploy) and press Enter to confirm deployment
 3. Switch to **pane 1** (Keyboard Publisher)
 4. Press `k` to start the C++ control loop (starts in PLANNER mode)
-5. Press `i` to blend to the initial pose (switches to POSE mode)
-   > The robot smoothly interpolates to the initial pose over 1 second. If your
-   > task starts from a different pose than the default, see
-   > [Customizing the Initial Pose](#customizing-the-initial-pose) below.
-6. Press `p` to unpause the inference loop
+5. Press `i` to ramp to the configured initial pose and hold PLANNER mode.
+   The default CALIB_FULL ramp takes 2 seconds. If your
+   task starts from a different pose than the default, see
+   [Customizing the Initial Pose](#customizing-the-initial-pose) below.
+6. Press `p` to unpause the inference loop; the first policy action enters POSE mode
 7. The robot will begin executing VLA-predicted actions
 8. Press `p` to pause, `k` to stop the control loop when done
+
+For PnP evaluation, launch with `--initial-pose planner_standing` (the
+evaluation presets select this explicitly), then use this reset sequence:
+
+1. Press `i` to return to straight standing in PLANNER mode. Wait until the
+   robot has settled before continuing. This uses the existing `straight`
+   planner preset: upright waist, shoulder pitch 0.2 rad, shoulder roll
+   ±0.2 rad, and elbows 0.6 rad. SONIC controls the legs and balance.
+   The return starts from measured joints, preserves heading, and opens both
+   hands unless `[` / `]` selected closed hands. Fresh robot state is required.
+2. Press `p` to resume inference using fresh observations. The first policy
+   action switches to POSE mode.
+
+Between attempts in `planner_standing` mode, use `p` (pause) → `i` (return to
+standing) → wait for the robot to settle → `p` (evaluate). Every `i` pauses
+the policy and discards cached and in-flight policy results. The standing target advances at up to
+0.5 rad/s per joint and stays within 0.15 rad ahead of measured feedback;
+stale feedback holds the last target. `k` remains available during the return.
+Restart the inference client to load changes to this keyboard behavior.
+
+The planner-standing reset preserves the measured world heading at `i`. This
+heading and feedback behavior applies when `--initial-pose planner_standing`
+is selected. The client uses deploy's `reference_heading_quat` feedback to convert that heading into
+the current planner reference frame on every publication, including after a
+POSE → PLANNER reinitialization. This also keeps manual movement directions
+consistent after turning. Rebuild/restart deploy and restart the inference
+client together for this heading fix; `deploy.sh` builds before launching.
+Older deploy binaries without this telemetry are rejected by the reset with
+an explicit rebuild message.
+In `planner_standing` mode, if `i` arrives before the POSE switch is reflected
+in feedback, the client remains paused and asks you to retry after the switch settles; it never uses
+the previous planner session's heading reference for the new reset.
+
+### Keyboard repositioning between trials
+
+Keep the original `--input-type zmq_manager` deployment. The inference client
+translates keyboard commands into ZMQ planner messages. Once deploy supplies
+the heading telemetry described above, no input-handler change is needed.
+Enter each key followed by **Enter** in the
+inference keyboard pane:
+
+| Key | Action in manual planner mode |
+|-----|-------------------------------|
+| `m` | Enter manual mode / stop movement and hold PLANNER mode |
+| `w` / `s` | Toggle forward / backward |
+| `a` / `d` | Toggle left / right |
+| `q` / `e` | Toggle turning left / right |
+| `z` | Stop movement |
+
+Sequence: `k → i → wait → p → p → i → wait → m → reposition → m → i → wait → p`.
+Evaluation stays paused in manual mode. Press a movement key once to start;
+press the same key again to stop. A different movement key switches direction;
+`z` stops all movement. **Movement continues until cancelled; there is no jog
+timeout.** Translation commands 0.2 m/s relative to the measured heading when
+selected. Turning continuously keeps a small ±5° target ahead of measured yaw.
+Missing/stale robot feedback cancels movement without replay on recovery.
+
+`m` sends idle before holding paused PLANNER mode. Press `i` and then `p` for
+the next trial. `p` is blocked during
+manual mode; `i` cancels movement and resets standing; `k` stops the controller.
+If `i` cannot reset because feedback is unavailable, the cancelled manual hold
+remains active until reset succeeds or you exit with `m`. The recorder still
+uses `c` to start or save a recording and `x` to discard; these are not movement keys.
+
+Restart the workstation inference client and keyboard publisher to load these
+controls. No H100 server change is required.
 
 ## Manual Setup (Without tmux)
 
@@ -325,6 +398,113 @@ python gear_sonic/scripts/launch_inference.py \
 ```
 
 Make sure port 5550 (or your chosen port) is accessible between the two machines.
+
+## Left-only pnp_trash evaluation with SONIC on PC2
+
+The left-only models each trained on 44 complete episodes for 20,000 steps.
+Run this preset **on the workstation**, from the repository root:
+
+```bash
+# Full-episode prompt; H100 GPU 7, checkpoint-20000
+python gear_sonic/scripts/launch_pnp_trash_left_eval.py full --object "pill bottle"
+
+# Four operator-controlled subtask prompts; H100 GPU 6, checkpoint-20000
+python gear_sonic/scripts/launch_pnp_trash_left_eval.py subtasks --object "pill bottle"
+```
+
+Choose one model at a time. Both use the `sonic_inference` tmux session and the
+same action/keyboard ports. An existing session is preserved and the launcher
+prints its reattach command. Add `--dry-run` to either command to preview the
+configuration without opening tmux, connecting to servers, or publishing actions.
+Supported objects are `apple`, `cup`, `pill bottle`, `pill box`, and `red bottle`.
+
+| Connection | Address |
+|------------|---------|
+| Full-prompt left-only PolicyServer | `192.168.75.173:15552` |
+| Subtask left-only PolicyServer | `192.168.75.173:15553` |
+| PC2 camera | `192.168.0.223:5555` |
+| PC2 SONIC state and robot configuration | `192.168.0.223:5557` |
+| Workstation action publisher, subscribed to by PC2 | `192.168.0.62:5556` |
+| Workstation keyboard publisher | `localhost:5580` |
+
+The preset accepts `--policy-host`, `--robot-host`, and `--action-host` if these
+addresses change. `--action-host` must be an address on the workstation.
+It uses live PC2 camera/state, a 40-frame action horizon, and 50 Hz publication.
+
+The existing PC2 deployment must use `--input-type zmq_manager`,
+`--zmq-host 192.168.0.62`, `--output-type zmq`, and these SONIC v1.1 assets:
+
+```text
+--cp policy/sonic_v1_1/model
+--obs-config policy/sonic_v1_1/observation_config.yaml
+--planner planner/target_vel/V2/planner_sonic.onnx
+```
+
+Keep its deploy console open. The workstation preset leaves that process under
+the operator's control; it does not SSH to PC2 or start another C++ deployment.
+
+| Pane | Content |
+|------|---------|
+| 0, top-left | PC2 deployment notes and an available shell |
+| 1, bottom-left | Keyboard publisher: enter controls and `t <prompt>` |
+| 2, top-right | GR00T inference client, initially paused |
+| 3, bottom-right | Data exporter using PC2 camera/state |
+
+Use the existing startup procedure in [Typical Workflow](#typical-workflow),
+with deployment confirmation in the **PC2 console**. `i` uses the straight
+standing planner preset described above. No `k`, `i`, or `p`
+commands are sent automatically. Keep PC2's controller state consistent with
+the client's initial stopped state before starting a new client.
+
+The full model gets its complete prompt at startup. For the subtask model,
+the initial prompt is `approach brown table`. Enter these lines in pane 1
+as each real subtask completes (replace the object to match `--object`):
+
+```text
+t pick the pill bottle
+t turn left and approach the trash bin
+t put it in to the trash bin
+```
+
+Use task completion to choose prompt transitions on the real robot. The dataset's
+recorded transition timestamps are for recorded-video evaluation.
+
+Recording starts with `c`; press `c` again to finish and save, or `x` to discard. Each
+launch records under a fresh `outputs/pnp_trash_left_eval_<variant>_<object>_<UTC>/`
+directory, labeled with the full task prompt. The recorder does not add the live
+subtask prompt transitions as per-frame labels.
+
+To switch models, pause with `p` if running, stop the controller with `k` if
+running, and confirm the stop in the PC2 console. Then close the workstation
+session with `tmux kill-session -t sonic_inference` and run the other preset.
+Detaching with `Ctrl+b`, then `d`, leaves the session running.
+
+## pnp_table_260908 evaluation
+
+The completed table subtask model uses a separate H100 Docker PolicyServer at
+`192.168.75.173:15554`. From the workstation repository root:
+
+```bash
+python3 gear_sonic/scripts/launch_pnp_table_eval.py
+
+# Full-task checkpoint on H100 GPU 7, Docker server port 15555
+python3 gear_sonic/scripts/launch_pnp_table_eval.py full
+```
+
+Add `--dry-run` to preview the command. This uses the same four-pane PC2 layout
+described above, with the inference client initially paused. For the default
+subtask variant, the initial prompt is `approach the table`; use `t grasp the bottle` and then `t pick up the bottle`
+in the keyboard pane as the real subtasks complete. Recordings use a fresh
+`outputs/pnp_table_260908_subtask_eval_<UTC>/` directory and the full task label
+`approach the table and pick the bottle`.
+
+The `full` variant connects to `192.168.75.173:15555`, keeps the full task prompt
+throughout the episode, and records under `outputs/pnp_table_260908_full_task_eval_<UTC>/`.
+Use one workstation client at a time; both variants share the `sonic_inference`
+tmux session and action/keyboard ports.
+
+See [the table evaluation report](../../pnp_table_260908_evaluation.md) for the
+checkpoint, recorded-data results, Docker commands, and operator instructions.
 
 ## Latency Compensation
 

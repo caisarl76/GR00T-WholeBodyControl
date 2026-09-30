@@ -43,7 +43,7 @@ def test_inference_command_passes_calib_full_initial_pose() -> None:
 
     command = launch_inference._build_inference_command(Path("/repo"), config)
 
-    assert "PYTHONPATH=. python gear_sonic/scripts/run_vla_inference.py" in command
+    assert "PYTHONPATH=. python -m gear_sonic.scripts.run_vla_inference" in command
     assert "--initial-pose calib_full" in command
     assert "--initial-pose-ramp-s 2.0" in command
     assert "--standing-ramp-s 2.0" in command

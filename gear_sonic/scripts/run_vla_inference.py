@@ -14,13 +14,15 @@ running PolicyServer.
 Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   p  -> pause / resume the policy loop
   k  -> start / stop the C++ control loop
-  i  -> prepare CALIB_FULL in PLANNER, or blend to the standing latent pose when selected
+  i  -> prepare the selected initial pose (CALIB_FULL, latent standing, or planner standing)
+  m  -> enter / leave manual planner repositioning (policy stays paused)
+  w/s, a/d -> toggle forward/back, left/right movement in manual mode
+  q/e, z -> turn left/right, stop movement in manual mode
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
   [  -> toggle left hand open/closed for initial pose
   ]  -> toggle right hand open/closed for initial pose
-  c  -> start recording (handled by data exporter if running)
-  s  -> stop recording success (handled by data exporter)
-  f  -> stop recording failure (handled by data exporter)
+  c  -> start / finish recording (legacy data exporter keyboard mode)
+  x  -> discard active recording (legacy data exporter keyboard mode)
 """
 
 from dataclasses import dataclass
@@ -54,6 +56,9 @@ from gear_sonic.utils.inference.initial_pose_ramp import (
     build_standing_ramp_messages,
 )
 from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
+from gear_sonic.utils.inference.manual_planner import ManualPlanner
+from gear_sonic.utils.inference.planner_heading_frame import planner_command_in_reference_frame
+from gear_sonic.utils.inference.standing_reset import StandingReset
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
@@ -63,6 +68,7 @@ from gear_sonic.utils.inference.vla_utils import (
 from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
     G1GripperInverseKinematicsSolver,
 )
+from gear_sonic.utils.teleop.xr_upperbody_bridge import feedback_payload_heading_yaw
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     pack_pose_message,
@@ -92,8 +98,8 @@ class InferenceConfig:
     action_horizon: int = 40
     """Action horizon of the VLA policy (number of future actions per inference)."""
 
-    initial_pose: Literal["calib_full", "standing"] = "calib_full"
-    """Initial pose behavior. calib_full ramps planner mode from standing to teleop CALIB_FULL."""
+    initial_pose: Literal["calib_full", "standing", "planner_standing"] = "calib_full"
+    """Initial pose: CALIB_FULL ramp, latent standing blend, or feedback-paced planner standing."""
 
     initial_pose_ramp_s: float = 2.0
     """Seconds for the standing-to-CALIB_FULL planner ramp before latent pose handoff."""
@@ -344,29 +350,29 @@ def _inference_worker_loop(
     while not stop_event.is_set():
         try:
             try:
-                inference_queue.get(timeout=0.1)
+                epoch = inference_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
             busy_event.set()
             try:
+                inference_start_time = time.monotonic()
                 observation = prepare_obs_fn()
                 if observation is None:
                     print("[DEBUG] Worker thread: Observation is None, skipping", flush=True)
                     continue
 
-                inference_start_time = time.monotonic()
                 processed_action = inference_fn(observation)
 
                 if processed_action is not None:
                     try:
-                        result_queue.put_nowait((processed_action, inference_start_time))
+                        result_queue.put_nowait((processed_action, inference_start_time, epoch))
                     except queue.Full:
                         try:
                             result_queue.get_nowait()
-                            result_queue.put_nowait((processed_action, inference_start_time))
+                            result_queue.put_nowait((processed_action, inference_start_time, epoch))
                         except queue.Empty:
-                            result_queue.put_nowait((processed_action, inference_start_time))
+                            result_queue.put_nowait((processed_action, inference_start_time, epoch))
             finally:
                 busy_event.clear()
         except Exception as e:
@@ -408,6 +414,14 @@ def main(config: InferenceConfig):
         host=config.state_zmq_host,
         port=config.state_zmq_port,
     )
+    # Separate socket: the inference worker owns state_subscriber's reads.
+    reset_state_subscriber = ZMQStateSubscriber(
+        host=config.state_zmq_host, port=config.state_zmq_port
+    )
+    reset_feedback = None
+    reset_feedback_time = float("-inf")
+    standing_reset = None
+    manual_planner = None
 
     camera_subscriber = ComposedCameraClientSensor(
         server_ip=config.camera_host, port=config.camera_port
@@ -456,7 +470,8 @@ def main(config: InferenceConfig):
         return left_hand, right_hand
 
     def _feedback_upper_body(default: np.ndarray) -> np.ndarray:
-        state_msg = state_subscriber.get_msg()
+        # The main loop already consumed this socket's latest message.
+        state_msg = reset_feedback
         if state_msg is None:
             return default
         body_q = state_msg.get("body_q_measured", state_msg.get("body_q"))
@@ -597,6 +612,60 @@ def main(config: InferenceConfig):
         print_green("Initial pose blend complete.")
         return True
 
+    def begin_standing_reset():
+        """Prime measured joints before switching back to the standing planner."""
+        nonlocal standing_reset
+        if reset_feedback is None or time.monotonic() - reset_feedback_time > 0.5:
+            print("Cannot initialize: no fresh robot state. Policy remains paused.")
+            return False
+        if cpp_mode == "POSE" and np.array_equal(reset_feedback.get("planner_reference_active"), [1]):
+            print("Cannot initialize: waiting for POSE feedback. Retry 'i' after the mode switch settles.")
+            return False
+        left_hand = (
+            _compute_closed_hand_joints("L")
+            if initial_pose_left_hand_closed
+            else np.zeros(7, dtype=np.float32)
+        )
+        right_hand = (
+            _compute_closed_hand_joints("R")
+            if initial_pose_right_hand_closed
+            else np.zeros(7, dtype=np.float32)
+        )
+        try:
+            reset = StandingReset(reset_feedback, left_hand, right_hand)
+            message = planner_command_in_reference_frame(reset.command, reset_feedback).encode()
+        except (TypeError, ValueError) as exc:
+            print(f"Cannot initialize: {exc}. Policy remains paused.")
+            return False
+        zmq_socket.send(message)
+        if send_cpp_control_command(start=True, planner=True):
+            standing_reset = reset
+            print_green("Returning to straight standing; policy paused. Press 'p' when ready.")
+            return True
+        return False
+
+    def fresh_heading():
+        if reset_feedback is None or time.monotonic() - reset_feedback_time > 0.5:
+            return None
+        return feedback_payload_heading_yaw(reset_feedback)
+
+    def stop_manual_motion():
+        """Cancel movement before a reset or mode switch, including stale feedback."""
+        heading = fresh_heading()
+        if heading is not None:
+            manual_planner.handle_key("z", heading)
+        command = manual_planner.command(standing_reset.command, None)
+        publish_planner_command(command)
+
+    def publish_planner_command(command):
+        # Reproject every frame: POSE -> PLANNER reanchors the reference.
+        # StandingReset and ManualPlanner retain their desired WORLD heading.
+        try:
+            message = planner_command_in_reference_frame(command, reset_feedback).encode()
+        except ValueError:
+            return
+        zmq_socket.send(message)
+
     def send_cpp_control_command(start: bool, planner: bool = False):
         """Send C++ control loop start/stop commands via ZMQ."""
         nonlocal cpp_loop_running, cpp_mode, last_sent_motion_token
@@ -624,6 +693,7 @@ def main(config: InferenceConfig):
     cached_action_chunk = None
     action_chunk_index = 0
     last_inference_time = 0.0
+    inference_epoch = 0
     inference_interval = 1.0 / config.rate
 
     zmq_frame_counter = 0
@@ -631,12 +701,25 @@ def main(config: InferenceConfig):
 
     PROMPT_MSG_PREFIX = "prompt:"
 
+    def invalidate_policy_actions():
+        nonlocal cached_action_chunk, action_chunk_index, last_inference_time, inference_epoch
+        inference_epoch += 1
+        cached_action_chunk = None
+        action_chunk_index = 0
+        last_inference_time = 0.0
+        for pending in (inference_queue, result_queue):
+            while True:
+                try:
+                    pending.get_nowait()
+                except queue.Empty:
+                    break
+
     def check_keyboard_input():
         nonlocal pause_loop, cpp_loop_running, cpp_mode, initial_pose_ready
         nonlocal pose_start_pending
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
-        nonlocal zmq_frame_counter, last_sent_motion_token
+        nonlocal zmq_frame_counter, last_sent_motion_token, standing_reset, manual_planner
 
         key = keyboard_listener.read_msg()
         if key is None:
@@ -653,11 +736,23 @@ def main(config: InferenceConfig):
             return
 
         if key == "c":
-            print("Keyboard: 'c' (start recording -- handled by data exporter)")
-        elif key == "s":
-            print("Keyboard: 's' (stop recording success -- handled by data exporter)")
-        elif key == "f":
-            print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
+            print("Keyboard: 'c' (recording toggle -- handled by data exporter)")
+        elif key == "x":
+            print("Keyboard: 'x' (discard recording -- handled by data exporter)")
+        elif key == "i" and config.initial_pose == "planner_standing":
+            pause_loop = True
+            initial_pose_ready = False
+            pose_start_pending = False
+            invalidate_policy_actions()
+            if manual_planner is not None:
+                stop_manual_motion()
+            zmq_frame_counter = 0
+            if cpp_loop_running:
+                if begin_standing_reset():
+                    manual_planner = None
+                    initial_pose_ready = True
+            else:
+                print("C++ control loop is not running; press 'k' first.")
         elif key == "i" and config.initial_pose == "standing":
             if not cpp_loop_running:
                 print("C++ control loop is not running; press 'k' first.")
@@ -665,9 +760,11 @@ def main(config: InferenceConfig):
             pause_loop = True
             initial_pose_ready = False
             pose_start_pending = False
-            cached_action_chunk = None
-            action_chunk_index = 0
-            last_inference_time = 0.0
+            invalidate_policy_actions()
+            if manual_planner is not None:
+                stop_manual_motion()
+            manual_planner = None
+            standing_reset = None
             zmq_frame_counter = 0
             if (
                 cpp_mode == "POSE"
@@ -681,6 +778,10 @@ def main(config: InferenceConfig):
                 initial_pose_ready = True
                 print("Standing initial pose ready in POSE mode; press 'p' to start inference")
         elif key == "i":
+            if manual_planner is not None:
+                stop_manual_motion()
+            manual_planner = None
+            standing_reset = None
             transition = plan_i_transition(
                 InferenceControlState(
                     pause_loop=pause_loop,
@@ -695,9 +796,7 @@ def main(config: InferenceConfig):
                 zmq_frame_counter = 0
                 print("Reset ZMQ frame counter")
             if transition.clear_action_cache:
-                cached_action_chunk = None
-                action_chunk_index = 0
-                last_inference_time = 0.0
+                invalidate_policy_actions()
                 print("Cleared cached action chunk")
             if transition.start_planner:
                 print("Starting/switching C++ control loop in PLANNER mode for CALIB_FULL ramp...")
@@ -712,16 +811,58 @@ def main(config: InferenceConfig):
             cpp_mode = transition.next_state.cpp_mode
             initial_pose_ready = transition.next_state.initial_pose_ready
             print("Holding CALIB_FULL in PLANNER mode; press 'p' to start inference")
+        elif key == "m":
+            pause_loop = True
+            invalidate_policy_actions()
+            pose_start_pending = False
+            initial_pose_ready = False
+            if not cpp_loop_running:
+                print("C++ loop not running - press 'k' to start")
+                return
+            if manual_planner is not None:
+                stop_manual_motion()
+                if begin_standing_reset():
+                    manual_planner = None
+                    print_green("Manual movement stopped; holding PLANNER. Use 'i' then 'p' for the next trial.")
+            elif begin_standing_reset():
+                facing = standing_reset.command.facing
+                manual_planner = ManualPlanner(float(np.arctan2(facing[1], facing[0])))
+                print_green(
+                    "Manual planner: w/s forward/back, a/d left/right, q/e turn, "
+                    "same key stops, z stops all; m exits. Enter after each key."
+                )
+        elif key in {"w", "s", "a", "d", "q", "e", "z"}:
+            if manual_planner is None:
+                print("Movement ignored - press 'm' to enter manual planner mode")
+                return
+            heading = fresh_heading()
+            if heading is None:
+                print("Movement ignored - no fresh robot heading")
+                return
+            manual_planner.handle_key(key, heading)
+            active = manual_planner.active_key
+            print_green(f"Manual movement: {active or 'STOPPED'} (same key or z stops)")
         elif key == "p":
+            if manual_planner is not None:
+                print("Policy stays paused during manual repositioning - press 'm' to exit first")
+                return
+            if config.initial_pose == "planner_standing":
+                if not cpp_loop_running or not initial_pose_ready:
+                    print("Planner standing pose is not ready; press 'k' then 'i' first.")
+                    return
+                invalidate_policy_actions()
+                pause_loop = not pause_loop
+                pose_start_pending = not pause_loop and cpp_mode != "POSE"
+                print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
+                return
+
             if config.initial_pose == "standing":
                 if not cpp_loop_running or not initial_pose_ready:
                     print("Standing initial pose is not ready; press 'k' then 'i' first.")
                     return
                 pause_loop = not pause_loop
                 pose_start_pending = False
-                cached_action_chunk = None
-                action_chunk_index = 0
-                last_inference_time = 0.0
+                invalidate_policy_actions()
                 print(f"{'Paused' if pause_loop else 'Resumed'} policy loop in POSE mode")
                 return
             transition = plan_p_transition(
@@ -737,9 +878,7 @@ def main(config: InferenceConfig):
                 return
             if not transition.next_state.pause_loop:
                 if transition.clear_action_cache:
-                    cached_action_chunk = None
-                    action_chunk_index = 0
-                    last_inference_time = 0.0
+                    invalidate_policy_actions()
                     print("Cleared cached action chunk")
                 if transition.publish_latent_initial:
                     publish_latent_initial_pose()
@@ -758,9 +897,7 @@ def main(config: InferenceConfig):
 
             pause_loop = True
             pose_start_pending = False
-            cached_action_chunk = None
-            action_chunk_index = 0
-            last_inference_time = 0.0
+            invalidate_policy_actions()
             print("Policy loop paused; returning to CALIB_FULL pose")
             if transition.start_planner:
                 send_cpp_control_command(start=True, planner=True)
@@ -771,6 +908,11 @@ def main(config: InferenceConfig):
             initial_pose_ready = transition.next_state.initial_pose_ready
             print("Paused at CALIB_FULL (press 'p' to resume, 'k' to stand and stop)")
         elif key == "k":
+            invalidate_policy_actions()
+            if manual_planner is not None:
+                stop_manual_motion()
+            manual_planner = None
+            standing_reset = None
             transition = plan_k_transition(
                 InferenceControlState(
                     pause_loop=pause_loop,
@@ -788,21 +930,20 @@ def main(config: InferenceConfig):
                     cpp_mode = transition.next_state.cpp_mode
                     initial_pose_ready = transition.next_state.initial_pose_ready
                     print("Started C++ control loop in PLANNER mode")
-                    print("Press 'i' to ramp to CALIB_FULL and arm inference")
+                    print(f"Press 'i' to prepare {config.initial_pose} and arm inference")
                 return
 
             pause_loop = True
             pose_start_pending = False
-            cached_action_chunk = None
-            action_chunk_index = 0
-            last_inference_time = 0.0
             print(f"Stopping C++ control loop from {cpp_mode} mode via standing ramp...")
-            if transition.start_planner:
-                send_cpp_control_command(start=True, planner=True)
+            if transition.start_planner and not send_cpp_control_command(start=True, planner=True):
+                print("Cannot stop: PLANNER switch failed; controller state is unchanged.")
+                return
             if transition.publish_standing:
                 publish_standing_pose()
-            if transition.stop_control:
-                send_cpp_control_command(start=False, planner=True)
+            if transition.stop_control and not send_cpp_control_command(start=False, planner=True):
+                print("Cannot confirm stop: controller remains in its last known mode.")
+                return
             cpp_loop_running = transition.next_state.cpp_loop_running
             cpp_mode = transition.next_state.cpp_mode
             initial_pose_ready = transition.next_state.initial_pose_ready
@@ -853,13 +994,46 @@ def main(config: InferenceConfig):
     inference_worker_thread.start()
 
     try:
+        last_reset_tick = time.monotonic()
         while True:
             t_start = time.monotonic()
+            feedback = reset_state_subscriber.get_msg()
+            if feedback is not None:
+                reset_feedback = feedback
+                reset_feedback_time = t_start
             check_keyboard_input()
+
+            if standing_reset is not None and cpp_loop_running and cpp_mode == "PLANNER":
+                fresh_feedback = reset_feedback if t_start - reset_feedback_time <= 0.5 else None
+                command = standing_reset.advance(fresh_feedback, t_start - last_reset_tick)
+                if manual_planner is not None:
+                    command = manual_planner.command(command, fresh_heading())
+                publish_planner_command(command)
+            last_reset_tick = t_start
+
+            if pause_loop:
+                if (
+                    config.initial_pose == "calib_full"
+                    and cpp_loop_running
+                    and cpp_mode == "PLANNER"
+                    and initial_pose_ready
+                    and standing_reset is None
+                    and manual_planner is None
+                ):
+                    now = time.monotonic()
+                    if now - last_calib_full_hold_time >= 0.2:
+                        publish_calib_full_hold_pose()
+                        last_calib_full_hold_time = now
+                _sleep_remaining(t_start, loop_period)
+                continue
 
             # Consume result first so last_inference_time is fresh before trigger check
             try:
-                processed_action, inference_start_time = result_queue.get_nowait()
+                processed_action, inference_start_time, result_epoch = result_queue.get_nowait()
+                if result_epoch != inference_epoch:
+                    # A request already in flight during pause/reset cannot be reused.
+                    _sleep_remaining(t_start, loop_period)
+                    continue
                 inference_delay = time.monotonic() - inference_start_time
                 action_chunk_index = calculate_latency_compensated_index(
                     inference_delay, config.action_publish_rate, config.action_horizon
@@ -883,25 +1057,9 @@ def main(config: InferenceConfig):
 
             if should_start:
                 try:
-                    inference_queue.put_nowait(None)
+                    inference_queue.put_nowait(inference_epoch)
                 except queue.Full:
                     pass
-
-            if pause_loop:
-                if (
-                    config.initial_pose == "calib_full"
-                    and cpp_loop_running
-                    and cpp_mode == "PLANNER"
-                    and initial_pose_ready
-                ):
-                    now = time.monotonic()
-                    if now - last_calib_full_hold_time >= 0.2:
-                        publish_calib_full_hold_pose()
-                        last_calib_full_hold_time = now
-                print("Pausing...", end="", flush=True)
-                time.sleep(0.2)
-                print(".", end="", flush=True)
-                continue
 
             with telemetry.timer("total_loop"):
                 if cached_action_chunk is None:
@@ -993,6 +1151,7 @@ def main(config: InferenceConfig):
         zmq_socket.close()
         zmq_context.term()
         state_subscriber.close()
+        reset_state_subscriber.close()
         keyboard_listener.close()
         print("Shutdown complete.")
 

@@ -509,6 +509,82 @@ python gear_sonic/scripts/process_dataset.py \
 ```
 
 To keep discarded episodes (e.g., for inspection), pass `--no-remove-discarded`.
+### Apply XLSX validity and language annotations
+
+For the PnP trash recordings, create two independent LeRobot v2.1 datasets
+from `pnp_trash.xlsx`:
+
+```bash
+python gear_sonic/scripts/annotate_pnp_trash_dataset.py \
+  --dataset-path outputs/pnp_trash \
+  --annotations-path outputs/pnp_trash/pnp_trash.xlsx \
+  --subtasks-output-path outputs/pnp_trash_subtasks \
+  --full-prompt-output-path outputs/pnp_trash_full_prompt
+```
+
+The source is never modified, and either final output already existing is a
+hard error. Both outputs retain only rows whose `Valid` value is `1`:
+
+- `pnp_trash_subtasks` uses `[0,time1)`, `[time1,time2)`, `[time2,time3)`,
+  and `[time3,end]` for the four spreadsheet subtask prompts.
+- `pnp_trash_full_prompt` assigns the spreadsheet `Full Prompt` to every frame
+  of its episode.
+
+For the current workbook, each output contains 72 episodes, 154,625 frames,
+72 ego videos, and 9 unique prompt strings. Re-run all structural checks
+without changing either dataset with:
+
+```bash
+python gear_sonic/scripts/annotate_pnp_trash_dataset.py \
+  --dataset-path outputs/pnp_trash \
+  --annotations-path outputs/pnp_trash/pnp_trash.xlsx \
+  --subtasks-output-path outputs/pnp_trash_subtasks \
+  --full-prompt-output-path outputs/pnp_trash_full_prompt \
+  --validate-only
+```
+
+### Publish the left-only PnP trash release
+
+The left-only release is a separately published, filtered pair. Before
+generation, all three final targets—the two output directories and the release
+marker—must be absent. Generate it with:
+
+```bash
+python gear_sonic/scripts/annotate_pnp_trash_dataset.py \
+  --dataset-path outputs/pnp_trash \
+  --annotations-path outputs/pnp_trash/pnp_trash.xlsx \
+  --direction-filter left \
+  --expected-left-episodes 44 \
+  --expected-right-episodes 28 \
+  --subtasks-output-path outputs/pnp_trash_subtasks_left_only \
+  --full-prompt-output-path outputs/pnp_trash_full_prompt_left_only \
+  --release-marker-path outputs/pnp_trash_left_only.release.json
+```
+
+Validate the already-published release without modifying it:
+
+```bash
+python gear_sonic/scripts/annotate_pnp_trash_dataset.py \
+  --dataset-path outputs/pnp_trash \
+  --annotations-path outputs/pnp_trash/pnp_trash.xlsx \
+  --direction-filter left \
+  --expected-left-episodes 44 \
+  --expected-right-episodes 28 \
+  --subtasks-output-path outputs/pnp_trash_subtasks_left_only \
+  --full-prompt-output-path outputs/pnp_trash_full_prompt_left_only \
+  --release-marker-path outputs/pnp_trash_left_only.release.json \
+  --validate-only
+```
+
+The pair is consumable only when its release marker is present and accepted as
+`complete`. Publication requires Linux filesystem support for
+`renameat2(RENAME_NOREPLACE)`, same-filesystem hard links, and directory
+`fsync`. Unmarked incomplete outputs are preserved for explicit operator
+recovery; they must not be auto-deleted or retried. There is no recovery
+command yet. Validate-only canonicalizes output and marker paths, rejects
+symlink components, and requires the source dataset and workbook to remain
+stable throughout validation. Namespace components must remain non-mutating
+throughout the command.
 
 ### Remove Stale SMPL Frames
 

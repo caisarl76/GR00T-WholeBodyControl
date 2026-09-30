@@ -26,6 +26,12 @@ def make(config, keyboard_listener, zmq_socket):
     cached_action_chunk = None
     action_chunk_index = 0
     last_inference_time = 0.0
+    inference_epoch = 0
+    inference_queue = queue.Queue(maxsize=1)
+    result_queue = queue.Queue(maxsize=1)
+    language_prompt_ref = [config.prompt]
+    standing_reset = None
+    manual_planner = None
     zmq_frame_counter = 0
     last_sent_motion_token = INITIAL_TOKEN
     PROMPT_MSG_PREFIX = "prompt:"
@@ -37,6 +43,7 @@ def make(config, keyboard_listener, zmq_socket):
         "publish_latent_initial_pose",
         "blend_to_initial_pose",
         "send_cpp_control_command",
+        "invalidate_policy_actions",
         "check_keyboard_input",
     }
     factory.body.extend(
@@ -49,8 +56,9 @@ def make(config, keyboard_listener, zmq_socket):
             """
 def snapshot():
     return dict(paused=pause_loop, mode=cpp_mode, ready=initial_pose_ready,
-                pending=pose_start_pending, token=last_sent_motion_token)
-return check_keyboard_input, send_cpp_control_command, snapshot
+                pending=pose_start_pending, token=last_sent_motion_token,
+                epoch=inference_epoch)
+return check_keyboard_input, send_cpp_control_command, snapshot, inference_queue, result_queue
 """
         ).body
     )
@@ -70,7 +78,7 @@ return check_keyboard_input, send_cpp_control_command, snapshot
     exec(compile(module, runner.__file__, "exec"), namespace)
     keyboard, socket = Mock(), Mock()
     config = runner.InferenceConfig(initial_pose=initial_pose, action_publish_rate=2)
-    handle, command, snapshot = namespace["make"](config, keyboard, socket)
+    handle, command, snapshot, requests, results = namespace["make"](config, keyboard, socket)
 
     def press(key):
         keyboard.read_msg.return_value = key
@@ -79,6 +87,7 @@ return check_keyboard_input, send_cpp_control_command, snapshot
     return SimpleNamespace(
         press=press, command=command, snapshot=snapshot, socket=socket,
         calib=calib, standing=standing,
+        requests=requests, results=results,
     )
 
 
@@ -91,6 +100,7 @@ def _tokens(control):
 
 
 def test_default_calib_full_prepares_planner_and_defers_pose_until_action():
+    assert runner.InferenceConfig().initial_pose == "calib_full"
     control = _control_harness(initial_pose="calib_full", mode="OFF")
     control.press("i")
     control.calib.assert_called_once_with(send_latent_handoff=False)
@@ -99,6 +109,7 @@ def test_default_calib_full_prepares_planner_and_defers_pose_until_action():
     control.press("p")
     assert not control.snapshot()["paused"]
     assert control.snapshot()["pending"]
+    assert control.snapshot()["mode"] == "PLANNER"
     assert not _tokens(control)
 
 
@@ -156,15 +167,28 @@ def test_standing_pause_resume_keeps_pose_and_stop_uses_standing_ramp():
     control.socket.reset_mock()
     control.press("p")
     assert not control.snapshot()["paused"]
+    resume_epoch = control.snapshot()["epoch"]
+    control.requests.put_nowait(resume_epoch)
+    control.results.put_nowait(({"stale": True}, 0.0, resume_epoch))
     control.press("p")
     assert control.snapshot()["paused"]
+    assert control.snapshot()["epoch"] == resume_epoch + 1
+    assert control.requests.empty()
+    assert control.results.empty()
     assert control.snapshot()["mode"] == "POSE"
     control.socket.send.assert_not_called()
     control.calib.assert_not_called()
+    control.requests.put_nowait(resume_epoch)
+    control.results.put_nowait(({"stale": True}, 0.0, resume_epoch))
     control.press("k")
     control.standing.assert_called_once_with()
     assert control.snapshot()["mode"] == "OFF"
     assert not control.snapshot()["ready"]
+    assert not control.snapshot()["pending"]
+    assert control.snapshot()["token"] is None
+    assert control.snapshot()["epoch"] == resume_epoch + 2
+    assert control.requests.empty()
+    assert control.results.empty()
 
 
 def test_standing_cannot_initialize_or_resume_before_control_starts():
@@ -174,3 +198,31 @@ def test_standing_cannot_initialize_or_resume_before_control_starts():
     control.socket.send.assert_not_called()
     assert control.snapshot()["paused"]
     assert not control.snapshot()["ready"]
+
+
+def test_failed_planner_switch_does_not_ramp_or_report_control_stopped():
+    control = _control_harness(initial_pose="standing", mode="POSE")
+
+    def fail_command(message):
+        if message["kind"] == "command":
+            raise RuntimeError("command transport failed")
+
+    control.socket.send.side_effect = fail_command
+    control.press("k")
+
+    assert control.snapshot()["mode"] == "POSE"
+    control.standing.assert_not_called()
+
+
+def test_failed_stop_command_keeps_planner_control_state():
+    control = _control_harness(initial_pose="standing", mode="PLANNER")
+
+    def fail_command(message):
+        if message["kind"] == "command" and message["stop"]:
+            raise RuntimeError("stop transport failed")
+
+    control.socket.send.side_effect = fail_command
+    control.press("k")
+
+    control.standing.assert_called_once_with()
+    assert control.snapshot()["mode"] == "PLANNER"
