@@ -112,6 +112,7 @@ def main():
     )
     camera_stamp = 0.0
     previous_phase, old_epoch, rejected = None, None, False
+    takeover_at = None
     try:
         while True:
             now = time.monotonic()
@@ -131,6 +132,14 @@ def main():
             )
             control.tick(now, feedback, now)
             server.drain(control, now)
+            if args.scenario == "operator_pause" and control.phase == "MANIPULATING":
+                takeover_at = now + .2 if takeover_at is None else takeover_at
+                if now >= takeover_at:
+                    old_epoch = control.epoch
+                    control.operator_override("p")
+                    sink.record("operator_override")
+                    assert not control.accept_policy_result(old_epoch, now, action, now)
+                    sink.record("late_result_rejected")
             if control.phase == "MANIPULATING":
                 old_epoch = control.epoch
                 if control.accept_policy_result(control.epoch, now, action, now):
