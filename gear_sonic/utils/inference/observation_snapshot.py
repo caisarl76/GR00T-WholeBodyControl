@@ -95,9 +95,10 @@ class ObservationSnapshotCache:
     def latest(self, now):
         with self._lock:
             snapshot = self._snapshot
-        if snapshot is None or not 0 <= now - snapshot["received_at"] <= self.max_age_s:
+        # A concurrent local capture can follow the caller's sampled clock.
+        if snapshot is None or max(0.0, now - snapshot["received_at"]) > self.max_age_s:
             return None
-        return {**snapshot, "age_s": now - snapshot["received_at"]}
+        return {**snapshot, "age_s": max(0.0, now - snapshot["received_at"])}
 
     def start(self):
         if self._thread is not None:
@@ -108,7 +109,7 @@ class ObservationSnapshotCache:
     def latest_camera(self, now):
         with self._lock:
             camera = self._camera
-        if camera is None or not 0 <= now - camera[1] <= self.max_age_s:
+        if camera is None or max(0.0, now - camera[1]) > self.max_age_s:
             return None
         message, received_at = camera
         return {

@@ -80,7 +80,7 @@ class HarnessControl:
         return (
             self.feedback is not None
             and self.feedback_time is not None
-            and 0 <= now - self.feedback_time <= self.profile.limits.feedback_max_age_s
+            and max(0., now - self.feedback_time) <= self.profile.limits.feedback_max_age_s
         )
 
     def _planner_active(self):

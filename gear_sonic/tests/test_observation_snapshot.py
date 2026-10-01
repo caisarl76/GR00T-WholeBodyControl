@@ -96,3 +96,12 @@ def test_raw_frame_and_timestamp_stay_paired_across_camera_updates():
     assert np.all(old_message["images"]["ego_view"] == 11)
     message["images"]["ego_view"][:] = 99
     assert np.all(c.latest_camera(1.03)[0]["images"]["ego_view"] == 22)
+
+
+def test_cache_update_after_caller_clock_sample_remains_fresh():
+    c = cache()
+    sampled_at = 1.0
+    c.ingest(frame(101.0), 1.007)  # Concurrent update after caller sampled now.
+    assert c.latest(sampled_at)["age_s"] == 0.0
+    assert c.latest_camera(sampled_at)[1] == 1.007
+    assert c.latest(1.508) is None
