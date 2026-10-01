@@ -69,3 +69,11 @@ def test_camera_owned_by_one_worker_thread():
     assert {name for name, _ in calls} == {"create", "read", "close"}
     assert len({tid for _, tid in calls}) == 1
     assert calls[0][1] != threading.get_ident()
+
+
+def test_worker_uses_continuous_camera_capture_time():
+    c = cache()
+    c.ingest(frame(100.0), 0.0)
+    c.ingest(frame(101.0), 0.1)  # Arrives while inference is busy.
+    assert c.capture_time(frame(101.0), 0.2) == 0.1
+    assert c.capture_time(frame(101.0), 0.75) is None  # Cannot rebase frozen frame.

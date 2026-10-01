@@ -169,6 +169,8 @@ def validate_skill_call(
         if call.params:
             raise ValueError("Manipulation takes no free-form arguments")
     elif call.skill_id == "reset_standing":
+        if call.params.keys() != {"open_hands"}:
+            raise ValueError("Standing reset requires only open_hands")
         validate_params("reset_standing", {"execution_id": "", **call.params})
     elif locomotion_enabled and call.skill_id in {"walk_for", "turn_by"}:
         validate_params(call.skill_id, call.params)

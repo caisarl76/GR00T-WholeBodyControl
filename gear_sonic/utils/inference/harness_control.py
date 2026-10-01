@@ -108,13 +108,12 @@ class HarnessControl:
         self._hold(now)
 
     def operator_override(self, reason: str):
-        if self.owner is None and self.execution is None:
+        if self.owner is None and self.execution is None and self.phase == "IDLE":
             return
         if self.owner is not None:
             self.interrupt(f"operator_override:{reason}", time.monotonic())
         else:
             self.epoch = self.hooks.invalidate_policy_actions()
-            self.hooks.set_policy_enabled(False)
         self.owner = None
         self.reset, self.planner = None, None
         self.hold_confirmed = False
@@ -314,8 +313,10 @@ class HarnessControl:
                 self.feedback, self.feedback_index, self.feedback_time = feedback, index, feedback_received_at
                 advanced = True
             elif type(index) is int and self.feedback_index is not None and index < self.feedback_index:
+                self.feedback, self.feedback_time, self.feedback_index = None, None, index
                 self.interrupt("telemetry_stream_restarted", now)
                 self.owner = None
+                self.hold_started = None
         if self.owner and now >= self.owner["expires_at"]:
             self.interrupt("lease_expired", now)
             self.owner = None
@@ -325,7 +326,7 @@ class HarnessControl:
             self.hold_confirmed, self.dwell = False, None
             return
         if not self._planner_active():
-            self.hold_confirmed = False
+            self.hold_confirmed, self.dwell = False, None
         if (
             self.hold_started is not None
             and advanced
@@ -338,8 +339,9 @@ class HarnessControl:
             and not self.hold_confirmed
             and now - self.hold_started > self.profile.limits.planner_deadline_s
         ):
-            self.phase, self.reason = "FAULT", "planner_activation_timeout"
-            self.dwell = None
+            self.interrupt("planner_activation_timeout", now)
+            self.phase = "FAULT"
+            return
         lim = self.profile.limits
         if self.phase == "MANIPULATING":
             since = self.last_policy_result if self.last_policy_result is not None else self.transition_started

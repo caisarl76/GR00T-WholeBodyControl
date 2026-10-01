@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from gear_sonic.scripts import run_vla_inference as runner
 from gear_sonic.utils.teleop.xr_upperbody_bridge import unpack_bridge_message
@@ -62,7 +63,8 @@ def test_stale_camera_blocks_policy_request():
     assert freshness.capture(camera, 0.51) is None
 
 
-def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch):
+@pytest.mark.parametrize("scenario", ["reset", "operator_pause", "policy_failure"])
+def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch, scenario):
     from pathlib import Path
 
     from gear_sonic.utils.inference import harness_rpc, observation_snapshot
@@ -108,6 +110,8 @@ def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch):
             self.control = control
             control.observation = Snapshots().latest(now)
             self.count += 1
+            if scenario != "reset" and self.count >= 5:
+                return
             method, params = None, {}
             if self.count == 2:
                 method, params = "claim_control", {"registry_sha256": control.profile.registry_sha256}
@@ -158,10 +162,12 @@ def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch):
             args[1].put((action, clock[0], epoch))
         if index == 6:
             args[1].put(({"malformed_old": True}, clock[0], 0))
+        if scenario == "policy_failure" and index == 4:
+            args[1].put((None, clock[0], instances[0].control.epoch))
 
     messages = run_keys(
         monkeypatch,
-        ["k"] + [None] * 8,
+        ["k", None, None, None, "p" if scenario == "operator_pause" else None] + [None] * 4,
         measured,
         on_key,
         runner.InferenceConfig(harness_endpoint="ipc:///tmp/unused-test.sock", harness_profile=str(profile)),
@@ -169,7 +175,9 @@ def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch):
     assert all(r["error"] is None for r in instances[0].responses)
     poses = [unpack_bridge_message(raw, topic="pose") for raw in messages if raw.startswith(b"pose")]
     assert len(poses) == 1  # Prewarm and late result never publish.
-    assert instances[0].control.phase == "RESETTING"
+    assert instances[0].control.phase == ("RESETTING" if scenario == "reset" else "INTERRUPTED")
+    if scenario != "reset":
+        assert not instances[0].control.hooks.runtime_facts().policy_enabled
     np.testing.assert_allclose(poses[0]["token_state"], 0.1)
 
 

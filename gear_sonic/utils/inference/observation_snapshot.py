@@ -92,6 +92,16 @@ class ObservationSnapshotCache:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    def capture_time(self, message, now):
+        snapshot = self.latest(now)
+        try:
+            stamp = float(message["timestamps"][self.camera_key])
+            if snapshot is None or snapshot["source_timestamp"] != stamp:
+                return None
+        except (TypeError, KeyError, ValueError):
+            return None
+        return snapshot["received_at"]
+
     def _run(self):
         camera = None
         try:

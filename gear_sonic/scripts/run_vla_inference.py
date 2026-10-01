@@ -320,6 +320,7 @@ def _inference_worker_loop(
     prepare_obs_fn,
     inference_fn,
     close_fn=None,
+    report_failures=False,
 ):
     """Persistent worker thread for async inference."""
     while not stop_event.is_set():
@@ -334,6 +335,8 @@ def _inference_worker_loop(
                 inference_start_time = time.monotonic()
                 observation = prepare_obs_fn()
                 if observation is None:
+                    if report_failures:
+                        raise ValueError("Policy observation unavailable")
                     print("[DEBUG] Worker thread: Observation is None, skipping", flush=True)
                     continue
 
@@ -342,7 +345,7 @@ def _inference_worker_loop(
 
                 processed_action = inference_fn(observation)
 
-                if processed_action is not None:
+                if processed_action is not None or report_failures:
                     try:
                         result_queue.put_nowait((processed_action, inference_start_time, epoch))
                     except queue.Full:
@@ -351,6 +354,15 @@ def _inference_worker_loop(
                             result_queue.put_nowait((processed_action, inference_start_time, epoch))
                         except queue.Empty:
                             result_queue.put_nowait((processed_action, inference_start_time, epoch))
+            except Exception:
+                if report_failures:
+                    try:
+                        result_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    result_queue.put_nowait((None, inference_start_time, epoch))
+                else:
+                    raise
             finally:
                 busy_event.clear()
         except Exception as e:
@@ -393,7 +405,7 @@ def main(config: InferenceConfig):
         from gear_sonic.utils.inference.harness_control import HarnessControl, RuntimeFacts, validate_native_action
         from gear_sonic.utils.inference.harness_profile import load_profile
         from gear_sonic.utils.inference.harness_rpc import HarnessRPCServer
-        from gear_sonic.utils.inference.observation_snapshot import ObservationSnapshotCache, SensorFreshness
+        from gear_sonic.utils.inference.observation_snapshot import ObservationSnapshotCache
 
         profile = load_profile(Path(config.harness_profile))
         config.host, config.port = profile.policy_host, profile.policy_port
@@ -573,7 +585,11 @@ def main(config: InferenceConfig):
             or key in {"i", "m", "p", "k", "[", "]"}
             or (manual_planner is not None and key in {"w", "s", "a", "d", "q", "e", "z"})
         ):
+            was_owned = harness_control.owner is not None
             harness_control.operator_override(key)
+            if key == "p" and was_owned:
+                print("Agent ownership revoked; policy remains paused.")
+                return
 
         if key.startswith(PROMPT_MSG_PREFIX):
             new_prompt = key[len(PROMPT_MSG_PREFIX) :]
@@ -690,8 +706,6 @@ def main(config: InferenceConfig):
     inference_busy_event = threading.Event()
 
     worker_sensors = {}
-    if harness_enabled:
-        freshness = SensorFreshness(profile.limits.camera_max_age_s)
 
     def prepare_worker_observation():
         if not harness_enabled:
@@ -709,8 +723,8 @@ def main(config: InferenceConfig):
         camera_msg = worker_sensors["camera"].read()
         state_msg = worker_sensors["state"].get_msg()
         now = time.monotonic()
-        captured = freshness.capture(camera_msg, now)
-        if captured is None or state_msg is None:
+        captured = snapshots.capture_time(camera_msg, now)
+        if captured is None or state_msg is None or not harness_control._fresh(now):
             return None
         observation = prepare_observation_from_sensors(
             SimpleNamespace(read=lambda: camera_msg),
@@ -842,6 +856,7 @@ def main(config: InferenceConfig):
             ),
             close_worker_sensors,
         ),
+        kwargs={"report_failures": harness_enabled},
         daemon=True,
     )
     inference_worker_thread.start()
@@ -889,8 +904,8 @@ def main(config: InferenceConfig):
                 fresh_feedback = reset_feedback if t_start - reset_feedback_time <= 0.5 else None
                 if (
                     harness_control is not None
-                    and harness_control.phase == "RESETTING"
-                    and not harness_control.hold_confirmed
+                    and harness_control.owner is not None
+                    and (harness_control.phase != "RESETTING" or not harness_control.hold_confirmed)
                 ):
                     fresh_feedback = None
                 command = standing_reset.advance(fresh_feedback, t_start - last_reset_tick)
@@ -921,6 +936,16 @@ def main(config: InferenceConfig):
                 ):
                     _sleep_remaining(t_start, loop_period)
                     continue
+                if harness_enabled and (
+                    processed_action is None
+                    or not validate_native_action(processed_action)
+                    or not 0
+                    <= time.monotonic() - inference_start_time
+                    < config.action_horizon / config.action_publish_rate
+                ):
+                    harness_control.interrupt("invalid_or_failed_policy_result", time.monotonic())
+                    _sleep_remaining(t_start, loop_period)
+                    continue
                 inference_delay = time.monotonic() - inference_start_time
                 action_chunk_index = calculate_latency_compensated_index(
                     inference_delay, config.action_publish_rate, config.action_horizon
@@ -943,6 +968,15 @@ def main(config: InferenceConfig):
             )
 
             if should_start:
+                if harness_enabled and (
+                    not harness_control._fresh(time.monotonic())
+                    or harness_control.observation is None
+                    or time.monotonic() - harness_control.observation["received_at"]
+                    > profile.limits.camera_max_age_s
+                ):
+                    harness_control.interrupt("stale_policy_observation", time.monotonic())
+                    _sleep_remaining(t_start, loop_period)
+                    continue
                 try:
                     inference_queue.put_nowait(inference_epoch)
                 except queue.Full:
