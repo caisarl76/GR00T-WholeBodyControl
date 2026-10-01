@@ -1,0 +1,132 @@
+{
+  "valid_requests": [
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "get_status",
+      "params": {}
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "observe",
+      "params": {}
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "claim_control",
+      "params": {
+        "registry_sha256": "abc"
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "start_manipulation",
+      "params": {
+        "skill_id": "bottle_to_right_table"
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "pause_manipulation",
+      "params": {
+        "execution_id": "execution-1"
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "reset_standing",
+      "params": {
+        "execution_id": "execution-1",
+        "open_hands": true
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "heartbeat",
+      "params": {}
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "cancel",
+      "params": {
+        "execution_id": "execution-1"
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "release_control",
+      "params": {}
+    }
+  ],
+  "invalid_requests": [
+    {
+      "version": 2,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "get_status",
+      "params": {}
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "start_manipulation",
+      "params": {
+        "skill_id": "bottle_to_right_table",
+        "prompt": "invented"
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "walk_for",
+      "params": {
+        "direction": "forward",
+        "duration_s": 5.01,
+        "speed_mps": 0.2
+      }
+    }
+  ]
+}
