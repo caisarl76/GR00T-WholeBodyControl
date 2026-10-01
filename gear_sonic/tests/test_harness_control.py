@@ -1,0 +1,144 @@
+import importlib
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+PROFILE = Path(__file__).parent / 'fixtures/g1_profile.yaml'
+
+
+def state(index=1, planner=1):
+    return dict(index=index, body_q=[0.] * 29, left_hand_q=[.3] * 7, right_hand_q=[.4] * 7,
+                base_quat=[1, 0, 0, 0], reference_heading_quat=[1, 0, 0, 0], planner_reference_active=[planner])
+
+
+class Hooks:
+    def __init__(self):
+        self.epoch = 0
+        self.enabled = False
+        self.holds = []
+        self.prompt = None
+
+    def runtime_facts(self):
+        return SimpleNamespace(controller_running=True, policy_enabled=self.enabled, policy_ready=True,
+                               inference_busy=False, mode_requested='PLANNER' if not self.enabled else 'POSE', operator_busy=False)
+
+    def invalidate_policy_actions(self):
+        self.epoch += 1
+        return self.epoch
+
+    def set_policy_prompt(self, prompt):
+        self.prompt = prompt
+
+    def set_policy_enabled(self, enabled):
+        self.enabled = enabled
+
+    def request_planner_hold(self, feedback, open_hands):
+        self.holds.append((feedback, open_hands))
+
+    def begin_standing_reset(self, feedback, open_hands):
+        from gear_sonic.utils.inference.standing_reset import StandingReset
+        return StandingReset(feedback, np.zeros(7) if open_hands else feedback['left_hand_q'],
+                             np.zeros(7) if open_hands else feedback['right_hand_q'])
+
+    def set_planner_command(self, command):
+        self.command = command
+
+
+def make():
+    assert importlib.util.find_spec('gear_sonic.utils.inference.harness_control'), 'Native harness control missing'
+    cls = importlib.import_module('gear_sonic.utils.inference.harness_control').HarnessControl
+    h = Hooks()
+    c = cls(PROFILE, h, 'boot')
+    c.tick(0., state(), 0.)
+    return c, h
+
+
+def request(c, method, params=None, now=0., rid=None, session='s', lease=None):
+    if lease is None and c.owner:
+        lease = c.owner['lease_id']
+    return c.dispatch(dict(version=1, request_id=rid or f'{method}-{now}', runtime_id='boot',
+                           session_id=session, lease_id=lease, method=method, params=params or {}), now)
+
+
+def start(c):
+    assert request(c, 'claim_control', {'registry_sha256': c.profile.registry_sha256})['error'] is None
+    result = request(c, 'start_manipulation', {'skill_id': 'bottle_to_right_table'})
+    assert result['error'] is None
+    return result['result']['execution_id']
+
+
+def action():
+    return dict(motion_token=np.zeros((1, 40, 64)), left_hand_joints=np.zeros((1, 40, 7)), right_hand_joints=np.zeros((1, 40, 7)))
+
+
+def test_pause_rejects_late_epoch():
+    c, h = make(); eid = start(c); old = h.epoch
+    assert c.accept_policy_result(old, 0., action(), .1)
+    request(c, 'pause_manipulation', {'execution_id': eid}, .2)
+    assert not c.accept_policy_result(old, .2, action(), .3)
+    assert not h.enabled
+
+
+def test_expired_chunk_never_replays_last_frame():
+    c, h = make(); start(c)
+    assert not c.accept_policy_result(h.epoch, 0., action(), .801)
+    assert not h.enabled
+
+
+def test_keyboard_override_revokes_lease():
+    c, h = make(); start(c); old = h.epoch
+    c.operator_override('p')
+    assert c.status(.1)['owner_session_id'] is None
+    assert not c.accept_policy_result(old, .05, action(), .1)
+
+
+def test_fault_hold_preserves_hands():
+    c, h = make(); eid = start(c)
+    request(c, 'cancel', {'execution_id': eid}, .1)
+    assert h.holds[-1][1] is False
+    assert h.holds[-1][0]['left_hand_q'] == [.3] * 7
+    assert not c.status(.1)['hold_confirmed']
+    c.tick(.2, state(2), .2)
+    assert c.status(.2)['hold_confirmed']
+
+
+def test_reset_requires_new_planner_feedback_and_measured_dwell():
+    c, h = make(); eid = start(c)
+    request(c, 'pause_manipulation', {'execution_id': eid}, .1)
+    reset = request(c, 'reset_standing', {'execution_id': eid, 'open_hands': True}, .2)
+    assert reset['error'] is None
+    target = c.reset.target
+    measured = state(2)
+    from gear_sonic.utils.teleop.xr_upperbody_bridge import G1_UPPER_BODY_JOINT_INDICES
+    measured['body_q'] = np.zeros(29)
+    measured['body_q'][G1_UPPER_BODY_JOINT_INDICES] = target[:17]
+    measured['left_hand_q'] = target[17:24]
+    measured['right_hand_q'] = target[24:]
+    c.tick(.3, measured, .3)
+    assert c.status(.3)['phase'] == 'RESETTING'
+    c.tick(.9, measured, .9)  # A republished index cannot satisfy the dwell.
+    assert c.status(.9)['phase'] != 'COMPLETED'
+
+
+@pytest.mark.parametrize('field', ['motion_token', 'left_hand_joints', 'right_hand_joints'])
+def test_nonfinite_action_rejected(field):
+    c, h = make(); start(c); a = action(); a[field][0, 0, 0] = float('nan')
+    assert not c.accept_policy_result(h.epoch, 0., a, .1)
+
+
+def test_claim_profile_mismatch_and_unknown_skill():
+    c, _ = make()
+    assert request(c, 'claim_control', {'registry_sha256': 'wrong'})['error']['code'] == 'PROFILE_MISMATCH'
+    request(c, 'claim_control', {'registry_sha256': c.profile.registry_sha256}, rid='claim-ok')
+    assert request(c, 'start_manipulation', {'skill_id': 'invented'})['error']['code'] == 'UNSUPPORTED_SKILL'
+
+
+def test_stale_feedback_reports_unconfirmed_fault():
+    c, h = make(); start(c)
+    c.tick(.6, state(), .6)
+    assert c.status(.6)['phase'] == 'FAULT'
+    assert not c.status(.6)['hold_confirmed']
+    assert not h.enabled

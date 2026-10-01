@@ -10,7 +10,7 @@ from gear_sonic.scripts import run_vla_inference as runner
 from gear_sonic.utils.teleop.xr_upperbody_bridge import unpack_bridge_message
 
 
-def run_keys(monkeypatch, keys, state=None, on_key=None):
+def run_keys(monkeypatch, keys, state=None, on_key=None, config=None):
     if state is not None:
         state.setdefault("reference_heading_quat", [1, 0, 0, 0])
         state.setdefault("planner_reference_active", [1])
@@ -48,8 +48,77 @@ def run_keys(monkeypatch, keys, state=None, on_key=None):
 
     keyboard.read_msg.side_effect = read_key
     monkeypatch.setitem(sys.modules, "gr00t.policy.server_client", SimpleNamespace(PolicyClient=MagicMock()))
-    runner.main(runner.InferenceConfig())
+    runner.main(config or runner.InferenceConfig())
     return [call.args[0] for call in socket.send.call_args_list]
+
+
+def test_stale_camera_blocks_policy_request():
+    from gear_sonic.utils.inference.observation_snapshot import SensorFreshness
+    freshness = SensorFreshness()
+    camera = {'timestamps': {'ego_view': 1.}, 'images': {'ego_view': np.zeros((2, 2, 3))}}
+    assert freshness.capture(camera, 0.) == 0.
+    assert freshness.capture(camera, .49) == 0.
+    assert freshness.capture(camera, .51) is None
+
+
+def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch):
+    from pathlib import Path
+    from gear_sonic.utils.inference import harness_rpc, observation_snapshot
+    profile = Path(__file__).parent / 'fixtures/g1_profile.yaml'
+    clock = [0.]
+    monkeypatch.setattr(runner.time, 'monotonic', lambda: clock[0])
+    instances = []
+
+    class Snapshots:
+        def __init__(self, *args): pass
+        def start(self): pass
+        def close(self): pass
+        def latest(self, now):
+            return dict(camera_key='ego_view', source_timestamp=now, frame_id=str(now), received_at=now, age_s=0., jpeg_rgb_b64='unused')
+
+    class RPC:
+        def __init__(self, *args): self.count = 0; self.responses = []; instances.append(self)
+        def start(self): pass
+        def close(self): pass
+        def drain(self, control, now):
+            self.control = control
+            control.observation = Snapshots().latest(now)
+            self.count += 1
+            method, params = None, {}
+            if self.count == 2:
+                method, params = 'claim_control', {'registry_sha256': control.profile.registry_sha256}
+            elif self.count == 3:
+                method, params = 'start_manipulation', {'skill_id': 'bottle_to_right_table'}
+            elif self.count == 5:
+                method, params = 'pause_manipulation', {'execution_id': control.execution['execution_id']}
+            elif self.count == 6:
+                method, params = 'reset_standing', {'execution_id': control.execution['execution_id'], 'open_hands': True}
+            if method:
+                response = control.dispatch(dict(version=1, request_id=str(self.count), runtime_id=control.runtime_id,
+                    session_id='s', lease_id=control.owner['lease_id'] if control.owner else None, method=method, params=params), now)
+                self.responses.append(response)
+
+    monkeypatch.setattr(harness_rpc, 'HarnessRPCServer', RPC)
+    monkeypatch.setattr(observation_snapshot, 'ObservationSnapshotCache', Snapshots)
+    measured = dict(index=0, body_q=np.zeros(29), left_hand_q=np.full(7, .3), right_hand_q=np.full(7, .4), base_quat=[1, 0, 0, 0])
+
+    def on_key(index, args):
+        measured['index'] += 1
+        clock[0] += .1
+        if index in {1, 3}:
+            epoch = args[0].get_nowait()
+            action = dict(motion_token=np.full((1,40,64), .1), left_hand_joints=np.zeros((1,40,7)), right_hand_joints=np.zeros((1,40,7)))
+            args[1].put((action, clock[0], epoch))
+        if index == 6:
+            args[1].put(({'malformed_old': True}, clock[0], 0))
+
+    messages = run_keys(monkeypatch, ['k'] + [None]*8, measured, on_key,
+        runner.InferenceConfig(harness_endpoint='ipc:///tmp/unused-test.sock', harness_profile=str(profile)))
+    assert all(r['error'] is None for r in instances[0].responses)
+    poses = [unpack_bridge_message(raw, topic='pose') for raw in messages if raw.startswith(b'pose')]
+    assert len(poses) == 1  # Prewarm and late result never publish.
+    assert instances[0].control.phase == 'RESETTING'
+    np.testing.assert_allclose(poses[0]['token_state'], .1)
 
 
 def test_repeated_init_uses_planner_standing_and_resume_switches_to_pose(monkeypatch):

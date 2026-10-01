@@ -45,6 +45,7 @@ class StandingReset:
         yaw = feedback_payload_heading_yaw(state)
         if yaw is None:
             raise ValueError("Standing reset requires a valid measured heading")
+        self._yaw = yaw
         frame = anchor_frame_planner_heading(UpperBodyFrame(self._position[:17], np.zeros(17)), yaw)
         self._standing = build_stop_standing_command(frame, hand_preset="open")
         self._target = np.concatenate(
@@ -54,6 +55,22 @@ class StandingReset:
                 _vector(right_hand_target, 7),
             ]
         )
+
+    @property
+    def target(self):
+        return self._target.copy()
+
+    def is_settled(self, state, joint_tolerance, yaw_tolerance_rad):
+        try:
+            measured = _measured_joints(state)
+            yaw = feedback_payload_heading_yaw(state)
+            if yaw is None:
+                return False
+            yaw_error = np.arctan2(np.sin(yaw - self._yaw), np.cos(yaw - self._yaw))
+            return bool(np.max(np.abs(measured - self._target)) <= joint_tolerance
+                        and abs(yaw_error) <= yaw_tolerance_rad)
+        except (TypeError, ValueError):
+            return False
 
     @property
     def command(self):
