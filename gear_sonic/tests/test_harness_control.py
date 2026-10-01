@@ -63,6 +63,12 @@ class Hooks:
     def set_planner_command(self, command):
         self.command = command
 
+    def stop_planner_motion(self):
+        from dataclasses import replace
+
+        if hasattr(self, "command"):
+            self.command = replace(self.command, mode=0, movement=(0.0, 0.0, 0.0), speed=0.0)
+
 
 def make():
     assert importlib.util.find_spec("gear_sonic.utils.inference.harness_control"), "Native harness control missing"
@@ -70,6 +76,7 @@ def make():
     h = Hooks()
     c = cls(PROFILE, h, "boot")
     c.tick(0.0, state(), 0.0)
+    c.observation = {"received_at": 0.0, "frame_id": "initial"}
     return c, h
 
 
@@ -184,4 +191,13 @@ def test_stale_feedback_reports_unconfirmed_fault():
     c.tick(0.6, state(), 0.6)
     assert c.status(0.6)["phase"] == "FAULT"
     assert not c.status(0.6)["hold_confirmed"]
+    assert not h.enabled
+
+
+def test_missing_camera_prevents_manipulation():
+    c, h = make()
+    c.observation = None
+    request(c, "claim_control", {"registry_sha256": c.profile.registry_sha256})
+    response = request(c, "start_manipulation", {"skill_id": "bottle_to_right_table"})
+    assert response["error"]["code"] == "NOT_READY"
     assert not h.enabled

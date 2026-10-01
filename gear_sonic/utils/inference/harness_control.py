@@ -33,6 +33,8 @@ class RuntimeHooks(Protocol):
     def set_policy_enabled(self, enabled: bool) -> None: ...
     def request_planner_hold(self, feedback: dict, open_hands: bool) -> None: ...
     def begin_standing_reset(self, feedback: dict, open_hands: bool) -> StandingReset: ...
+    def set_planner_command(self, command) -> None: ...
+    def stop_planner_motion(self) -> None: ...
 
 
 def load_harness_profile(path: Path) -> dict:
@@ -101,6 +103,7 @@ class HarnessControl:
     def interrupt(self, reason: str, now: float):
         self.epoch = self.hooks.invalidate_policy_actions()
         self.hooks.set_policy_enabled(False)
+        self.hooks.stop_planner_motion()
         self.phase, self.reason = "INTERRUPTED", reason
         self._hold(now)
 
@@ -234,8 +237,8 @@ class HarnessControl:
             ):
                 raise ControlError("NOT_READY", "Paused prepared executor required")
             if (
-                self.observation is not None
-                and now - self.observation["received_at"] > self.profile.limits.camera_max_age_s
+                self.observation is None
+                or not 0 <= now - self.observation["received_at"] <= self.profile.limits.camera_max_age_s
             ):
                 raise ControlError("NOT_READY", "Fresh camera required")
             self.epoch = self.hooks.invalidate_policy_actions()
@@ -278,7 +281,15 @@ class HarnessControl:
         if not self.locomotion_enabled:
             raise ControlError("UNSUPPORTED_SKILL", "Locomotion disabled")
         validate_skill_call(self.profile, SkillCall(method, params), locomotion_enabled=True)
-        if not self.hold_confirmed or not self._fresh(now) or self.phase not in {"IDLE", "PAUSED", "COMPLETED"}:
+        facts = self.hooks.runtime_facts()
+        if (
+            not self.hold_confirmed
+            or not self._fresh(now)
+            or not self._planner_active()
+            or facts.policy_enabled
+            or not facts.controller_running
+            or self.phase not in {"IDLE", "PAUSED", "COMPLETED"}
+        ):
             raise ControlError("NOT_READY", "Confirmed planner hold required")
         from .bounded_planner import BoundedPlanner
 
@@ -291,6 +302,8 @@ class HarnessControl:
             self.planner.begin_turn(**params)
             self.phase = "TURNING"
         self.hold_confirmed = False
+        self.hold_started, self.hold_index = None, None
+        self.reset = None
         return self._execution()
 
     def tick(self, now, feedback, feedback_received_at):
@@ -348,7 +361,14 @@ class HarnessControl:
                 else:
                     self.dwell = None
         elif self.phase in {"WALKING", "TURNING"}:
-            self.hooks.set_planner_command(self.planner.advance(self.feedback, now))
+            if not self._planner_active():
+                self.interrupt("planner_inactive", now)
+                return
+            try:
+                self.hooks.set_planner_command(self.planner.advance(self.feedback, now))
+            except (TypeError, ValueError) as exc:
+                self.interrupt(f"planner_error:{exc}", now)
+                return
             if self.planner.finished:
                 if self.hold_started is None or self.hold_started < self.transition_started:
                     self.hold_index, self.hold_started = self.feedback_index, now
@@ -394,4 +414,5 @@ class HarnessControl:
             checkpoint_expected=self.profile.checkpoint,
             owner_session_id=self.owner["session_id"] if self.owner else None,
             reason=self.reason,
+            locomotion_enabled=self.locomotion_enabled,
         )

@@ -91,6 +91,31 @@
       "lease_id": "lease-1",
       "method": "release_control",
       "params": {}
+    },
+    {
+      "version": 1,
+      "request_id": "walk_for",
+      "runtime_id": "boot",
+      "session_id": "agent",
+      "lease_id": "lease",
+      "method": "walk_for",
+      "params": {
+        "direction": "backward",
+        "duration_s": 1.0,
+        "speed_mps": 0.2
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "turn_by",
+      "runtime_id": "boot",
+      "session_id": "agent",
+      "lease_id": "lease",
+      "method": "turn_by",
+      "params": {
+        "angle_rad": 0.2617993877991494,
+        "rate_rps": 0.17453292519943295
+      }
     }
   ],
   "invalid_requests": [
@@ -127,6 +152,36 @@
         "duration_s": 5.01,
         "speed_mps": 0.2
       }
+    }
+  ],
+  "valid_responses": [
+    {
+      "request_id": "status",
+      "runtime_id": "boot",
+      "result": {
+        "runtime_id": "boot",
+        "phase": "IDLE",
+        "skill_id": null,
+        "execution_id": null,
+        "inference_epoch": 0,
+        "controller_running": true,
+        "policy_ready": true,
+        "mode_requested": "PLANNER",
+        "planner_reference_active": true,
+        "hold_confirmed": false,
+        "telemetry_age_s": 0.0,
+        "telemetry_index": 1,
+        "observation_age_s": 0.0,
+        "frame_id": "frame",
+        "registry_sha256": "17e415bf4ebd63e771e3befe9c0c95ce360ad36ec03c94f1f2b535a89406b71f",
+        "policy_host": "127.0.0.1",
+        "policy_port": 15558,
+        "checkpoint_expected": "/mnt/data/jihun/models/pnp_bottle_260916_n17_raw_gpu7/checkpoint-20000",
+        "owner_session_id": null,
+        "reason": null,
+        "locomotion_enabled": false
+      },
+      "error": null
     }
   ]
 }

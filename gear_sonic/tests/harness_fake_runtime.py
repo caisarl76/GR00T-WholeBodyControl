@@ -4,6 +4,7 @@ There is deliberately no PUB socket, DDS channel, or robot connection here.
 """
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import time
@@ -75,6 +76,11 @@ class Hooks:
 
     def set_planner_command(self, command):
         self.reset, self.command = None, command
+
+    def stop_planner_motion(self):
+        if self.command is not None:
+            self.command = replace(self.command, mode=0, movement=(0.0, 0.0, 0.0), speed=0.0)
+        self.reset = None
 
 
 def main():

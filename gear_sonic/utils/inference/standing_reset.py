@@ -67,8 +67,9 @@ class StandingReset:
             if yaw is None:
                 return False
             yaw_error = np.arctan2(np.sin(yaw - self._yaw), np.cos(yaw - self._yaw))
-            return bool(np.max(np.abs(measured - self._target)) <= joint_tolerance
-                        and abs(yaw_error) <= yaw_tolerance_rad)
+            return bool(
+                np.max(np.abs(measured - self._target)) <= joint_tolerance and abs(yaw_error) <= yaw_tolerance_rad
+            )
         except (TypeError, ValueError):
             return False
 

@@ -141,6 +141,7 @@ class Status:
     checkpoint_expected: str
     owner_session_id: str | None
     reason: str | None
+    locomotion_enabled: bool = False
 
 
 @dataclass(frozen=True)
