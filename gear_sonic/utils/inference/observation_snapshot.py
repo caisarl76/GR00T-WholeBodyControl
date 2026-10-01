@@ -46,6 +46,7 @@ class ObservationSnapshotCache:
         self.camera_factory, self.camera_key, self.max_age_s = camera_factory, camera_key, max_age_s
         self.freshness = SensorFreshness(max_age_s)
         self._snapshot = None
+        self._camera = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
@@ -55,6 +56,7 @@ class ObservationSnapshotCache:
         if captured is None:
             with self._lock:
                 self._snapshot = None
+                self._camera = None
             return
         frame_id = f"{self.freshness.generation}:{self.freshness.timestamp}"
         with self._lock:
@@ -78,6 +80,17 @@ class ObservationSnapshotCache:
             snapshot = None
         with self._lock:
             self._snapshot = snapshot
+            self._camera = (
+                None
+                if snapshot is None
+                else (
+                    {
+                        "timestamps": {self.camera_key: snapshot["source_timestamp"]},
+                        "images": {self.camera_key: array.copy()},
+                    },
+                    captured,
+                )
+            )
 
     def latest(self, now):
         with self._lock:
@@ -92,15 +105,16 @@ class ObservationSnapshotCache:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def capture_time(self, message, now):
-        snapshot = self.latest(now)
-        try:
-            stamp = float(message["timestamps"][self.camera_key])
-            if snapshot is None or snapshot["source_timestamp"] != stamp:
-                return None
-        except (TypeError, KeyError, ValueError):
+    def latest_camera(self, now):
+        with self._lock:
+            camera = self._camera
+        if camera is None or not 0 <= now - camera[1] <= self.max_age_s:
             return None
-        return snapshot["received_at"]
+        message, received_at = camera
+        return {
+            "timestamps": dict(message["timestamps"]),
+            "images": {self.camera_key: message["images"][self.camera_key].copy()},
+        }, received_at
 
     def _run(self):
         camera = None
@@ -112,6 +126,7 @@ class ObservationSnapshotCache:
                 except Exception:
                     with self._lock:
                         self._snapshot = None
+                        self._camera = None
                 self._stop.wait(0.02)
         finally:
             if camera is not None:

@@ -75,5 +75,24 @@ def test_worker_uses_continuous_camera_capture_time():
     c = cache()
     c.ingest(frame(100.0), 0.0)
     c.ingest(frame(101.0), 0.1)  # Arrives while inference is busy.
-    assert c.capture_time(frame(101.0), 0.2) == 0.1
-    assert c.capture_time(frame(101.0), 0.75) is None  # Cannot rebase frozen frame.
+    message, received = c.latest_camera(0.2)
+    assert message["timestamps"]["ego_view"] == 101.0 and received == 0.1
+    assert c.latest_camera(0.75) is None  # Cannot rebase frozen frame.
+
+
+def test_raw_frame_and_timestamp_stay_paired_across_camera_updates():
+    c = cache()
+    first = frame(100.0)
+    first["images"]["ego_view"][:] = 11
+    c.ingest(first, 1.0)
+    old_message, old_received = c.latest_camera(1.01)
+    second = frame(101.0)
+    second["images"]["ego_view"][:] = 22
+    c.ingest(second, 1.02)
+    message, received = c.latest_camera(1.025)
+    assert message["timestamps"]["ego_view"] == 101.0 and received == 1.02
+    assert np.all(message["images"]["ego_view"] == 22)
+    assert old_message["timestamps"]["ego_view"] == 100.0 and old_received == 1.0
+    assert np.all(old_message["images"]["ego_view"] == 11)
+    message["images"]["ego_view"][:] = 99
+    assert np.all(c.latest_camera(1.03)[0]["images"]["ego_view"] == 22)

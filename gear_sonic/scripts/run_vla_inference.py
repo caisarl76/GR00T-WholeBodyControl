@@ -713,19 +713,16 @@ def main(config: InferenceConfig):
                 camera_subscriber, state_subscriber, robot_model, language_prompt_ref[0], True
             )
         if not worker_sensors:
-            worker_sensors["camera"] = ComposedCameraClientSensor(
-                server_ip=config.camera_host, port=config.camera_port
-            )
             worker_sensors["state"] = ZMQStateSubscriber(host=config.state_zmq_host, port=config.state_zmq_port)
             worker_sensors["policy"] = PolicyClient(
                 host=config.host, port=config.port, timeout_ms=int(profile.limits.prewarm_deadline_s * 1000)
             )
-        camera_msg = worker_sensors["camera"].read()
         state_msg = worker_sensors["state"].get_msg()
         now = time.monotonic()
-        captured = snapshots.capture_time(camera_msg, now)
-        if captured is None or state_msg is None or not harness_control._fresh(now):
+        camera_snapshot = snapshots.latest_camera(now)
+        if camera_snapshot is None or state_msg is None or not harness_control._fresh(now):
             return None
+        camera_msg, captured = camera_snapshot
         observation = prepare_observation_from_sensors(
             SimpleNamespace(read=lambda: camera_msg),
             SimpleNamespace(get_msg=lambda: state_msg),
