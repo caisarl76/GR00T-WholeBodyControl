@@ -195,6 +195,7 @@ external_dependencies/XRoboToolkit-PC-Service-Pybind/
 uv.lock
 
 # Virtual environments (created by install_scripts/)
+.venv/
 .venv_sim/
 .venv_teleop/
 .venv_data_collection/
