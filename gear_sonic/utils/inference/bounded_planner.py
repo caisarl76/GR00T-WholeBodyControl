@@ -98,10 +98,14 @@ class BoundedPlanner:
                     self.limits.turn_lead_rad,
                 ))
         reference_goal = wrap(self.goal + self.heading_trim)
-        delta = float(np.clip(wrap(reference_goal - self.yaw), -self.rate * dt, self.rate * dt))
-        lead = wrap(self.yaw - measured)
-        room = max(0.0, self.limits.turn_lead_rad - np.sign(delta) * lead)
-        self.yaw = wrap(self.yaw + np.sign(delta) * min(abs(delta), room))
+        bounded_goal = wrap(measured + float(np.clip(
+            wrap(reference_goal - measured), -self.limits.turn_lead_rad, self.limits.turn_lead_rad,
+        )))
+        delta = float(np.clip(wrap(bounded_goal - self.yaw), -self.rate * dt, self.rate * dt))
+        candidate = wrap(self.yaw + delta)
+        if abs(wrap(candidate - measured)) > self.limits.turn_lead_rad + 1e-8:
+            raise ValueError("Heading feedback moved beyond the rate-limited lead bound")
+        self.yaw = candidate
         index = feedback.get("index")
         if type(index) is int and (self.last_index is None or index > self.last_index):
             self.last_index = index
