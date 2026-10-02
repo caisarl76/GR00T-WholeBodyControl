@@ -805,7 +805,10 @@ def main(config: InferenceConfig):
                     if open_hands
                     else feedback.get("right_hand_q_measured", feedback.get("right_hand_q"))
                 )
-                reset = StandingReset(feedback, left, right)
+                reset = StandingReset(
+                    feedback, left, right, compensate_tracking_bias=True,
+                    joint_tolerance_rad=harness_control.profile.limits.reset_joint_tolerance_rad,
+                )
                 if not publish_planner_command(reset.command):
                     raise ValueError("Cannot encode standing reset")
                 if not cpp_loop_running or not send_cpp_control_command(start=True, planner=True):

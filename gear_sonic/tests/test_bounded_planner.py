@@ -63,6 +63,33 @@ def test_turn_rate_and_lead_are_bounded():
         p.advance(feedback(), 10.01)
 
 
+@pytest.mark.parametrize("start_deg,angle_deg,bias_deg", [(179, 15, 4), (-179, -15, -4)])
+def test_turn_corrects_steady_heading_bias_without_relaxing_rate_lead_or_goal(start_deg, angle_deg, bias_deg):
+    from gear_sonic.utils.inference.bounded_planner import wrap
+
+    measured = np.deg2rad(start_deg)
+    p = planner(measured)
+    p.begin_turn(np.deg2rad(angle_deg), np.deg2rad(10))
+    goal = wrap(np.deg2rad(start_deg + angle_deg))
+    initial_goal = p.goal
+    previous = measured
+    for i in range(1, 401):
+        command = p.advance(feedback(measured, i + 1), i * 0.02)
+        reference = np.arctan2(command.facing[1], command.facing[0])
+        assert abs(wrap(reference - previous)) <= np.deg2rad(10) * 0.02 + 1e-8
+        assert abs(wrap(reference - measured)) <= np.deg2rad(5) + 1e-8
+        assert command.mode == 0 and command.speed == 0
+        assert command.movement == (0.0, 0.0, 0.0)
+        if p.finished:
+            break
+        measured = wrap(measured + 0.1 * wrap(reference - np.deg2rad(bias_deg) - measured))
+        previous = reference
+    assert p.finished
+    assert abs(wrap(goal - measured)) <= np.deg2rad(3)
+    assert p.goal == initial_goal
+    assert abs(wrap(p.goal - goal)) < 1e-12
+
+
 def test_missing_feedback_cannot_advance_or_complete():
     p = planner()
     p.begin_walk("forward", 1.0, 0.2)

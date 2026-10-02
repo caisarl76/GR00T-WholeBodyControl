@@ -60,6 +60,8 @@ class BoundedPlanner:
         positive(abs(angle_rad), self.limits.turn_max_angle_rad)
         positive(rate_rps, self.limits.turn_max_rate_rps)
         self.kind, self.goal, self.rate = "turn", wrap(self.yaw + angle_rad), rate_rps
+        self.heading_trim = 0.0
+        self.nominal_heading_reached = False
         self.deadline = self.started_at + self.limits.turn_deadline_s
 
     def advance(self, feedback, now):
@@ -83,7 +85,20 @@ class BoundedPlanner:
             return self.command
         if now > self.deadline:
             raise ValueError("Turn deadline exceeded")
-        delta = float(np.clip(wrap(self.goal - self.yaw), -self.rate * dt, self.rate * dt))
+        # SONIC can stop a few degrees short of an exact facing reference.
+        # Correct that bias only after reaching the nominal reference. Keep
+        # the measured goal and all rate, lead, dwell and deadline limits.
+        self.nominal_heading_reached |= abs(wrap(self.goal - self.yaw)) < 1e-6
+        if self.nominal_heading_reached:
+            error = wrap(self.goal - measured)
+            if abs(error) > self.limits.turn_tolerance_rad * 0.5:
+                self.heading_trim = float(np.clip(
+                    self.heading_trim + dt * error,
+                    -self.limits.turn_lead_rad,
+                    self.limits.turn_lead_rad,
+                ))
+        reference_goal = wrap(self.goal + self.heading_trim)
+        delta = float(np.clip(wrap(reference_goal - self.yaw), -self.rate * dt, self.rate * dt))
         lead = wrap(self.yaw - measured)
         room = max(0.0, self.limits.turn_lead_rad - np.sign(delta) * lead)
         self.yaw = wrap(self.yaw + np.sign(delta) * min(abs(delta), room))

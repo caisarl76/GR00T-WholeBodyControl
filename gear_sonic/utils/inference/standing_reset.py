@@ -38,10 +38,22 @@ class StandingReset:
     waiting for SONIC's planner to initialize cannot advance a timed ramp all
     the way to its endpoint before the robot has started following it.
     Missing/invalid feedback holds the last command; it never advances the ramp.
+    Harness resets may compensate a steady upper-body tracking offset after
+    reaching the nominal reference. Trim is capped at 0.15 rad; the same rate
+    and measured-lead caps apply. The physical settling target never changes.
     """
 
-    def __init__(self, state, left_hand_target, right_hand_target):
+    def __init__(
+        self, state, left_hand_target, right_hand_target, *,
+        compensate_tracking_bias=False, joint_tolerance_rad=0.05,
+    ):
         self._position = _measured_joints(state)
+        self._compensate_tracking_bias = compensate_tracking_bias
+        if not np.isfinite(joint_tolerance_rad) or joint_tolerance_rad <= 0:
+            raise ValueError("Standing reset requires a positive finite joint tolerance")
+        self._tracking_deadband = joint_tolerance_rad * 0.5
+        self._tracking_trim = np.zeros(17)
+        self._nominal_reached = False
         yaw = feedback_payload_heading_yaw(state)
         if yaw is None:
             raise ValueError("Standing reset requires a valid measured heading")
@@ -89,8 +101,17 @@ class StandingReset:
             measured = _measured_joints(state)
         except (TypeError, ValueError):
             return self.command
-        step = 0.5 * np.clip(dt, 0.0, 0.05)
-        delta = np.clip(self._target - self._position, -step, step)
+        dt = np.clip(dt, 0.0, 0.05)
+        step = 0.5 * dt
+        reference = self._target.copy()
+        if self._compensate_tracking_bias:
+            self._nominal_reached |= bool(np.max(np.abs(self._position[:17] - self._target[:17])) < 1e-6)
+            if self._nominal_reached:
+                error = self._target[:17] - measured[:17]
+                error = np.where(np.abs(error) > self._tracking_deadband, error, 0.0)
+                self._tracking_trim = np.clip(self._tracking_trim + dt * error, -0.15, 0.15)
+                reference[:17] += self._tracking_trim
+        delta = np.clip(reference - self._position, -step, step)
         # Only move toward the target, without getting ahead of feedback.
         room = np.maximum(0.0, 0.15 - np.sign(delta) * (self._position - measured))
         self._position += np.sign(delta) * np.minimum(np.abs(delta), room)
