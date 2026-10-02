@@ -21,7 +21,7 @@ def _vector(value, size):
 
 
 def _measured_joints(state):
-    body = _vector(state.get("body_q_measured", state.get("body_q")), 29)
+    body = _vector(state.get("body_q_measured_motor", state.get("body_q_measured", state.get("body_q"))), 29)
     return np.concatenate(
         [
             body[G1_UPPER_BODY_JOINT_INDICES],

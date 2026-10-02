@@ -17,6 +17,17 @@ def feedback(value=0.8):
     }
 
 
+def test_explicit_absolute_motor_measurement_wins_over_legacy_joint_fields():
+    state = feedback(-9.0)
+    state["body_q"] = np.arange(29) * -2.0
+    state["body_q_measured_motor"] = np.arange(29) * 0.01
+    reset = StandingReset(state, np.zeros(7), np.zeros(7))
+    np.testing.assert_allclose(
+        reset.command.upper_body_position,
+        state["body_q_measured_motor"][G1_UPPER_BODY_JOINT_INDICES],
+    )
+
+
 def test_standing_reset_starts_at_measured_pose_and_reaches_straight_preset():
     state = feedback()
     reset = StandingReset(state, np.zeros(7), np.zeros(7))

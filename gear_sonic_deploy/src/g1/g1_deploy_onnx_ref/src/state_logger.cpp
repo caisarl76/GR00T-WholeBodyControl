@@ -100,7 +100,9 @@ uint64_t StateLogger::LogFullState(const std::array<double, 4>& base_quat,
                                    const std::span<double>& right_hand_dq,
                                    const std::span<double>& last_left_hand_action,
                                    const std::span<double>& last_right_hand_action,
-                                   double ros_timestamp) {
+                                   double ros_timestamp,
+                                   std::chrono::steady_clock::time_point left_hand_received_at,
+                                   std::chrono::steady_clock::time_point right_hand_received_at) {
   Entry e;
   e.index = next_index_.fetch_add(1, std::memory_order_relaxed);
   e.timestamp = std::chrono::system_clock::now();
@@ -128,6 +130,8 @@ uint64_t StateLogger::LogFullState(const std::array<double, 4>& base_quat,
   e.right_hand_dq.assign(std::begin(right_hand_dq), std::end(right_hand_dq));
   e.last_left_hand_action.assign(std::begin(last_left_hand_action), std::end(last_left_hand_action));
   e.last_right_hand_action.assign(std::begin(last_right_hand_action), std::end(last_right_hand_action));
+  e.left_hand_received_at = left_hand_received_at;
+  e.right_hand_received_at = right_hand_received_at;
 
   pushToRing_(e);
   if (enable_csv_) {
@@ -503,4 +507,3 @@ Entry StateLogger::makeZeroEntry_() const {
   e.token_state.clear();
   return e;
 }
-

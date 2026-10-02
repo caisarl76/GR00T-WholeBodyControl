@@ -144,8 +144,12 @@ def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch, scenario):
     measured = dict(
         index=0,
         body_q=np.zeros(29),
+        body_q_measured_motor=np.zeros(29),
+        harness_planner_hold_enabled=[1],
         left_hand_q=np.full(7, 0.3),
         right_hand_q=np.full(7, 0.4),
+        left_hand_q_measured=np.full(7, 0.3),
+        right_hand_q_measured=np.full(7, 0.4),
         base_quat=[1, 0, 0, 0],
     )
 

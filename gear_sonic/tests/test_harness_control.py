@@ -13,12 +13,63 @@ def state(index=1, planner=1):
     return dict(
         index=index,
         body_q=[0.0] * 29,
+        body_q_measured_motor=[0.0] * 29,
+        harness_planner_hold_enabled=[1],
         left_hand_q=[0.3] * 7,
         right_hand_q=[0.4] * 7,
+        left_hand_q_measured=[0.3] * 7,
+        right_hand_q_measured=[0.4] * 7,
         base_quat=[1, 0, 0, 0],
         reference_heading_quat=[1, 0, 0, 0],
         planner_reference_active=[planner],
     )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["body_q_measured_motor", "harness_planner_hold_enabled", "left_hand_q_measured", "right_hand_q_measured"],
+)
+def test_claim_rejects_ambiguous_or_unsafe_controller(field):
+    c, _ = make()
+    incompatible = state(2)
+    del incompatible[field]
+    c.tick(0.1, incompatible, 0.1)
+    response = request(c, "claim_control", {"registry_sha256": c.profile.registry_sha256}, now=0.1)
+    assert response["error"]["code"] == "NOT_READY"
+    assert c.owner is None
+
+
+@pytest.mark.parametrize("field", ["left_hand_q_measured", "right_hand_q_measured"])
+def test_missing_or_stale_hand_feedback_revokes_authority(field):
+    c, h = make()
+    start(c)
+    incompatible = state(2)
+    incompatible[field] = []  # C++ emits empty measurements for absent/stale DDS data.
+    c.tick(0.1, incompatible, 0.1)
+    assert c.phase == "FAULT" and c.owner is None and not h.enabled
+    assert not c.status(0.1)["hold_confirmed"]
+
+
+def test_disabled_cpp_timeout_hold_blocks_claim():
+    c, _ = make()
+    incompatible = state(2)
+    incompatible["harness_planner_hold_enabled"] = [0]
+    c.tick(0.1, incompatible, 0.1)
+    response = request(c, "claim_control", {"registry_sha256": c.profile.registry_sha256}, now=0.1)
+    assert response["error"]["code"] == "NOT_READY"
+
+
+def test_controller_capability_loss_revokes_owner_and_cannot_acknowledge_hold():
+    c, h = make()
+    start(c)
+    incompatible = state(2)
+    incompatible["body_q_measured_motor"][3] = float("nan")
+    c.tick(0.1, incompatible, 0.1)
+    assert c.phase == "FAULT" and c.owner is None and not h.enabled
+    assert not c.status(0.1)["hold_confirmed"]
+    c.tick(0.2, state(3), 0.2)
+    assert c.phase == "FAULT" and c.owner is None
+    assert not c.status(0.2)["hold_confirmed"]
 
 
 class Hooks:
@@ -161,8 +212,11 @@ def test_reset_requires_new_planner_feedback_and_measured_dwell():
 
     measured["body_q"] = np.zeros(29)
     measured["body_q"][G1_UPPER_BODY_JOINT_INDICES] = target[:17]
+    measured["body_q_measured_motor"] = measured["body_q"].copy()
     measured["left_hand_q"] = target[17:24]
     measured["right_hand_q"] = target[24:]
+    measured["left_hand_q_measured"] = target[17:24]
+    measured["right_hand_q_measured"] = target[24:]
     c.tick(0.3, measured, 0.3)
     assert c.status(0.3)["phase"] == "RESETTING"
     c.tick(0.9, measured, 0.9)  # A republished index cannot satisfy the dwell.

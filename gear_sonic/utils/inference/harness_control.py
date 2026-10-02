@@ -80,8 +80,25 @@ class HarnessControl:
         return (
             self.feedback is not None
             and self.feedback_time is not None
-            and max(0., now - self.feedback_time) <= self.profile.limits.feedback_max_age_s
+            and max(0.0, now - self.feedback_time) <= self.profile.limits.feedback_max_age_s
+            and self._compatible_feedback(self.feedback)
         )
+
+    @staticmethod
+    def _compatible_feedback(feedback):
+        try:
+            body = np.asarray(feedback["body_q_measured_motor"], dtype=float)
+            capability = np.asarray(feedback["harness_planner_hold_enabled"], dtype=float)
+            hands = [
+                np.asarray(feedback[key], dtype=float)
+                for key in ("left_hand_q_measured", "right_hand_q_measured")
+            ]
+            return bool(
+                body.shape == (29,) and np.isfinite(body).all() and capability.shape == (1,) and capability[0] == 1
+                and all(hand.shape == (7,) and np.isfinite(hand).all() for hand in hands)
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
 
     def _planner_active(self):
         value = np.asarray(self.feedback.get("planner_reference_active", []) if self.feedback else []).reshape(-1)
@@ -93,6 +110,7 @@ class HarnessControl:
         self.reset, self.planner, self.dwell = None, None, None
         if not self._fresh(now):
             self.phase = "FAULT"
+            self.hold_started = None
             return
         try:
             _measured_joints(self.feedback)
@@ -204,7 +222,9 @@ class HarnessControl:
             ):
                 raise ControlError("NOT_READY", "Operator must start control and prepare a paused executor")
             if not self._fresh(now):
-                raise ControlError("NOT_READY", "Fresh telemetry required")
+                raise ControlError(
+                    "NOT_READY", "Fresh measured body/hand telemetry and C++ --harness-planner-hold required"
+                )
             self.owner = dict(
                 runtime_id=self.runtime_id,
                 session_id=req["session_id"],
@@ -312,6 +332,13 @@ class HarnessControl:
             if type(index) is int and index >= 0 and (self.feedback_index is None or index > self.feedback_index):
                 self.feedback, self.feedback_index, self.feedback_time = feedback, index, feedback_received_at
                 advanced = True
+                if not self._compatible_feedback(feedback) and (
+                    self.owner is not None or self.phase in {"MANIPULATING", "RESETTING", "WALKING", "TURNING"}
+                ):
+                    self.interrupt("incompatible_controller_telemetry", now)
+                    self.owner = None
+                    self.phase = "FAULT"
+                    return
             elif type(index) is int and self.feedback_index is not None and index < self.feedback_index:
                 self.feedback, self.feedback_time, self.feedback_index = None, None, index
                 self.interrupt("telemetry_stream_restarted", now)

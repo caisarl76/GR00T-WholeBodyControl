@@ -104,8 +104,12 @@ def main():
     feedback = dict(
         index=0,
         body_q=np.zeros(29),
+        body_q_measured_motor=np.zeros(29),
+        harness_planner_hold_enabled=[1],
         left_hand_q=np.full(7, 0.3),
         right_hand_q=np.full(7, 0.4),
+        left_hand_q_measured=np.full(7, 0.3),
+        right_hand_q_measured=np.full(7, 0.4),
         base_quat=[1, 0, 0, 0],
         reference_heading_quat=[1, 0, 0, 0],
         planner_reference_active=[1],
@@ -133,7 +137,7 @@ def main():
             control.tick(now, feedback, now)
             server.drain(control, now)
             if args.scenario == "operator_pause" and control.phase == "MANIPULATING":
-                takeover_at = now + .2 if takeover_at is None else takeover_at
+                takeover_at = now + 0.2 if takeover_at is None else takeover_at
                 if now >= takeover_at:
                     old_epoch = control.epoch
                     control.operator_override("p")
@@ -170,8 +174,11 @@ def main():
                 feedback = {
                     **feedback,
                     "body_q": body,
+                    "body_q_measured_motor": body.copy(),
                     "left_hand_q": list(hooks.command.left_hand_position),
                     "right_hand_q": list(hooks.command.right_hand_position),
+                    "left_hand_q_measured": list(hooks.command.left_hand_position),
+                    "right_hand_q_measured": list(hooks.command.right_hand_position),
                     "base_quat": [np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)],
                 }
             if control.phase != previous_phase:

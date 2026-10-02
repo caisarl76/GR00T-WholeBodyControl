@@ -2165,7 +2165,8 @@ class G1Deploy {
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
       bool enable_dex3_hands = true,
-      Vr3PtSafetyFilter::Config vr3pt_filter_config = Vr3PtSafetyFilter::Config{})
+      Vr3PtSafetyFilter::Config vr3pt_filter_config = Vr3PtSafetyFilter::Config{},
+      bool harness_planner_hold = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2500,7 +2501,7 @@ class G1Deploy {
       else if (input_type == "zmq_manager") {
         input_interface_ = std::make_unique<ZMQManager>(
           zmq_host, zmq_port, zmq_topic, "command", "planner", zmq_conflate,
-          zmq_verbose, vr3pt_filter_config
+          zmq_verbose, vr3pt_filter_config, harness_planner_hold
         );
         std::cout << "Initialized ZMQ manager" << std::endl;
         std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
@@ -2588,6 +2589,9 @@ class G1Deploy {
         std::cout << "Unknown output type '" << output_type << "' - no output will be published" << std::endl;
       } else {
         std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
+        for (auto& output : output_interfaces_) {
+          output->SetHarnessPlannerHold(harness_planner_hold && input_type == "zmq_manager");
+        }
       }
 
       // create threads
@@ -2926,7 +2930,9 @@ class G1Deploy {
       std::array<double, 7> right_hand_q = {0.0};
       std::array<double, 7> right_hand_dq = {0.0};
       
-      auto left_hand_state_ptr = enable_dex3_hands_ ? dex3_hands_.getState(true) : nullptr;
+      auto left_hand_state = enable_dex3_hands_ ? dex3_hands_.getStateWithTime(true)
+          : TimestampedData<unitree_hg::msg::dds_::HandState_>{};
+      auto left_hand_state_ptr = left_hand_state.data;
       if (left_hand_state_ptr) {
         for (int i = 0; i < 7; ++i) {
           left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
@@ -2934,7 +2940,9 @@ class G1Deploy {
         }
       }
       
-      auto right_hand_state_ptr = enable_dex3_hands_ ? dex3_hands_.getState(false) : nullptr;
+      auto right_hand_state = enable_dex3_hands_ ? dex3_hands_.getStateWithTime(false)
+          : TimestampedData<unitree_hg::msg::dds_::HandState_>{};
+      auto right_hand_state_ptr = right_hand_state.data;
       if (right_hand_state_ptr) {
         for (int i = 0; i < 7; ++i) {
           right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
@@ -2959,7 +2967,7 @@ class G1Deploy {
                                     std::span(right_hand_dq),
                                     std::span(last_left_hand_action),
                                     std::span(last_right_hand_action),
-                                    ros_timestamp);
+                                    ros_timestamp, left_hand_state.timestamp, right_hand_state.timestamp);
       }
       return true;
     }
@@ -4199,6 +4207,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --zmq-topic <topic>: ZMQ topic/prefix (default: pose)" << std::endl;
     std::cout << "  --zmq-conflate: enable ZMQ CONFLATE (default: disabled)" << std::endl;
     std::cout << "  --zmq-verbose: enable ZMQ subscriber verbose logs" << std::endl;
+    std::cout << "  --harness-planner-hold: retain applied arm/hand targets on planner-input timeout (zmq_manager only)" << std::endl;
     std::cout << "  --zmq-out-port <port>: ZMQ port for output (default: 5557)" << std::endl;
     std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
     std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
@@ -4253,6 +4262,7 @@ int main(int argc, char const* argv[]) {
   std::string zmq_topic = "pose";
   bool zmq_conflate = false;  // default off; enable with --zmq-conflate
   bool zmq_verbose = false;
+  bool harness_planner_hold = false;
   bool enableMotionRecording = false;  // default off; enable with --enable-motion-recording
   int zmq_out_port = 5557;
   std::string zmq_out_topic = "g1_debug";
@@ -4264,6 +4274,8 @@ int main(int argc, char const* argv[]) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--harness-planner-hold") {
+      harness_planner_hold = true;
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4560,7 +4572,8 @@ int main(int argc, char const* argv[]) {
     initial_compliance,
     initial_max_close_ratio,
     enable_dex3_hands,
-    vr3pt_filter_config
+    vr3pt_filter_config,
+    harness_planner_hold
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

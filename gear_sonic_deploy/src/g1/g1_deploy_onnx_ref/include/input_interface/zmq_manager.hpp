@@ -27,7 +27,8 @@
  *
  * If no planner message arrives within 1 second (PLANNER_TIMEOUT), the manager
  * automatically resets the locomotion to IDLE and clears upper-body / hand-joint
- * control flags.
+ * control flags. Opt-in harness hold retains established position targets and
+ * zeros upper-body velocity; explicit stop and mode changes clear the targets.
  *
  * ## Keyboard Shortcuts (via stdin)
  *
@@ -89,7 +90,8 @@ class ZMQManager : public InputInterface {
       const std::string& planner_topic = "planner",
       bool zmq_conflate = false,
       bool zmq_verbose = false,
-      Vr3PtSafetyFilter::Config vr3pt_filter_config = Vr3PtSafetyFilter::Config{}
+      Vr3PtSafetyFilter::Config vr3pt_filter_config = Vr3PtSafetyFilter::Config{},
+      bool harness_planner_hold = false
     ) : InputInterface(), 
         zmq_host_(zmq_host), 
         zmq_port_(zmq_port), 
@@ -98,7 +100,8 @@ class ZMQManager : public InputInterface {
         planner_topic_(planner_topic),
         zmq_conflate_(zmq_conflate), 
         zmq_verbose_(zmq_verbose),
-        vr3pt_filter_(vr3pt_filter_config) {
+        vr3pt_filter_(vr3pt_filter_config),
+        harness_planner_hold_(harness_planner_hold) {
       
       type_ = InputType::NETWORK;
       active_mode_ = ManagedMode::PLANNER;  // Default to planner mode
@@ -254,6 +257,14 @@ class ZMQManager : public InputInterface {
           ManagedMode new_mode = latest_command_.planner ? ManagedMode::PLANNER : ManagedMode::STREAMED_MOTION;
           
           if (new_mode != active_mode_) {
+            // Targets belong to one planner session; never carry them across
+            // a mode boundary. A fresh priming packet may enable them below.
+            {
+              std::lock_guard<std::mutex> lock(planner_mutex_);
+              has_upper_body_control_ = false;
+              has_hand_joints_ = false;
+              upper_body_joint_velocities_.SetData(std::array<double, 17>{});
+            }
             // Trigger safety reset on mode switch
             TriggerSafetyReset();
             if (pose_interface_) {
@@ -262,6 +273,7 @@ class ZMQManager : public InputInterface {
 
             if (new_mode == ManagedMode::PLANNER) {
               std::cout << "[ZMQManager] Switched to: PLANNER mode (safety reset)" << std::endl;
+              std::lock_guard<std::mutex> lock(planner_mutex_);
               if (latest_planner_message_.valid) {
                 constexpr auto PLANNER_MESSAGE_TIMEOUT = std::chrono::milliseconds(100);
                 auto time_since_last_planner = std::chrono::steady_clock::now() - latest_planner_message_.timestamp;
@@ -269,6 +281,9 @@ class ZMQManager : public InputInterface {
                   // Valid planner message within timeout - use it
                   // Update upper body control state based on this message
                   has_upper_body_control_ = latest_planner_message_.upper_body_position.has_value();
+                  if (has_upper_body_control_ && latest_planner_message_.upper_body_velocity) {
+                    upper_body_joint_velocities_.SetData(*latest_planner_message_.upper_body_velocity);
+                  }
 
                   // Update hand joints control state based on this message
                   has_hand_joints_ = latest_planner_message_.left_hand_joints.has_value() || 
@@ -494,6 +509,8 @@ class ZMQManager : public InputInterface {
         }
         if (operator_state.start) {
           if (planner_state.enabled && planner_state.initialized) {
+            is_planner_ready_ = true;
+            switch_from_teleop_to_planner_ = false;
             // Planner is already on, keep it as is (don't touch initialized flag)
             {
               std::lock_guard<std::mutex> lock(current_motion_mutex);
@@ -650,10 +667,14 @@ class ZMQManager : public InputInterface {
           latest_planner_message_.valid = false;
 
         } else if (!latest_planner_message_.valid && time_since_last_planner >= PLANNER_TIMEOUT) {
-          // Planner timeout - reset to IDLE and clear buffer
-          has_upper_body_control_ = false;
-
-          has_hand_joints_ = false;
+          // Harness timeout retains this session's applied position targets.
+          // Explicit stop, emergency stop and mode changes still clear them.
+          if (harness_planner_hold_) {
+            upper_body_joint_velocities_.SetData(std::array<double, 17>{});
+          } else {
+            has_upper_body_control_ = false;
+            has_hand_joints_ = false;
+          }
 
           auto current_facing = movement_state_buffer.GetDataWithTime().data->facing_direction;
           MovementState idle_state(
@@ -668,7 +689,8 @@ class ZMQManager : public InputInterface {
           if (latest_planner_message_.timestamp != std::chrono::steady_clock::time_point{}) {
             std::cout << "[ZMQManager] Planner timeout (" 
                       << std::chrono::duration_cast<std::chrono::milliseconds>(time_since_last_planner).count()
-                      << "ms) - reset to IDLE and cleared buffer" << std::endl;
+                      << "ms) - reset to IDLE; overrides "
+                      << (harness_planner_hold_ ? "retained for harness hold" : "cleared") << std::endl;
 
             // Clear planner buffer to avoid using stale data
             latest_planner_message_.valid = false;
@@ -1279,6 +1301,7 @@ class ZMQManager : public InputInterface {
     bool emergency_stop_ = false;  ///< Set by 'O'/'o' keyboard shortcut.
     bool report_temperature_flag_ = false;  ///< Set by 'F'/'f' keyboard shortcut.
     bool start_control_ = false;   ///< Start request from command message.
+    bool harness_planner_hold_ = false;
     bool stop_control_ = false;    ///< Stop request from command message.
 
     /// True once the planner has been initialised and is generating motions.
