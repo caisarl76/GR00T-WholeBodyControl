@@ -241,10 +241,8 @@ def prepare_observation_from_sensors(
 
     cam_img = camera_msg["images"]["ego_view"]
 
-    # Copy index finger data to middle finger (hardware coupling)
-    state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
-    state_msg["left_hand_q"][6] = state_msg["left_hand_q"][4]
-
+    # Training's data exporter uses all measured hand joints unchanged.
+    # Preserve those measurements here, including independently measured fingers.
     qpos = robot_model.get_configuration_from_actuated_joints(
         body_actuated_joint_values=state_msg["body_q"],
         left_hand_actuated_joint_values=state_msg["left_hand_q"],
