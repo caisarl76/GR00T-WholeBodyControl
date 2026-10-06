@@ -63,6 +63,90 @@ def test_stale_camera_blocks_policy_request():
     assert freshness.capture(camera, 0.51) is None
 
 
+@pytest.mark.parametrize("policy_delay_s,expected_phase", [(0.25, "MANIPULATING"), (0.9, "INTERRUPTED")])
+def test_harness_refills_before_capture_deadline_and_rejects_late_results(
+    monkeypatch, policy_delay_s, expected_phase,
+):
+    """Two fresh 250ms queries must not leave a gap in an 800ms chunk."""
+    from pathlib import Path
+
+    from gear_sonic.utils.inference import harness_rpc, observation_snapshot
+
+    clock, instances, pending, started_requests = [0.0], [], [], []
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock[0])
+    snapshots = SimpleNamespace(start=lambda: None, close=lambda: None, latest=lambda now: dict(
+        camera_key="ego_view", source_timestamp=now, frame_id=str(now),
+        received_at=now, age_s=0.0, jpeg_rgb_b64="unused",
+    ))
+    monkeypatch.setattr(observation_snapshot, "ObservationSnapshotCache", lambda *args: snapshots)
+
+    class RPC:
+        def __init__(self, *args):
+            self.count, self.responses = 0, []
+            instances.append(self)
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+        def drain(self, control, now):
+            self.control = control
+            control.observation = snapshots.latest(now)
+            self.count += 1
+            if self.count < 2:
+                return
+            method, params = "heartbeat", {}
+            if self.count == 2:
+                method, params = "claim_control", {"registry_sha256": control.profile.registry_sha256}
+            elif self.count == 3:
+                method, params = "start_manipulation", {"skill_id": "bottle_to_right_table"}
+            self.responses.append(control.dispatch(dict(
+                version=1, request_id=str(self.count), runtime_id=control.runtime_id,
+                session_id="s", lease_id=control.owner["lease_id"] if control.owner else None,
+                method=method, params=params,
+            ), now))
+
+    monkeypatch.setattr(harness_rpc, "HarnessRPCServer", RPC)
+    measured = dict(index=0, body_q=np.zeros(29), body_q_measured_motor=np.zeros(29),
+                    harness_planner_hold_enabled=[1], left_hand_q=np.zeros(7), right_hand_q=np.zeros(7),
+                    left_hand_q_measured=np.zeros(7), right_hand_q_measured=np.zeros(7), base_quat=[1,0,0,0])
+    action = dict(motion_token=np.full((1,40,64), .1), left_hand_joints=np.zeros((1,40,7)),
+                  right_hand_joints=np.zeros((1,40,7)))
+
+    def on_key(index, args):
+        clock[0] = (index+1)*.02
+        measured["index"] += 1
+        requests, results, _, busy = args[:4]
+        if pending and clock[0] >= pending[0][0]:
+            _, captured_at, epoch = pending.pop(0)
+            results.put((action, captured_at, epoch))
+            busy.clear()
+        if not requests.empty() and not busy.is_set():
+            epoch = requests.get_nowait()
+            started_requests.append(epoch)
+            if len(started_requests) == 1:  # Prewarm completes without publishing.
+                results.put((action, clock[0], epoch))
+            else:
+                pending.append((clock[0]+policy_delay_s, clock[0], epoch))
+                busy.set()
+
+    profile = Path(__file__).parent/"fixtures/g1_profile.yaml"
+    messages = run_keys(
+        monkeypatch, ["k"]+[None]*119, measured, on_key,
+        runner.InferenceConfig(harness_endpoint="ipc:///tmp/unused-test.sock", harness_profile=str(profile)),
+    )
+    assert all(r["error"] is None for r in instances[0].responses), instances[0].responses[:3]
+    assert instances[0].control.phase == expected_phase, instances[0].control.reason
+    poses = [raw for raw in messages if raw.startswith(b"pose")]
+    if expected_phase == "MANIPULATING":
+        assert len(poses) > 75
+    else:
+        assert poses == []
+        assert instances[0].control.reason == "invalid_or_stale_policy_action"
+
+
 @pytest.mark.parametrize("scenario", ["reset", "operator_pause", "policy_failure"])
 def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch, scenario):
     from pathlib import Path

@@ -950,7 +950,11 @@ def main(config: InferenceConfig):
                 )
                 cached_action_chunk = processed_action
                 cached_capture_time = inference_start_time
-                last_inference_time = time.monotonic()
+                # Harness chunks expire from observation capture, so start the
+                # next query on that cadence too. Waiting a full interval after
+                # acceptance needlessly spends the preceding query's latency
+                # a second time and can exhaust otherwise fresh chunks.
+                last_inference_time = inference_start_time if harness_enabled else time.monotonic()
                 print_green(
                     f'New action chunk (prompt: "{language_prompt_ref[0]}", latency: {inference_delay:.3f}s)'
                 )
