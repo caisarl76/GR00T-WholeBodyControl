@@ -36,6 +36,7 @@
 #include <cmath>
 #include <algorithm>
 #include <mutex>
+#include <cstdint>
 
 // Motion data structures
 #include "motion_data_reader.hpp"
@@ -268,6 +269,9 @@ public:
     MotionSequence planner_motion_50hz_;
     int gen_frame_;
     bool motion_available_ = false;
+    // Diagnostic identity, published with the trajectory under the same mutex.
+    std::uint64_t diagnostic_generation_ = 0;
+    int diagnostic_generation_frame_ = 0;
 
 protected:
     // Common configuration
@@ -514,6 +518,8 @@ public:
         {
             planner_motion_50hz_.JointVelocities(planner_motion_50hz_.timesteps-1)[joint] = planner_motion_50hz_.JointVelocities(planner_motion_50hz_.timesteps-2)[joint];
         }
+        ++diagnostic_generation_;
+        diagnostic_generation_frame_ = gen_frame_;
         motion_available_ = true;
         return true;
     }
