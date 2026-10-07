@@ -34,12 +34,14 @@ class MemoryPublisher:
 
 
 class Hooks:
-    def __init__(self, sink):
+    def __init__(self, sink, scenario="success"):
         self.sink = sink
+        self.scenario, self.inference_busy = scenario, False
         self.enabled, self.epoch, self.command, self.reset = False, 0, None, None
 
     def runtime_facts(self):
-        return RuntimeFacts(True, self.enabled, True, False, "POSE" if self.enabled else "PLANNER")
+        return RuntimeFacts(True, self.enabled, True, self.inference_busy,
+                            "POSE" if self.enabled else "PLANNER")
 
     def invalidate_policy_actions(self):
         self.epoch += 1
@@ -83,6 +85,29 @@ class Hooks:
         self.reset = None
 
 
+class MemoryHarnessControl(HarnessControl):
+    """Make the first handoff encounter a busy worker without wall-clock races."""
+
+    busy_handoff_seen = False
+
+    def _dispatch(self, req, now):
+        first_handoff = (
+            self.hooks.scenario == "subskill_handoff"
+            and req["method"] == "start_manipulation"
+            and self.phase == "PAUSED"
+            and not self.busy_handoff_seen
+        )
+        if first_handoff:
+            self.busy_handoff_seen = True
+            self.hooks.inference_busy = True
+            self.hooks.sink.record("handoff_worker_busy")
+        try:
+            return super()._dispatch(req, now)
+        finally:
+            if first_handoff:
+                self.hooks.inference_busy = False
+
+
 def main():
     parser = argparse.ArgumentParser()
     for name in ["endpoint", "profile", "evidence"]:
@@ -90,8 +115,8 @@ def main():
     parser.add_argument("--scenario", default="success")
     args = parser.parse_args()
     sink = MemoryPublisher(Path(args.evidence))
-    hooks = Hooks(sink)
-    control = HarnessControl(Path(args.profile), hooks, uuid.uuid4().hex)
+    hooks = Hooks(sink, args.scenario)
+    control = MemoryHarnessControl(Path(args.profile), hooks, uuid.uuid4().hex)
     control.locomotion_enabled = args.scenario == "locomotion"
     cache = ObservationSnapshotCache(lambda: None, "ego_view")
     server = HarnessRPCServer(args.endpoint, cache)
@@ -163,6 +188,10 @@ def main():
             if args.scenario == "late_result" and control.phase == "RESETTING" and not rejected:
                 assert not control.accept_policy_result(old_epoch, now, action, now)
                 sink.record("late_result_rejected")
+                rejected = True
+            if args.scenario == "subskill_handoff" and control.phase == "PAUSED" and not rejected:
+                assert not control.accept_policy_result(old_epoch, now, action, now)
+                sink.record("late_result_rejected", epoch=old_epoch)
                 rejected = True
             if hooks.reset is not None and control.hold_confirmed:
                 hooks.command = hooks.reset.advance(feedback, 0.02)

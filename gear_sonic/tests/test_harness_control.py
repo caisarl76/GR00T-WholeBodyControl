@@ -173,6 +173,29 @@ def test_pause_rejects_late_epoch():
     assert not h.enabled
 
 
+def test_paused_start_requires_new_hold_acknowledgement():
+    c, h = make()
+    eid = start(c)
+    request(c, "pause_manipulation", {"execution_id": eid}, 0.1)
+    rejected = request(c, "start_manipulation", {"skill_id": "bottle_to_right_table"}, 0.15)
+    assert rejected["error"] and rejected["error"]["code"] == "NOT_READY"
+    assert c.phase == "PAUSED" and not h.enabled
+    c.tick(0.2, state(2), 0.2)
+    started = request(c, "start_manipulation", {"skill_id": "bottle_to_right_table"}, 0.2)
+    assert started["error"] is None and h.enabled
+
+
+def test_paused_start_rejects_lost_planner_ack():
+    c, h = make()
+    eid = start(c)
+    request(c, "pause_manipulation", {"execution_id": eid}, 0.1)
+    c.tick(0.2, state(2), 0.2)
+    c.tick(0.25, state(3, planner=0), 0.25)
+    result = request(c, "start_manipulation", {"skill_id": "bottle_to_right_table"}, 0.3)
+    assert result["error"] and result["error"]["code"] == "NOT_READY"
+    assert not h.enabled
+
+
 def test_expired_chunk_never_replays_last_frame():
     c, h = make()
     start(c)

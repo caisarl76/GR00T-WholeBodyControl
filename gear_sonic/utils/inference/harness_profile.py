@@ -68,6 +68,7 @@ class SkillDefinition:
     skill_id: str
     prompt: str
     completion_criteria: str
+    completion_action: str = "reset_standing"
 
 
 @dataclass(frozen=True)
@@ -141,11 +142,17 @@ def load_profile(path: Path) -> G1Profile:
             or not key
             or key in {"reset_standing", "walk_for", "turn_by"}
             or not isinstance(spec, dict)
-            or spec.keys() != {"prompt", "completion_criteria"}
+            or not {"prompt", "completion_criteria"} <= spec.keys()
+            or spec.keys() - {"prompt", "completion_criteria", "completion_action"}
         ):
             raise ValueError("Invalid skill entry")
         if any(type(v) is not str or not v.strip() for v in spec.values()):
             raise ValueError("Empty skill text")
+        if spec.get("completion_action", "reset_standing") not in {
+            "reset_standing",
+            "hold",
+        }:
+            raise ValueError("Invalid completion action")
         skills[key] = SkillDefinition(key, **spec)
     del data["schema_version"]
     data.update(

@@ -253,6 +253,7 @@ class HarnessControl:
                 or facts.inference_busy
                 or not facts.controller_running
                 or not self._fresh(now)
+                or (self.phase == "PAUSED" and (not self.hold_confirmed or not self._planner_active()))
             ):
                 raise ControlError("NOT_READY", "Paused prepared executor required")
             if (
