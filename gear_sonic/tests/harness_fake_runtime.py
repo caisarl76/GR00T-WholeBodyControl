@@ -79,6 +79,13 @@ class Hooks:
     def set_planner_command(self, command):
         self.reset, self.command = None, command
 
+    def begin_ready_reset(self, feedback, right_arm_target):
+        self.reset = StandingReset(feedback, feedback["left_hand_q_measured"], np.zeros(7),
+                                   right_arm_target=right_arm_target)
+        self.command = self.reset.command
+        self.sink.record("ready_reset")
+        return self.reset
+
     def stop_planner_motion(self):
         if self.command is not None:
             self.command = replace(self.command, mode=0, movement=(0.0, 0.0, 0.0), speed=0.0)
@@ -189,7 +196,7 @@ def main():
                 assert not control.accept_policy_result(old_epoch, now, action, now)
                 sink.record("late_result_rejected")
                 rejected = True
-            if args.scenario == "subskill_handoff" and control.phase == "PAUSED" and not rejected:
+            if args.scenario in {"subskill_handoff", "handover"} and control.phase == "PAUSED" and not rejected:
                 assert not control.accept_policy_result(old_epoch, now, action, now)
                 sink.record("late_result_rejected", epoch=old_epoch)
                 rejected = True

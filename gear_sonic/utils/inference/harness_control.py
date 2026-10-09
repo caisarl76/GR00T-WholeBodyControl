@@ -237,13 +237,18 @@ class HarnessControl:
                 lease_id=uuid.uuid4().hex,
                 expires_at=now + self.profile.limits.lease_s,
             )
+            if self.profile.handover and self._handover_enabled():
+                self._hold(now)
+                if self.phase == "FAULT":
+                    self.owner = None
+                    raise ControlError("FAULT", "Cannot establish initial handover hold")
             return self.owner.copy()
         self._lease(req, now)
         if method == "heartbeat":
             self.owner["expires_at"] = now + self.profile.limits.lease_s
             return self.status(now)
         if method == "release_control":
-            if not self.hold_confirmed or self.phase not in {"PAUSED", "COMPLETED", "INTERRUPTED", "FAULT"}:
+            if not self.hold_confirmed or self.phase not in {"IDLE", "PAUSED", "COMPLETED", "INTERRUPTED", "FAULT"}:
                 raise ControlError("NOT_READY", "Release requires a confirmed planner hold")
             self.owner = None
             return self.status(now)

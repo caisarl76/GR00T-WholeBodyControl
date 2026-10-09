@@ -1,10 +1,8 @@
-from dataclasses import replace
-
 import numpy as np
 import pytest
+from test_harness_control import PROFILE, Hooks, request, state
 import yaml
 
-from test_harness_control import Hooks, PROFILE, request, state
 from gear_sonic.utils.inference.harness_control import HarnessControl
 from gear_sonic.utils.inference.standing_reset import StandingReset
 from gear_sonic.utils.teleop.xr_upperbody_bridge import G1_UPPER_BODY_JOINT_INDICES
@@ -83,3 +81,30 @@ def test_ready_requires_measured_settling_for_half_second(tmp_path):
     assert c.phase == "COMPLETED" and c.status(.61)["right_hand_open"] is True
     c.tick(1.2, None, None)
     assert c.status(1.2)["right_hand_open"] is None
+
+
+def test_handover_claim_requests_measured_hold_before_camera_checks(tmp_path):
+    c = make_ready(tmp_path)
+    assert len(c.hooks.holds) == 1
+    assert c.hooks.holds[0][1] is False
+    assert c.phase == "IDLE" and c.reset is None
+    c.tick(.1, state(2), .1)
+    assert c.hold_confirmed
+    assert request(c, "release_control", now=.1)["error"] is None
+
+
+@pytest.mark.parametrize("boundary,drift", [(1.97222,-.1), (-1.97222,.1)])
+def test_ready_tracking_compensation_cannot_cross_joint_bound(boundary, drift):
+    target = list(TARGET)
+    target[4] = boundary
+    s = state()
+    body = np.asarray(s["body_q_measured_motor"])
+    body[np.asarray(G1_UPPER_BODY_JOINT_INDICES)[10:17]] = target
+    s["body_q_measured_motor"] = body.tolist()
+    reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7),
+                          right_arm_target=target, compensate_tracking_bias=True)
+    body[np.asarray(G1_UPPER_BODY_JOINT_INDICES)[14]] += drift
+    s["body_q_measured_motor"] = body.tolist()
+    for _ in range(30):
+        command = reset.advance(s, .05)
+        assert -1.97222 <= command.upper_body_position[14] <= 1.97222

@@ -183,7 +183,13 @@ def load_profile(path: Path) -> G1Profile:
         h = data["handover"]
         if (
             not isinstance(h, dict)
-            or h.keys() != {"skill_id", "checkpoint_verified", "ready_pose_reviewed", "ready_right_arm_joints"}
+            or h.keys()
+            != {
+                "skill_id",
+                "checkpoint_verified",
+                "ready_pose_reviewed",
+                "ready_right_arm_joints",
+            }
             or type(h["skill_id"]) is not str
             or h["skill_id"] not in skills
             or skills[h["skill_id"]].completion_action != "hold"

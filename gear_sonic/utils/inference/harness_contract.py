@@ -86,7 +86,9 @@ def validate_params(method: str, params: dict) -> None:
         elif (
             kind is str
             and not value
-            and not (method in {"reset_standing", "reset_ready"} and key == "execution_id")
+            and not (
+                method in {"reset_standing", "reset_ready"} and key == "execution_id"
+            )
         ):
             raise ValueError(f"Empty {key}")
     if method == "walk_for":

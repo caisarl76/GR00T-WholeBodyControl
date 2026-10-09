@@ -68,10 +68,17 @@ class StandingReset:
                 _vector(right_hand_target, 7),
             ]
         )
+        self._right_arm_bounds = None
         if right_arm_target is not None:
+            from .harness_profile import RIGHT_ARM_BOUNDS
+
             # Upper-body motor order: waist 3, left arm 7, right arm 7.
             self._target[:10] = self._position[:10]
             self._target[10:17] = _vector(right_arm_target, 7)
+            self._right_arm_bounds = np.asarray(list(RIGHT_ARM_BOUNDS.values())).T
+            low, high = self._right_arm_bounds
+            if np.any(self._target[10:17] < low) or np.any(self._target[10:17] > high):
+                raise ValueError("Ready target exceeds G1 right-arm joint limits")
 
     @property
     def target(self):
@@ -116,6 +123,8 @@ class StandingReset:
                 error = np.where(np.abs(error) > self._tracking_deadband, error, 0.0)
                 self._tracking_trim = np.clip(self._tracking_trim + dt * error, -0.15, 0.15)
                 reference[:17] += self._tracking_trim
+        if self._right_arm_bounds is not None:
+            reference[10:17] = np.clip(reference[10:17], *self._right_arm_bounds)
         delta = np.clip(reference - self._position, -step, step)
         # Only move toward the target, without getting ahead of feedback.
         room = np.maximum(0.0, 0.15 - np.sign(delta) * (self._position - measured))
