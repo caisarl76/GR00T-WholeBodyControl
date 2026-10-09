@@ -116,6 +116,17 @@
         "angle_rad": 0.2617993877991494,
         "rate_rps": 0.17453292519943295
       }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "reset_ready",
+      "params": {
+        "execution_id": ""
+      }
     }
   ],
   "invalid_requests": [
@@ -179,7 +190,9 @@
         "checkpoint_expected": "/mnt/data/jihun/models/pnp_bottle_260916_n17_raw_gpu7/checkpoint-20000",
         "owner_session_id": null,
         "reason": null,
-        "locomotion_enabled": false
+        "locomotion_enabled": false,
+        "ready_return_enabled": false,
+        "right_hand_open": null
       },
       "error": null
     }

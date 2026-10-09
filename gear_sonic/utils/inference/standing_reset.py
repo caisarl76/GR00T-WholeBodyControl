@@ -46,6 +46,7 @@ class StandingReset:
     def __init__(
         self, state, left_hand_target, right_hand_target, *,
         compensate_tracking_bias=False, joint_tolerance_rad=0.05,
+        right_arm_target=None,
     ):
         self._position = _measured_joints(state)
         self._compensate_tracking_bias = compensate_tracking_bias
@@ -67,6 +68,10 @@ class StandingReset:
                 _vector(right_hand_target, 7),
             ]
         )
+        if right_arm_target is not None:
+            # Upper-body motor order: waist 3, left arm 7, right arm 7.
+            self._target[:10] = self._position[:10]
+            self._target[10:17] = _vector(right_arm_target, 7)
 
     @property
     def target(self):

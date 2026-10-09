@@ -41,6 +41,7 @@ PARAMS = {
     "pause_manipulation": {"execution_id": str},
     "cancel": {"execution_id": str},
     "reset_standing": {"execution_id": str, "open_hands": bool},
+    "reset_ready": {"execution_id": str},
     "walk_for": {"direction": str, "duration_s": float, "speed_mps": float},
     "turn_by": {"angle_rad": float, "rate_rps": float},
 }
@@ -85,7 +86,7 @@ def validate_params(method: str, params: dict) -> None:
         elif (
             kind is str
             and not value
-            and not (method == "reset_standing" and key == "execution_id")
+            and not (method in {"reset_standing", "reset_ready"} and key == "execution_id")
         ):
             raise ValueError(f"Empty {key}")
     if method == "walk_for":
@@ -142,6 +143,8 @@ class Status:
     owner_session_id: str | None
     reason: str | None
     locomotion_enabled: bool = False
+    ready_return_enabled: bool = False
+    right_hand_open: bool | None = None
 
 
 @dataclass(frozen=True)

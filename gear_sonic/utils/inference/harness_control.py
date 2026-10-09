@@ -33,6 +33,7 @@ class RuntimeHooks(Protocol):
     def set_policy_enabled(self, enabled: bool) -> None: ...
     def request_planner_hold(self, feedback: dict, open_hands: bool) -> None: ...
     def begin_standing_reset(self, feedback: dict, open_hands: bool) -> StandingReset: ...
+    def begin_ready_reset(self, feedback: dict, right_arm_target) -> StandingReset: ...
     def set_planner_command(self, command) -> None: ...
     def stop_planner_motion(self) -> None: ...
 
@@ -161,6 +162,11 @@ class HarnessControl:
             reason=self.reason,
         )
 
+    def _handover_enabled(self):
+        h = self.profile.handover
+        return bool(h and h.checkpoint_verified and h.ready_pose_reviewed
+                    and callable(getattr(self.hooks, "begin_ready_reset", None)))
+
     def _new_execution(self, skill_id, now):
         self.execution = dict(execution_id=uuid.uuid4().hex, skill_id=skill_id, started_at=now)
         self.reason, self.dwell = None, None
@@ -246,6 +252,8 @@ class HarnessControl:
                 skill = self.profile.require_skill(params["skill_id"])
             except ValueError as exc:
                 raise ControlError("UNSUPPORTED_SKILL", str(exc)) from exc
+            if self.profile.handover and skill.skill_id == self.profile.handover.skill_id and not self._handover_enabled():
+                raise ControlError("NOT_READY", "Handover checkpoint/ready return not verified")
             facts = self.hooks.runtime_facts()
             if (
                 self.phase not in {"IDLE", "COMPLETED", "PAUSED"}
@@ -271,7 +279,7 @@ class HarnessControl:
             return self._execution()
         if method in {"walk_for", "turn_by"}:
             return self._begin_locomotion(method, params, now)
-        standalone = method == "reset_standing" and params["execution_id"] == ""
+        standalone = method in {"reset_standing", "reset_ready"} and params["execution_id"] == ""
         if not standalone and (not self.execution or params["execution_id"] != self.execution["execution_id"]):
             raise ControlError("INVALID_REQUEST", "Execution mismatch")
         if method == "cancel":
@@ -284,14 +292,20 @@ class HarnessControl:
             if self.phase != "FAULT":
                 self.phase, self.reason = "PAUSED", None
             return self._execution()
-        if method == "reset_standing":
+        if method in {"reset_standing", "reset_ready"}:
+            if method == "reset_ready" and not self._handover_enabled():
+                raise ControlError("NOT_READY", "Verified handover ready return unavailable")
             if self.phase not in ({"IDLE", "COMPLETED"} if standalone else {"PAUSED"}) or not self._fresh(now):
                 raise ControlError("NOT_READY", "Pause and fresh telemetry required before reset")
             if standalone:
-                self._new_execution("reset_standing", now)
+                self._new_execution(method, now)
             self.epoch = self.hooks.invalidate_policy_actions()
             self.hooks.set_policy_enabled(False)
-            self.reset = self.hooks.begin_standing_reset(self.feedback, params["open_hands"])
+            self.reset = (
+                self.hooks.begin_ready_reset(self.feedback, self.profile.handover.right_arm_target)
+                if method == "reset_ready"
+                else self.hooks.begin_standing_reset(self.feedback, params["open_hands"])
+            )
             self.phase, self.transition_started, self.dwell = "RESETTING", now, None
             self.hold_confirmed, self.hold_index, self.hold_started = False, self.feedback_index, now
             return self._execution()
@@ -445,4 +459,7 @@ class HarnessControl:
             owner_session_id=self.owner["session_id"] if self.owner else None,
             reason=self.reason,
             locomotion_enabled=self.locomotion_enabled,
+            ready_return_enabled=self._handover_enabled(),
+            right_hand_open=(bool(np.max(np.abs(self.feedback["right_hand_q_measured"])) <= 0.05)
+                             if fresh else None),
         )

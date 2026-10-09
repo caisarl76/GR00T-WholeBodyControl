@@ -72,6 +72,30 @@ class SkillDefinition:
 
 
 @dataclass(frozen=True)
+class HandoverSettings:
+    skill_id: str
+    checkpoint_verified: bool
+    ready_pose_reviewed: bool
+    ready_right_arm_joints: dict[str, float]
+
+    @property
+    def right_arm_target(self) -> tuple[float, ...]:
+        return tuple(self.ready_right_arm_joints[name] for name in RIGHT_ARM_BOUNDS)
+
+
+# Motor order and limits from g1_29dof_with_hand.xml (right arm motors 22–28).
+RIGHT_ARM_BOUNDS = {
+    "right_shoulder_pitch_joint": (-3.0892, 2.6704),
+    "right_shoulder_roll_joint": (-2.2515, 1.5882),
+    "right_shoulder_yaw_joint": (-2.618, 2.618),
+    "right_elbow_joint": (-1.0472, 2.0944),
+    "right_wrist_roll_joint": (-1.97222, 1.97222),
+    "right_wrist_pitch_joint": (-1.61443, 1.61443),
+    "right_wrist_yaw_joint": (-1.61443, 1.61443),
+}
+
+
+@dataclass(frozen=True)
 class G1Profile:
     registry_sha256: str
     policy_host: str
@@ -83,6 +107,7 @@ class G1Profile:
     publish_rate: int
     limits: HarnessLimits
     skills: dict[str, SkillDefinition]
+    handover: HandoverSettings | None = None
 
     def require_skill(self, skill_id: str) -> SkillDefinition:
         if skill_id not in self.skills:
@@ -107,7 +132,7 @@ def load_profile(path: Path) -> G1Profile:
     }
     if (
         not isinstance(data, dict)
-        or data.keys() != expected
+        or data.keys() not in (expected, expected | {"handover"})
         or type(data["schema_version"]) is not int
         or data["schema_version"] != 1
     ):
@@ -140,7 +165,7 @@ def load_profile(path: Path) -> G1Profile:
         if (
             type(key) is not str
             or not key
-            or key in {"reset_standing", "walk_for", "turn_by"}
+            or key in {"reset_standing", "reset_ready", "walk_for", "turn_by"}
             or not isinstance(spec, dict)
             or not {"prompt", "completion_criteria"} <= spec.keys()
             or spec.keys() - {"prompt", "completion_criteria", "completion_action"}
@@ -154,6 +179,25 @@ def load_profile(path: Path) -> G1Profile:
         }:
             raise ValueError("Invalid completion action")
         skills[key] = SkillDefinition(key, **spec)
+    if "handover" in data:
+        h = data["handover"]
+        if (
+            not isinstance(h, dict)
+            or h.keys() != {"skill_id", "checkpoint_verified", "ready_pose_reviewed", "ready_right_arm_joints"}
+            or type(h["skill_id"]) is not str
+            or h["skill_id"] not in skills
+            or skills[h["skill_id"]].completion_action != "hold"
+            or type(h["checkpoint_verified"]) is not bool
+            or type(h["ready_pose_reviewed"]) is not bool
+        ):
+            raise ValueError("Invalid handover settings")
+        joints = h["ready_right_arm_joints"]
+        if not isinstance(joints, dict) or joints.keys() != RIGHT_ARM_BOUNDS.keys():
+            raise ValueError("Ready pose requires seven named right-arm joints")
+        for name, (low, high) in RIGHT_ARM_BOUNDS.items():
+            if not finite_number(joints[name]) or not low <= joints[name] <= high:
+                raise ValueError(f"Ready joint outside G1 bounds: {name}")
+        data["handover"] = HandoverSettings(**h)
     del data["schema_version"]
     data.update(
         registry_sha256=hashlib.sha256(raw).hexdigest(),

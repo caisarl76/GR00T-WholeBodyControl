@@ -819,6 +819,20 @@ def main(config: InferenceConfig):
                 planner_command_in_reference_frame(command, reset_feedback).encode()
                 harness_planner_command, standing_reset = command, None
 
+            def begin_ready_reset(self, feedback, right_arm_target):
+                nonlocal standing_reset, manual_planner, harness_planner_command
+                reset = StandingReset(
+                    feedback, feedback["left_hand_q_measured"], np.zeros(7),
+                    right_arm_target=right_arm_target, compensate_tracking_bias=True,
+                    joint_tolerance_rad=harness_control.profile.limits.reset_joint_tolerance_rad,
+                )
+                if not publish_planner_command(reset.command):
+                    raise ValueError("Cannot encode ready reset")
+                if not cpp_loop_running or not send_cpp_control_command(start=True, planner=True):
+                    raise ValueError("Cannot activate ready planner")
+                standing_reset, manual_planner, harness_planner_command = reset, None, None
+                return reset
+
             def stop_planner_motion(self):
                 nonlocal harness_planner_command, standing_reset, manual_planner
                 command = harness_planner_command
