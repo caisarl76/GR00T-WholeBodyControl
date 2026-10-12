@@ -12,6 +12,11 @@ from gear_sonic.utils.teleop.xr_upperbody_bridge import (
     feedback_payload_heading_yaw,
 )
 
+# Planner order interleaves the arms; body motor indices 22..28 are the right arm.
+_RIGHT_ARM_PLANNER_INDICES = [
+    G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(22, 29)
+]
+
 
 def _vector(value, size):
     array = np.asarray(value, dtype=np.float64).reshape(-1)
@@ -72,12 +77,12 @@ class StandingReset:
         if right_arm_target is not None:
             from .harness_profile import RIGHT_ARM_BOUNDS
 
-            # Upper-body motor order: waist 3, left arm 7, right arm 7.
-            self._target[:10] = self._position[:10]
-            self._target[10:17] = _vector(right_arm_target, 7)
+            self._target[:17] = self._position[:17]
+            self._target[_RIGHT_ARM_PLANNER_INDICES] = _vector(right_arm_target, 7)
             self._right_arm_bounds = np.asarray(list(RIGHT_ARM_BOUNDS.values())).T
             low, high = self._right_arm_bounds
-            if np.any(self._target[10:17] < low) or np.any(self._target[10:17] > high):
+            if (np.any(self._target[_RIGHT_ARM_PLANNER_INDICES] < low)
+                    or np.any(self._target[_RIGHT_ARM_PLANNER_INDICES] > high)):
                 raise ValueError("Ready target exceeds G1 right-arm joint limits")
 
     @property
@@ -124,7 +129,9 @@ class StandingReset:
                 self._tracking_trim = np.clip(self._tracking_trim + dt * error, -0.15, 0.15)
                 reference[:17] += self._tracking_trim
         if self._right_arm_bounds is not None:
-            reference[10:17] = np.clip(reference[10:17], *self._right_arm_bounds)
+            reference[_RIGHT_ARM_PLANNER_INDICES] = np.clip(
+                reference[_RIGHT_ARM_PLANNER_INDICES], *self._right_arm_bounds
+            )
         delta = np.clip(reference - self._position, -step, step)
         # Only move toward the target, without getting ahead of feedback.
         room = np.maximum(0.0, 0.15 - np.sign(delta) * (self._position - measured))

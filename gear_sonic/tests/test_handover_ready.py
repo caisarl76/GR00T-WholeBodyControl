@@ -40,8 +40,11 @@ def test_ready_preserves_other_arm_waist_heading_and_left_hand():
     s["body_q_measured_motor"] = np.linspace(-.1, .1, 29).tolist()
     reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=TARGET)
     upper = np.asarray(s["body_q_measured_motor"])[G1_UPPER_BODY_JOINT_INDICES]
-    assert reset.target[:10] == pytest.approx(upper[:10])
-    assert reset.target[10:17] == pytest.approx(TARGET)
+    # Check actual motor semantics, independently of the reset's vector layout.
+    target_body = np.asarray(s["body_q_measured_motor"]).copy()
+    target_body[G1_UPPER_BODY_JOINT_INDICES] = reset.target[:17]
+    assert target_body[:22] == pytest.approx(s["body_q_measured_motor"][:22])
+    assert target_body[22:29] == pytest.approx(TARGET)
     assert reset.target[17:24] == pytest.approx([.3]*7)
     assert reset.target[24:] == pytest.approx([0]*7)
     last = np.r_[reset.command.upper_body_position, reset.command.left_hand_position,
@@ -99,12 +102,14 @@ def test_ready_tracking_compensation_cannot_cross_joint_bound(boundary, drift):
     target[4] = boundary
     s = state()
     body = np.asarray(s["body_q_measured_motor"])
-    body[np.asarray(G1_UPPER_BODY_JOINT_INDICES)[10:17]] = target
+    body[22:29] = target
     s["body_q_measured_motor"] = body.tolist()
     reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7),
                           right_arm_target=target, compensate_tracking_bias=True)
-    body[np.asarray(G1_UPPER_BODY_JOINT_INDICES)[14]] += drift
+    body[26] += drift  # Native right_wrist_roll motor.
     s["body_q_measured_motor"] = body.tolist()
     for _ in range(30):
         command = reset.advance(s, .05)
-        assert -1.97222 <= command.upper_body_position[14] <= 1.97222
+        commanded_body = body.copy()
+        commanded_body[G1_UPPER_BODY_JOINT_INDICES] = command.upper_body_position
+        assert -1.97222 <= commanded_body[26] <= 1.97222
