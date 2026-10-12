@@ -225,7 +225,7 @@ def test_invalid_generation_and_retarget_failure_hold():
 
 
 @pytest.mark.parametrize("profile,size,ceiling", [("dex3", 7, 2.0), ("inspire_ftp", 6, 1.0)])
-@pytest.mark.parametrize("rate", [0.0, -0.1, np.nan, np.inf, -np.inf, "above"])
+@pytest.mark.parametrize("rate", [-0.1, np.nan, np.inf, -np.inf, "above"])
 def test_custom_rate_rejects_invalid_or_above_nominal(profile, size, ceiling, rate):
     if rate == "above":
         rate = np.nextafter(ceiling, np.inf)
@@ -244,6 +244,50 @@ def test_custom_rate_accepts_default_lower_and_nominal(profile, size, ceiling, f
         step(tracker, frame + 1, frame * 20_000_000)
     output = step(tracker, 6, 100_000_000)
     np.testing.assert_allclose(output.command, expected * 0.02, rtol=1e-6)
+
+
+@pytest.mark.parametrize("profile,size", [("dex3", 7), ("inspire_ftp", 6)])
+def test_zero_rate_removes_slew_cap_but_keeps_smoothing(profile, size):
+    tracker = HandTracker(Retargeter(size, target=1), profile, max_rate=0.0)
+    for frame in range(5):
+        output = step(tracker, frame + 1, frame * 20_000_000)
+    assert output.state == TrackingState.RECOVERING
+    np.testing.assert_array_equal(output.command, np.zeros(size))
+    output = step(tracker, 6, 100_000_000)
+    np.testing.assert_allclose(output.command, 1 - np.exp(-0.02 / 0.060), rtol=1e-6)
+    assert output.command[0] > 2.0 * 0.02
+    for frame in range(6, 35):
+        output = step(tracker, frame + 1, frame * 20_000_000)
+    assert output.state == TrackingState.TRACKING
+    previous = output.command.copy()
+    tracker.retargeter.target[:] = 0
+    output = step(tracker, 36, 700_000_000)
+    assert np.max(previous - output.command) > 2.0 * 0.02
+    assert np.all(output.command > 0)  # Smoothing remains active.
+
+
+@pytest.mark.parametrize("failure", ["stale", "feedback", "target", "disabled"])
+@pytest.mark.parametrize("profile,size", [("dex3", 7), ("inspire_ftp", 6)])
+def test_zero_rate_preserves_holds_and_position_validation(failure, profile, size):
+    tracker = HandTracker(Retargeter(size, target=0.8), profile, max_rate=0.0)
+    for frame in range(12):
+        output = step(tracker, frame + 1, frame * 20_000_000)
+    held = output.command.copy()
+    tracker.retargeter.target[:] = 0.2
+    measured = np.zeros(size)
+    stamp, now, enabled = 13, 240_000_000, True
+    if failure == "stale":
+        stamp, now = 12, 320_000_000
+    elif failure == "feedback":
+        measured[:] = np.nan
+    elif failure == "target":
+        tracker.retargeter.target[:] = 2
+    else:
+        enabled = False
+    output = step(tracker, stamp, now, measured=measured, enabled=enabled)
+    assert output.state == TrackingState.HOLDING
+    assert output.reason != HandReason.OK
+    np.testing.assert_array_equal(output.command, held)
 
 
 @pytest.mark.parametrize("profile,size", [("dex3", 7), ("inspire_ftp", 6)])
@@ -269,15 +313,9 @@ def test_startup_invalid_or_disabled_optical_uses_latest_measured_baseline(profi
     assert output.state == TrackingState.HOLDING
     np.testing.assert_array_equal(output.command, held)
     output = tracker.step(None, np.zeros(3), np.full(size, 0.2), 160_000_000)
-    if profile == "dex3":
-        # Re-entry transfers ownership back from the planner: seed its measured
-        # pose even when optics are unavailable, and wait before recovery.
-        assert output.state == TrackingState.WAITING
-        np.testing.assert_allclose(output.command, 0.2)
-    else:
-        assert output.state == TrackingState.HOLDING
-        np.testing.assert_array_equal(output.command, held)
-
+    # Both hand backends rearm from fresh measured positions on POSE entry.
+    assert output.state == TrackingState.WAITING
+    np.testing.assert_allclose(output.command, 0.2)
 
 
 def test_right_index_measurement_allowance_does_not_accept_invalid_target():

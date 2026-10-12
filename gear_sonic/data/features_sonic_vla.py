@@ -323,6 +323,18 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "shape": (1,),
             "names": ["stream_mode"],
         },
+        # Exporter-local monotonic receive ages. -1 means no received message.
+        # Quality metadata only: intentionally excluded from action modalities.
+        "teleop.pose_receive_age_ms": {
+            "dtype": "float64",
+            "shape": (1,),
+            "names": ["pose_receive_age_ms"],
+        },
+        "teleop.planner_receive_age_ms": {
+            "dtype": "float64",
+            "shape": (1,),
+            "names": ["planner_receive_age_ms"],
+        },
         "teleop.planner_mode": {
             "dtype": "int32",
             "shape": (1,),

@@ -31,9 +31,10 @@ import numpy as np
 
 from gear_sonic.utils.teleop.inspire_ftp_real_bridge import (
     CONTROL_PERIOD_NS,
+    MAX_STEP,
     MAX_TICK_INTERVAL_NS,
-    MIN_COMMAND,
     OPEN_FEEDBACK_MIN,
+    OPEN_ONLY_MAX_FEEDBACK_LAG,
     STATE_STALE_NS,
     BridgeState,
     CallbackFaultEvent,
@@ -57,7 +58,7 @@ MAX_ZMQ_DRAIN_NS = 5_000_000
 # Fixed defense-in-depth cap, comfortably above current production pose frames.
 MAX_ZMQ_MESSAGE_BYTES = 1_048_576
 DEFAULT_INBOX_CAPACITY = 256
-ZMQ_RCVHWM = 64
+ZMQ_RCVHWM = 16
 DISCOVERY_WINDOW_NS = 2_000_000_000
 DISCOVERY_POLL_SECONDS = 0.1
 DEFAULT_DISCOVERY_TIMEOUT_NS = 5_000_000_000
@@ -243,6 +244,13 @@ class PublicationOwnershipTracker:
         for sample in samples:
             if not isinstance(sample, PublicationLifecycleSample):
                 raise TypeError("discovery samples must be PublicationLifecycleSample values")
+            # CycloneDDS disposals may omit non-key topic metadata.
+            if not sample.alive and sample.topic_name == "None":
+                known = [i for i in self._identities.values() if i.key == sample.key]
+                if len(known) == 1 and known[0].participant_key == sample.participant_key:
+                    sample = replace(sample, topic_name=known[0].topic_name)
+                elif known:
+                    self._identity_mismatch = True
             self._lifecycle.append(sample)
             state_side = self._side_for_topic(STATE_TOPICS, sample.topic_name)
             side = self._side_for_topic(COMMAND_TOPICS, sample.topic_name)
@@ -317,7 +325,7 @@ class PublicationOwnershipTracker:
         state_healthy = (
             all(len(keys) == 1 for _, keys in state_alive)
             and len(state_participants) == len(STATE_TOPICS)
-            and len(set(state_participants)) == 1
+            # Installed driver uses independently pinned participants per side.
             and not self._state_identity_fault
             and not self._identity_mismatch
         )
@@ -835,6 +843,7 @@ def drain_zmq_packets(
     rejected_count = 0
     oversized_count = 0
     time_budget_exhausted = False
+    pending = []
     while received_count < max_packets and not time_budget_exhausted:
         try:
             raw = socket.recv(zmq_module.NOBLOCK)
@@ -859,21 +868,24 @@ def drain_zmq_packets(
             continue
         received_ns = monotonic_ns()
         packet = _stamp_bridge_payload(decoded, received_ns)
-        if isinstance(packet, ManagerPacket):
-            controller.accept_manager(packet.provenance, packet.received_ns)
-        else:
-            controller.accept_pair(
-                packet.left,
-                packet.right,
-                packet.provenance,
-                packet.topic,
-                packet.received_ns,
-                packet.message_seq,
-                decoded.fingerprint,
-            )
-        dispatched_count += 1
+        pending.append((packet, decoded))
         current_ns = monotonic_ns()
         time_budget_exhausted = current_ns - start_ns >= max_drain_ns
+    if received_count < max_packets and not time_budget_exhausted:
+        for packet, decoded in pending:
+            if isinstance(packet, ManagerPacket):
+                controller.accept_manager(packet.provenance, packet.received_ns)
+            else:
+                controller.accept_pair(
+                    packet.left,
+                    packet.right,
+                    packet.provenance,
+                    packet.topic,
+                    packet.received_ns,
+                    packet.message_seq,
+                    decoded.fingerprint,
+                )
+            dispatched_count += 1
     return DrainStats(
         received=received_count,
         dispatched=dispatched_count,
@@ -917,7 +929,11 @@ class InspireStatusPublisher:
         fields["status_seq"][0] = self.sequence
         if controller.manager_provenance is not None:
             fields["accepted_pv"][:] = controller.manager_provenance.to_array()
-        fields["bridge_state"][0] = list(BridgeState).index(controller.state)
+        fields["bridge_state"][0] = (
+            3
+            if controller.state is BridgeState.COMMISSIONING_OPENING
+            else list(BridgeState).index(controller.state)
+        )
         fields["last_applied_message_seq"][0] = controller.last_applied_message_seq
         healthy = True
         for side, snapshot, applied in zip(
@@ -926,6 +942,9 @@ class InspireStatusPublisher:
             (controller.last_successful_left, controller.last_successful_right),
             strict=True,
         ):
+            age_field = f"{side}_feedback_age_ns"
+            if age_field in fields:
+                fields[age_field][0] = -1 if snapshot is None else now_ns - snapshot.received_ns
             if snapshot is None:
                 healthy = False
             else:
@@ -1058,7 +1077,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--status-port", type=int, default=5563)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--evidence-log", default="")
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--initialize-hands",
+        action="store_true",
+        help="Open from measured positions before admitting optical commands",
+    )
+    parser.add_argument(
+        "--full-position-range", action="store_true", help="Opt in to 0–1000 motor counts (default: 800–1000)"
+    )
+    parser.add_argument(
+        "--no-active-slew-limit",
+        action="store_true",
+        help="Opt in to direct active q6 targets; opening retains five-count steps",
+    )
+    args = parser.parse_args(argv)
+    if any((args.initialize_hands, args.full_position_range, args.no_active_slew_limit)) and not args.publish:
+        parser.error("hand initialization, full range and active slew options require --publish")
+    return args
 
 
 def _json_logger(record: Mapping[str, Any]) -> None:
@@ -1166,6 +1201,7 @@ class BridgeRuntimeResources:
     zmq_backlog_discarded: int = 0
     signal_count: int = 0
     status_publisher: Any | None = None
+    source_factory: Callable[[], Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1180,7 +1216,7 @@ class RuntimeDependencies:
     status_publisher_factory: Callable[[int], Any] | None = None
     dds_loader: Callable[[str], Any] = load_pc2_dds
     signal_source_factory: Callable[[], Any] = WakeupSignalPipe
-    controller_factory: Callable[[], Any] = InspireFtpSafetyController
+    controller_factory: Callable[..., Any] = InspireFtpSafetyController
     logger: Callable[[Mapping[str, Any]], None] = _json_logger
     evidence_sink: Callable[[Mapping[str, Any]], None] | None = None
     max_ticks: int | None = None
@@ -1302,7 +1338,7 @@ def _emergency_open_existing_writers(
     if (
         len(left) != 6
         or len(right) != 6
-        or any(type(value) is not int or not MIN_COMMAND <= value <= 1000 for value in left + right)
+        or any(type(value) is not int or not 0 <= value <= 1000 for value in left + right)
     ):
         return False
     open_counts = (1000,) * 6
@@ -1319,7 +1355,7 @@ def _emergency_open_existing_writers(
             skipped = (now_ns - next_deadline_ns) // CONTROL_PERIOD_NS + 1
             next_deadline_ns += skipped * CONTROL_PERIOD_NS
 
-    for _ in range(40):
+    for _ in range(max(40, (1000 - min(left + right) + MAX_STEP - 1) // MAX_STEP)):
         if left == open_counts and right == open_counts:
             break
         if abort is not None and abort():
@@ -1335,6 +1371,7 @@ def _emergency_open_existing_writers(
             return False
         if write_hand_command(right_writer, right_message, attempted_right):
             right = attempted_right
+        next_deadline_ns = monotonic_ns() + CONTROL_PERIOD_NS
     if left != open_counts or right != open_counts:
         return False
     for _ in range(20):
@@ -1343,10 +1380,13 @@ def _emergency_open_existing_writers(
         wait_for_deadline()
         if abort is not None and abort():
             return False
-        write_hand_command(left_writer, left_message, open_counts)
+        if not write_hand_command(left_writer, left_message, open_counts):
+            return False
         if abort is not None and abort():
             return False
-        write_hand_command(right_writer, right_message, open_counts)
+        if not write_hand_command(right_writer, right_message, open_counts):
+            return False
+        next_deadline_ns = monotonic_ns() + CONTROL_PERIOD_NS
     return True
 
 
@@ -1504,6 +1544,22 @@ def build_status_record(
             "envelope_limited_values": controller.envelope_limited_values,
         },
         "fault": None if controller.fault_reason is None else _bounded_text(controller.fault_reason),
+        "ready_error_feedback": None
+        if controller.ready_error_feedback is None
+        else {
+            "side": controller.ready_error_feedback.side,
+            "received_ns": controller.ready_error_feedback.received_ns,
+            "angles": list(controller.ready_error_feedback.angle_act),
+            "errors": list(controller.ready_error_feedback.err),
+        },
+        "fault_feedback": None
+        if controller.fault_feedback is None
+        else {
+            "side": controller.fault_feedback.side,
+            "received_ns": controller.fault_feedback.received_ns,
+            "angles": list(controller.fault_feedback.angle_act),
+            "errors": list(controller.fault_feedback.err),
+        },
     }
 
 
@@ -1610,7 +1666,8 @@ def run_control_loop(
     if dependencies.max_ticks is not None and dependencies.max_ticks < 0:
         raise ValueError("max_ticks must be nonnegative")
     next_deadline_ns = dependencies.monotonic_ns()
-    last_tick_start_ns: int | None = None
+    last_controller_call_ns: int | None = None
+    last_pair_write_completed_ns: int | None = None
     last_status_ns: int | None = None
     previous_state = resources.controller.state
     ticks = 0
@@ -1643,13 +1700,51 @@ def run_control_loop(
             ),
         )
 
+    def emit_write(side, counts, started, completed, succeeded):
+        _emit_record(
+            dependencies,
+            {
+                "event": "command_write",
+                "timestamp_ns": started,
+                "completed_ns": completed,
+                "topic": COMMAND_TOPICS[side],
+                "angle_set": list(counts),
+                "mode": 1,
+                "succeeded": succeeded,
+            },
+        )
+
+    def require_initialization_write_healthy(side, counts, decision_ns):
+        drain_signals()
+        resources.ownership.observe(resources.discovery.drain_publications(monotonic_ns=dependencies.monotonic_ns))
+        drain_controller_events(resources.inbox, resources.controller)
+        fault = resources.ownership.health_fault()
+        if fault:
+            raise RuntimeError(fault)
+        _require_controller_not_faulted(resources.controller)
+        resources.controller.require_publish_feedback_healthy(dependencies.monotonic_ns())
+        snapshot = resources.controller.hand_states[0 if side == "left" else 1]
+        baseline = getattr(resources.controller, "last_successful_" + side)
+        if any(not old <= target <= old + MAX_STEP for old, target in zip(baseline, counts)):
+            raise RuntimeError("initialization command exceeded bounded step")
+        if any(
+            not measured - MAX_STEP <= target <= measured + OPEN_ONLY_MAX_FEEDBACK_LAG
+            for measured, target in zip(snapshot.angle_act, counts)
+        ):
+            raise RuntimeError("initialization feedback outside bounded command")
+        if resources.signal_count or dependencies.monotonic_ns() - decision_ns > MAX_TICK_INTERVAL_NS:
+            raise RuntimeError("initialization interrupted or write interval overrun")
+
     while dependencies.max_ticks is None or ticks < dependencies.max_ticks:
         now_ns = dependencies.monotonic_ns()
         if now_ns < next_deadline_ns:
             dependencies.sleep((next_deadline_ns - now_ns) / 1_000_000_000)
         tick_start_ns = dependencies.monotonic_ns()
-        overrun = last_tick_start_ns is not None and tick_start_ns - last_tick_start_ns > MAX_TICK_INTERVAL_NS
-        if overrun:
+        open_only = resources.controller.open_only
+        overrun = (
+            last_controller_call_ns is not None and tick_start_ns - last_controller_call_ns > MAX_TICK_INTERVAL_NS
+        )
+        if overrun and resources.controller.state is not BridgeState.READY:
             resources.controller.latch_fault("control tick interval overrun")
 
         drain_signals()
@@ -1660,12 +1755,19 @@ def run_control_loop(
         drain_signals()
         if resources.signal_count >= 2:
             return forced_result(ticks)
-        if overrun:
+        if open_only:
+            pass
+        elif overrun:
             resources.zmq_backlog_discarded += _discard_zmq_backlog(
                 resources.zmq_socket,
                 monotonic_ns=dependencies.monotonic_ns,
                 zmq_module=dependencies.zmq_module,
             )
+            if resources.source_factory is not None:
+                _close_resource(resources.zmq_socket)
+                resources.zmq_socket = resources.source_factory()
+            else:
+                resources.controller.latch_fault("optical input backlog after scheduling overrun")
         else:
             drain_stats = drain_zmq_packets(
                 resources.zmq_socket,
@@ -1675,6 +1777,15 @@ def run_control_loop(
             )
             resources.zmq_rejected += drain_stats.rejected
             resources.zmq_oversized += drain_stats.oversized
+            if drain_stats.packet_budget_exhausted or drain_stats.time_budget_exhausted:
+                # A saturated batch is never dispatched; reconnect to drop the
+                # remaining transport queue instead of replaying old commands.
+                resources.zmq_backlog_discarded += drain_stats.received
+                if resources.source_factory is not None:
+                    _close_resource(resources.zmq_socket)
+                    resources.zmq_socket = resources.source_factory()
+                else:
+                    resources.controller.latch_fault("optical input backlog exceeded bounded drain")
         drain_signals()
         if resources.signal_count >= 2:
             return forced_result(ticks)
@@ -1706,6 +1817,18 @@ def run_control_loop(
         if resources.signal_count >= 2:
             return forced_result(ticks)
         controller_now_ns = dependencies.monotonic_ns()
+        if last_controller_call_ns is not None:
+            admission_ns = last_controller_call_ns + CONTROL_PERIOD_NS
+            if last_pair_write_completed_ns is not None:
+                admission_ns = max(admission_ns, last_pair_write_completed_ns + CONTROL_PERIOD_NS)
+            while controller_now_ns < admission_ns:
+                dependencies.sleep((admission_ns - controller_now_ns) / 1_000_000_000)
+                drain_signals()
+                if resources.signal_count >= 2:
+                    return forced_result(ticks)
+                controller_now_ns = dependencies.monotonic_ns()
+        drain_controller_events(resources.inbox, resources.controller)
+        last_controller_call_ns = controller_now_ns
         try:
             decision = resources.controller.tick(controller_now_ns)
         except Exception as error:
@@ -1716,6 +1839,7 @@ def run_control_loop(
         if (
             decision is not None
             and resources.signal_count == 1
+            and not open_only
             and decision.state is not BridgeState.SHUTDOWN_OPENING
         ):
             decision = None
@@ -1733,6 +1857,11 @@ def run_control_loop(
                     },
                 )
                 previous_state = decision.state
+            if open_only and decision.state is BridgeState.READY:
+                if resources.source_factory is None:
+                    raise RuntimeError("initialized optical source factory missing")
+                resources.zmq_socket = resources.source_factory()
+                _emit_record(dependencies, {"event": "hand_initialized", "timestamp_ns": controller_now_ns})
             if decision.publish:
                 if decision.state is not BridgeState.ACTIVE:
                     resources.controller.last_applied_message_seq = -1
@@ -1743,34 +1872,60 @@ def run_control_loop(
                     return forced_result(ticks + 1)
                 if new_signals:
                     ticks += 1
-                    last_tick_start_ns = tick_start_ns
                     next_deadline_ns += CONTROL_PERIOD_NS
                     now_ns = dependencies.monotonic_ns()
                     if next_deadline_ns < now_ns:
                         skipped = (now_ns - next_deadline_ns) // CONTROL_PERIOD_NS + 1
                         next_deadline_ns += skipped * CONTROL_PERIOD_NS
                     continue
+                if open_only:
+                    require_initialization_write_healthy("left", attempted_left, controller_now_ns)
+                left_started_ns = dependencies.monotonic_ns()
                 try:
                     left_ok = write_hand_command(resources.left_writer, resources.left_message, attempted_left)
                 except Exception as error:
                     runtime_fault = f"left command exception: {error}"
                     left_ok = False
+                left_completed_ns = dependencies.monotonic_ns()
                 resources.controller.record_write_result("left", attempted_left, left_ok)
+                emit_write("left", attempted_left, left_started_ns, left_completed_ns, left_ok)
                 drain_signals()
                 if resources.signal_count >= 2:
                     return forced_result(ticks + 1)
+                if open_only:
+                    require_initialization_write_healthy("right", attempted_right, controller_now_ns)
+                right_started_ns = dependencies.monotonic_ns()
                 try:
                     right_ok = write_hand_command(resources.right_writer, resources.right_message, attempted_right)
                 except Exception as error:
                     runtime_fault = f"right command exception: {error}"
                     right_ok = False
+                right_completed_ns = dependencies.monotonic_ns()
+                last_pair_write_completed_ns = right_completed_ns
                 resources.controller.record_write_result("right", attempted_right, right_ok)
-                if left_ok and right_ok and decision.state is BridgeState.ACTIVE:
+                emit_write("right", attempted_right, right_started_ns, right_completed_ns, right_ok)
+                if (
+                    left_ok
+                    and right_ok
+                    and decision.state is BridgeState.ACTIVE
+                    and resources.controller.latest_pair is not None
+                    and resources.controller.latest_pair.provenance == resources.controller.manager_provenance
+                ):
                     resources.controller.last_applied_message_seq = resources.controller.latest_pair.message_seq
                 drain_signals()
                 if resources.signal_count >= 2:
                     return forced_result(ticks + 1)
             if decision.exit_now:
+                if open_only:
+                    return RuntimeResult(
+                        1,
+                        decision.fault_reason or "initialization stopped",
+                        ticks + 1,
+                        opening_unconfirmed=True,
+                        measured_feedback_confirmed=_measured_open_feedback_confirmed(
+                            resources.controller, controller_now_ns
+                        ),
+                    )
                 if resources.controller.state is BridgeState.SHUTDOWN_OPENING:
                     if resources.left_writer is None and resources.right_writer is None:
                         return RuntimeResult(0, "monitor shutdown", ticks + 1)
@@ -1790,7 +1945,10 @@ def run_control_loop(
                                 controller_now_ns,
                             ),
                         )
-                    exhausted = resources.controller.shutdown_open_attempts >= 40
+                    exhausted = (
+                        resources.controller.shutdown_open_attempts
+                        >= resources.controller.shutdown_open_attempt_limit
+                    )
                     return RuntimeResult(
                         1,
                         "shutdown opening exhausted" if exhausted else "shutdown opening unconfirmed",
@@ -1803,15 +1961,16 @@ def run_control_loop(
                     )
                 return RuntimeResult(1 if runtime_fault else 0, runtime_fault or "controller exit", ticks + 1)
 
+        status_now_ns = dependencies.monotonic_ns()
         if resources.status_publisher is not None:
-            resources.status_publisher.publish(resources.controller, controller_now_ns)
-        if last_status_ns is None or controller_now_ns - last_status_ns >= 1_000_000_000:
+            resources.status_publisher.publish(resources.controller, status_now_ns)
+        if last_status_ns is None or status_now_ns - last_status_ns >= 1_000_000_000:
             _emit_record(
                 dependencies,
                 build_status_record(
                     resources.controller,
                     evidence,
-                    controller_now_ns,
+                    status_now_ns,
                     attempted_left,
                     attempted_right,
                     zmq_rejected=resources.zmq_rejected,
@@ -1819,10 +1978,9 @@ def run_control_loop(
                     zmq_backlog_discarded=resources.zmq_backlog_discarded,
                 ),
             )
-            last_status_ns = controller_now_ns
+            last_status_ns = status_now_ns
 
         ticks += 1
-        last_tick_start_ns = tick_start_ns
         # The safety controller timestamps decisions after ingress. Do not schedule
         # the next decision before its full 100ms period when ingress jitter changes.
         next_deadline_ns = max(next_deadline_ns + CONTROL_PERIOD_NS, controller_now_ns + CONTROL_PERIOD_NS)
@@ -1842,6 +2000,16 @@ def run_control_loop(
             measured_feedback_confirmed=_measured_open_feedback_confirmed(
                 resources.controller,
                 result_now_ns,
+            ),
+        )
+    if resources.controller.open_only:
+        return RuntimeResult(
+            1,
+            "initialization incomplete at tick limit",
+            ticks,
+            opening_unconfirmed=True,
+            measured_feedback_confirmed=_measured_open_feedback_confirmed(
+                resources.controller, dependencies.monotonic_ns()
             ),
         )
     return RuntimeResult(1 if runtime_fault else 0, runtime_fault or "tick limit", ticks)
@@ -1886,16 +2054,24 @@ def run_bridge(args: argparse.Namespace, dependencies: RuntimeDependencies | Non
     resources: BridgeRuntimeResources | None = None
     observed_signal_count = 0
     try:
-        signal_source = dependencies.signal_source_factory()
-        if dependencies.zmq_socket_factory is not None:
-            socket = dependencies.zmq_socket_factory(args.host, args.port)
-        else:
-            socket = create_zmq_subscriber(
-                args.host,
-                args.port,
-                context=dependencies.zmq_context,
-                zmq_module=dependencies.zmq_module,
+        if (
+            any(
+                getattr(args, name, False)
+                for name in ("initialize_hands", "full_position_range", "no_active_slew_limit")
             )
+            and not args.publish
+        ):
+            raise ValueError("hand initialization, full range and active slew options require --publish")
+        signal_source = dependencies.signal_source_factory()
+
+        def source_factory():
+            if dependencies.zmq_socket_factory is not None:
+                return dependencies.zmq_socket_factory(args.host, args.port)
+            return create_zmq_subscriber(
+                args.host, args.port, context=dependencies.zmq_context, zmq_module=dependencies.zmq_module
+            )
+
+        socket = None if getattr(args, "initialize_hands", False) else source_factory()
         status_publisher = (
             dependencies.status_publisher_factory(args.status_port)
             if dependencies.status_publisher_factory is not None
@@ -1904,7 +2080,13 @@ def run_bridge(args: argparse.Namespace, dependencies: RuntimeDependencies | Non
             )
         )
         dds = dependencies.dds_loader(args.network_interface)
-        controller = dependencies.controller_factory()
+        controller = dependencies.controller_factory(
+            **{
+                name: True
+                for name in ("initialize_hands", "full_position_range", "no_active_slew_limit")
+                if getattr(args, name, False)
+            }
+        )
         inbox = InboundInbox()
         for side, topic in STATE_TOPICS.items():
             subscriber = dds.subscriber_factory(topic, dds.state_type)
@@ -2057,6 +2239,7 @@ def run_bridge(args: argparse.Namespace, dependencies: RuntimeDependencies | Non
             ownership=tracker,
             signal_source=signal_source,
             status_publisher=status_publisher,
+            source_factory=source_factory,
             left_writer=left_writer,
             right_writer=right_writer,
             left_message=left_message,
@@ -2085,9 +2268,11 @@ def run_bridge(args: argparse.Namespace, dependencies: RuntimeDependencies | Non
             emergency_signal_count += signal_source.drain()
             return emergency_signal_count >= 2
 
-        emergency_attempted = bool(writers and controller is not None and ownership_registered)
+        emergency_attempted = bool(
+            writers and controller is not None and ownership_registered and not controller.open_only
+        )
         emergency_completed = False
-        if writers and controller is not None and ownership_registered:
+        if emergency_attempted:
             emergency_completed = _emergency_open_existing_writers(
                 left_writer,
                 right_writer,
@@ -2109,7 +2294,7 @@ def run_bridge(args: argparse.Namespace, dependencies: RuntimeDependencies | Non
             0,
             forced_exit=emergency_signal_count >= 2,
             opening_confirmed=emergency_completed,
-            opening_unconfirmed=emergency_attempted and not emergency_completed,
+            opening_unconfirmed=bool(writers) and not emergency_completed,
             measured_feedback_confirmed=_measured_open_feedback_confirmed(
                 controller,
                 dependencies.monotonic_ns(),
@@ -2195,6 +2380,18 @@ def run_bridge(args: argparse.Namespace, dependencies: RuntimeDependencies | Non
                 )
             except Exception:
                 pass
+        if controller is not None and controller.fault_feedback is not None:
+            try:
+                _emit_record(
+                    active_dependencies,
+                    build_status_record(controller, tracker.evidence(), dependencies.monotonic_ns(), None, None),
+                )
+            except Exception as error:
+                result = replace(
+                    result,
+                    exit_code=1,
+                    exit_reason=_bounded_text(f"{result.exit_reason}; fault evidence failure: {error}"),
+                )
         result = _emit_terminal_result(
             active_dependencies,
             result,
@@ -2206,6 +2403,8 @@ def run_bridge(args: argparse.Namespace, dependencies: RuntimeDependencies | Non
             _close_resource(getattr(dds, "publication_reader", None))
             _close_resource(getattr(dds, "participant", None))
         _close_resource(status_publisher)
+        if resources is not None and resources.zmq_socket is not socket:
+            _close_resource(resources.zmq_socket)
         _close_resource(socket)
         _close_resource(signal_source)
         _close_resource(evidence_sink)

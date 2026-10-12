@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from gear_sonic.utils.teleop.pico_recording import PROFILES, parse_pv
+from gear_sonic.utils.teleop.pico_recording import PROFILES, parse_pv, recording_mode_allowed
 
 INSPIRE_JOINTS = ("little_1", "ring_1", "middle_1", "index_1", "thumb_2", "thumb_1")
 INSPIRE_RANGES = np.array([1.4381, 1.4381, 1.4381, 1.4381, 0.5864, 1.1641])
@@ -35,6 +35,16 @@ def hand_episode_features(profile):
         ):
             features[f"teleop.{side}_hand_{key}"] = {"dtype": dtype, "shape": (1,), "names": [key]}
         if profile == "inspire_ftp":
+            for key, dtype, size in (
+                ("angle_act", "int32", 6),
+                ("motor_error", "int32", 6),
+                ("feedback_age_ns", "int64", 1),
+            ):
+                features[f"teleop.{side}_inspire_{key}"] = {
+                    "dtype": dtype,
+                    "shape": (size,),
+                    "names": [key] if size == 1 else list(INSPIRE_JOINTS),
+                }
             for prefix, key in (("teleop", "command"), ("observation", "state"), ("action", "applied")):
                 features[f"{prefix}.{side}_inspire_hand_{key}"] = {
                     "dtype": "float32",
@@ -66,9 +76,16 @@ def join_hand_frame(
         if not 0 <= now_ns - packet["received_ns"] < HAND_MAX_AGE_NS:
             raise ValueError("stale hand/body generation")
     session, epoch, mode = parse_pv(diagnostics.get("pv"))
+    hand_input = exact(diagnostics, "hand_input", np.int32, (1,))
+    if hand_input.item() not in (0, 1):
+        raise ValueError("unsupported recording hand input")
     if manager_epoch is not None and epoch != manager_epoch:
         raise ValueError("wrong manager mode epoch")
-    if session != manager_session or mode != manager_mode or mode not in (1, 5):
+    if (
+        session != manager_session
+        or mode != manager_mode
+        or not recording_mode_allowed(mode, PROFILES[profile], hand_input.item())
+    ):
         raise ValueError("wrong manager provenance")
     generation = exact(diagnostics, "sample_generation", np.int64, (1,))
     if generation.item() < 0 or not np.array_equal(generation, exact(body, "sample_generation", np.int64, (1,))):
@@ -79,13 +96,11 @@ def join_hand_frame(
         raise ValueError("wrong hand profile")
     if not exact(diagnostics, "body_sent", np.bool_, (1,)).item():
         raise ValueError("no body packet for hand generation")
-    hand_input = exact(diagnostics, "hand_input", np.int32, (1,))
-    if hand_input.item() not in (0, 1):
-        raise ValueError("unsupported recording hand input")
     result = {"teleop.hand_sample_generation": generation.copy(), "teleop.hand_input": hand_input.copy()}
     for side in ("left", "right"):
         state = exact(diagnostics, f"{side}_state", np.int32, (1,))
-        if state.item() not in (1, 2, 3):
+        planner_hold = profile == "inspire_ftp" and mode in (2, 3)
+        if state.item() not in (1, 2, 3) and not (planner_hold and state.item() == 0):
             raise ValueError("uninitialized hand")
         epoch = exact(diagnostics, f"{side}_source_epoch", np.int64, (1,))
         stamp = exact(diagnostics, f"{side}_source_timestamp_ns", np.int64, (1,))
@@ -100,7 +115,7 @@ def join_hand_frame(
         if timestamp_source.item() not in (-1, 0, 1):
             raise ValueError("invalid hand timestamp source")
         valid = exact(diagnostics, f"{side}_valid", np.bool_, (1,))
-        if epoch.item() < 0 or stamp.item() <= 0:
+        if epoch.item() < 0 or stamp.item() < 0 or (stamp.item() == 0 and not planner_hold):
             raise ValueError("invalid optical source metadata")
         result.update(
             {
@@ -109,7 +124,9 @@ def join_hand_frame(
                 f"teleop.{side}_hand_source_timestamp_ns": stamp.copy(),
                 f"teleop.{side}_hand_timestamp_source": timestamp_source.copy(),
                 f"teleop.{side}_hand_valid": valid.copy(),
-                f"teleop.{side}_hand_held": np.array([state.item() == 1], np.bool_),
+                f"teleop.{side}_hand_held": np.array(
+                    [state.item() == 1 or (planner_hold and state.item() == 0)], np.bool_
+                ),
             }
         )
         command = exact(diagnostics, f"{side}_command", np.float32, (7 if profile == "dex3" else 6,))
@@ -141,6 +158,16 @@ def join_hand_frame(
         result["teleop.inspire_applied_message_seq"] = applied_seq.copy()
         result["teleop.inspire_intended_message_seq"] = intended_seq.copy()
         for side in ("left", "right"):
+            age = exact(inspire_status, f"{side}_feedback_age_ns", np.int64, (1,))
+            if age[0] < 0 or age[0] + now_ns - inspire_status["received_ns"] >= 500_000_000:
+                raise ValueError("stale physical feedback")
+            result[f"teleop.{side}_inspire_feedback_age_ns"] = age + (now_ns - inspire_status["received_ns"])
+            result[f"teleop.{side}_inspire_angle_act"] = exact(
+                inspire_status, f"{side}_angle_act", np.int32, (6,)
+            ).copy()
+            result[f"teleop.{side}_inspire_motor_error"] = exact(
+                inspire_status, f"{side}_err", np.uint8, (6,)
+            ).astype(np.int32)
             result[f"observation.{side}_inspire_hand_state"] = (inspire_status[f"{side}_angle_act"] / 1000).astype(
                 np.float32
             )

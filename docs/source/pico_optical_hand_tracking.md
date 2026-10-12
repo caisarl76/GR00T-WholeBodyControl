@@ -107,6 +107,19 @@ production is 2.0 rad/s only after the staged checks in the design pass.
 The initial hands must have fresh measured feedback; optical frames can become
 valid after the controllers are put down. Five advancing valid hand samples
 admit each side, followed by a bounded transition to live finger targets.
+For Dex3 or Inspire, explicitly pass `--hand-max-rate 0.0` to disable the manager's
+per-joint speed cap during both recovery and tracking. Dex3 defaults to 2.0 rad/s;
+Inspire defaults to 1.0 normalized units/s. Positive values cannot exceed the
+respective default. Inspire's separate PC2 bridge limiter remains enabled unless
+the operator explicitly starts that bridge with `--no-active-slew-limit`;
+even that option preserves the bridge's initialization and opening limits.
+The 60 ms smoothing filter, measured startup baseline, five-sample admission,
+position bounds, feedback freshness and tracking-loss holds remain enabled.
+This does not remove motor/firmware limits or change SONIC body control.
+Stop SONIC before restarting the manager with this option. For captures made
+with the cap disabled, use `replay_pico_hands.py --max-rate 0`; its report marks
+the cap disabled and does not assess velocity-cap qualification.
+
 Do not pass `--disable-dex3-hands` to deployment when using optical Dex3:
 that removes the hand state/command channels required for arming.
 
@@ -163,6 +176,13 @@ fists without optical hand action fields, so C or the recording chord is refused
 with an explicit message in that mode. Finish saving before leaving POSE.
 The recorder also refuses an optical Dex3 START in VR_3PT from an older manager.
 Controller-hand and Inspire recording in VR_3PT remain supported.
+
+With Dex3 controller input, B+Y can freeze and unfreeze the upper body during
+an episode. Recording continues through the frozen planner packets, including
+the held hand commands. C or the recording chord can also start an episode
+while frozen, and S or the recording chord saves it without unfreezing.
+Switching to plain PLANNER with A+X still requires recording to finish because
+that mode does not publish controller hand commands.
 
 The September 14 MuJoCo retest confirmed repeated A+X switches after these
 changes. See the [handoff and validation record](../artifacts/sonic_hand_mode_ownership_20260914/README.md).
@@ -262,6 +282,10 @@ qualification and live-host timing evidence have been reviewed.
 
 ## Inspire FTP
 
+The [2026-09-15 integration guide](inspire_optical_integration.md) describes the
+ported physical bridge corrections, fresh physical feedback ages, Inspire
+PLANNER hold recording, and exact local MuJoCo commands for the isolated build.
+
 ### Local MuJoCo optical test
 
 Stop the previous Dex3 simulator, deployment and manager first. Run all three
@@ -322,9 +346,10 @@ python gear_sonic/scripts/run_pico_inspire_bridge.py --help
 ```
 
 The PC2 bridge defaults to monitor-only and requires the existing PC2 DDS SDK
-and driver environment. Publishing retains the reviewed Stage A envelope
+and driver environment. Publishing defaults to the reviewed Stage A envelope
 800–1000 counts and maximum 5 counts per 100 ms tick. Later hardware ranges
-remain separate qualification stages. Use its CLI help for existing DDS
+remain separate qualification stages. Explicit initialization, full-range and
+active-slew options are available but do not qualify optical hardware. Use its CLI help for DDS
 interface/domain/source options. Monitor-only feedback is not a recordable
 applied action. Recording requires fresh ACTIVE feedback and a successfully
 applied command sequence under the current manager provenance.

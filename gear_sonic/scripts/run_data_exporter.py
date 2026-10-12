@@ -466,7 +466,15 @@ class GrootDataCollector:
                 ):
                     self._pc2_healthy_streak = 0
                 self._pc2_seq = sequence
-                healthy = bool(fields["feedback_healthy"].item()) and fields["fault_code"].item() == 0
+                healthy = (
+                    bool(fields["feedback_healthy"].item())
+                    and fields["fault_code"].item() == 0
+                    and all(
+                        f"{side}_feedback_age_ns" in fields
+                        and 0 <= fields[f"{side}_feedback_age_ns"].item() < 500_000_000
+                        for side in ("left", "right")
+                    )
+                )
                 self._pc2_healthy_streak = self._pc2_healthy_streak + 1 if healthy else 0
                 self._inspire_status = {**fields, "received_ns": now_ns, "ready": self._pc2_healthy_streak >= 10}
             except (ValueError, TypeError, KeyError):
@@ -571,6 +579,7 @@ class GrootDataCollector:
             "left_hand_joints": self._extract_hand_joints(data, "left_hand_joints"),
             "right_hand_joints": self._extract_hand_joints(data, "right_hand_joints"),
             "receive_timestamp": time.time(),
+            "receive_monotonic": time.monotonic(),
         }
 
     def _handle_pose_message(self, raw: bytes) -> None:
@@ -649,6 +658,7 @@ class GrootDataCollector:
                 "vr_3pt_orientation": vr_3pt_orientation,
                 "frame_index": frame_index,
                 "receive_timestamp": time.time(),
+                "receive_monotonic": time.monotonic(),
             }
         except Exception as e:
             if not hasattr(self, "_sonic_error_count"):
@@ -883,6 +893,19 @@ class GrootDataCollector:
         else:
             frame_data["action.motion_token"] = np.zeros(64, dtype=np.float64)
 
+    @staticmethod
+    def _receive_age_ms(message: dict | None, now: float) -> float:
+        """Local receive age; -1 means missing/invalid reception information.
+
+        This measures delivery to the exporter, not headset sensor capture age.
+        Identical newly received commands refresh it just like changed commands.
+        """
+        received = (message or {}).get("receive_monotonic")
+        if received is None:
+            return -1.0
+        age_ms = (now - received) * 1000
+        return float(age_ms) if np.isfinite(age_ms) and age_ms >= 0 else -1.0
+
     def _add_sonic_pose_features(self, frame_data: dict) -> float | None:
         """Add teleop features based on current stream mode."""
         sonic_latency_ms = None
@@ -890,13 +913,17 @@ class GrootDataCollector:
         frame_data["teleop.stream_mode"] = np.array([self.current_stream_mode], dtype=np.int32)
 
         smpl_msg = self.latest_sonic_msg
+        planner_msg = self.latest_planner_msg
+        now = time.monotonic()
+        pose_age_ms = self._receive_age_ms(smpl_msg, now)
+        planner_age_ms = self._receive_age_ms(planner_msg, now)
+        frame_data["teleop.pose_receive_age_ms"] = np.array([pose_age_ms], dtype=np.float64)
+        frame_data["teleop.planner_receive_age_ms"] = np.array([planner_age_ms], dtype=np.float64)
         use_smpl = False
         if self.current_stream_mode in (1, 4) and smpl_msg is not None:
-            receive_ts = smpl_msg.get("receive_timestamp")
-            if receive_ts is not None:
-                age_sec = time.time() - receive_ts
-                sonic_latency_ms = age_sec * 1000
-                self.sonic_timing_monitor.log_time_delta(age_sec)
+            if pose_age_ms >= 0:
+                sonic_latency_ms = pose_age_ms
+                self.sonic_timing_monitor.log_time_delta(pose_age_ms / 1000)
                 if sonic_latency_ms <= 100.0:
                     use_smpl = True
                 elif (self.sonic_timing_monitor.failure_count + 1) % 10 == 0:
@@ -904,22 +931,13 @@ class GrootDataCollector:
                         f"Sonic pose stale ({sonic_latency_ms:.1f}ms old), using zeros",
                         say=False,
                     )
-            else:
-                use_smpl = True
-
-        planner_msg = self.latest_planner_msg
         use_planner = False
-        if self.current_stream_mode == 5 and planner_msg is not None:
-            receive_ts = planner_msg.get("receive_timestamp")
-            if receive_ts is not None:
-                age_sec = time.time() - receive_ts
-                planner_latency_ms = age_sec * 1000
+        if self.current_stream_mode in (2, 3, 5) and planner_msg is not None:
+            if planner_age_ms >= 0:
                 if sonic_latency_ms is None:
-                    sonic_latency_ms = planner_latency_ms
-                if planner_latency_ms <= 200.0:
+                    sonic_latency_ms = planner_age_ms
+                if planner_age_ms <= 200.0:
                     use_planner = True
-            else:
-                use_planner = True
 
         # SMPL features
         if use_smpl and smpl_msg.get("smpl_joints") is not None:
@@ -1144,6 +1162,13 @@ def main(config: SonicDataExporterConfig):
             modality_config["action"].pop(f"{side}_hand_joints")
         for name, feature in hand_episode_features(config.hand_profile).items():
             prefix, key = name.split(".", 1)
+            # Quality/provenance is persisted, but is not a policy target.
+            if name not in {
+                f"{kind}.{side}_inspire_hand_{value}"
+                for side in ("left", "right")
+                for kind, value in (("teleop", "command"), ("observation", "state"), ("action", "applied"))
+            }:
+                continue
             group = "state" if prefix == "observation" else "action"
             modality_config[group][key] = {"start": 0, "end": feature["shape"][0], "original_key": name}
 

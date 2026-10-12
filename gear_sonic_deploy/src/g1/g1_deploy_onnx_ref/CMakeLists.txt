@@ -209,6 +209,7 @@ set(EXE_LIBS
 if(BUILD_DEPLOY_TESTS)
   add_executable(zmq_mode_handoff_test tests/zmq_mode_handoff_test.cpp)
   target_include_directories(zmq_mode_handoff_test PRIVATE ${EXE_INCLUDES})
+  target_link_directories(zmq_mode_handoff_test PRIVATE ${CUDA_LINK_DIRS})
   target_link_libraries(zmq_mode_handoff_test PRIVATE ${EXE_LIBS})
   # Invoke real receive callbacks deterministically, without test hooks in production.
   target_compile_options(zmq_mode_handoff_test PRIVATE -fno-access-control)

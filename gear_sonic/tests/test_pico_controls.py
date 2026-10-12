@@ -75,6 +75,36 @@ def test_bounce_and_packet_loss_cancel_without_action_and_rearm_neutral():
     assert press(resolver, "abxy", 500) == "sonic"
 
 
+@pytest.mark.parametrize("button,expected", [("a", "record"), ("b", "abort")])
+def test_preheld_grip_allows_recording_chord(button, expected):
+    resolver = armed()
+    for ms in (50, 90, 290, 1000):
+        assert press(resolver, ("grip",), ms) is None
+    keys = ("grip", button)
+    assert press(resolver, keys, 1010) is None
+    assert press(resolver, keys, 1050) is None
+    assert press(resolver, keys, 1249) is None
+    assert press(resolver, keys, 1250) == expected
+    assert press(resolver, keys, 2000) is None
+    # Releasing only A/B cannot rearm a recording toggle.
+    press(resolver, ("grip",), 2100)
+    press(resolver, ("grip",), 2200)
+    assert press(resolver, keys, 2500) is None
+
+
+def test_incomplete_chord_cancels_window_before_new_recording_press():
+    resolver = armed()
+    press(resolver, ("grip", "a"), 50)
+    press(resolver, ("grip", "a"), 90)
+    press(resolver, ("grip",), 100)
+    press(resolver, ("grip",), 140)
+    assert press(resolver, ("grip",), 400) is None
+    assert press(resolver, ("grip", "a"), 500) is None
+    assert press(resolver, ("grip", "a"), 540) is None
+    assert press(resolver, ("grip", "a"), 739) is None
+    assert press(resolver, ("grip", "a"), 740) == "record"
+
+
 def sample(**changes):
     return {
         "binding_generation": 1,

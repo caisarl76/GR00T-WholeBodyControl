@@ -31,6 +31,8 @@ STATUS_SCHEMA = (
     ("right_applied", "<f4", 6),
     ("feedback_healthy", "?", 1),
     ("fault_code", "<i4", 1),
+    ("left_feedback_age_ns", "<i8", 1),
+    ("right_feedback_age_ns", "<i8", 1),
 )
 
 
@@ -75,7 +77,9 @@ def validate_inspire_hand(fields):
 
 
 def validate_inspire_status(fields):
-    _validate(fields, STATUS_SCHEMA)
+    # Older v1 status is readable for diagnostics, but has no measurable age.
+    has_age = "left_feedback_age_ns" in fields or "right_feedback_age_ns" in fields
+    _validate(fields, STATUS_SCHEMA if has_age else STATUS_SCHEMA[:-2])
     if not fields["pc2_session_id"].any() or fields["status_seq"][0] < 0:
         raise ValueError("Invalid PC2 identity/sequence")
     if fields["accepted_pv"].any():
@@ -85,6 +89,8 @@ def validate_inspire_status(fields):
     if fields["fault_code"][0] < 0:
         raise ValueError("Invalid PC2 fault code")
     for side in ("left", "right"):
+        if has_age and fields[f"{side}_feedback_age_ns"][0] < -1:
+            raise ValueError("Invalid physical feedback age")
         measured, applied = fields[f"{side}_angle_act"], fields[f"{side}_applied"]
         if np.any((measured < 0) | (measured > 1000)) or np.any((applied < 0) | (applied > 1)):
             raise ValueError("PC2 measured/applied range violation")
