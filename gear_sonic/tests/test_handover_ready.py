@@ -8,6 +8,7 @@ from gear_sonic.utils.inference.standing_reset import StandingReset
 from gear_sonic.utils.teleop.xr_upperbody_bridge import G1_UPPER_BODY_JOINT_INDICES
 
 TARGET = [-.1, -.08, .3, -.21, 1.7, -.09, -.07]
+RAISED = [.011, -.68, -.60, .16, 1.09, -.16, -.49]
 NAMES = [f"right_{name}_joint" for name in (
     "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
     "wrist_roll", "wrist_pitch", "wrist_yaw",
@@ -15,9 +16,9 @@ NAMES = [f"right_{name}_joint" for name in (
 
 
 class ReadyHooks(Hooks):
-    def begin_ready_reset(self, feedback, right_arm_target):
+    def begin_ready_reset(self, feedback, right_arm_target, right_arm_waypoint):
         return StandingReset(feedback, feedback["left_hand_q_measured"], np.zeros(7),
-                             right_arm_target=right_arm_target)
+                             right_arm_target=right_arm_target, right_arm_waypoint=right_arm_waypoint)
 
 
 def make_ready(tmp_path, *, verified=True, reviewed=True, hooks=None):
@@ -25,7 +26,8 @@ def make_ready(tmp_path, *, verified=True, reviewed=True, hooks=None):
     data["skills"] = {"bottle_handover": dict(prompt="test-only handover",
         completion_criteria="Stable offer", completion_action="hold")}
     data["handover"] = dict(skill_id="bottle_handover", checkpoint_verified=verified,
-        ready_pose_reviewed=reviewed, ready_right_arm_joints=dict(zip(NAMES, TARGET)))
+        ready_pose_reviewed=reviewed, ready_right_arm_joints=dict(zip(NAMES, TARGET)),
+        raised_right_arm_joints=dict(zip(NAMES, RAISED)))
     path = tmp_path / "ready.yaml"
     path.write_text(yaml.safe_dump(data))
     c = HarnessControl(path, hooks or ReadyHooks(), "boot")
@@ -72,18 +74,26 @@ def test_ready_requires_measured_settling_for_half_second(tmp_path):
     result = request(c, "reset_ready", {"execution_id": ""})
     assert result["error"] is None
     assert c.phase == "RESETTING"
-    s = state(2)
+    raised = state(2)
+    raised["body_q_measured_motor"][22:29] = RAISED
+    for index in range(2, 22):
+        now = (index - 1) * .03
+        raised["index"] = index
+        c.reset.advance(raised, .03)
+        c.tick(now, raised, now)
+        assert c.phase == "RESETTING"
+    s = state(22)
     body = np.asarray(s["body_q_measured_motor"])
     body[G1_UPPER_BODY_JOINT_INDICES] = c.reset.target[:17]
     s["body_q_measured_motor"] = body.tolist()
     s["right_hand_q_measured"] = [0]*7
-    c.tick(.1, s, .1)
-    c.tick(.59, {**s, "index":3}, .59)
+    c.tick(.63, s, .63)
+    c.tick(1.12, {**s, "index":23}, 1.12)
     assert c.phase == "RESETTING"
-    c.tick(.61, {**s, "index":4}, .61)
-    assert c.phase == "COMPLETED" and c.status(.61)["right_hand_open"] is True
-    c.tick(1.2, None, None)
-    assert c.status(1.2)["right_hand_open"] is None
+    c.tick(1.14, {**s, "index":24}, 1.14)
+    assert c.phase == "COMPLETED" and c.status(1.14)["right_hand_open"] is True
+    c.tick(1.8, None, None)
+    assert c.status(1.8)["right_hand_open"] is None
 
 
 def test_handover_claim_requests_measured_hold_before_camera_checks(tmp_path):
@@ -113,3 +123,114 @@ def test_ready_tracking_compensation_cannot_cross_joint_bound(boundary, drift):
         commanded_body = body.copy()
         commanded_body[G1_UPPER_BODY_JOINT_INDICES] = command.upper_body_position
         assert -1.97222 <= commanded_body[26] <= 1.97222
+
+
+def lift_reset():
+    s = state()
+    return StandingReset(s, s["left_hand_q_measured"], np.zeros(7),
+                         right_arm_target=TARGET, right_arm_waypoint=RAISED), s
+
+
+def test_raise_retains_fingers_until_distinct_feedback_settles():
+    reset, s = lift_reset()
+    s["body_q_measured_motor"][22:29] = RAISED
+    for index in range(2, 11):
+        s["index"] = index
+        reset.advance(s, .05)
+        assert reset.stage == 0
+        assert reset.command.right_hand_position == pytest.approx([.4] * 7)
+    for _ in range(20):
+        reset.advance(s, .05)
+        assert reset.stage == 0
+    s["index"] = 11
+    reset.advance(s, .05)
+    # Allow floating-point summation at exactly the dwell boundary.
+    for index in (12, 13):
+        s["index"] = index
+        reset.advance(s, .05)
+    assert reset.stage == 1
+    assert reset.command.right_hand_position == pytest.approx([.4] * 7)
+    assert not reset.is_settled(s, .05, .1)
+    s["index"] = 14
+    assert reset.advance(s, .05).right_hand_position == pytest.approx([.375] * 7)
+    s["body_q_measured_motor"][22:29] = TARGET
+    assert not reset.is_settled(s, .05, .1)
+    s["right_hand_q_measured"] = [0] * 7
+    assert reset.is_settled(s, .05, .1)
+
+
+def test_raise_first_qualifying_sample_does_not_credit_unsettled_interval():
+    reset, s = lift_reset()
+    reset.advance(s, .025)  # The preceding sample is outside raise tolerance.
+    s["body_q_measured_motor"][22:29] = RAISED
+    for index in range(2, 22):
+        s["index"] = index
+        reset.advance(s, .025)
+    # Twenty samples span only nineteen intervals: .475 s since first settled.
+    assert reset.stage == 0
+    s["index"] = 22
+    reset.advance(s, .025)
+    assert reset.stage == 1
+
+
+@pytest.mark.parametrize("bad", [None, {"index": True}, {"index": -1},
+                                 {"index": 2}, {"index": 1}])
+def test_missing_or_regressed_raise_feedback_holds_and_clears_dwell(bad):
+    reset, s = lift_reset()
+    s["body_q_measured_motor"][22:29] = RAISED
+    for index in range(2, 11):
+        s["index"] = index
+        reset.advance(s, .05)
+    before = reset.command
+    assert reset.advance(bad, .05) == before
+    for index in range(11, 14):
+        s["index"] = index
+        reset.advance(s, .05)
+        assert reset.stage == 0
+
+
+def test_raise_dwell_requires_heading_and_upper_body_but_not_finger_settling():
+    reset, s = lift_reset()
+    s["body_q_measured_motor"][22:29] = RAISED
+    s["right_hand_q_measured"] = [.3] * 7
+    s["base_quat"] = [np.cos(.2), 0, 0, np.sin(.2)]
+    for index in range(2, 25):
+        s["index"] = index
+        reset.advance(s, .05)
+    assert reset.stage == 0
+    s["base_quat"] = [1, 0, 0, 0]
+    for index in range(25, 38):
+        s["index"] = index
+        reset.advance(s, .05)
+    assert reset.stage == 1
+
+
+def test_lift_transition_keeps_rate_lead_and_preserved_joint_limits():
+    reset, s = lift_reset()
+    previous = np.r_[reset.command.upper_body_position,
+                     reset.command.left_hand_position, reset.command.right_hand_position]
+    for index in range(2, 250):
+        s["index"] = index
+        measured = np.r_[np.asarray(s["body_q_measured_motor"])[G1_UPPER_BODY_JOINT_INDICES],
+                         s["left_hand_q_measured"], s["right_hand_q_measured"]]
+        command = reset.advance(s, .05)
+        current = np.r_[command.upper_body_position, command.left_hand_position, command.right_hand_position]
+        assert np.max(np.abs(current - previous)) <= .02500001
+        assert np.max(np.abs(current - measured)) <= .15000001
+        body = np.asarray(s["body_q_measured_motor"])
+        body[G1_UPPER_BODY_JOINT_INDICES] = command.upper_body_position
+        assert body[:22] == pytest.approx([0] * 22)
+        assert command.left_hand_position == pytest.approx([.3] * 7)
+        assert tuple(command.movement) == (0., 0., 0.)
+        s["body_q_measured_motor"] = body.tolist()
+        s["right_hand_q_measured"] = command.right_hand_position
+        previous = current
+    assert reset.stage == 1 and reset.is_settled(s, .05, .1)
+
+
+@pytest.mark.parametrize("waypoint", [[0] * 6, [0, 0, 0, 0, 3, 0, 0], [float("nan")] * 7])
+def test_lift_rejects_invalid_waypoint(waypoint):
+    s = state()
+    with pytest.raises(ValueError):
+        StandingReset(s, s["left_hand_q_measured"], np.zeros(7),
+                      right_arm_target=TARGET, right_arm_waypoint=waypoint)

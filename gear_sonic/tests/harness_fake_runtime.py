@@ -79,9 +79,10 @@ class Hooks:
     def set_planner_command(self, command):
         self.reset, self.command = None, command
 
-    def begin_ready_reset(self, feedback, right_arm_target):
+    def begin_ready_reset(self, feedback, right_arm_target, right_arm_waypoint):
         self.reset = StandingReset(feedback, feedback["left_hand_q_measured"], np.zeros(7),
-                                   right_arm_target=right_arm_target)
+                                   right_arm_target=right_arm_target,
+                                   right_arm_waypoint=right_arm_waypoint)
         self.command = self.reset.command
         self.sink.record("ready_reset")
         return self.reset

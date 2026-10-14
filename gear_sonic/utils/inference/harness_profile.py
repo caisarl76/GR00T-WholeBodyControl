@@ -77,10 +77,15 @@ class HandoverSettings:
     checkpoint_verified: bool
     ready_pose_reviewed: bool
     ready_right_arm_joints: dict[str, float]
+    raised_right_arm_joints: dict[str, float]
 
     @property
     def right_arm_target(self) -> tuple[float, ...]:
         return tuple(self.ready_right_arm_joints[name] for name in RIGHT_ARM_BOUNDS)
+
+    @property
+    def right_arm_waypoint(self) -> tuple[float, ...]:
+        return tuple(self.raised_right_arm_joints[name] for name in RIGHT_ARM_BOUNDS)
 
 
 # Motor order and limits from g1_29dof_with_hand.xml (right arm motors 22–28).
@@ -189,6 +194,7 @@ def load_profile(path: Path) -> G1Profile:
                 "checkpoint_verified",
                 "ready_pose_reviewed",
                 "ready_right_arm_joints",
+                "raised_right_arm_joints",
             }
             or type(h["skill_id"]) is not str
             or h["skill_id"] not in skills
@@ -197,12 +203,13 @@ def load_profile(path: Path) -> G1Profile:
             or type(h["ready_pose_reviewed"]) is not bool
         ):
             raise ValueError("Invalid handover settings")
-        joints = h["ready_right_arm_joints"]
-        if not isinstance(joints, dict) or joints.keys() != RIGHT_ARM_BOUNDS.keys():
-            raise ValueError("Ready pose requires seven named right-arm joints")
-        for name, (low, high) in RIGHT_ARM_BOUNDS.items():
-            if not finite_number(joints[name]) or not low <= joints[name] <= high:
-                raise ValueError(f"Ready joint outside G1 bounds: {name}")
+        for field in ("ready_right_arm_joints", "raised_right_arm_joints"):
+            joints = h[field]
+            if not isinstance(joints, dict) or joints.keys() != RIGHT_ARM_BOUNDS.keys():
+                raise ValueError(f"{field} requires seven named right-arm joints")
+            for name, (low, high) in RIGHT_ARM_BOUNDS.items():
+                if not finite_number(joints[name]) or not low <= joints[name] <= high:
+                    raise ValueError(f"{field} outside G1 bounds: {name}")
         data["handover"] = HandoverSettings(**h)
     del data["schema_version"]
     data.update(

@@ -819,12 +819,15 @@ def main(config: InferenceConfig):
                 planner_command_in_reference_frame(command, reset_feedback).encode()
                 harness_planner_command, standing_reset = command, None
 
-            def begin_ready_reset(self, feedback, right_arm_target):
+            def begin_ready_reset(self, feedback, right_arm_target, right_arm_waypoint):
                 nonlocal standing_reset, manual_planner, harness_planner_command
                 reset = StandingReset(
                     feedback, feedback["left_hand_q_measured"], np.zeros(7),
                     right_arm_target=right_arm_target, compensate_tracking_bias=True,
+                    right_arm_waypoint=right_arm_waypoint,
                     joint_tolerance_rad=harness_control.profile.limits.reset_joint_tolerance_rad,
+                    yaw_tolerance_rad=harness_control.profile.limits.reset_yaw_tolerance_rad,
+                    settle_dwell_s=harness_control.profile.limits.settle_dwell_s,
                 )
                 if not publish_planner_command(reset.command):
                     raise ValueError("Cannot encode ready reset")
