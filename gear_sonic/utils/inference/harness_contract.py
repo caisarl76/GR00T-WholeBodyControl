@@ -48,7 +48,10 @@ PARAMS = {
 
 
 def finite_number(value):
-    return type(value) in (int, float) and math.isfinite(value)
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _load(payload: bytes) -> dict:
@@ -179,6 +182,9 @@ class ObservationSnapshot:
     received_at: float
     age_s: float
     jpeg_rgb_b64: str
+    right_hand_state: str = "unknown"
+    right_hand_sample_at: float | None = None
+    right_hand_sample_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -215,6 +221,10 @@ def decode_request(payload: bytes) -> Request:
 
 
 def _typed(cls, data):
+    if cls is ObservationSnapshot and isinstance(data, dict):
+        # Older executors carry no measured-hand evidence.
+        data = {"right_hand_state": "unknown", "right_hand_sample_at": None,
+                "right_hand_sample_index": None, **data}
     if not isinstance(data, dict) or data.keys() != {f.name for f in fields(cls)}:
         raise ValueError(f"Invalid {cls.__name__} fields")
     for name, hint in get_type_hints(cls).items():
@@ -230,6 +240,10 @@ def _typed(cls, data):
             raise ValueError(f"Invalid {name} type")
     if "phase" in data and data["phase"] not in PHASES:
         raise ValueError("Invalid phase")
+    if "right_hand_state" in data and data["right_hand_state"] not in {"open", "closed", "partial", "unknown"}:
+        raise ValueError("Invalid measured hand state")
+    if data.get("right_hand_sample_index") is not None and data["right_hand_sample_index"] < 0:
+        raise ValueError("Invalid hand sample index")
     return cls(**data)
 
 

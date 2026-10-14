@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 import json
+import math
+from numbers import Real
+import os
 from pathlib import Path
 import time
 from typing import Protocol
@@ -13,7 +17,19 @@ import numpy as np
 
 from .harness_contract import SkillCall, decode_request
 from .harness_profile import load_profile, validate_skill_call
+from .harness_hand_pose import classify_right_hand, HAND_FRAME_MAX_SKEW_S
 from .standing_reset import StandingReset, _measured_joints
+
+
+@lru_cache(maxsize=1)
+def monotonic_clock_id():
+    """Match C++ receipt times only on the same Linux boot and time namespace."""
+    try:
+        identity = (Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+                    + '|' + os.readlink('/proc/self/ns/time'))
+        return tuple(ord(char) for char in identity)
+    except OSError:
+        return ()
 
 
 @dataclass(frozen=True)
@@ -207,8 +223,25 @@ class HarnessControl:
                 or now - self.observation["received_at"] > self.profile.limits.camera_max_age_s
             ):
                 raise ControlError("UNAVAILABLE", "No fresh ego_view")
+            hand = dict(right_hand_state="unknown", right_hand_sample_at=None,
+                        right_hand_sample_index=None)
+            try:
+                receipt = self.feedback.get('right_hand_received_at', []) if self.feedback else []
+                clock = tuple(self.feedback.get('controller_clock_id', [])) if self.feedback else ()
+                if (self._fresh(now) and monotonic_clock_id() and clock == monotonic_clock_id()
+                        and len(receipt) == 1 and isinstance(receipt[0], Real)
+                        and not isinstance(receipt[0], bool) and math.isfinite(receipt[0])):
+                    at = float(receipt[0])
+                    if (at >= 0 and 0 <= now - at <= self.profile.limits.feedback_max_age_s
+                            and abs(at - self.observation['received_at']) <= HAND_FRAME_MAX_SKEW_S):
+                        hand.update(right_hand_state=classify_right_hand(self.feedback['right_hand_q_measured']),
+                                    right_hand_sample_at=at,
+                                    right_hand_sample_index=int(round(at * 1_000_000_000)))
+            except (TypeError, ValueError, OverflowError):
+                pass
             return {
                 **self.observation,
+                **hand,
                 "age_s": max(0.0, now - self.observation["received_at"]),
                 "runtime_id": self.runtime_id,
                 "execution_id": self.execution["execution_id"] if self.execution else None,

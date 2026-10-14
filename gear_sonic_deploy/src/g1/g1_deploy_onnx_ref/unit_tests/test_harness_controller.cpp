@@ -73,6 +73,19 @@ TEST(HarnessTelemetry, AbsoluteMotorOrderingAndEffectiveCapability) {
   for (int i = 0; i < 29; ++i) EXPECT_NEAR(actual[i], expected[i], 1e-12) << i;
   EXPECT_EQ(output.data().at("left_hand_q_measured"), (std::vector<double>(hands.begin(), hands.end())));
   EXPECT_EQ(output.data().at("right_hand_q_measured"), (std::vector<double>(hands.begin(), hands.end())));
+  const auto receipt = std::chrono::duration<double>(now.time_since_epoch()).count();
+  EXPECT_EQ(output.data().at("right_hand_received_at"), std::vector<double>{receipt});
+  EXPECT_FALSE(output.data().at("controller_clock_id").empty());
+  logger.LogFullState(identity, {}, {}, identity, {}, {}, q,z,z,empty,empty,empty,
+                      hand,hand,hand,hand,hand,hand,0.0,now,now);
+  output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
+  EXPECT_EQ(output.data().at("right_hand_received_at"), std::vector<double>{receipt});
+  const auto newer = std::chrono::steady_clock::now();
+  logger.LogFullState(identity, {}, {}, identity, {}, {}, q,z,z,empty,empty,empty,
+                      hand,hand,hand,hand,hand,hand,0.0,newer,newer);
+  output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
+  EXPECT_EQ(output.data().at("right_hand_received_at"), std::vector<double>{
+      std::chrono::duration<double>(newer.time_since_epoch()).count()});
   EXPECT_EQ(output.data().at("harness_planner_hold_enabled"), std::vector<double>{0});
   output.SetHarnessPlannerHold(true);
   output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
@@ -86,6 +99,7 @@ TEST(HarnessTelemetry, AbsoluteMotorOrderingAndEffectiveCapability) {
                           missing_left ? absent : now, missing_left ? now : absent);
       output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
       EXPECT_TRUE(output.data().at(missing_left ? "left_hand_q_measured" : "right_hand_q_measured").empty());
+      EXPECT_EQ(output.data().at("right_hand_received_at").empty(), !missing_left);
       EXPECT_EQ(output.data().at(missing_left ? "right_hand_q_measured" : "left_hand_q_measured").size(), 7);
     }
   }
@@ -94,6 +108,7 @@ TEST(HarnessTelemetry, AbsoluteMotorOrderingAndEffectiveCapability) {
   output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
   EXPECT_TRUE(output.data().at("left_hand_q_measured").empty());
   EXPECT_TRUE(output.data().at("right_hand_q_measured").empty());
+  EXPECT_TRUE(output.data().at("right_hand_received_at").empty());
 }
 
 TEST(HarnessTimeout, RetainsOnlyOptedInTargetsAndZerosVelocity) {

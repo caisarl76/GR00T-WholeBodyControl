@@ -12,7 +12,7 @@ import uuid
 
 import numpy as np
 
-from gear_sonic.utils.inference.harness_control import HarnessControl, RuntimeFacts
+from gear_sonic.utils.inference.harness_control import HarnessControl, RuntimeFacts, monotonic_clock_id
 from gear_sonic.utils.inference.harness_rpc import HarnessRPCServer
 from gear_sonic.utils.inference.observation_snapshot import ObservationSnapshotCache
 from gear_sonic.utils.inference.standing_reset import StandingReset
@@ -155,6 +155,8 @@ def main():
             feedback = {
                 **feedback,
                 "index": feedback["index"] + 1,
+                "right_hand_received_at": [now],
+                "controller_clock_id": list(monotonic_clock_id()),
                 "planner_reference_active": [0 if hooks.enabled or args.scenario == "failed_ack" else 1],
             }
             if args.scenario != "frozen_camera" or control.phase != "MANIPULATING":

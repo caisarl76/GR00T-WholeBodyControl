@@ -40,6 +40,8 @@
 #include <memory>
 #include <array>
 #include <vector>
+#include <filesystem>
+#include <fstream>
 #include <msgpack.hpp>
 
 #include "../state_logger.hpp"
@@ -157,6 +159,8 @@ protected:
         static const std::string kBodyQMeasured = "body_q_measured";
         static const std::string kLeftHandQMeasured = "left_hand_q_measured";
         static const std::string kRightHandQMeasured = "right_hand_q_measured";
+        static const std::string kRightHandReceivedAt = "right_hand_received_at";
+        static const std::string kControllerClockId = "controller_clock_id";
         static const std::string kVr3pointPosition = "vr_3point_position";
         static const std::string kVr3pointOrientation = "vr_3point_orientation";
         static const std::string kVr3pointCompliance = "vr_3point_compliance";
@@ -282,6 +286,22 @@ protected:
             ? state.left_hand_q : std::vector<double>{};
         output_data_map_[kRightHandQMeasured] = fresh_hand(state.right_hand_received_at)
             ? state.right_hand_q : std::vector<double>{};
+        // Preserve the DDS receipt: faster logger packets may repeat this hand sample.
+        output_data_map_[kRightHandReceivedAt] = fresh_hand(state.right_hand_received_at)
+            ? std::vector<double>{std::chrono::duration<double>(
+                state.right_hand_received_at.time_since_epoch()).count()}
+            : std::vector<double>{};
+        static const std::vector<double> clock_id = [] {
+          std::ifstream boot("/proc/sys/kernel/random/boot_id");
+          std::string boot_id;
+          std::getline(boot, boot_id);
+          std::error_code error;
+          auto time_ns = std::filesystem::read_symlink("/proc/self/ns/time", error);
+          if (!boot || boot_id.empty() || error) return std::vector<double>{};
+          const auto identity = boot_id + "|" + time_ns.string();
+          return std::vector<double>(identity.begin(), identity.end());
+        }();
+        output_data_map_[kControllerClockId] = clock_id;
 
         // write vr controller data:
         output_data_map_[kVr3pointPosition].assign(vr_3point_position_sent.begin(), vr_3point_position_sent.end());
