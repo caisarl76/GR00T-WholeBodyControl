@@ -78,6 +78,10 @@ class HandoverSettings:
     ready_pose_reviewed: bool
     ready_right_arm_joints: dict[str, float]
     raised_right_arm_joints: dict[str, float]
+    # Optional desk pose in the pelvis frame; when set, the raise is skipped if the
+    # direct return keeps clear of the desk (ready_clearance.py). Absent: always raise.
+    desk_top_above_pelvis_m: float | None = None
+    desk_front_from_pelvis_m: float | None = None
 
     @property
     def right_arm_target(self) -> tuple[float, ...]:
@@ -186,16 +190,17 @@ def load_profile(path: Path) -> G1Profile:
         skills[key] = SkillDefinition(key, **spec)
     if "handover" in data:
         h = data["handover"]
+        required = {
+            "skill_id",
+            "checkpoint_verified",
+            "ready_pose_reviewed",
+            "ready_right_arm_joints",
+            "raised_right_arm_joints",
+        }
+        desk = {"desk_top_above_pelvis_m", "desk_front_from_pelvis_m"}
         if (
             not isinstance(h, dict)
-            or h.keys()
-            != {
-                "skill_id",
-                "checkpoint_verified",
-                "ready_pose_reviewed",
-                "ready_right_arm_joints",
-                "raised_right_arm_joints",
-            }
+            or h.keys() not in (required, required | desk)
             or type(h["skill_id"]) is not str
             or h["skill_id"] not in skills
             or skills[h["skill_id"]].completion_action != "hold"
@@ -210,6 +215,12 @@ def load_profile(path: Path) -> G1Profile:
             for name, (low, high) in RIGHT_ARM_BOUNDS.items():
                 if not finite_number(joints[name]) or not low <= joints[name] <= high:
                     raise ValueError(f"{field} outside G1 bounds: {name}")
+        if desk <= h.keys() and not (
+            all(finite_number(h[key]) for key in desk)
+            and -1.0 < h["desk_top_above_pelvis_m"] < 1.0
+            and 0.0 < h["desk_front_from_pelvis_m"] < 2.0
+        ):
+            raise ValueError("Invalid handover desk pose")
         data["handover"] = HandoverSettings(**h)
     del data["schema_version"]
     data.update(

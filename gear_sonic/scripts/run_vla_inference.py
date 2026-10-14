@@ -412,6 +412,12 @@ def main(config: InferenceConfig):
         config.prompt = next(iter(profile.skills.values())).prompt
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
+    ready_link_boxes = None
+    if harness_enabled and profile.handover is not None and profile.handover.desk_top_above_pelvis_m is not None:
+        from gear_sonic.utils.inference.ready_clearance import ready_waypoint, right_arm_link_boxes
+
+        # Own instance: forward kinematics overwrites the cache robot_model shares with inference.
+        ready_link_boxes = right_arm_link_boxes(instantiate_g1_robot_model(waist_location="lower_and_upper_body"))
 
     # Isaac-GR00T PolicyClient
     from gr00t.policy.server_client import PolicyClient
@@ -821,6 +827,10 @@ def main(config: InferenceConfig):
 
             def begin_ready_reset(self, feedback, right_arm_target, right_arm_waypoint):
                 nonlocal standing_reset, manual_planner, harness_planner_command
+                if ready_link_boxes is not None:
+                    right_arm_waypoint = ready_waypoint(harness_control.profile.handover, feedback, ready_link_boxes)
+                    print(f"[harness] ready return: {'direct' if right_arm_waypoint is None else 'raise first'}",
+                          flush=True)
                 reset = StandingReset(
                     feedback, feedback["left_hand_q_measured"], np.zeros(7),
                     right_arm_target=right_arm_target, compensate_tracking_bias=True,
