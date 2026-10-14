@@ -131,3 +131,35 @@ def test_tracking_deadband_honors_a_tighter_profile_tolerance():
             np.asarray(command.upper_body_position) - 0.02 - measured
         )
     assert reset.is_settled(state, 0.01, np.deg2rad(5))
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_reset_retracts_reference_when_measured_tracking_falls_back(direction):
+    state = feedback(0.)
+    state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES] = G1_STANDING_UPPER_BODY
+    reset = StandingReset(state, np.zeros(7), np.zeros(7))
+    before = np.asarray(reset.command.upper_body_position)
+    state["body_q_measured"][22] += direction * .155
+    measured = state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES]
+    reference = np.asarray(reset.advance(state, .02).upper_body_position)
+    assert np.max(np.abs(reference - measured)) <= .15000001
+    assert np.max(np.abs(reference - before)) <= .01000001
+
+
+def test_reset_rejects_tracking_loss_that_cannot_meet_rate_and_lead_bounds():
+    state = feedback(0.)
+    state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES] = G1_STANDING_UPPER_BODY
+    reset = StandingReset(state, np.zeros(7), np.zeros(7))
+    before = reset.command
+    state["body_q_measured"][22] += .18
+    with pytest.raises(ValueError, match="rate-limited lead bound"):
+        reset.advance(state, .02)
+    assert reset.command == before
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_measured_hold_rejects_out_of_bounds_right_arm(direction):
+    state = feedback(0.)
+    state["body_q_measured"][26] = direction * 2.12722
+    with pytest.raises(ValueError, match="Measured right-arm"):
+        StandingReset(state, state["left_hand_q_measured"], state["right_hand_q_measured"])

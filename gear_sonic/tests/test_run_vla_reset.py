@@ -147,7 +147,7 @@ def test_harness_refills_before_capture_deadline_and_rejects_late_results(
         assert instances[0].control.reason == "invalid_or_stale_policy_action"
 
 
-@pytest.mark.parametrize("scenario", ["reset", "operator_pause", "policy_failure"])
+@pytest.mark.parametrize("scenario", ["reset", "operator_pause", "policy_failure", "reset_tracking_loss", "reset_out_of_bounds"])
 def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch, scenario):
     from pathlib import Path
 
@@ -194,7 +194,7 @@ def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch, scenario):
             self.control = control
             control.observation = Snapshots().latest(now)
             self.count += 1
-            if scenario != "reset" and self.count >= 5:
+            if not scenario.startswith("reset") and self.count >= 5:
                 return
             method, params = None, {}
             if self.count == 2:
@@ -252,6 +252,10 @@ def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch, scenario):
             args[1].put(({"malformed_old": True}, clock[0], 0))
         if scenario == "policy_failure" and index == 4:
             args[1].put((None, clock[0], instances[0].control.epoch))
+        if scenario == "reset_tracking_loss" and index == 7:
+            measured["body_q_measured_motor"][24] = .5
+        if scenario == "reset_out_of_bounds" and index == 7:
+            measured["body_q_measured_motor"][26] = 2.12722
 
     messages = run_keys(
         monkeypatch,
@@ -263,10 +267,34 @@ def test_harness_prewarm_pause_reset_and_old_actions(monkeypatch, scenario):
     assert all(r["error"] is None for r in instances[0].responses)
     poses = [unpack_bridge_message(raw, topic="pose") for raw in messages if raw.startswith(b"pose")]
     assert len(poses) == 1  # Prewarm and late result never publish.
-    assert instances[0].control.phase == ("RESETTING" if scenario == "reset" else "INTERRUPTED")
+    expected = "RESETTING" if scenario == "reset" else "FAULT" if scenario == "reset_out_of_bounds" else "INTERRUPTED"
+    assert instances[0].control.phase == expected
     if scenario != "reset":
         assert not instances[0].control.hooks.runtime_facts().policy_enabled
+    if scenario == "reset_tracking_loss":
+        assert instances[0].control.reason == "reset_reference_lead_exceeded"
+        planners = [unpack_bridge_message(raw, topic="planner") for raw in messages if raw.startswith(b"planner")]
+        assert planners[-1]["upper_body_position"][8] == pytest.approx(.5)
+    if scenario == "reset_out_of_bounds":
+        planners = [unpack_bridge_message(raw, topic="planner") for raw in messages if raw.startswith(b"planner")]
+        assert all(-1.97222 <= p["upper_body_position"][12] <= 1.97222 for p in planners)
     np.testing.assert_allclose(poses[0]["token_state"], 0.1)
+
+
+def test_operator_reset_tracking_loss_requests_measured_hold(monkeypatch):
+    state = dict(index=1, body_q=np.zeros(29), body_q_measured_motor=np.zeros(29),
+                 left_hand_q=np.zeros(7), right_hand_q=np.zeros(7),
+                 left_hand_q_measured=np.zeros(7), right_hand_q_measured=np.zeros(7),
+                 base_quat=[1, 0, 0, 0])
+
+    def lose_tracking(index, args):
+        if index == 2:
+            state["body_q_measured_motor"][24] = .5
+
+    messages = run_keys(monkeypatch, ["k", "i", None, None], state, lose_tracking)
+    planners = [unpack_bridge_message(raw, topic="planner") for raw in messages if raw.startswith(b"planner")]
+    assert planners[-1]["upper_body_position"][8] == pytest.approx(.5)
+    assert planners[-1]["mode"][0] == 0
 
 
 def test_repeated_init_uses_planner_standing_and_resume_switches_to_pose(monkeypatch):

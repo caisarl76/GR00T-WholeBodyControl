@@ -60,6 +60,13 @@ class StandingReset:
         yaw_tolerance_rad=np.pi / 36, settle_dwell_s=0.5,
     ):
         self._position = _measured_joints(state)
+        from .harness_profile import RIGHT_ARM_BOUNDS
+
+        self._right_arm_bounds = np.asarray(list(RIGHT_ARM_BOUNDS.values())).T
+        low, high = self._right_arm_bounds
+        measured_arm = self._position[_RIGHT_ARM_PLANNER_INDICES]
+        if np.any(measured_arm < low) or np.any(measured_arm > high):
+            raise ValueError("Measured right-arm exceeds G1 joint limits")
         self._compensate_tracking_bias = compensate_tracking_bias
         if not np.isfinite(joint_tolerance_rad) or joint_tolerance_rad <= 0:
             raise ValueError("Standing reset requires a positive finite joint tolerance")
@@ -88,14 +95,9 @@ class StandingReset:
                 _vector(right_hand_target, 7),
             ]
         )
-        self._right_arm_bounds = None
         if right_arm_target is not None:
-            from .harness_profile import RIGHT_ARM_BOUNDS
-
             self._target[:17] = self._position[:17]
             self._target[_RIGHT_ARM_PLANNER_INDICES] = _vector(right_arm_target, 7)
-            self._right_arm_bounds = np.asarray(list(RIGHT_ARM_BOUNDS.values())).T
-            low, high = self._right_arm_bounds
             if (np.any(self._target[_RIGHT_ARM_PLANNER_INDICES] < low)
                     or np.any(self._target[_RIGHT_ARM_PLANNER_INDICES] > high)):
                 raise ValueError("Ready target exceeds G1 right-arm joint limits")
@@ -173,10 +175,21 @@ class StandingReset:
             reference[_RIGHT_ARM_PLANNER_INDICES] = np.clip(
                 reference[_RIGHT_ARM_PLANNER_INDICES], *self._right_arm_bounds
             )
-        delta = np.clip(reference - self._position, -step, step)
-        # Only move toward the target, without getting ahead of feedback.
-        room = np.maximum(0.0, 0.15 - np.sign(delta) * (self._position - measured))
-        self._position += np.sign(delta) * np.minimum(np.abs(delta), room)
+        # A measured joint can fall back after reaching a reference. Retract
+        # toward the feasible interval rather than freezing an excessive lead.
+        lower, upper = measured - 0.15, measured + 0.15
+        lower[_RIGHT_ARM_PLANNER_INDICES] = np.maximum(lower[_RIGHT_ARM_PLANNER_INDICES], self._right_arm_bounds[0])
+        upper[_RIGHT_ARM_PLANNER_INDICES] = np.minimum(upper[_RIGHT_ARM_PLANNER_INDICES], self._right_arm_bounds[1])
+        if np.any(lower > upper):
+            raise ValueError("Joint feedback cannot satisfy G1 joint and lead bounds")
+        bounded_reference = np.clip(reference, lower, upper)
+        candidate = self._position + np.clip(bounded_reference - self._position, -step, step)
+        if np.max(np.abs(candidate - measured)) > 0.15 + 1e-8:
+            raise ValueError("Joint feedback moved beyond the rate-limited lead bound")
+        arm = candidate[_RIGHT_ARM_PLANNER_INDICES]
+        if np.any(arm < self._right_arm_bounds[0]) or np.any(arm > self._right_arm_bounds[1]):
+            raise ValueError("Joint feedback cannot satisfy G1 joint and lead bounds")
+        self._position = candidate
         if self.stage == 0:
             yaw = feedback_payload_heading_yaw(state)
             yaw_error = None if yaw is None else np.arctan2(np.sin(yaw - self._yaw), np.cos(yaw - self._yaw))

@@ -923,7 +923,28 @@ def main(config: InferenceConfig):
                     and (harness_control.phase != "RESETTING" or not harness_control.hold_confirmed)
                 ):
                     fresh_feedback = None
-                command = standing_reset.advance(fresh_feedback, t_start - last_reset_tick)
+                try:
+                    command = standing_reset.advance(fresh_feedback, t_start - last_reset_tick)
+                except ValueError as error:
+                    if harness_control is not None and harness_control.owner is not None:
+                        harness_control.interrupt("reset_reference_lead_exceeded", t_start)
+                    else:
+                        pause_loop = True
+                        invalidate_policy_actions()
+                        try:
+                            hold = StandingReset(
+                                reset_feedback,
+                                reset_feedback.get("left_hand_q_measured", reset_feedback.get("left_hand_q")),
+                                reset_feedback.get("right_hand_q_measured", reset_feedback.get("right_hand_q")),
+                            ).command
+                        except (TypeError, ValueError):
+                            hold = standing_reset.command
+                        standing_reset, manual_planner, harness_planner_command = None, None, hold
+                        publish_planner_command(hold)
+                    print(f"Standing reset interrupted: {error}")
+                    last_reset_tick = t_start
+                    _sleep_remaining(t_start, loop_period)
+                    continue
                 if manual_planner is not None:
                     command = manual_planner.command(command, fresh_heading())
                 publish_planner_command(command)

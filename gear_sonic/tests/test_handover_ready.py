@@ -21,7 +21,7 @@ class ReadyHooks(Hooks):
                              right_arm_target=right_arm_target, right_arm_waypoint=right_arm_waypoint)
 
 
-def make_ready(tmp_path, *, verified=True, reviewed=True, hooks=None):
+def make_ready(tmp_path, *, verified=True, reviewed=True, hooks=None, initially_raised=False):
     data = yaml.safe_load(PROFILE.read_text())
     data["skills"] = {"bottle_handover": dict(prompt="test-only handover",
         completion_criteria="Stable offer", completion_action="hold")}
@@ -31,7 +31,10 @@ def make_ready(tmp_path, *, verified=True, reviewed=True, hooks=None):
     path = tmp_path / "ready.yaml"
     path.write_text(yaml.safe_dump(data))
     c = HarnessControl(path, hooks or ReadyHooks(), "boot")
-    c.tick(0., state(), 0.)
+    initial = state()
+    if initially_raised:
+        initial["body_q_measured_motor"][22:29] = RAISED
+    c.tick(0., initial, 0.)
     c.observation = {"received_at": 0., "frame_id": "first"}
     assert request(c, "claim_control", {"registry_sha256": c.profile.registry_sha256})["error"] is None
     return c
@@ -70,30 +73,20 @@ def test_unverified_or_unsupported_handover_cannot_activate(tmp_path, verified, 
 
 
 def test_ready_requires_measured_settling_for_half_second(tmp_path):
-    c = make_ready(tmp_path)
+    c = make_ready(tmp_path, initially_raised=True)
     result = request(c, "reset_ready", {"execution_id": ""})
     assert result["error"] is None
     assert c.phase == "RESETTING"
-    raised = state(2)
-    raised["body_q_measured_motor"][22:29] = RAISED
-    for index in range(2, 22):
-        now = (index - 1) * .03
-        raised["index"] = index
-        c.reset.advance(raised, .03)
-        c.tick(now, raised, now)
-        assert c.phase == "RESETTING"
-    s = state(22)
-    body = np.asarray(s["body_q_measured_motor"])
-    body[G1_UPPER_BODY_JOINT_INDICES] = c.reset.target[:17]
-    s["body_q_measured_motor"] = body.tolist()
-    s["right_hand_q_measured"] = [0]*7
-    c.tick(.63, s, .63)
-    c.tick(1.12, {**s, "index":23}, 1.12)
+    # Exercise the ramp with synthetic tracking before testing native dwell.
+    s = {**c.feedback}
+    track_reset(c.reset, s)
+    c.tick(.1, s, .1)
+    c.tick(.59, {**s, "index":s["index"] + 1}, .59)
     assert c.phase == "RESETTING"
-    c.tick(1.14, {**s, "index":24}, 1.14)
-    assert c.phase == "COMPLETED" and c.status(1.14)["right_hand_open"] is True
-    c.tick(1.8, None, None)
-    assert c.status(1.8)["right_hand_open"] is None
+    c.tick(.61, {**s, "index":s["index"] + 2}, .61)
+    assert c.phase == "COMPLETED" and c.status(.61)["right_hand_open"] is True
+    c.tick(1.2, None, None)
+    assert c.status(1.2)["right_hand_open"] is None
 
 
 def test_handover_claim_requests_measured_hold_before_camera_checks(tmp_path):
@@ -125,10 +118,37 @@ def test_ready_tracking_compensation_cannot_cross_joint_bound(boundary, drift):
         assert -1.97222 <= commanded_body[26] <= 1.97222
 
 
-def lift_reset():
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_ready_rejects_outward_drift_when_joint_and_lead_intervals_do_not_intersect(direction):
+    target = list(TARGET)
+    target[4] = direction * 1.97222
     s = state()
+    s["body_q_measured_motor"][22:29] = target
+    reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=target)
+    before = reset.command
+    s["body_q_measured_motor"][26] += direction * .155
+    with pytest.raises(ValueError, match="joint and lead bounds"):
+        reset.advance(s, .02)
+    assert reset.command == before
+
+
+def lift_reset(*, initially_raised=True):
+    s = state()
+    if initially_raised:
+        s["body_q_measured_motor"][22:29] = RAISED
     return StandingReset(s, s["left_hand_q_measured"], np.zeros(7),
                          right_arm_target=TARGET, right_arm_waypoint=RAISED), s
+
+
+def track_reset(reset, s):
+    for _ in range(250):
+        s["index"] += 1
+        command = reset.advance(s, .03)
+        body = np.asarray(s["body_q_measured_motor"])
+        body[G1_UPPER_BODY_JOINT_INDICES] = command.upper_body_position
+        s["body_q_measured_motor"] = body.tolist()
+        s["left_hand_q_measured"] = command.left_hand_position
+        s["right_hand_q_measured"] = command.right_hand_position
 
 
 def test_raise_retains_fingers_until_distinct_feedback_settles():
@@ -153,7 +173,8 @@ def test_raise_retains_fingers_until_distinct_feedback_settles():
     assert not reset.is_settled(s, .05, .1)
     s["index"] = 14
     assert reset.advance(s, .05).right_hand_position == pytest.approx([.375] * 7)
-    s["body_q_measured_motor"][22:29] = TARGET
+    track_reset(reset, s)
+    s["right_hand_q_measured"] = [.4] * 7
     assert not reset.is_settled(s, .05, .1)
     s["right_hand_q_measured"] = [0] * 7
     assert reset.is_settled(s, .05, .1)
@@ -161,6 +182,7 @@ def test_raise_retains_fingers_until_distinct_feedback_settles():
 
 def test_raise_first_qualifying_sample_does_not_credit_unsettled_interval():
     reset, s = lift_reset()
+    s["body_q_measured_motor"][24] += .1
     reset.advance(s, .025)  # The preceding sample is outside raise tolerance.
     s["body_q_measured_motor"][22:29] = RAISED
     for index in range(2, 22):
@@ -206,7 +228,7 @@ def test_raise_dwell_requires_heading_and_upper_body_but_not_finger_settling():
 
 
 def test_lift_transition_keeps_rate_lead_and_preserved_joint_limits():
-    reset, s = lift_reset()
+    reset, s = lift_reset(initially_raised=False)
     previous = np.r_[reset.command.upper_body_position,
                      reset.command.left_hand_position, reset.command.right_hand_position]
     for index in range(2, 250):
