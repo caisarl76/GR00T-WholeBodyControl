@@ -26,6 +26,7 @@ def test_left_only_presets_use_matching_servers_and_dataset_prompts(capsys):
         output = capsys.readouterr().out
         command = shlex.split(output.splitlines()[-1])
         assert "--no-deploy" in command
+        assert command[command.index("--initial-pose") + 1] == "planner_standing"
         for flag, value in {
             "--policy-host": "192.168.75.173",
             "--policy-port": port,

@@ -22,6 +22,11 @@ include(CheckLanguage)
 
 # Optional builds
 option(BUILD_SRCS "Build sources" ON)
+option(BUILD_DEPLOY_TESTS "Build deploy-side test executables" OFF)
+
+if(BUILD_DEPLOY_TESTS)
+  enable_testing()
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 

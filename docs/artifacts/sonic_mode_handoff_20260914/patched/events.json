@@ -1,0 +1,49 @@
+[
+  {
+    "wall": 262040.160026783,
+    "kind": "start"
+  },
+  {
+    "wall": 262040.160459431,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 262043.172251319,
+    "kind": "release_band"
+  },
+  {
+    "wall": 262048.169766136,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 262053.167549024,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 262058.170613448,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 262063.168756442,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 262068.166487008,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 262073.164239977,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 262078.162019819,
+    "kind": "end"
+  }
+]

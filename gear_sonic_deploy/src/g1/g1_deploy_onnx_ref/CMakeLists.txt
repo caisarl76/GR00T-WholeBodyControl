@@ -6,6 +6,24 @@ set(EXECUTABLE_NAME g1_deploy_onnx_ref)
 option(BUILD_ROS2 "Build optional ROS2 input/output support" OFF)
 option(BUILD_DEPLOY_TESTS "Build deploy-side test executables" OFF)
 
+if(BUILD_DEPLOY_TESTS)
+  add_executable(dex3_hand_field_decoder_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/dex3_hand_field_decoder_test.cpp)
+  target_include_directories(dex3_hand_field_decoder_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  set_target_properties(dex3_hand_field_decoder_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(dex3_hand_field_decoder_test PRIVATE
+      -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(dex3_hand_field_decoder_test PRIVATE
+      -fsanitize=address,undefined)
+  endif()
+  add_test(NAME dex3_hand_field_decoder_test COMMAND dex3_hand_field_decoder_test)
+endif()
+
 if(BUILD_ROS2)
   find_package(rclcpp QUIET)
   find_package(std_msgs QUIET)
@@ -188,6 +206,18 @@ set(EXE_LIBS
 )
 
 
+if(BUILD_DEPLOY_TESTS)
+  add_executable(zmq_mode_handoff_test tests/zmq_mode_handoff_test.cpp)
+  target_include_directories(zmq_mode_handoff_test PRIVATE ${EXE_INCLUDES})
+  target_link_libraries(zmq_mode_handoff_test PRIVATE ${EXE_LIBS})
+  # Invoke real receive callbacks deterministically, without test hooks in production.
+  target_compile_options(zmq_mode_handoff_test PRIVATE -fno-access-control)
+  set_target_properties(zmq_mode_handoff_test PROPERTIES
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+  add_test(NAME zmq_mode_handoff_test COMMAND zmq_mode_handoff_test)
+endif()
+
+
 # build the main executable:
 add_executable(${EXECUTABLE_NAME} ${CMAKE_CURRENT_SOURCE_DIR}/src/g1_deploy_onnx_ref.cpp)
 target_include_directories(${EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/ ${PROJECT_SOURCE_DIR}/src)
@@ -213,9 +243,8 @@ if(rclcpp_FOUND AND std_msgs_FOUND)
   include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ROS2.cmake)
   
   # Add ROS2 support to main executable (requires msgpack)
-  target_include_directories(${EXECUTABLE_NAME} PRIVATE ${ROS2_INCLUDE_DIRS} ${MSGPACK_INCLUDE_DIRS})
-  target_link_libraries(${EXECUTABLE_NAME} PRIVATE ${ROS2_LIBS} pthread)
-  target_compile_definitions(${EXECUTABLE_NAME} PRIVATE HAS_ROS2=1)
+  target_include_directories(${EXECUTABLE_NAME} PRIVATE ${MSGPACK_INCLUDE_DIRS})
+  configure_ros2_target(${EXECUTABLE_NAME})
   
   message(STATUS "✅ ROS2InputHandler support enabled with msgpack")
 else()

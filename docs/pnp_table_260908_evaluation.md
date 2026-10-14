@@ -82,7 +82,7 @@ are not a schedule for the real robot.
 For the full-task model, retain **approach the table and pick the bottle** for
 the entire episode; the preset does not prompt for language transitions.
 
-Use `c` to start recording, `s` to finish successfully, or `f` to discard.
+Use `c` to start recording, press `c` again to finish and save, or `x` to discard.
 Each launch uses a fresh `outputs/pnp_table_260908_subtask_eval_<UTC>/` directory
 or `outputs/pnp_table_260908_full_task_eval_<UTC>/` for the full-task model,
 with full task label `approach the table and pick the bottle`. The existing

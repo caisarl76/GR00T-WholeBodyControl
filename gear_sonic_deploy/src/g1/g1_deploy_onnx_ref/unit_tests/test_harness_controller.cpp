@@ -60,7 +60,7 @@ TEST(HarnessTelemetry, AbsoluteMotorOrderingAndEffectiveCapability) {
   const std::array<double, 4> identity{1,0,0,0};
   const auto now = std::chrono::steady_clock::now();
   logger.LogFullState(identity, {}, {}, identity, {}, {}, q,z,z,empty,empty,empty,
-                      hand,hand,hand,hand,hand,hand,0.0,now,now);
+                      hand,hand,hand,hand,hand,hand,0.0,{now,now});
   TestOutput output(logger);
   DataBuffer<HeadingState> heading;
   output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
@@ -77,12 +77,12 @@ TEST(HarnessTelemetry, AbsoluteMotorOrderingAndEffectiveCapability) {
   EXPECT_EQ(output.data().at("right_hand_received_at"), std::vector<double>{receipt});
   EXPECT_FALSE(output.data().at("controller_clock_id").empty());
   logger.LogFullState(identity, {}, {}, identity, {}, {}, q,z,z,empty,empty,empty,
-                      hand,hand,hand,hand,hand,hand,0.0,now,now);
+                      hand,hand,hand,hand,hand,hand,0.0,{now,now});
   output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
   EXPECT_EQ(output.data().at("right_hand_received_at"), std::vector<double>{receipt});
   const auto newer = std::chrono::steady_clock::now();
   logger.LogFullState(identity, {}, {}, identity, {}, {}, q,z,z,empty,empty,empty,
-                      hand,hand,hand,hand,hand,hand,0.0,newer,newer);
+                      hand,hand,hand,hand,hand,hand,0.0,{newer,newer});
   output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
   EXPECT_EQ(output.data().at("right_hand_received_at"), std::vector<double>{
       std::chrono::duration<double>(newer.time_since_epoch()).count()});
@@ -90,24 +90,24 @@ TEST(HarnessTelemetry, AbsoluteMotorOrderingAndEffectiveCapability) {
   output.SetHarnessPlannerHold(true);
   output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
   EXPECT_EQ(output.data().at("harness_planner_hold_enabled"), std::vector<double>{1});
-  // Disabled/absent and stale hands cannot be reported as measured-open.
+  // Disabled/absent and stale hands carry no receipt, so they cannot be
+  // reported as measured-open.
   for (bool missing_left : {false, true}) {
     for (bool stale : {false, true}) {
       const auto absent = stale ? now - std::chrono::seconds(1) : std::chrono::steady_clock::time_point{};
       logger.LogFullState(identity, {}, {}, identity, {}, {}, q,z,z,empty,empty,empty,
                           hand,hand,hand,hand,hand,hand,0.0,
-                          missing_left ? absent : now, missing_left ? now : absent);
+                          {missing_left ? absent : now, missing_left ? now : absent});
       output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
-      EXPECT_TRUE(output.data().at(missing_left ? "left_hand_q_measured" : "right_hand_q_measured").empty());
+      // Samples stay 7-DOF; *_hand_feedback_valid and the receipt carry freshness.
       EXPECT_EQ(output.data().at("right_hand_received_at").empty(), !missing_left);
-      EXPECT_EQ(output.data().at(missing_left ? "right_hand_q_measured" : "left_hand_q_measured").size(), 7);
+      EXPECT_EQ(output.data().at("left_hand_q_measured").size(), 7);
+      EXPECT_EQ(output.data().at("right_hand_q_measured").size(), 7);
     }
   }
   logger.LogFullState(identity, {}, {}, identity, {}, {}, q,z,z,empty,empty,empty,
                       hand,hand,hand,hand,hand,hand);  // Disabled Dex3: no receipts.
   output.publish({}, {}, {}, {}, {}, identity, heading, nullptr, 0);
-  EXPECT_TRUE(output.data().at("left_hand_q_measured").empty());
-  EXPECT_TRUE(output.data().at("right_hand_q_measured").empty());
   EXPECT_TRUE(output.data().at("right_hand_received_at").empty());
 }
 
@@ -182,9 +182,11 @@ TEST(HarnessTimeout, ModeBoundariesAndStopsClearRetainedTargets) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1250)); tick();
     ASSERT_TRUE(manager.GetUpperBodyJointPositions().first);
     if (scenario == 0) {
+      // The committed planner stays the outgoing source until streamed motion
+      // takes over; entering the next PLANNER session clears the held targets.
       send_command(false, false);
-      EXPECT_FALSE(manager.GetUpperBodyJointPositions().first);
-      EXPECT_FALSE(manager.GetHandPose(true).first);
+      EXPECT_TRUE(manager.GetUpperBodyJointPositions().first);
+      EXPECT_TRUE(manager.GetHandPose(true).first);
       send_command(false, true);
     } else if (scenario == 1) {
       send_command(true, true);

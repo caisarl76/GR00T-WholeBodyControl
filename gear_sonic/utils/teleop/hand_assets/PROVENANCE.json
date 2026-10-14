@@ -1,0 +1,14 @@
+{
+  "source_repository": "https://github.com/unitreerobotics/xr_teleoperate",
+  "source_commit": "934361718c5886356e19f9068f4536f04d2b9feb",
+  "license": "Apache-2.0",
+  "license_sha256": "63762ccebdb836cf2bae6b1ae0de526e7499dbf45e554c790ebc45942cce3e36",
+  "sha256": {
+    "unitree_hand/unitree_dex3.yml": "2c39bc8c123bdc00f299d02d995d9bc4a12179adf4942eabc27349252c1c7f15",
+    "unitree_hand/unitree_dex3_left.urdf": "569e4d8ca55b1b76e51cd41df3cd6f655c5475a3e02e908f673f999759c51bd0",
+    "unitree_hand/unitree_dex3_right.urdf": "4e36e939466d386524d38079f8e2ff84d9dd4d3a7f8db6319374067970ad7075",
+    "inspire_hand/inspire_hand.yml": "94feea4fc387a52bdda57538715f508b51a7704225e102e59db24941de5c05bf",
+    "inspire_hand/inspire_hand_left.urdf": "bfd26847a64b3794aabdeaeda6c790866b5d702c919d765fecf56fb584212367",
+    "inspire_hand/inspire_hand_right.urdf": "3dc82ee57e8918ce6316b4d0a0572450e719474b437f91dca4fea1253547b8c1"
+  }
+}

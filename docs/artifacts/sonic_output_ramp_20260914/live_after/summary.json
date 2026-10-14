@@ -1,0 +1,97 @@
+{
+  "directory": "/tmp/sonic-live-handoff/capture_fixed_20805c8",
+  "band_release_wall": 268534.969185203,
+  "end_wall": 268615.253835,
+  "unsupported_measured_seconds": 78.28464979695855,
+  "min_root_height_m": 0.7813357205675192,
+  "max_root_tilt_deg": 6.78176613285697,
+  "paused_ticks": 0,
+  "logged_ticks": 3915,
+  "transitions": [
+    {
+      "from": "planner_motion",
+      "to": "streamed",
+      "wall": 268537.093842,
+      "seconds_after_band_release": 2.1246567969792522,
+      "min_z_first_second": 0.785233501148901,
+      "max_tilt_first_second": 2.94977683478373
+    },
+    {
+      "from": "streamed",
+      "to": "planner_motion",
+      "wall": 268541.493852,
+      "seconds_after_band_release": 6.524666796962265,
+      "min_z_first_second": 0.7852747441148685,
+      "max_tilt_first_second": 2.8894014881131533
+    },
+    {
+      "from": "planner_motion",
+      "to": "streamed",
+      "wall": 268544.89383899997,
+      "seconds_after_band_release": 9.924653796944767,
+      "min_z_first_second": 0.7816781717985619,
+      "max_tilt_first_second": 6.78176613285697
+    },
+    {
+      "from": "streamed",
+      "to": "planner_motion",
+      "wall": 268546.99383600004,
+      "seconds_after_band_release": 12.024650797015056,
+      "min_z_first_second": 0.7838323046541481,
+      "max_tilt_first_second": 3.7484939349872333
+    },
+    {
+      "from": "planner_motion",
+      "to": "streamed",
+      "wall": 268548.73383499996,
+      "seconds_after_band_release": 13.76464979693992,
+      "min_z_first_second": 0.7845272012946429,
+      "max_tilt_first_second": 4.513398746196513
+    },
+    {
+      "from": "streamed",
+      "to": "planner_motion",
+      "wall": 268549.893858,
+      "seconds_after_band_release": 14.924672796973027,
+      "min_z_first_second": 0.784714923400237,
+      "max_tilt_first_second": 4.562602033717354
+    },
+    {
+      "from": "planner_motion",
+      "to": "streamed",
+      "wall": 268551.453844,
+      "seconds_after_band_release": 16.48465879698051,
+      "min_z_first_second": 0.783657483160985,
+      "max_tilt_first_second": 3.144053532564212
+    },
+    {
+      "from": "streamed",
+      "to": "planner_motion",
+      "wall": 268553.393842,
+      "seconds_after_band_release": 18.42465679696761,
+      "min_z_first_second": 0.7834889964757341,
+      "max_tilt_first_second": 2.824360749334159
+    },
+    {
+      "from": "planner_motion",
+      "to": "streamed",
+      "wall": 268555.513835,
+      "seconds_after_band_release": 20.54464979696786,
+      "min_z_first_second": 0.783038003482457,
+      "max_tilt_first_second": 3.7627450390173256
+    },
+    {
+      "from": "streamed",
+      "to": "planner_motion",
+      "wall": 268557.49383600004,
+      "seconds_after_band_release": 22.524650797015056,
+      "min_z_first_second": 0.7818431265690372,
+      "max_tilt_first_second": 3.545427071509146
+    }
+  ],
+  "threshold_crossings": 0,
+  "operator_confirmation": "Balance loss is gone",
+  "source_commit": "20805c8",
+  "hand_input": "off",
+  "scope": "Live MuJoCo body-mode switching; optical-hand integration and PC2 hardware not qualified by this run."
+}

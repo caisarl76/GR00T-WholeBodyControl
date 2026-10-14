@@ -5,10 +5,10 @@ Starts the full data collection stack in a single tmux session:
 
     Window 0 — data_collection (4 panes):
     ┌───────────────────────┬───────────────────────┐
-    │ Pane 0: C++ Deploy    │ Pane 1: Data Exporter │
+    │ Pane 0: C++ Deploy    │ Pane 2: Data Exporter │
     │ (gear_sonic_deploy)   │ (.venv_data_collection)│
     ├───────────────────────┼───────────────────────┤
-    │ Pane 2: PICO Teleop   │ Pane 3: Camera Viewer │
+    │ Pane 1: Teleop        │ Pane 3: Camera Viewer │
     │ (.venv_teleop)        │ (.venv_data_collection)│
     └───────────────────────┴───────────────────────┘
 
@@ -21,26 +21,28 @@ Starts the full data collection stack in a single tmux session:
 Prerequisites:
     - tmux installed (sudo apt install tmux)
     - Virtual environments set up:
-        bash install_scripts/install_pico.sh          -> .venv_teleop
+        bash install_scripts/install_pico.sh            -> .venv_teleop
         bash install_scripts/install_data_collection.sh -> .venv_data_collection
     - gear_sonic_deploy built (see docs)
     - For sim: .venv_sim must exist (see install instructions)
 
 Usage (from repo root — no venv activation needed):
-    python gear_sonic/scripts/launch_data_collection.py              # real robot (default)
-    python gear_sonic/scripts/launch_data_collection.py --sim        # MuJoCo sim
-    python gear_sonic/scripts/launch_data_collection.py --no-camera-viewer  # skip viewer
+    python gear_sonic/scripts/launch_data_collection.py                          # real robot (default)
+    python gear_sonic/scripts/launch_data_collection.py --sim                    # MuJoCo sim
+    python gear_sonic/scripts/launch_data_collection.py --no-camera-viewer       # skip viewer
+    python gear_sonic/scripts/launch_data_collection.py --pico-input-source isaac-teleop  # in-process CloudXR / DeviceIO
 """
 
 from dataclasses import dataclass
-from pathlib import Path
 import os
+from pathlib import Path
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+from typing import Literal
 
 
 def _bootstrap_venv():
@@ -66,7 +68,7 @@ def _bootstrap_venv():
 
 _bootstrap_venv()
 
-import tyro
+import tyro  # noqa: E402
 
 
 def _get_local_ip() -> str:
@@ -88,6 +90,9 @@ class DataCollectionLaunchConfig:
     # Deployment mode
     sim: bool = False
     """Run against MuJoCo sim (deploy.sh sim) instead of real robot."""
+
+    hand_profile: Literal["dex3", "inspire_ftp"] = "dex3"
+    """Select the matching simulator, PICO mapper, and C++ hand owner."""
 
     # C++ deploy options
     deploy_input_type: str = "zmq_manager"
@@ -112,9 +117,18 @@ class DataCollectionLaunchConfig:
     deploy_output_type: str = ""
     """Output type for deploy.sh. Leave empty for default."""
 
-    # PICO teleop options
+    deploy_motor_kp_scale: str = ""
+    """Kp scale specification for hardware motor indices (for example, 4,10=1.5)."""
+
+    deploy_motor_kd_scale: str = ""
+    """Kd scale specification for hardware motor indices (for example, 4,10=1.5)."""
+
+    # Teleop streamer options
     pico_manager: bool = True
     """Run pico_manager_thread_server with --manager flag."""
+
+    pico_input_source: str = "xrt"
+    """Teleop input source for pico_manager_thread_server.py (xrt or isaac-teleop)."""
 
     pico_vis_vr3pt: bool = False
     """Enable VR 3-point visualization on the teleop streamer."""
@@ -155,7 +169,7 @@ class DataCollectionLaunchConfig:
 SESSION_NAME = "sonic_data_collection"
 
 
-def _check_prerequisites(sim: bool = False):
+def _check_prerequisites(config: DataCollectionLaunchConfig):
     """Verify that required tools and venvs exist."""
     errors = []
 
@@ -182,11 +196,14 @@ def _check_prerequisites(sim: bool = False):
             "Ensure the deploy directory is set up."
         )
 
-    if sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
+    if config.sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
         errors.append(
             ".venv_sim not found. Set up the simulation venv first "
             "(see install instructions)."
         )
+
+    if config.pico_input_source not in {"xrt", "isaac-teleop"}:
+        errors.append("--pico-input-source must be one of: xrt, isaac-teleop")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -272,19 +289,88 @@ def _check_pane_alive(pane_index: int) -> bool:
     return result.stdout.strip() != "1"
 
 
+def _build_sim_command(config: DataCollectionLaunchConfig, repo_root: Path) -> str:
+    command = (
+        f"cd {repo_root} && "
+        f"source .venv_sim/bin/activate && "
+        f"python gear_sonic/scripts/run_sim_loop.py"
+    )
+    if config.hand_profile == "inspire_ftp":
+        command += " --hand-profile inspire_ftp"
+    return (
+        command
+        + " --enable-image-publish --enable-offscreen "
+        + f"--camera-port {config.camera_port}"
+    )
+
+
+def _build_deploy_command(
+    config: DataCollectionLaunchConfig, repo_root: Path
+) -> str:
+    command = f"cd {repo_root / 'gear_sonic_deploy'} && ./deploy.sh "
+    if config.hand_profile == "inspire_ftp":
+        command += "--disable-dex3-hands "
+    command += (
+        f"--input-type {config.deploy_input_type} "
+        f"--zmq-host {config.deploy_zmq_host} "
+    )
+    if config.deploy_checkpoint:
+        command += f"--cp {config.deploy_checkpoint} "
+    if config.deploy_obs_config:
+        command += f"--obs-config {config.deploy_obs_config} "
+    if config.deploy_planner:
+        command += f"--planner {config.deploy_planner} "
+    if config.deploy_motion_data:
+        command += f"--motion-data {config.deploy_motion_data} "
+    if config.deploy_output_type:
+        command += f"--output-type {config.deploy_output_type} "
+    if config.deploy_motor_kp_scale:
+        command += f"--motor-kp-scale {config.deploy_motor_kp_scale} "
+    if config.deploy_motor_kd_scale:
+        command += f"--motor-kd-scale {config.deploy_motor_kd_scale} "
+    return command + ("sim" if config.sim else "real")
+
+
+def _build_pico_command(config: DataCollectionLaunchConfig, repo_root: Path) -> str:
+    command = (
+        f"cd {repo_root} && "
+        f"source .venv_teleop/bin/activate && "
+        f"python gear_sonic/scripts/pico_manager_thread_server.py"
+    )
+    if config.hand_profile == "inspire_ftp":
+        command += " --hand-profile inspire_ftp"
+    command += f" --input-source {config.pico_input_source}"
+    if config.pico_manager:
+        command += " --manager"
+    if config.pico_vis_vr3pt:
+        command += " --vis_vr3pt"
+    if config.pico_vis_smpl:
+        command += " --vis_smpl"
+    if config.pico_waist_tracking:
+        command += " --waist_tracking"
+    return command
+
+
 def main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
-    _check_prerequisites(sim=config.sim)
+    if config.hand_profile == "inspire_ftp" and not config.sim:
+        raise ValueError(
+            "the Inspire FTP profile is simulation-only until the PC2 DDS backend is integrated"
+        )
+
+    _check_prerequisites(config=config)
     _kill_existing_session()
 
     print("=" * 60)
     print("  SONIC Data Collection Launcher")
     print("=" * 60)
     print(f"  Mode:            {'Simulation' if config.sim else 'Real Robot'}")
+    print(f"  Hand profile:    {config.hand_profile}")
     print(f"  Task prompt:     {config.task_prompt}")
     print(f"  Dataset name:    {config.dataset_name or '(auto)'}")
     print(f"  Deploy input:    {config.deploy_input_type}")
+    print(f"  Teleop input:    {config.pico_input_source}")
     if config.deploy_checkpoint:
         print(f"  Checkpoint:      {config.deploy_checkpoint}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
@@ -292,6 +378,14 @@ def main(config: DataCollectionLaunchConfig):
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
+    print(
+        "  Data exporter:   "
+        + (
+            "Disabled (Inspire six-motor schema not implemented)"
+            if config.hand_profile == "inspire_ftp"
+            else "Enabled"
+        )
+    )
     print(f"  PICO vis:        vr3pt={config.pico_vis_vr3pt} smpl={config.pico_vis_smpl}")
     print(f"  PC IP (for PICO): {_get_local_ip()}")
     print("=" * 60)
@@ -304,13 +398,7 @@ def main(config: DataCollectionLaunchConfig):
         subprocess.run(
             ["tmux", "new-window", "-t", SESSION_NAME, "-n", "sim"],
         )
-        sim_cmd = (
-            f"cd {repo_root} && "
-            f"source .venv_sim/bin/activate && "
-            f"python gear_sonic/scripts/run_sim_loop.py "
-            f"--enable-image-publish --enable-offscreen "
-            f"--camera-port {config.camera_port}"
-        )
+        sim_cmd = _build_sim_command(config, repo_root)
         sim_target = f"{SESSION_NAME}:sim"
         subprocess.run(
             ["tmux", "send-keys", "-t", sim_target, sim_cmd, "C-m"],
@@ -324,24 +412,7 @@ def main(config: DataCollectionLaunchConfig):
         )
 
     # --- Pane 0 (top-left): C++ Deploy ---
-    deploy_mode = "sim" if config.sim else "real"
-    deploy_cmd = (
-        f"cd {repo_root / 'gear_sonic_deploy'} && "
-        f"./deploy.sh "
-        f"--input-type {config.deploy_input_type} "
-        f"--zmq-host {config.deploy_zmq_host} "
-    )
-    if config.deploy_checkpoint:
-        deploy_cmd += f"--cp {config.deploy_checkpoint} "
-    if config.deploy_obs_config:
-        deploy_cmd += f"--obs-config {config.deploy_obs_config} "
-    if config.deploy_planner:
-        deploy_cmd += f"--planner {config.deploy_planner} "
-    if config.deploy_motion_data:
-        deploy_cmd += f"--motion-data {config.deploy_motion_data} "
-    if config.deploy_output_type:
-        deploy_cmd += f"--output-type {config.deploy_output_type} "
-    deploy_cmd += deploy_mode
+    deploy_cmd = _build_deploy_command(config, repo_root)
 
     print("Starting C++ deploy (pane 0)...")
     _send_to_pane(0, deploy_cmd, wait=3.0)
@@ -350,21 +421,9 @@ def main(config: DataCollectionLaunchConfig):
         print("WARNING: C++ deploy pane may have failed to start.")
 
     # --- Pane 2 (bottom-left): PICO Teleop Streamer ---
-    pico_cmd = (
-        f"cd {repo_root} && "
-        f"source .venv_teleop/bin/activate && "
-        f"python gear_sonic/scripts/pico_manager_thread_server.py"
-    )
-    if config.pico_manager:
-        pico_cmd += " --manager"
-    if config.pico_vis_vr3pt:
-        pico_cmd += " --vis_vr3pt"
-    if config.pico_vis_smpl:
-        pico_cmd += " --vis_smpl"
-    if config.pico_waist_tracking:
-        pico_cmd += " --waist_tracking"
+    pico_cmd = _build_pico_command(config, repo_root)
 
-    print("Starting PICO teleop streamer (pane 2)...")
+    print("Starting teleop streamer (pane 2)...")
     _send_to_pane(1, pico_cmd, wait=2.0)
 
     # --- Pane 3 (bottom-right): Camera Viewer ---
@@ -379,29 +438,39 @@ def main(config: DataCollectionLaunchConfig):
         print("Starting camera viewer (pane 3)...")
         _send_to_pane(3, viewer_cmd, wait=2.0)
 
-    # --- Pane 1 (top-right): Data Exporter ---
-    exporter_cmd = (
-        f"cd {repo_root} && "
-        f"source .venv_data_collection/bin/activate && "
-        f"python gear_sonic/scripts/run_data_exporter.py "
-        f"--task-prompt '{config.task_prompt}' "
-        f"--data-collection-frequency {config.data_exporter_frequency} "
-        f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
-    )
-    if config.dataset_name:
-        exporter_cmd += f" --dataset-name '{config.dataset_name}'"
-    if config.record_wrist_cameras:
-        exporter_cmd += " --record-wrist-cameras"
-    if not config.text_to_speech:
-        exporter_cmd += " --no-text-to-speech"
+    # The current LeRobot feature schema is Dex3-specific (seven values per
+    # hand). Do not start an exporter that would reject or mislabel Inspire's
+    # six-motor commands.
+    if config.hand_profile == "inspire_ftp":
+        print("Skipping data exporter: Inspire six-motor schema is not implemented.")
+    else:
+        exporter_cmd = (
+            f"cd {repo_root} && "
+            f"source .venv_data_collection/bin/activate && "
+            f"python gear_sonic/scripts/run_data_exporter.py "
+            f"--task-prompt '{config.task_prompt}' "
+            f"--data-collection-frequency {config.data_exporter_frequency} "
+            f"--camera-host {config.camera_host} "
+            f"--camera-port {config.camera_port}"
+        )
+        if config.dataset_name:
+            exporter_cmd += f" --dataset-name '{config.dataset_name}'"
+        if config.record_wrist_cameras:
+            exporter_cmd += " --record-wrist-cameras"
+        if not config.text_to_speech:
+            exporter_cmd += " --no-text-to-speech"
 
-    print("Starting data exporter (pane 1)...")
-    _send_to_pane(2, exporter_cmd, wait=1.0)
+        print("Starting data exporter (pane 1)...")
+        _send_to_pane(2, exporter_cmd, wait=1.0)
 
-    # Select the data exporter pane so the user lands there for interactive input
+    # Select the interactive exporter pane for Dex3, or PICO for Inspire.
     subprocess.run(
-        ["tmux", "select-pane", "-t", f"{SESSION_NAME}:0.2"],
+        [
+            "tmux",
+            "select-pane",
+            "-t",
+            f"{SESSION_NAME}:0.{2 if config.hand_profile == 'dex3' else 1}",
+        ],
     )
 
     print()
@@ -417,7 +486,11 @@ def main(config: DataCollectionLaunchConfig):
     print("  Window 'data_collection':")
     print("    Pane 0 (top-left):     C++ Deploy")
     print("    Pane 1 (bottom-left):  PICO Teleop")
-    print("    Pane 2 (top-right):    Data Exporter  <-- you are here")
+    if config.hand_profile == "dex3":
+        print("    Pane 2 (top-right):    Data Exporter  <-- you are here")
+    else:
+        print("    Pane 2 (top-right):    Data Exporter disabled for Inspire")
+        print("                              PICO Teleop  <-- you are here")
     if config.camera_viewer:
         print("    Pane 3 (bottom-right): Camera Viewer")
     print()

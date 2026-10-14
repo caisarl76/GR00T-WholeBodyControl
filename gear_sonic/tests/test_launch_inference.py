@@ -46,6 +46,7 @@ def test_remote_mode_builds_module_commands_and_skips_deploy():
     assert "--state-zmq-host 192.168.0.223" in inference
     assert "--action-zmq-host 192.168.0.62" in inference
     assert "python -m gear_sonic.scripts.run_data_exporter" in exporter
+    assert "--legacy-recording-controls" in exporter
     assert "--state-zmq-host 192.168.0.223" in exporter
     assert "--sonic-zmq-host 192.168.0.62" in exporter
     assert shlex.quote("pick O'Reilly's cup") in inference

@@ -1,0 +1,100 @@
+[
+  {
+    "wall": 262198.515063099,
+    "kind": "start"
+  },
+  {
+    "wall": 262198.515566737,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 262198.515929507,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 262201.526886598,
+    "kind": "release_band"
+  },
+  {
+    "wall": 262204.517799995,
+    "kind": "facing",
+    "value": [
+      0.7071067811865476,
+      0.7071067811865476,
+      0.0
+    ]
+  },
+  {
+    "wall": 262210.519316047,
+    "kind": "request",
+    "mode": "pose"
+  },
+  {
+    "wall": 262210.520174236,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 262215.520225349,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 262215.520425202,
+    "kind": "facing",
+    "value": [
+      1.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "wall": 262215.520715066,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 262218.532288066,
+    "kind": "facing",
+    "value": [
+      0.7071067811865476,
+      0.7071067811865476,
+      0.0
+    ]
+  },
+  {
+    "wall": 262224.534878103,
+    "kind": "request",
+    "mode": "pose"
+  },
+  {
+    "wall": 262224.535156078,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 262229.532782859,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 262229.533126735,
+    "kind": "facing",
+    "value": [
+      1.0,
+      0.0,
+      0.0
+    ]
+  },
+  {
+    "wall": 262229.533412376,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 262234.533010647,
+    "kind": "end"
+  }
+]

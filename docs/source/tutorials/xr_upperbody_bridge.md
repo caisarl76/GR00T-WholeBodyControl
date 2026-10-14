@@ -155,7 +155,7 @@ python teleop/teleop_hand_and_arm.py \
   --gear-sonic-export \
   --gear-sonic-export-port 5560 \
   --gear-sonic-export-topic xr_teleop \
-  --gear-sonic-ramp-in-s 2.0 \
+   --gear-sonic-ramp-in-s 2.0 \
   --gear-sonic-ramp-out-s 2.0 \
   --gear-sonic-exit-hold-s 2.0 \
   --gear-sonic-debug

@@ -68,6 +68,7 @@
 #include <limits>
 
 #include "input_interface.hpp"
+#include "dex3_hand_field_decoder.hpp"
 #include "zmq_packed_message_subscriber.hpp"
 #include "streamed_motion_merger.hpp"
 
@@ -129,8 +130,10 @@ public:
         int port = 5556,
         const std::string& topic = "pose",
         bool use_conflate = false,
-        bool verbose = false
-    ) : InputInterface(), host_(host), port_(port), topic_(topic), verbose_(verbose), is_localhost_(host == LOCALHOST) {
+        bool verbose = false,
+        bool decode_dex3_hands = true
+    ) : InputInterface(), host_(host), port_(port), topic_(topic), verbose_(verbose),
+        decode_dex3_hands_(decode_dex3_hands), is_localhost_(host == LOCALHOST) {
         type_ = InputType::NETWORK;
         
         // Set terminal to non-blocking mode (same as SimpleKeyboard)
@@ -389,7 +392,7 @@ public:
                         std::cout << "[ZMQEndpointInterface] *** Starting ZMQ processing ***" << std::endl;
                     }
                     // Decode into a new MotionSequence with current playback position
-                    auto result = DecodeIntoMotionSequence(current_frame, streamed_motion_, stream_window_start_, heading_state_buffer);
+                    auto result = DecodeIntoMotionSequence(managed_handoff_pending_ ? 0 : current_frame, streamed_motion_, stream_window_start_, heading_state_buffer);
                     
                     // Handle Protocol v4 (token-only) - no motion, just tokens
                     if (result.protocol_version == 4) {
@@ -410,6 +413,14 @@ public:
                         // Keep robot active
                         {
                             std::lock_guard<std::mutex> lock(current_motion_mutex);
+                            if (managed_handoff_pending_) {
+                                planner_state.enabled = false;
+                                planner_state.initialized = false;
+                                ++planner_state.generation;
+                                planner_state.preserve_heading_on_init = false;
+                                *managed_pose_controls_owner_ = true;
+                                managed_handoff_pending_ = false;
+                            }
                             external_token_state_.SetData(result.token_data);
                             has_external_token_state_ = true;
                             operator_state.play = true; // this should be redundant because the robot never read reference motion
@@ -466,12 +477,31 @@ public:
                 streamed_motion_ = new_motion;
                 
                 // Handle catch-up reset: when window was reset due to large gap, start from beginning
-                if (did_catchup) {
+                if (did_catchup || managed_handoff_pending_) {
                     std::lock_guard<std::mutex> lock(current_motion_mutex);
+                    if (managed_handoff_pending_ && current_motion->timesteps > 0 &&
+                        current_motion->GetNumBodyQuaternions() > 0) {
+                        planner_state.QueueHeadingHandoff(
+                            current_motion->BodyQuaternions(std::clamp(current_frame, 0, current_motion->timesteps - 1))[0],
+                            streamed_motion_->BodyQuaternions(0)[0]);
+                    }
                     current_frame = 0;
                     current_motion = streamed_motion_;  // Assign shared_ptr directly for thread safety
                     operator_state.play = true; // Auto-play when entering ZMQ mode
-                    reinitialize_heading = true;
+                    if (managed_handoff_pending_) {
+                        // Reference ownership changes under the same mutex used by
+                        // CurrentFrameAdvancement(), so planner output cannot overwrite it.
+                        planner_state.enabled = false;
+                        planner_state.initialized = false;
+                        ++planner_state.generation;
+                        has_external_token_state_ = false;
+                        external_token_state_.SetData({});
+                        planner_state.preserve_heading_on_init = false;
+                        *managed_pose_controls_owner_ = true;
+                        managed_handoff_pending_ = false;
+                    } else {
+                        reinitialize_heading = true;
+                    }
                     
                     if constexpr (DEBUG_LOGGING) {
                         std::cout << "[ZMQEndpointInterface] Catch-up: Reset to frame 0 at global frame " 
@@ -570,6 +600,28 @@ public:
         }
     }
 
+    // Managed mode changes prepare a new stream without altering the live reference.
+    // Keep a freshly received first packet: command and pose have independent subscribers.
+    void PrepareManagedStream(std::atomic<bool>& pose_controls_owner) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        const auto received = last_receive_time_;
+        const bool fresh = received &&
+            std::chrono::steady_clock::now() - *received < std::chrono::milliseconds(100);
+        ResetStreamedMotion();
+        has_new_data_ = has_new_data_ && fresh;
+        if (has_new_data_) last_receive_time_ = received;
+        use_zmq_stream = true;
+        managed_handoff_pending_ = true;
+        managed_pose_controls_owner_ = &pose_controls_owner;
+    }
+
+    void SuspendManagedStream() {
+        use_zmq_stream = false;
+        managed_handoff_pending_ = false;
+    }
+
+    bool ManagedHandoffPending() const { return managed_handoff_pending_; }
+
     // Public method to trigger ZMQ mode toggle (for programmatic control from GamepadManager)
     void TriggerZMQToggle() {
         toggle_zmq_mode = true;
@@ -583,6 +635,22 @@ public:
     }
     
 private:
+    std::optional<std::array<double, 7>> DecodeDex3HandFieldAt(
+        int field_index, bool needs_byte_swap) const {
+        if (!decode_dex3_hands_ || field_index < 0 ||
+            static_cast<std::size_t>(field_index) >= buffered_header_.fields.size() ||
+            static_cast<std::size_t>(field_index) >= buffered_buffers_.size()) {
+            return std::nullopt;
+        }
+
+        const auto& field = buffered_header_.fields[field_index];
+        const auto& buffer = buffered_buffers_[field_index];
+        return gear_sonic::deploy::DecodeDex3HandField(
+                   field.dtype, field.shape, buffer.data(), buffer.size(),
+                   needs_byte_swap)
+            .values;
+    }
+
     /// Reset the streamed motion buffer, merger state, and protocol version.
     /// Called on construction, when toggling ZMQ mode, and on safety reset.
     void ResetStreamedMotion() {
@@ -759,80 +827,21 @@ private:
             // Store tokens in the external token state buffer (inherited from InputInterface)
             result.token_data = std::move(token_data);
             
-            // Decode hand joint positions if present (7 DOF joint values) - same as protocol v2/v3
-            bool has_left_hand_joints = (left_hand_joints_idx >= 0);
-            bool has_right_hand_joints = (right_hand_joints_idx >= 0);
-            auto [has_left_hand_v4, left_hand_joint_values] = GetHandPose(true);
-            auto [has_right_hand_v4, right_hand_joint_values] = GetHandPose(false);
-            
-            if (has_left_hand_joints) {
-                const auto& left_hand_field = buffered_header_.fields[left_hand_joints_idx];
-                const auto& left_hand_buf = buffered_buffers_[left_hand_joints_idx];
-                
-                // Validate shape: expect [7] or [N, 7] (for chunks, use first frame)
-                int num_hand_joints = 0;
-                if (left_hand_field.shape.size() == 1 && left_hand_field.shape[0] == 7) {
-                    num_hand_joints = 7;
-                } else if (left_hand_field.shape.size() == 2 && left_hand_field.shape[1] == 7) {
-                    num_hand_joints = 7;
-                }
-                
-                if (num_hand_joints == 7) {
-                    // Decode 7 joint values (from first frame if chunked [N, 7])
-                    if (left_hand_field.dtype == "f32") {
-                        for (int j = 0; j < 7; ++j) {
-                            float val;
-                            std::memcpy(&val, left_hand_buf.data() + j * sizeof(float), sizeof(float));
-                            if (needs_swap) val = byte_swap(val);
-                            left_hand_joint_values[j] = static_cast<double>(val);
-                        }
-                    } else if (left_hand_field.dtype == "f64") {
-                        for (int j = 0; j < 7; ++j) {
-                            double val;
-                            std::memcpy(&val, left_hand_buf.data() + j * sizeof(double), sizeof(double));
-                            if (needs_swap) val = byte_swap(val);
-                            left_hand_joint_values[j] = val;
-                        }
-                    }
-                } else {
-                    std::cerr << "[ZMQEndpointInterface] Protocol v4: Invalid left_hand_joints shape" << std::endl;
-                    has_left_hand_joints = false;
-                }
+            // Decode only validated 7-DOF Dex3 fields. Six-value Inspire
+            // fields are owned by the Python MuJoCo adapter and are ignored.
+            auto left_hand_joint_values = GetHandPose(true).second;
+            auto right_hand_joint_values = GetHandPose(false).second;
+            const auto decoded_left_hand =
+                DecodeDex3HandFieldAt(left_hand_joints_idx, needs_swap);
+            const auto decoded_right_hand =
+                DecodeDex3HandFieldAt(right_hand_joints_idx, needs_swap);
+            const bool has_left_hand_joints = decoded_left_hand.has_value();
+            const bool has_right_hand_joints = decoded_right_hand.has_value();
+            if (decoded_left_hand.has_value()) {
+                left_hand_joint_values = decoded_left_hand.value();
             }
-            
-            if (has_right_hand_joints) {
-                const auto& right_hand_field = buffered_header_.fields[right_hand_joints_idx];
-                const auto& right_hand_buf = buffered_buffers_[right_hand_joints_idx];
-                
-                // Validate shape: expect [7] or [N, 7] (for chunks, use first frame)
-                int num_hand_joints = 0;
-                if (right_hand_field.shape.size() == 1 && right_hand_field.shape[0] == 7) {
-                    num_hand_joints = 7;
-                } else if (right_hand_field.shape.size() == 2 && right_hand_field.shape[1] == 7) {
-                    num_hand_joints = 7;
-                }
-                
-                if (num_hand_joints == 7) {
-                    // Decode 7 joint values (from first frame if chunked [N, 7])
-                    if (right_hand_field.dtype == "f32") {
-                        for (int j = 0; j < 7; ++j) {
-                            float val;
-                            std::memcpy(&val, right_hand_buf.data() + j * sizeof(float), sizeof(float));
-                            if (needs_swap) val = byte_swap(val);
-                            right_hand_joint_values[j] = static_cast<double>(val);
-                        }
-                    } else if (right_hand_field.dtype == "f64") {
-                        for (int j = 0; j < 7; ++j) {
-                            double val;
-                            std::memcpy(&val, right_hand_buf.data() + j * sizeof(double), sizeof(double));
-                            if (needs_swap) val = byte_swap(val);
-                            right_hand_joint_values[j] = val;
-                        }
-                    }
-                } else {
-                    std::cerr << "[ZMQEndpointInterface] Protocol v4: Invalid right_hand_joints shape" << std::endl;
-                    has_right_hand_joints = false;
-                }
+            if (decoded_right_hand.has_value()) {
+                right_hand_joint_values = decoded_right_hand.value();
             }
             
             // Set hand joints if present
@@ -1225,98 +1234,21 @@ private:
             }
         }
         
-        // Decode hand joint positions if present (7 DOF joint values)
-        bool has_left_hand_joints = (left_hand_joints_idx >= 0);
-        bool has_right_hand_joints = (right_hand_joints_idx >= 0);
-        auto [has_left_hand, left_hand_joint_values] = GetHandPose(true);
-        auto [has_right_hand, right_hand_joint_values] = GetHandPose(false);
-        
-        if (has_left_hand_joints) {
-            const auto& left_hand_field = buffered_header_.fields[left_hand_joints_idx];
-            const auto& left_hand_buf = buffered_buffers_[left_hand_joints_idx];
-            
-            // Validate shape: expect [7] or [1, 7]
-            int num_hand_joints = 0;
-            if (left_hand_field.shape.size() == 1 && left_hand_field.shape[0] == 7) {
-                num_hand_joints = 7;
-            } else if (left_hand_field.shape.size() == 2 && left_hand_field.shape[1] == 7) {
-                num_hand_joints = 7;
-            }
-            
-            if (num_hand_joints == 7) {
-                // Decode 7 joint values
-                if (left_hand_field.dtype == "f32") {
-                    for (int j = 0; j < 7; ++j) {
-                        float val;
-                        std::memcpy(&val, left_hand_buf.data() + j * sizeof(float), sizeof(float));
-                        if (needs_swap) val = byte_swap(val);
-                        left_hand_joint_values[j] = static_cast<double>(val);
-                    }
-                } else if (left_hand_field.dtype == "f64") {
-                    for (int j = 0; j < 7; ++j) {
-                        double val;
-                        std::memcpy(&val, left_hand_buf.data() + j * sizeof(double), sizeof(double));
-                        if (needs_swap) val = byte_swap(val);
-                        left_hand_joint_values[j] = val;
-                    }
-                }
-                
-                if constexpr (DEBUG_LOGGING) {
-                    std::cout << "[ZMQEndpointInterface] Decoded left_hand_joints: [";
-                    for (int j = 0; j < 7; ++j) {
-                        if (j > 0) std::cout << ", ";
-                        std::cout << std::fixed << std::setprecision(4) << left_hand_joint_values[j];
-                    }
-                    std::cout << "]" << std::endl;
-                }
-            } else {
-                std::cerr << "[ZMQEndpointInterface] Invalid left_hand_joints shape" << std::endl;
-                has_left_hand_joints = false;
-            }
+        // Decode only validated 7-DOF Dex3 fields. Invalid dtype, shape, or
+        // byte count is treated as an absent optional field without log spam.
+        auto left_hand_joint_values = GetHandPose(true).second;
+        auto right_hand_joint_values = GetHandPose(false).second;
+        const auto decoded_left_hand =
+            DecodeDex3HandFieldAt(left_hand_joints_idx, needs_swap);
+        const auto decoded_right_hand =
+            DecodeDex3HandFieldAt(right_hand_joints_idx, needs_swap);
+        const bool has_left_hand_joints = decoded_left_hand.has_value();
+        const bool has_right_hand_joints = decoded_right_hand.has_value();
+        if (decoded_left_hand.has_value()) {
+            left_hand_joint_values = decoded_left_hand.value();
         }
-        
-        if (has_right_hand_joints) {
-            const auto& right_hand_field = buffered_header_.fields[right_hand_joints_idx];
-            const auto& right_hand_buf = buffered_buffers_[right_hand_joints_idx];
-            
-            // Validate shape: expect [7] or [1, 7]
-            int num_hand_joints = 0;
-            if (right_hand_field.shape.size() == 1 && right_hand_field.shape[0] == 7) {
-                num_hand_joints = 7;
-            } else if (right_hand_field.shape.size() == 2 && right_hand_field.shape[1] == 7) {
-                num_hand_joints = 7;
-            }
-            
-            if (num_hand_joints == 7) {
-                // Decode 7 joint values
-                if (right_hand_field.dtype == "f32") {
-                    for (int j = 0; j < 7; ++j) {
-                        float val;
-                        std::memcpy(&val, right_hand_buf.data() + j * sizeof(float), sizeof(float));
-                        if (needs_swap) val = byte_swap(val);
-                        right_hand_joint_values[j] = static_cast<double>(val);
-                    }
-                } else if (right_hand_field.dtype == "f64") {
-                    for (int j = 0; j < 7; ++j) {
-                        double val;
-                        std::memcpy(&val, right_hand_buf.data() + j * sizeof(double), sizeof(double));
-                        if (needs_swap) val = byte_swap(val);
-                        right_hand_joint_values[j] = val;
-                    }
-                }
-                
-                if constexpr (DEBUG_LOGGING) {
-                    std::cout << "[ZMQEndpointInterface] Decoded right_hand_joints: [";
-                    for (int j = 0; j < 7; ++j) {
-                        if (j > 0) std::cout << ", ";
-                        std::cout << std::fixed << std::setprecision(4) << right_hand_joint_values[j];
-                    }
-                    std::cout << "]" << std::endl;
-                }
-            } else {
-                std::cerr << "[ZMQEndpointInterface] Invalid right_hand_joints shape" << std::endl;
-                has_right_hand_joints = false;
-            }
+        if (decoded_right_hand.has_value()) {
+            right_hand_joint_values = decoded_right_hand.value();
         }
         
         // ===== Decode VR 3-point tracking data if present =====
@@ -1837,6 +1769,7 @@ private:
     int port_;            ///< ZMQ server port.
     std::string topic_;   ///< ZMQ subscription topic.
     bool verbose_;        ///< Verbose logging flag.
+    bool decode_dex3_hands_;  ///< Decode optional 7-DOF Dex3 fields when enabled.
     
     /// Background subscriber for the pose / motion topic.
     std::unique_ptr<ZMQPackedMessageSubscriber> subscriber_;
@@ -1847,6 +1780,9 @@ private:
     // Thread-safe data buffering (written by ZMQ subscriber thread, read by input thread)
     // ------------------------------------------------------------------
     mutable std::mutex data_mutex_;           ///< Guards the fields below.
+    // Points to the owning manager's atomic; its lifetime contains this endpoint.
+    std::atomic<bool>* managed_pose_controls_owner_ = nullptr;
+    bool managed_handoff_pending_ = false;
     bool has_new_data_ = false;               ///< True when a new message is waiting to be decoded.
     ZMQPackedMessageSubscriber::DecodedHeader buffered_header_;  ///< Latest JSON header.
     std::vector<std::vector<uint8_t>> buffered_buffers_;         ///< Copied binary field data.

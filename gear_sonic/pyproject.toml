@@ -35,8 +35,11 @@ license = {text = "Apache-2.0"}
 teleop = [
     "pyzmq",
     "msgpack",
+    "msgpack-numpy",
     "pin",
     "pyvista; platform_machine != 'aarch64'",
+    "dex-retargeting==0.4.6",
+    "pyyaml",
 ]
 # MuJoCo simulation (run_sim_loop.py and related scripts)
 # Usage: pip install -e "gear_sonic[sim]"
@@ -49,6 +52,7 @@ sim = [
     "msgpack",
     "msgpack-numpy",
     "opencv-python",
+    "pillow",
 ]
 # Data collection: Sonic VLA data exporter with LeRobot dataset output
 # Usage: pip install -e "gear_sonic[data_collection]"
@@ -58,11 +62,23 @@ data_collection = [
     "msgpack-numpy",
     "pin",
     "tyro",
+    "huggingface_hub>=0.34,<2",
+    "onnxruntime>=1.23,<1.24",
+    "pyarrow>=20,<25",
+    "pyyaml>=6,<7",
     "pyttsx3==2.90",
     "av>=14.2",
     "opencv-python",
     "lerobot @ git+https://github.com/huggingface/lerobot.git@a445d9c9da6bea99a8972daa4fe1fdd053d711d2",
     "datasets==3.6.0",
+]
+# Dataset review UI: local Gradio page for video, prompt, joint velocity plots, and trims.
+# Usage: pip install -e "gear_sonic[review]"
+review = [
+    "gradio",
+    "pandas",
+    "pyarrow",
+    "matplotlib",
 ]
 # Camera server: runs on the robot to publish camera frames over ZMQ
 # Includes depthai (OAK cameras) by default. For other SDKs (pyrealsense2),
@@ -100,6 +116,8 @@ training = [
     "accelerate>=1.3.0",
     "tensorboard",
     "smpl_sim @ git+https://github.com/ZhengyiLuo/SMPLSim.git",
+    "open3d",
+    "vector_quantize_pytorch",
 ]
 
 [tool.setuptools.packages.find]
@@ -110,7 +128,7 @@ include = ["gear_sonic*"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-gear_sonic = ["py.typed", "**/*.json", "**/*.yaml"]
+gear_sonic = ["py.typed", "**/*.json", "**/*.yaml", "utils/teleop/hand_assets/**/*.yml", "utils/teleop/hand_assets/**/*.urdf", "utils/teleop/hand_assets/LICENSE", "scripts/pico_hand_viewer.html", "data/robot_model/model_data/g1/*inspire_ftp.xml", "data/robot_model/model_data/g1/g1_41dof_inspire_episode.urdf"]
 
 [tool.setuptools.dynamic]
 version = {attr = "gear_sonic.version.VERSION"}

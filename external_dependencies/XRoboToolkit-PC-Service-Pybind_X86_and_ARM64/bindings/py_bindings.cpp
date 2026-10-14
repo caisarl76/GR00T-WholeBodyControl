@@ -1,19 +1,156 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/chrono.h>
 #include <pybind11/stl.h>
+#include <pybind11/numpy.h>
 #include <thread>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <array>
+#include <chrono>
+#include <cmath>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include "PXREARobotSDK.h"
 
 
 using json = nlohmann::json;
 
-std::array<double, 7> LeftControllerPose;
-std::array<double, 7> RightControllerPose;
+struct HandSnapshot {
+    std::array<std::array<double, 7>, 26> pose{};
+    std::array<uint64_t, 26> location_flags{};
+    std::array<double, 26> radius{};
+    double scale = 1.0;
+    int32_t is_active = 0;
+    int64_t source_timestamp_ns = 0;
+    int32_t timestamp_source = 0;  // 0: device sample, 1: host monotonic content change.
+    uint64_t binding_generation = 0;
+};
+
+HandSnapshot LeftHandSnapshot, RightHandSnapshot;
+
+struct ControllerSnapshot {
+    std::array<double, 7> pose{};
+    bool primary_button = false, secondary_button = false, axis_click = false, menu_button = false;
+    double grip = 0, trigger = 0;
+    std::array<double, 2> axis{};
+    uint64_t binding_generation = 0;
+    int64_t receipt_timestamp_ns = 0;
+};
+ControllerSnapshot LeftControllerSnapshot, RightControllerSnapshot;
+
+int64_t steadyTimeNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+template <size_t N>
+bool strictPose(const json& value, std::array<double, N>& out) {
+    if (!value.is_string()) return false;
+    const auto text = value.get<std::string>();
+    if (text.empty() || text.back() == ',') return false;
+    std::stringstream ss(text);
+    std::string item;
+    size_t i = 0;
+    while (std::getline(ss, item, ',')) {
+        if (i == N || item.empty()) return false;
+        size_t consumed = 0;
+        const double number = std::stod(item, &consumed);
+        if (item.find_first_not_of(" \t\r\n", consumed) != std::string::npos ||
+            !std::isfinite(number)) return false;
+        out[i++] = number;
+    }
+    return i == N;
+}
+
+bool parseControllerSnapshot(const json& c, ControllerSnapshot& out) {
+    try {
+        if (!c.is_object() || !strictPose(c.at("pose"), out.pose)) return false;
+        out.primary_button = c.at("primaryButton").get<bool>();
+        out.secondary_button = c.at("secondaryButton").get<bool>();
+        out.menu_button = c.at("menuButton").get<bool>();
+        out.axis_click = c.at("axisClick").get<bool>();
+        out.axis = {c.at("axisX").get<double>(), c.at("axisY").get<double>()};
+        out.trigger = c.at("trigger").get<double>();
+        out.grip = c.at("grip").get<double>();
+        return std::isfinite(out.axis[0]) && std::isfinite(out.axis[1]) &&
+            std::isfinite(out.trigger) && std::isfinite(out.grip);
+    } catch (const std::exception&) { return false; }
+}
+
+// Original APK packets omit the timestamp; complete flags/radii still provide
+// optical evidence, with conservative per-side content-change freshness below.
+// Validate any metadata that is present before changing even the legacy getters.
+bool parseHandSnapshot(const json& hand, HandSnapshot& out, bool& optical) {
+    try {
+        if (!hand.is_object() || !hand.at("HandJointLocations").is_array() ||
+            hand.at("HandJointLocations").size() != 26) return false;
+        out.scale = hand.at("scale").get<double>();
+        const auto& active = hand.at("isActive");
+        if (!std::isfinite(out.scale) || !active.is_number_integer()) return false;
+        if (active.is_number_unsigned()) {
+            if (active.get<uint64_t>() > uint64_t(std::numeric_limits<int32_t>::max())) return false;
+        } else if (active.get<int64_t>() < std::numeric_limits<int32_t>::min() ||
+                   active.get<int64_t>() > std::numeric_limits<int32_t>::max()) return false;
+        out.is_active = active.get<int32_t>();
+        out.timestamp_source = hand.contains("timeStampNs") ? 0 : 1;
+        if (out.timestamp_source == 0) {
+            const auto& timestamp = hand.at("timeStampNs");
+            if (!timestamp.is_number_integer() ||
+                (timestamp.is_number_unsigned() &&
+                 timestamp.get<uint64_t>() > uint64_t(std::numeric_limits<int64_t>::max()))) return false;
+            out.source_timestamp_ns = timestamp.get<int64_t>();
+            if (out.source_timestamp_ns <= 0) return false;
+        }
+        size_t flagCount = 0, radiusCount = 0;
+        for (size_t i = 0; i < 26; ++i) {
+            const auto& joint = hand.at("HandJointLocations")[i];
+            if (!joint.is_object() || !strictPose(joint.at("p"), out.pose[i])) return false;
+            if (joint.contains("s")) {
+                const auto& flags = joint.at("s");
+                if (flags.is_number_integer()) {
+                    if (!flags.is_number_unsigned() && flags.get<int64_t>() < 0) return false;
+                    out.location_flags[i] = flags.get<uint64_t>();
+                } else if (flags.is_number_float()) {
+                    const double value = flags.get<double>();
+                    constexpr double maxSafeInteger = 9007199254740991.0;
+                    if (!std::isfinite(value) || value < 0 || value > maxSafeInteger ||
+                        std::trunc(value) != value) return false;
+                    out.location_flags[i] = static_cast<uint64_t>(value);
+                } else {
+                    return false;
+                }
+                ++flagCount;
+            }
+            if (joint.contains("r")) {
+                out.radius[i] = joint.at("r").get<double>();
+                if (!std::isfinite(out.radius[i])) return false;
+                ++radiusCount;
+            }
+        }
+        if ((flagCount != 0 && flagCount != 26) ||
+            (radiusCount != 0 && radiusCount != 26)) return false;
+        optical = flagCount == 26 && radiusCount == 26;
+        return true;
+    } catch (const std::exception&) { return false; }
+}
+
+// Caller holds this side's mutex. Packet arrival alone never refreshes the
+// original APK's cached side JSON. Once device timestamps are used, retain that
+// requirement until binding reset rather than accepting a missing-field downgrade.
+void commitHandSnapshot(HandSnapshot& current, HandSnapshot parsed) {
+    if (parsed.timestamp_source == 1) {
+        if (current.binding_generation != 0 && current.timestamp_source == 0) return;
+        const bool unchanged = current.binding_generation != 0 &&
+            parsed.pose == current.pose && parsed.location_flags == current.location_flags &&
+            parsed.radius == current.radius && parsed.scale == current.scale &&
+            parsed.is_active == current.is_active;
+        parsed.source_timestamp_ns = unchanged ? current.source_timestamp_ns : steadyTimeNs();
+    }
+    parsed.binding_generation = current.binding_generation + 1;
+    current = parsed;
+}
+
 std::array<double, 7> HeadsetPose;
 
 std::array<std::array<double, 7>, 26> LeftHandTrackingState;
@@ -39,22 +176,6 @@ int64_t MotionTimeStampNs = 0;  // Motion data timestamp
 int NumMotionDataAvailable = 0;  // number of motion trackers
 
 
-bool LeftMenuButton;
-double LeftTrigger;
-double LeftGrip;
-std::array<double, 2> LeftAxis{0.0, 0.0};
-bool LeftAxisClick;
-bool LeftPrimaryButton;
-bool LeftSecondaryButton;
-
-bool RightMenuButton;
-double RightTrigger;
-double RightGrip;
-std::array<double, 2> RightAxis{0.0, 0.0};
-bool RightAxisClick;
-bool RightPrimaryButton;
-bool RightSecondaryButton;
-
 int64_t TimeStampNs;
 
 std::mutex leftMutex;
@@ -65,6 +186,10 @@ std::mutex leftHandMutex;
 std::mutex rightHandMutex;
 std::mutex bodyMutex;  // Mutex for body tracking data
 std::mutex motionMutex;
+std::mutex handPacketDiagnosticMutex;
+uint64_t HandPacketCount = 0;
+json LastHandPacket;
+bool HasLastHandPacket = false;
 
 
 
@@ -117,70 +242,82 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
             json data = json::parse(dsj.stateJson);
             if (data.contains("value")) {
                 auto value = json::parse(data["value"].get<std::string>());
-                if (value["Controller"].contains("left")) {
-                    auto& left = value["Controller"]["left"];
-                    {
+                {
+                    std::lock_guard<std::mutex> lock(handPacketDiagnosticMutex);
+                    ++HandPacketCount;
+                    if (value.contains("Hand")) {
+                        LastHandPacket = value["Hand"];
+                        HasLastHandPacket = true;
+                    } else {
+                        LastHandPacket = {};
+                        HasLastHandPacket = false;
+                    }
+                }
+                if (value.contains("Controller") && value["Controller"].is_object() &&
+                    value["Controller"].contains("left")) {
+                    ControllerSnapshot parsed;
+                    if (parseControllerSnapshot(value["Controller"]["left"], parsed)) {
                         std::lock_guard<std::mutex> lock(leftMutex);
-                        LeftControllerPose = stringToPoseArray(left["pose"].get<std::string>());
-                        LeftTrigger = left["trigger"].get<double>();
-                        LeftGrip = left["grip"].get<double>();
-                        LeftMenuButton = left["menuButton"].get<bool>();
-                        LeftAxis[0] = left["axisX"].get<double>();
-                        LeftAxis[1] = left["axisY"].get<double>();
-                        LeftAxisClick = left["axisClick"].get<bool>();
-                        LeftPrimaryButton = left["primaryButton"].get<bool>();
-                        LeftSecondaryButton = left["secondaryButton"].get<bool>();
+                        parsed.binding_generation = LeftControllerSnapshot.binding_generation + 1;
+                        parsed.receipt_timestamp_ns = steadyTimeNs();
+                        LeftControllerSnapshot = parsed;
                     }
                 }
-                if (value["Controller"].contains("right")) {
-                    auto& right = value["Controller"]["right"];
-                    {
+                if (value.contains("Controller") && value["Controller"].is_object() &&
+                    value["Controller"].contains("right")) {
+                    ControllerSnapshot parsed;
+                    if (parseControllerSnapshot(value["Controller"]["right"], parsed)) {
                         std::lock_guard<std::mutex> lock(rightMutex);
-                        RightControllerPose = stringToPoseArray(right["pose"].get<std::string>());
-                        RightTrigger = right["trigger"].get<double>();
-                        RightGrip = right["grip"].get<double>();
-                        RightMenuButton = right["menuButton"].get<bool>();
-                        RightAxis[0] = right["axisX"].get<double>();
-                        RightAxis[1] = right["axisY"].get<double>();
-                        RightAxisClick = right["axisClick"].get<bool>();
-                        RightPrimaryButton = right["primaryButton"].get<bool>();
-                        RightSecondaryButton = right["secondaryButton"].get<bool>();
+                        parsed.binding_generation = RightControllerSnapshot.binding_generation + 1;
+                        parsed.receipt_timestamp_ns = steadyTimeNs();
+                        RightControllerSnapshot = parsed;
                     }
                 }
-                if (value.contains("Head")) {
-                    auto& headset = value["Head"];
-                    {
-                        std::lock_guard<std::mutex> lock(headsetPoseMutex);
-                        HeadsetPose = stringToPoseArray(headset["pose"].get<std::string>());
-                    }
-                }
-                if (value.contains("timeStampNs")) {
-                    std::lock_guard<std::mutex> lock(timestampMutex);
-                    TimeStampNs = value["timeStampNs"].get<int64_t>();
-                }
-                if (value["Hand"].contains("leftHand")) {
-                    auto& leftHand = value["Hand"]["leftHand"];
-                    {
+                if (value.contains("Hand") && value["Hand"].is_object() &&
+                    value["Hand"].contains("leftHand")) {
+                    HandSnapshot parsed;
+                    bool optical = false;
+                    if (parseHandSnapshot(value["Hand"]["leftHand"], parsed, optical)) {
                         std::lock_guard<std::mutex> lock(leftHandMutex);
-                        
-                        LeftHandScale = leftHand["scale"].get<double>();
-                        LeftHandIsActive = leftHand["isActive"].get<int>();
-                        for (int i = 0; i < 26; i++) {
-                            LeftHandTrackingState[i] = stringToPoseArray(leftHand["HandJointLocations"][i]["p"].get<std::string>());
+                        if (optical) {
+                            commitHandSnapshot(LeftHandSnapshot, parsed);
                         }
+                        LeftHandScale = parsed.scale;
+                        LeftHandIsActive = parsed.is_active;
+                        LeftHandTrackingState = parsed.pose;
                     }
                 }
-                if (value["Hand"].contains("rightHand")) {
-                    auto& rightHand = value["Hand"]["rightHand"];
-                    {
+                if (value.contains("Hand") && value["Hand"].is_object() &&
+                    value["Hand"].contains("rightHand")) {
+                    HandSnapshot parsed;
+                    bool optical = false;
+                    if (parseHandSnapshot(value["Hand"]["rightHand"], parsed, optical)) {
                         std::lock_guard<std::mutex> lock(rightHandMutex);
-                        RightHandScale = rightHand["scale"].get<double>();
-                        RightHandIsActive = rightHand["isActive"].get<int>();
-                        for (int i = 0; i < 26; i++) {
-                            RightHandTrackingState[i] = stringToPoseArray(rightHand["HandJointLocations"][i]["p"].get<std::string>());
+                        if (optical) {
+                            commitHandSnapshot(RightHandSnapshot, parsed);
                         }
+                        RightHandScale = parsed.scale;
+                        RightHandIsActive = parsed.is_active;
+                        RightHandTrackingState = parsed.pose;
                     }
                 }
+                // A malformed auxiliary field must not suppress independently valid sides/body.
+                try {
+                    if (value.contains("Head")) {
+                        std::array<double, 7> pose;
+                        if (strictPose(value["Head"].at("pose"), pose)) {
+                            std::lock_guard<std::mutex> lock(headsetPoseMutex);
+                            HeadsetPose = pose;
+                        }
+                    }
+                } catch (const std::exception&) {}
+                try {
+                    if (value.contains("timeStampNs")) {
+                        const auto timestamp = value["timeStampNs"].get<int64_t>();
+                        std::lock_guard<std::mutex> lock(timestampMutex);
+                        TimeStampNs = timestamp;
+                    }
+                } catch (const std::exception&) {}
                 // Parse Body data for whole body motion capture
                 if (value.contains("Body")) {
                     auto& body = value["Body"];
@@ -262,7 +399,7 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
                     }
                 }
             }
-        } catch (const json::exception& e) {
+        } catch (const std::exception& e) {
             std::cerr << "JSON parsing error: " << e.what() << std::endl;
         }
             break;
@@ -281,12 +418,12 @@ void deinit() {
 
 std::array<double, 7> getLeftControllerPose() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftControllerPose;
+    return LeftControllerSnapshot.pose;
 }
 
 std::array<double, 7> getRightControllerPose() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightControllerPose;
+    return RightControllerSnapshot.pose;
 }
 
 std::array<double, 7> getHeadsetPose() {
@@ -296,73 +433,73 @@ std::array<double, 7> getHeadsetPose() {
 
 double getLeftTrigger() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftTrigger;
+    return LeftControllerSnapshot.trigger;
 }
 
 double getLeftGrip() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftGrip;
+    return LeftControllerSnapshot.grip;
 }
 
 double getRightTrigger() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightTrigger;
+    return RightControllerSnapshot.trigger;
 }
 
 double getRightGrip() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightGrip;
+    return RightControllerSnapshot.grip;
 }
 
 bool getLeftMenuButton() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftMenuButton;
+    return LeftControllerSnapshot.menu_button;
 }
 
 bool getRightMenuButton() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightMenuButton;
+    return RightControllerSnapshot.menu_button;
 }
 
 bool getLeftAxisClick() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftAxisClick;
+    return LeftControllerSnapshot.axis_click;
 }
 
 bool getRightAxisClick() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightAxisClick;
+    return RightControllerSnapshot.axis_click;
 }
 
 std::array<double, 2> getLeftAxis() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftAxis;
+    return LeftControllerSnapshot.axis;
 }
 
 
 std::array<double, 2> getRightAxis() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightAxis;
+    return RightControllerSnapshot.axis;
 }
 
 bool getLeftPrimaryButton() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftPrimaryButton;
+    return LeftControllerSnapshot.primary_button;
 }
 
 bool getRightPrimaryButton() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightPrimaryButton;
+    return RightControllerSnapshot.primary_button;
 }
 
 bool getLeftSecondaryButton() {
     std::lock_guard<std::mutex> lock(leftMutex);
-    return LeftSecondaryButton;
+    return LeftControllerSnapshot.secondary_button;
 }
 
 bool getRightSecondaryButton() {
     std::lock_guard<std::mutex> lock(rightMutex);
-    return RightSecondaryButton;
+    return RightControllerSnapshot.secondary_button;
 }
 
 int64_t getTimeStampNs() {
@@ -398,6 +535,73 @@ int getRightHandScale() {
 int getRightHandIsActive() {
     std::lock_guard<std::mutex> lock(rightHandMutex);
     return RightHandIsActive;
+}
+
+pybind11::dict handSnapshot(const HandSnapshot& snapshot) {
+    namespace py = pybind11;
+    py::array_t<double> pose({26, 7});
+    auto poseView = pose.mutable_unchecked<2>();
+    for (ssize_t i = 0; i < 26; ++i) for (ssize_t j = 0; j < 7; ++j) poseView(i, j) = snapshot.pose[i][j];
+    py::array_t<uint64_t> flags(26);
+    py::array_t<double> radius(26);
+    auto flagsView = flags.mutable_unchecked<1>();
+    auto radiusView = radius.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < 26; ++i) { flagsView(i) = snapshot.location_flags[i]; radiusView(i) = snapshot.radius[i]; }
+    py::dict result;
+    result["pose"] = pose;
+    result["location_flags"] = flags;
+    result["radius"] = radius;
+    result["scale"] = snapshot.scale;
+    result["is_active"] = snapshot.is_active;
+    result["source_timestamp_ns"] = snapshot.source_timestamp_ns;
+    result["timestamp_source"] = snapshot.timestamp_source;
+    result["binding_generation"] = snapshot.binding_generation;
+    return result;
+}
+
+pybind11::dict getLeftHandSnapshot() {
+    HandSnapshot snapshot;
+    { std::lock_guard<std::mutex> lock(leftHandMutex); snapshot = LeftHandSnapshot; }
+    return handSnapshot(snapshot);
+}
+
+pybind11::dict getRightHandSnapshot() {
+    HandSnapshot snapshot;
+    { std::lock_guard<std::mutex> lock(rightHandMutex); snapshot = RightHandSnapshot; }
+    return handSnapshot(snapshot);
+}
+
+pybind11::dict getHandPacketDiagnostics() {
+    std::lock_guard<std::mutex> lock(handPacketDiagnosticMutex);
+    pybind11::dict result;
+    result["packets"] = HandPacketCount;
+    result["hand_json"] = HasLastHandPacket ? LastHandPacket.dump() : "";
+    return result;
+}
+
+pybind11::dict controllerSnapshot(const ControllerSnapshot& s) {
+    namespace py = pybind11;
+    py::dict d;
+    d["pose"] = py::cast(s.pose);
+    d["primary_button"] = s.primary_button; d["secondary_button"] = s.secondary_button;
+    d["grip"] = s.grip; d["trigger"] = s.trigger; d["axis"] = py::make_tuple(s.axis[0], s.axis[1]);
+    d["axis_click"] = s.axis_click; d["menu_button"] = s.menu_button;
+    d["binding_generation"] = s.binding_generation;
+    d["receipt_age_ns"] = s.binding_generation == 0 ? std::numeric_limits<int64_t>::max() :
+        std::max<int64_t>(0, steadyTimeNs() - s.receipt_timestamp_ns);
+    return d;
+}
+
+pybind11::dict getLeftControllerSnapshot() {
+    ControllerSnapshot snapshot;
+    { std::lock_guard<std::mutex> lock(leftMutex); snapshot = LeftControllerSnapshot; }
+    return controllerSnapshot(snapshot);
+}
+
+pybind11::dict getRightControllerSnapshot() {
+    ControllerSnapshot snapshot;
+    { std::lock_guard<std::mutex> lock(rightMutex); snapshot = RightControllerSnapshot; }
+    return controllerSnapshot(snapshot);
 }
 
 // Body tracking functions
@@ -520,6 +724,11 @@ PYBIND11_MODULE(xrobotoolkit_sdk, m) {
     m.def("get_right_hand_tracking_state", &getRightHandTrackingState, "Get the right hand state.");
     m.def("get_left_hand_is_active", &getLeftHandIsActive, "Get the left hand tracking quality (0 = low, 1 = high).");
     m.def("get_right_hand_is_active", &getRightHandIsActive, "Get the right hand tracking quality (0 = low, 1 = high).");
+    m.def("get_left_hand_snapshot", &getLeftHandSnapshot, "Get one atomic left hand snapshot.");
+    m.def("get_right_hand_snapshot", &getRightHandSnapshot, "Get one atomic right hand snapshot.");
+    m.def("get_hand_packet_diagnostics", &getHandPacketDiagnostics, "Get native hand packet diagnostics.");
+    m.def("get_left_controller_snapshot", &getLeftControllerSnapshot, "Get one atomic left controller snapshot.");
+    m.def("get_right_controller_snapshot", &getRightControllerSnapshot, "Get one atomic right controller snapshot.");
     
     // Body tracking functions
     m.def("is_body_data_available", &isBodyDataAvailable, "Check if body tracking data is available.");

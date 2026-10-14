@@ -35,9 +35,9 @@ e.g.
 import functools
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
 
 try:
     from pytorch3d.transforms.rotation_conversions import matrix_to_axis_angle
@@ -603,16 +603,32 @@ def quaternion_multiply_np(a, b):
 
 
 def decompose_rotation_aa(rotation_aa, v2):
+    rotation_aa = np.asarray(rotation_aa, dtype=np.float64)
     angle = np.linalg.norm(rotation_aa, axis=1)[:, None]
-    w = np.cos(angle / 2)
-    v = np.sin(angle / 2) * rotation_aa / angle
+    half_angle_scale = np.full_like(angle, 0.5)
+    np.divide(
+        np.sin(angle / 2.0),
+        angle,
+        out=half_angle_scale,
+        where=angle > np.finfo(np.float64).eps,
+    )
+    w = np.cos(angle / 2.0)
+    v = half_angle_scale * rotation_aa
     q = np.concatenate([w, v], axis=1)
 
     v_twist = np.dot(v, v2)[:, None] * v2
-    q_twist = np.concatenate([w, v_twist], axis=1)
-    q_twist = q_twist / np.linalg.norm(q_twist, axis=1)[:, None]
+    q_twist_raw = np.concatenate([w, v_twist], axis=1)
+    twist_norm = np.linalg.norm(q_twist_raw, axis=1)[:, None]
+    q_twist = np.zeros_like(q_twist_raw)
+    np.divide(
+        q_twist_raw,
+        twist_norm,
+        out=q_twist,
+        where=twist_norm > np.finfo(np.float64).eps,
+    )
+    q_twist[twist_norm[:, 0] <= np.finfo(np.float64).eps, 0] = 1.0
 
-    q_twist_inv = q_twist * np.array([1, -1, -1, -1])
+    q_twist_inv = q_twist * np.array([1.0, -1.0, -1.0, -1.0])
     q_swing = quaternion_multiply_np(q_twist_inv, q)
 
     return q_twist, q_swing

@@ -101,13 +101,13 @@ uint64_t StateLogger::LogFullState(const std::array<double, 4>& base_quat,
                                    const std::span<double>& last_left_hand_action,
                                    const std::span<double>& last_right_hand_action,
                                    double ros_timestamp,
-                                   std::chrono::steady_clock::time_point left_hand_received_at,
-                                   std::chrono::steady_clock::time_point right_hand_received_at) {
+                                   std::array<std::chrono::steady_clock::time_point, 2> hand_feedback_time) {
   Entry e;
   e.index = next_index_.fetch_add(1, std::memory_order_relaxed);
   e.timestamp = std::chrono::system_clock::now();
   e.timestamp_monotonic = std::chrono::steady_clock::now();
   e.ros_timestamp = ros_timestamp;
+  e.hand_feedback_time = hand_feedback_time;
   e.base_quat = base_quat;
   e.base_ang_vel = base_ang_vel;
   e.base_accel = base_accel;
@@ -130,8 +130,6 @@ uint64_t StateLogger::LogFullState(const std::array<double, 4>& base_quat,
   e.right_hand_dq.assign(std::begin(right_hand_dq), std::end(right_hand_dq));
   e.last_left_hand_action.assign(std::begin(last_left_hand_action), std::end(last_left_hand_action));
   e.last_right_hand_action.assign(std::begin(last_right_hand_action), std::end(last_right_hand_action));
-  e.left_hand_received_at = left_hand_received_at;
-  e.right_hand_received_at = right_hand_received_at;
 
   pushToRing_(e);
   if (enable_csv_) {

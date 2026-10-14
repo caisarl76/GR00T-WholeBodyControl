@@ -1,0 +1,100 @@
+# Inspire FTP hand overlay for g1_29dof_sonic_model12.yaml.
+# The loader applies this file after the base profile so SONIC's 29-DoF body
+# gains, observations, and policy settings remain a single source of truth.
+
+ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_41dof_inspire_ftp.xml"
+HAND_TYPE: "inspire_ftp"
+NUM_HAND_MOTORS: 6
+NUM_HAND_JOINTS: 12
+ENABLE_DEX3_DDS_HANDS: false
+
+LEFT_HAND_JOINT_NAMES:
+  - left_thumb_1_joint
+  - left_thumb_2_joint
+  - left_thumb_3_joint
+  - left_thumb_4_joint
+  - left_index_1_joint
+  - left_index_2_joint
+  - left_middle_1_joint
+  - left_middle_2_joint
+  - left_ring_1_joint
+  - left_ring_2_joint
+  - left_little_1_joint
+  - left_little_2_joint
+
+RIGHT_HAND_JOINT_NAMES:
+  - right_thumb_1_joint
+  - right_thumb_2_joint
+  - right_thumb_3_joint
+  - right_thumb_4_joint
+  - right_index_1_joint
+  - right_index_2_joint
+  - right_middle_1_joint
+  - right_middle_2_joint
+  - right_ring_1_joint
+  - right_ring_2_joint
+  - right_little_1_joint
+  - right_little_2_joint
+
+# Hardware-compatible command order:
+# little, ring, middle, index, thumb bend, thumb rotation.
+LEFT_HAND_ACTUATOR_NAMES:
+  - left_little_1_joint
+  - left_ring_1_joint
+  - left_middle_1_joint
+  - left_index_1_joint
+  - left_thumb_2_joint
+  - left_thumb_1_joint
+
+RIGHT_HAND_ACTUATOR_NAMES:
+  - right_little_1_joint
+  - right_ring_1_joint
+  - right_middle_1_joint
+  - right_index_1_joint
+  - right_thumb_2_joint
+  - right_thumb_1_joint
+
+INSPIRE_HAND_ZMQ_HOST: "localhost"
+INSPIRE_HAND_ZMQ_PORT: 5556
+INSPIRE_HAND_COMMAND_TIMEOUT_S: 0.25
+# Normalized rates corresponding to 1 rad/s in each active model joint.
+INSPIRE_HAND_MAX_SLEW_SPEED:
+  - 0.6953619358876295
+  - 0.6953619358876295
+  - 0.6953619358876295
+  - 0.6953619358876295
+  - 1.7053206002728512
+  - 0.8590327291469806
+
+# Only the 29 body torque actuators are clipped here. The twelve Inspire
+# position actuators enforce their own force ranges in the generated MJCF.
+motor_effort_limit_list:
+  - 88.0
+  - 88.0
+  - 88.0
+  - 139.0
+  - 50.0
+  - 50.0
+  - 88.0
+  - 88.0
+  - 88.0
+  - 139.0
+  - 50.0
+  - 50.0
+  - 88.0
+  - 50.0
+  - 50.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 5.0
+  - 5.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 5.0
+  - 5.0

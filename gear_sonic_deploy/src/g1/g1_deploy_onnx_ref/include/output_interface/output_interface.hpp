@@ -159,6 +159,8 @@ protected:
         static const std::string kBodyQMeasured = "body_q_measured";
         static const std::string kLeftHandQMeasured = "left_hand_q_measured";
         static const std::string kRightHandQMeasured = "right_hand_q_measured";
+        static const std::string kLeftHandQTarget = "left_hand_q_target";
+        static const std::string kRightHandQTarget = "right_hand_q_target";
         static const std::string kRightHandReceivedAt = "right_hand_received_at";
         static const std::string kControllerClockId = "controller_clock_id";
         static const std::string kVr3pointPosition = "vr_3point_position";
@@ -277,19 +279,21 @@ protected:
         output_data_map_[kBaseTransMeasured].assign(base_trans_measured.begin(), base_trans_measured.end());
         output_data_map_[kBaseQuatMeasured].assign(base_quat_measured.begin(), base_quat_measured.end());
         output_data_map_[kBodyQMeasured].assign(body_q_measured.begin(), body_q_measured.end());
+        // Genuine DDS hand state; freshness is reported by *_hand_feedback_valid.
+        output_data_map_[kLeftHandQMeasured] = state.left_hand_q;
+        output_data_map_[kRightHandQMeasured] = state.right_hand_q;
+        // This tick's hand command (last_*_hand_action is logged a tick earlier).
+        output_data_map_[kLeftHandQTarget].assign(left_hand_joint.begin(), left_hand_joint.end());
+        output_data_map_[kRightHandQTarget].assign(right_hand_joint.begin(), right_hand_joint.end());
         const auto now = std::chrono::steady_clock::now();
         auto fresh_hand = [now](auto received_at) {
           return received_at != std::chrono::steady_clock::time_point{} &&
               received_at <= now && now - received_at <= std::chrono::milliseconds(500);
         };
-        output_data_map_[kLeftHandQMeasured] = fresh_hand(state.left_hand_received_at)
-            ? state.left_hand_q : std::vector<double>{};
-        output_data_map_[kRightHandQMeasured] = fresh_hand(state.right_hand_received_at)
-            ? state.right_hand_q : std::vector<double>{};
         // Preserve the DDS receipt: faster logger packets may repeat this hand sample.
-        output_data_map_[kRightHandReceivedAt] = fresh_hand(state.right_hand_received_at)
+        output_data_map_[kRightHandReceivedAt] = fresh_hand(state.hand_feedback_time[1])
             ? std::vector<double>{std::chrono::duration<double>(
-                state.right_hand_received_at.time_since_epoch()).count()}
+                state.hand_feedback_time[1].time_since_epoch()).count()}
             : std::vector<double>{};
         static const std::vector<double> clock_id = [] {
           std::ifstream boot("/proc/sys/kernel/random/boot_id");

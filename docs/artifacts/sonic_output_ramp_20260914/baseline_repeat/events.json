@@ -1,0 +1,84 @@
+[
+  {
+    "wall": 268149.004017772,
+    "kind": "start"
+  },
+  {
+    "wall": 268149.004208278,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 268149.004387204,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 268152.014432326,
+    "kind": "release_band"
+  },
+  {
+    "wall": 268157.013104748,
+    "kind": "request",
+    "mode": "pose"
+  },
+  {
+    "wall": 268157.013405805,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 268162.009997603,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 268162.010365641,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 268167.007661577,
+    "kind": "request",
+    "mode": "pose"
+  },
+  {
+    "wall": 268167.008186795,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 268172.004924635,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 268172.005204395,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 268177.02202436,
+    "kind": "request",
+    "mode": "pose"
+  },
+  {
+    "wall": 268177.022352706,
+    "kind": "mode",
+    "mode": "pose"
+  },
+  {
+    "wall": 268182.01891193,
+    "kind": "request",
+    "mode": "planner"
+  },
+  {
+    "wall": 268182.01919206,
+    "kind": "mode",
+    "mode": "planner"
+  },
+  {
+    "wall": 268187.015925274,
+    "kind": "end"
+  }
+]

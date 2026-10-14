@@ -38,6 +38,7 @@ def test_table_preset_dry_run(capsys):
         assert command[command.index("--prompt") + 1] == prompt
         assert command[command.index("--dataset-name") + 1].startswith(dataset_prefix)
         assert "--no-deploy" in command
+        assert command[command.index("--initial-pose") + 1] == "planner_standing"
         for flag, value in {
             "--policy-host": "192.168.75.173",
             "--camera-host": "192.168.0.223",

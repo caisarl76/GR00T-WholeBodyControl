@@ -11,6 +11,14 @@ from gear_sonic.scripts import run_vla_inference as runner
 from gear_sonic.utils.teleop.xr_upperbody_bridge import unpack_bridge_message
 
 
+def policy_action(value):
+    return {
+        "motion_token": np.full((1, 40, 64), value),
+        "left_hand_joints": np.zeros((1, 40, 7)),
+        "right_hand_joints": np.zeros((1, 40, 7)),
+    }
+
+
 def run_keys(monkeypatch, keys, state=None, on_key=None, config=None):
     if state is not None:
         state.setdefault("reference_heading_quat", [1, 0, 0, 0])
@@ -49,7 +57,7 @@ def run_keys(monkeypatch, keys, state=None, on_key=None, config=None):
 
     keyboard.read_msg.side_effect = read_key
     monkeypatch.setitem(sys.modules, "gr00t.policy.server_client", SimpleNamespace(PolicyClient=MagicMock()))
-    runner.main(config or runner.InferenceConfig())
+    runner.main(config or runner.InferenceConfig(initial_pose="planner_standing"))
     return [call.args[0] for call in socket.send.call_args_list]
 
 
@@ -297,7 +305,7 @@ def test_operator_reset_tracking_loss_requests_measured_hold(monkeypatch):
     assert planners[-1]["mode"][0] == 0
 
 
-def test_repeated_init_uses_planner_standing_and_resume_switches_to_pose(monkeypatch):
+def test_repeated_init_and_resume_hold_planner_until_first_action(monkeypatch):
     state = {
         "body_q": np.zeros(29),
         "left_hand_q": np.zeros(7),
@@ -310,7 +318,6 @@ def test_repeated_init_uses_planner_standing_and_resume_switches_to_pose(monkeyp
     assert [(int(c["start"][0]), int(c["planner"][0])) for c in commands] == [
         (1, 1),
         (1, 1),
-        (1, 0),
         (1, 1),
         (0, 1),
     ]
@@ -331,6 +338,40 @@ def test_init_and_resume_do_not_command_robot_while_stopped(monkeypatch):
 def test_init_without_feedback_stays_paused_and_sends_no_pose(monkeypatch):
     messages = run_keys(monkeypatch, ["k", "i"])
     assert len(messages) == 1 and messages[0].startswith(b"command")
+
+
+def test_standing_reset_waits_for_measured_joints_before_advancing(monkeypatch):
+    state = {
+        "body_q": np.ones(29),
+        "left_hand_q": np.zeros(7),
+        "right_hand_q": np.zeros(7),
+        "base_quat": [1, 0, 0, 0],
+    }
+    clock = [100.0]
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock[0])
+
+    def advance_clock(*_):
+        clock[0] += 0.05
+
+    monkeypatch.setattr(runner, "_sleep_remaining", advance_clock)
+
+    def follow_target(index, worker_args):
+        assert worker_args[0].empty(), "Standing reset must keep inference paused"
+        if index == 14:
+            state["body_q"][:] = 0.8
+
+    messages = run_keys(monkeypatch, ["k", "i"] + [None] * 20, state, follow_target)
+    positions = np.array([
+        unpack_bridge_message(raw, topic="planner")["upper_body_position"]
+        for raw in messages if raw.startswith(b"planner")
+    ])
+    np.testing.assert_allclose(positions[0], 1)
+    # The waist target stops 0.15 rad ahead of stalled feedback, then advances
+    # again when the measured posture follows, at at most 0.5 rad/s.
+    np.testing.assert_allclose(positions[10:13, 0], 0.85)
+    np.testing.assert_allclose(positions[-1, 0], 0.65)
+    assert np.max(np.abs(np.diff(positions[:, 0]))) <= 0.025 + 1e-7
+    assert not any(raw.startswith(b"pose") for raw in messages)
 
 
 def test_inflight_result_retains_epoch_captured_before_observation():
@@ -371,11 +412,7 @@ def test_reset_discards_late_results_and_only_publishes_fresh_actions(monkeypatc
         if index in (4, 9):
             epoch = requests.get_nowait()
             assert epoch == (3 if index == 4 else 6)
-            action = {
-                "motion_token": np.full((1, 40, 64), 0.1 if index == 4 else 0.2),
-                "left_hand_joints": np.zeros((1, 40, 7)),
-                "right_hand_joints": np.zeros((1, 40, 7)),
-            }
+            action = policy_action(0.1 if index == 4 else 0.2)
             results.put((action, runner.time.monotonic(), epoch))
 
     messages = run_keys(monkeypatch, ["k", "i", "p", None, None, "p", "i", "p", None, None], state, on_key)
@@ -384,6 +421,14 @@ def test_reset_discards_late_results_and_only_publishes_fresh_actions(monkeypatc
     np.testing.assert_allclose(poses[0]["token_state"], 0.1)
     np.testing.assert_allclose(poses[1]["token_state"], 0.2)
     assert poses[0]["frame_index"][0] == poses[1]["frame_index"][0] == 0
+    commands = [unpack_bridge_message(raw, topic="command") for raw in messages if raw.startswith(b"command")]
+    assert [int(command["planner"][0]) for command in commands] == [1, 1, 0, 1, 0]
+    for index, raw in enumerate(messages):
+        if raw.startswith(b"pose"):
+            # Resuming and discarded results keep the planner active. Only a
+            # fresh action triggers the POSE command, immediately before it.
+            assert messages[index - 1].startswith(b"command")
+            assert unpack_bridge_message(messages[index - 1], topic="command")["planner"][0] == 0
 
 
 def test_keyboard_movement_uses_planner_and_policy_stays_paused(monkeypatch):
@@ -412,15 +457,13 @@ def test_keyboard_movement_uses_planner_and_policy_stays_paused(monkeypatch):
     assert [(int(c["start"][0]), int(c["planner"][0])) for _, c in switches] == [
         (1, 1),
         (1, 1),
-        (1, 0),
         (1, 1),
         (1, 1),
-        (1, 0),
         (1, 1),
-        (1, 0),
+        (1, 1),
     ]
     planners = [
-        unpack_bridge_message(raw, topic="planner") for raw in messages[switches[4][0] + 1 : switches[5][0]]
+        unpack_bridge_message(raw, topic="planner") for raw in messages[switches[3][0] + 1 : switches[4][0]]
     ]
     assert any(c["mode"][0] == 1 and c["movement"][0] > 0 for c in planners)
     assert any(c["mode"][0] == 1 and c["movement"][0] < 0 for c in planners)
@@ -474,14 +517,20 @@ def test_posture_reset_after_manual_turn_tracks_new_reference_without_world_turn
     def update_state(index, worker_args):
         if index == 4:
             state["base_quat"] = [np.cos(0.6), 0, 0, np.sin(0.6)]
-        if index == 6:
+        if index == 8:
+            requests, results = worker_args[:2]
+            results.put((policy_action(0.1), runner.time.monotonic(), requests.get_nowait()))
+        if index == 9:
             state["planner_reference_active"] = [0]
-        if index in (7, 8):
-            offset = 1.17 if index == 7 else 1.19
+        if index in (10, 11):
+            offset = 1.17 if index == 10 else 1.19
             state["planner_reference_active"] = [1]
             state["reference_heading_quat"] = [np.cos(offset / 2), 0, 0, np.sin(offset / 2)]
 
-    messages = run_keys(monkeypatch, ["k", "i", "m", "q", None, "m", "i", None, None], state, update_state)
+    messages = run_keys(
+        monkeypatch, ["k", "i", "m", "q", None, "m", "i", "p", None, "i", None, None], state, update_state
+    )
+    assert sum(raw.startswith(b"pose") for raw in messages) == 1
     planners = [unpack_bridge_message(raw, topic="planner") for raw in messages if raw.startswith(b"planner")]
     for command, offset in zip(planners[-2:], (1.17, 1.19)):
         reference_yaw = np.arctan2(command["facing"][1], command["facing"][0])
@@ -498,10 +547,14 @@ def test_reset_does_not_reuse_active_reference_from_before_pose_switch(monkeypat
     }
 
     def delayed_feedback(index, worker_args):
+        if index == 3:
+            requests, results = worker_args[:2]
+            results.put((policy_action(0.1), runner.time.monotonic(), requests.get_nowait()))
         if index == 4:
             state["planner_reference_active"] = [1]
 
-    messages = run_keys(monkeypatch, ["k", "i", "m", "m", "i"], state, delayed_feedback)
-    assert messages[-1].startswith(b"command")
-    assert unpack_bridge_message(messages[-1], topic="command")["planner"][0] == 0
+    messages = run_keys(monkeypatch, ["k", "i", "p", None, "i"], state, delayed_feedback)
+    assert messages[-2].startswith(b"command")
+    assert unpack_bridge_message(messages[-2], topic="command")["planner"][0] == 0
+    assert messages[-1].startswith(b"pose")
     assert "waiting for POSE feedback" in capsys.readouterr().out

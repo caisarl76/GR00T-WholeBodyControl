@@ -110,9 +110,14 @@ class HarnessControl:
                 np.asarray(feedback[key], dtype=float)
                 for key in ("left_hand_q_measured", "right_hand_q_measured")
             ]
+            # The controller reports stale or absent Dex3 feedback through these flags.
+            stale_hand = any(
+                key in feedback and feedback[key] is not True
+                for key in ("left_hand_feedback_valid", "right_hand_feedback_valid")
+            )
             return bool(
                 body.shape == (29,) and np.isfinite(body).all() and capability.shape == (1,) and capability[0] == 1
-                and all(hand.shape == (7,) and np.isfinite(hand).all() for hand in hands)
+                and all(hand.shape == (7,) and np.isfinite(hand).all() for hand in hands) and not stale_hand
             )
         except (KeyError, TypeError, ValueError):
             return False

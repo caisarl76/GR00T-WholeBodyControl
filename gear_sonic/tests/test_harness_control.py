@@ -39,12 +39,17 @@ def test_claim_rejects_ambiguous_or_unsafe_controller(field):
     assert c.owner is None
 
 
-@pytest.mark.parametrize("field", ["left_hand_q_measured", "right_hand_q_measured"])
-def test_missing_or_stale_hand_feedback_revokes_authority(field):
+@pytest.mark.parametrize("field,value", [
+    ("left_hand_q_measured", []), ("right_hand_q_measured", []),
+    # The controller keeps 7-DOF samples and flags absent/stale DDS data.
+    ("left_hand_feedback_valid", False), ("right_hand_feedback_valid", False),
+    ("right_hand_feedback_valid", None),
+])
+def test_missing_or_stale_hand_feedback_revokes_authority(field, value):
     c, h = make()
     start(c)
     incompatible = state(2)
-    incompatible[field] = []  # C++ emits empty measurements for absent/stale DDS data.
+    incompatible[field] = value
     c.tick(0.1, incompatible, 0.1)
     assert c.phase == "FAULT" and c.owner is None and not h.enabled
     assert not c.status(0.1)["hold_confirmed"]
