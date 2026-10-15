@@ -208,6 +208,7 @@ class G1Deploy {
     bool has_upper_body_data_ = false;
     std::array<double, 17> upper_body_joint_positions_buffer_;
     std::array<double, 17> upper_body_joint_velocities_buffer_;
+    std::array<double, 17> upper_body_tau_buffer_{};  ///< Planner-supplied feedforward, Nm.
     std::vector<double> token_state_data_;  // Token buffer (size from config)
     
     // =========================================================================
@@ -3100,6 +3101,7 @@ class G1Deploy {
       std::tie(has_right_hand_data_, right_hand_joint_buffer_) = input_interface_->GetHandPose(false);
       std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
       std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
+      upper_body_tau_buffer_ = input_interface_->GetUpperBodyFeedforwardTorques();
 
       auto last_update_time = input_interface_->GetLastUpdateTime();
       if (last_update_time.has_value()) {
@@ -3254,6 +3256,9 @@ class G1Deploy {
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
+      }
+      for (size_t i = 0; i < upper_body_tau_buffer_.size(); i++) {
+        motor_command_tmp.tau_ff.at(upper_body_joint_isaaclab_order_in_mujoco_index[i]) = upper_body_tau_buffer_[i];
       }
       // Keep balance feedback and last_action consistent across source changes.
       // Smooth teleop reference targets upstream, never the policy motor output.

@@ -70,6 +70,7 @@ struct Buffer {{ shared_ptr<MotorCommand> data;
 struct Harness {{
   vector<double> obs_buffer_{{0.0}}; unique_ptr<Policy> policy_engine_{{new Policy}}; Buffer motor_command_buffer_;
   array<double,29> last_action{{}}; array<double,29> teleop_output_ramp_start_q_{{}};
+  array<double,17> upper_body_tau_buffer_{{}};
   bool teleop_output_ramp_active_ = true; double teleop_output_ramp_elapsed_ = 0.0; double control_dt_ = 0.02;
       MotorGainScaleConfig motor_gain_scales_;
       static constexpr double kTeleopOutputRampDuration = 1.0;
@@ -80,6 +81,7 @@ int main() {{
   Harness h;
   h.policy_engine_->actions.resize(29); h.policy_engine_->input.resize(1);
   for (int i=0; i<29; ++i) h.teleop_output_ramp_start_q_[i] = 0.0;
+  h.upper_body_tau_buffer_[8] = -1.5;  // Planner index 8 is right shoulder yaw, motor 24.
   for (int frame=0; frame<51; ++frame) {{
     for (int i=0; i<29; ++i) h.policy_engine_->actions[i] = 0.1f * (i + 1) + 0.01f * frame;
     if (!h.CreatePolicyCommand()) return 2;
@@ -91,6 +93,7 @@ int main() {{
       if (abs(h.last_action[i] - h.policy_engine_->actions[i]) > 1e-6) return 11;
       const double executed = (command.q_target[i] - default_angles[i]) / g1_action_scale[i];
       if (abs(executed - h.last_action[isaaclab_to_mujoco[i]]) > 1e-5) return 12;
+      if (command.tau_ff[i] != (i == 24 ? -1.5 : 0.0)) return 13;
     }}
   }}
   return 0;

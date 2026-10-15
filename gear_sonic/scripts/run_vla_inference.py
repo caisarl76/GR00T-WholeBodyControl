@@ -450,6 +450,11 @@ def main(config: InferenceConfig):
 
         # Own instance: forward kinematics overwrites the cache robot_model shares with inference.
         ready_link_boxes = right_arm_link_boxes(instantiate_g1_robot_model(waist_location="lower_and_upper_body"))
+    ready_yaw_tau = None
+    if harness_enabled and profile.handover is not None and profile.handover.ready_gravity_feedforward:
+        from gear_sonic.utils.inference.ready_feedforward import right_yaw_gravity_tau
+
+        ready_yaw_tau = right_yaw_gravity_tau(instantiate_g1_robot_model(waist_location="lower_and_upper_body"))
 
     # Isaac-GR00T PolicyClient
     from gr00t.policy.server_client import PolicyClient
@@ -478,6 +483,7 @@ def main(config: InferenceConfig):
     reset_feedback_index = None
     reset_feedback_time = float("-inf")
     standing_reset = None
+    feedforward_reset = None  # The ready return that carries ready_yaw_tau, while it is standing_reset.
     manual_planner = None
 
     camera_subscriber = (
@@ -1149,7 +1155,7 @@ def main(config: InferenceConfig):
                 harness_planner_command, standing_reset = command, None
 
             def begin_ready_reset(self, feedback, right_arm_target, right_arm_waypoint):
-                nonlocal standing_reset, manual_planner, harness_planner_command
+                nonlocal standing_reset, manual_planner, harness_planner_command, feedforward_reset
                 if ready_link_boxes is not None:
                     right_arm_waypoint = ready_waypoint(harness_control.profile.handover, feedback, ready_link_boxes)
                     print(f"[harness] ready return: {'direct' if right_arm_waypoint is None else 'raise first'}",
@@ -1167,6 +1173,7 @@ def main(config: InferenceConfig):
                 if not cpp_loop_running or not send_cpp_control_command(start=True, planner=True):
                     raise ValueError("Cannot activate ready planner")
                 standing_reset, manual_planner, harness_planner_command = reset, None, None
+                feedforward_reset = reset if ready_yaw_tau is not None else None
                 return reset
 
             def stop_planner_motion(self):
@@ -1280,6 +1287,9 @@ def main(config: InferenceConfig):
                     continue
                 if manual_planner is not None:
                     command = manual_planner.command(command, fresh_heading())
+                if standing_reset is feedforward_reset and fresh_feedback is not None:
+                    # Stale feedback sends none; the deploy then applies zero.
+                    command = replace(command, upper_body_tau=ready_yaw_tau(fresh_feedback))
                 publish_planner_command(command)
             elif harness_planner_command is not None and cpp_loop_running and cpp_mode == "PLANNER":
                 publish_planner_command(harness_planner_command)

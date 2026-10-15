@@ -82,6 +82,9 @@ class HandoverSettings:
     # direct return keeps clear of the desk (ready_clearance.py). Absent: always raise.
     desk_top_above_pelvis_m: float | None = None
     desk_front_from_pelvis_m: float | None = None
+    # Send the right shoulder yaw's gravity torque as tau during ready returns
+    # (ready_feedforward.py). Simulation-tested only; unvalidated on hardware.
+    ready_gravity_feedforward: bool = False
 
     @property
     def right_arm_target(self) -> tuple[float, ...]:
@@ -200,7 +203,9 @@ def load_profile(path: Path) -> G1Profile:
         desk = {"desk_top_above_pelvis_m", "desk_front_from_pelvis_m"}
         if (
             not isinstance(h, dict)
-            or h.keys() not in (required, required | desk)
+            or not required <= h.keys() <= required | desk | {"ready_gravity_feedforward"}
+            or h.keys() & desk not in (set(), desk)
+            or type(h.get("ready_gravity_feedforward", False)) is not bool
             or type(h["skill_id"]) is not str
             or h["skill_id"] not in skills
             or skills[h["skill_id"]].completion_action != "hold"

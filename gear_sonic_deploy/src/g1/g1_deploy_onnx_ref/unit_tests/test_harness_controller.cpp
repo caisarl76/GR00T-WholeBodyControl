@@ -29,8 +29,11 @@ struct Publisher {
     port = std::stoi(std::string(endpoint).substr(std::string(endpoint).rfind(':') + 1));
   }
   ~Publisher() { zmq_close(socket); zmq_ctx_term(context); }
-  void planner() {
-    const std::string header = R"({"v":1,"endian":"le","count":1,"fields":[{"name":"mode","dtype":"i32","shape":[1]},{"name":"movement","dtype":"f32","shape":[3]},{"name":"facing","dtype":"f32","shape":[3]},{"name":"speed","dtype":"f32","shape":[1]},{"name":"height","dtype":"f32","shape":[1]},{"name":"upper_body_position","dtype":"f32","shape":[17]},{"name":"upper_body_velocity","dtype":"f32","shape":[17]},{"name":"left_hand_joints","dtype":"f32","shape":[7]},{"name":"right_hand_joints","dtype":"f32","shape":[7]}]})";
+  void planner(const std::vector<float>& tau = {}) {
+    std::string header = R"({"v":1,"endian":"le","count":1,"fields":[{"name":"mode","dtype":"i32","shape":[1]},{"name":"movement","dtype":"f32","shape":[3]},{"name":"facing","dtype":"f32","shape":[3]},{"name":"speed","dtype":"f32","shape":[1]},{"name":"height","dtype":"f32","shape":[1]},{"name":"upper_body_position","dtype":"f32","shape":[17]},{"name":"upper_body_velocity","dtype":"f32","shape":[17]},{"name":"left_hand_joints","dtype":"f32","shape":[7]},{"name":"right_hand_joints","dtype":"f32","shape":[7]}]})";
+    if (!tau.empty()) {
+      header.insert(header.size() - 2, R"(,{"name":"upper_body_tau","dtype":"f32","shape":[)" + std::to_string(tau.size()) + "]}");
+    }
     std::string message = "planner" + header + std::string(1280-header.size(), '\0');
     int32_t mode = 1;
     message.append(reinterpret_cast<const char*>(&mode), sizeof(mode));
@@ -39,6 +42,7 @@ struct Publisher {
     values.insert(values.end(), 17, 0.25f);
     values.insert(values.end(), 7, 0.45f);
     values.insert(values.end(), 7, -0.55f);
+    values.insert(values.end(), tau.begin(), tau.end());
     message.append(reinterpret_cast<const char*>(values.data()), values.size()*sizeof(float));
     zmq_send(socket, message.data(), message.size(), 0);
   }
@@ -211,4 +215,45 @@ TEST(HarnessTimeout, ModeBoundariesAndStopsClearRetainedTargets) {
       EXPECT_NEAR(manager.GetUpperBodyJointVelocities().second[0], 0.25, 1e-6);
     }
   }
+}
+
+TEST(HarnessFeedforward, OnlyFreshValidPlannerTorqueReachesTheMotors) {
+  Publisher publisher;
+  ZMQManager manager("127.0.0.1", publisher.port, "pose", "command", "planner",
+                     false, false, Vr3PtSafetyFilter::Config{}, true);
+  MotionDataReader reader;
+  auto motion = std::make_shared<MotionSequence>(); motion->name = "planner_motion";
+  std::shared_ptr<const MotionSequence> current = motion;
+  int frame = 0; bool reinitialize = false, report = false;
+  OperatorState state; state.start = true;
+  PlannerState planner; planner.enabled = planner.initialized = true;
+  DataBuffer<HeadingState> heading; DataBuffer<MovementState> movement;
+  movement.SetData(MovementState()); std::mutex mutex;
+  auto tick = [&] { manager.update(); manager.handle_input(reader, current, frame, state, reinitialize,
+                       heading, true, planner, movement, mutex, report); };
+  auto send = [&](const std::vector<float>& tau) {
+    publisher.planner(tau); std::this_thread::sleep_for(std::chrono::milliseconds(30)); tick();
+  };
+  std::vector<float> yaw(17, 0.0f); yaw[8] = -1.75f;  // Planner index 8 is motor 24.
+  EXPECT_EQ(manager.GetUpperBodyFeedforwardTorques(), (std::array<double, 17>{}));
+  for (int i = 0; i < 100 && manager.GetUpperBodyFeedforwardTorques()[8] == 0.0; ++i) send(yaw);
+  ASSERT_NEAR(manager.GetUpperBodyFeedforwardTorques()[8], -1.75, 1e-6);
+  send({});  // A message without the field drops the previous feedforward.
+  EXPECT_EQ(manager.GetUpperBodyFeedforwardTorques(), (std::array<double, 17>{}));
+  auto over = yaw; over[8] = -5.5f;
+  auto nan = yaw; nan[3] = std::nanf("");
+  for (const auto& bad : {over, nan, std::vector<float>(16, 0.1f)}) {
+    send(yaw); ASSERT_NEAR(manager.GetUpperBodyFeedforwardTorques()[8], -1.75, 1e-6);
+    send(bad);
+    EXPECT_EQ(manager.GetUpperBodyFeedforwardTorques(), (std::array<double, 17>{}));
+    EXPECT_TRUE(manager.GetUpperBodyJointPositions().first);
+  }
+  send(yaw);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1250)); tick();
+  EXPECT_TRUE(manager.GetUpperBodyJointPositions().first);  // Held position, no held torque.
+  EXPECT_EQ(manager.GetUpperBodyFeedforwardTorques(), (std::array<double, 17>{}));
+  send(yaw); ASSERT_NEAR(manager.GetUpperBodyFeedforwardTorques()[8], -1.75, 1e-6);
+  publisher.command(false, false); std::this_thread::sleep_for(std::chrono::milliseconds(30)); tick();
+  EXPECT_TRUE(manager.GetUpperBodyJointPositions().first);  // Outgoing planner pose, no torque.
+  EXPECT_EQ(manager.GetUpperBodyFeedforwardTorques(), (std::array<double, 17>{}));
 }
