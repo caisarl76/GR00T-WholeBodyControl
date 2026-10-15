@@ -108,6 +108,7 @@ class ZMQManager : public InputInterface {
       
       type_ = InputType::NETWORK;
       active_mode_ = ManagedMode::PLANNER;  // Default to planner mode
+      planner_tau_enabled_ = true;
       
       // Create pose interface (for streamed motion mode)
       pose_interface_ = std::make_unique<ZMQEndpointInterface>(
@@ -304,6 +305,7 @@ class ZMQManager : public InputInterface {
 
           // Clear valid flag - next callback will start fresh accumulation
           active_mode_ = new_mode;
+          planner_tau_enabled_ = new_mode == ManagedMode::PLANNER;
           latest_command_.valid = false;
         }
       }
@@ -493,8 +495,11 @@ class ZMQManager : public InputInterface {
     }
 
     std::array<double, 17> GetUpperBodyFeedforwardTorques() const override {
-      const auto tau = upper_body_tau_.GetDataWithTime().data;
-      return has_upper_body_control_ && tau ? *tau : std::array<double, 17>{};
+      // Expires on its own, independent of planner input handling and mode.
+      const auto tau = upper_body_tau_.GetDataWithTime();
+      const bool fresh = std::chrono::steady_clock::now() - tau.timestamp <= MAX_UPPER_BODY_TAU_AGE;
+      return planner_tau_enabled_ && has_upper_body_control_ && fresh && tau.data ? *tau.data
+                                                                                  : std::array<double, 17>{};
     }
 
     std::pair<bool, std::array<double, 7>> GetHandPose(bool is_left) const override {
@@ -954,8 +959,9 @@ class ZMQManager : public InputInterface {
 
       // Optional upper_body_tau (17 f32, Nm). Each message carries its own
       // feedforward: absent or invalid means zero, never the previous value.
+      // Only a PLANNER session accepts it; a late packet after leaving PLANNER stores zero.
       std::array<double, 17> upper_body_tau_data{};
-      if (upper_body_tau_idx >= 0) {
+      if (upper_body_tau_idx >= 0 && planner_tau_enabled_) {
         const auto& field = hdr.fields[upper_body_tau_idx];
         const auto& buf = bufs[upper_body_tau_idx];
         bool valid = field.dtype == "f32" && buf.size == 17 * sizeof(float);
@@ -963,7 +969,10 @@ class ZMQManager : public InputInterface {
           float val;
           std::memcpy(&val, static_cast<const uint8_t*>(buf.data) + i * sizeof(float), sizeof(float));
           if (needs_swap) val = byte_swap(val);
-          valid = std::isfinite(val) && std::abs(val) <= MAX_UPPER_BODY_TAU_NM;
+          // -ffast-math lets the compiler assume no NaN/Inf, so test the IEEE exponent bits.
+          uint32_t bits;
+          std::memcpy(&bits, &val, sizeof(bits));
+          valid = (bits & 0x7f800000u) != 0x7f800000u && std::fabs(val) <= MAX_UPPER_BODY_TAU_NM;
           upper_body_tau_data[i] = val;
         }
         if (!valid) {
@@ -1243,6 +1252,9 @@ class ZMQManager : public InputInterface {
 
     /// Per-joint cap on planner-supplied feedforward; G1 gravity loads stay below ~3 Nm.
     static constexpr double MAX_UPPER_BODY_TAU_NM = 5.0;
+    /// Feedforward older than this is dropped; the harness sends it every control tick.
+    static constexpr auto MAX_UPPER_BODY_TAU_AGE = std::chrono::milliseconds(200);
+    std::atomic<bool> planner_tau_enabled_{false};  ///< Active mode is PLANNER.
     DataBuffer<std::array<double, 17>> upper_body_tau_;  ///< Planner order, Nm.
     
     // ------------------------------------------------------------------

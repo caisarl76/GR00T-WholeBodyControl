@@ -257,3 +257,78 @@ TEST(HarnessFeedforward, OnlyFreshValidPlannerTorqueReachesTheMotors) {
   EXPECT_TRUE(manager.GetUpperBodyJointPositions().first);  // Outgoing planner pose, no torque.
   EXPECT_EQ(manager.GetUpperBodyFeedforwardTorques(), (std::array<double, 17>{}));
 }
+
+namespace {
+struct FeedforwardRig {
+  Publisher publisher;
+  ZMQManager manager{"127.0.0.1", publisher.port, "pose", "command", "planner",
+                     false, false, Vr3PtSafetyFilter::Config{}, true};
+  MotionDataReader reader;
+  std::shared_ptr<MotionSequence> motion = [] {
+    auto m = std::make_shared<MotionSequence>(); m->name = "planner_motion"; return m; }();
+  std::shared_ptr<const MotionSequence> current = motion;
+  int frame = 0; bool reinitialize = false, report = false;
+  OperatorState state;
+  PlannerState planner;
+  DataBuffer<HeadingState> heading; DataBuffer<MovementState> movement;
+  std::mutex mutex;
+  std::vector<float> yaw = [] { std::vector<float> v(17, 0.0f); v[8] = -1.75f; return v; }();
+  FeedforwardRig() {
+    state.start = true;
+    planner.enabled = planner.initialized = true;
+    movement.SetData(MovementState());
+  }
+  void tick() { manager.update(); manager.handle_input(reader, current, frame, state, reinitialize,
+                                                       heading, true, planner, movement, mutex, report); }
+  void send(const std::vector<float>& tau) {
+    publisher.planner(tau); std::this_thread::sleep_for(std::chrono::milliseconds(30)); tick();
+  }
+  void mode(bool planner_mode) {
+    publisher.command(false, planner_mode); std::this_thread::sleep_for(std::chrono::milliseconds(30)); tick();
+  }
+  double yaw_tau() const { return manager.GetUpperBodyFeedforwardTorques()[8]; }
+  void establish() {
+    for (int i = 0; i < 100 && yaw_tau() == 0.0; ++i) send(yaw);
+    ASSERT_NEAR(yaw_tau(), -1.75, 1e-6);
+  }
+};
+}
+
+TEST(HarnessFeedforward, LatePlannerPacketAfterPoseSwitchAppliesNoTorque) {
+  FeedforwardRig rig;
+  rig.establish();
+  rig.mode(false);  // VLA streamed motion; the outgoing planner pose stays retained.
+  ASSERT_TRUE(rig.manager.GetUpperBodyJointPositions().first);
+  EXPECT_EQ(rig.yaw_tau(), 0.0);
+  rig.send(rig.yaw);  // A delayed planner packet arrives after the switch.
+  EXPECT_EQ(rig.yaw_tau(), 0.0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1250)); rig.tick();
+  EXPECT_EQ(rig.yaw_tau(), 0.0);
+  rig.mode(true);  // Back to PLANNER: nothing from before the switch returns.
+  EXPECT_EQ(rig.yaw_tau(), 0.0);
+  rig.establish();  // A fresh PLANNER-session packet is accepted again.
+}
+
+TEST(HarnessFeedforward, TorqueExpiresWithoutNewPacketsOrPlannerTicks) {
+  FeedforwardRig rig;
+  rig.establish();
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  EXPECT_NEAR(rig.yaw_tau(), -1.75, 1e-6);  // Within 200 ms of the last packet.
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));  // No tick(): expiry is the getter's own.
+  EXPECT_EQ(rig.yaw_tau(), 0.0);
+}
+
+TEST(HarnessFeedforward, NonFiniteWireValuesRejectedUnderDeployFlags) {
+  FeedforwardRig rig;
+  for (uint32_t bits : {0x7fc00000u, 0xffc00001u, 0x7f800001u, 0x7f800000u, 0xff800000u}) {
+    rig.establish();
+    auto bad = rig.yaw;
+    std::memcpy(&bad[8], &bits, sizeof(bits));
+    rig.send(bad);
+    const auto tau = rig.manager.GetUpperBodyFeedforwardTorques();
+    uint64_t delivered;
+    std::memcpy(&delivered, &tau[8], sizeof(delivered));
+    EXPECT_EQ(delivered, uint64_t{0}) << "wire bits 0x" << std::hex << bits;
+    EXPECT_EQ(tau, (std::array<double, 17>{}));
+  }
+}
