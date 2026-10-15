@@ -90,7 +90,13 @@ class HarnessControl:
         self.hold_index, self.hold_started, self.dwell = None, None, None
         self.transition_started = 0.0
         self.last_policy_result = None
+        # Mutation replies of the owning session, for exact retries. Heartbeats use a
+        # per-session sequence instead, so retries are exact without growing this.
         self.replies = {}
+        self.heartbeat = None  # (session_id, sequence, canonical request, reply) of the last renewal.
+        # Ended sessions -> the request that ended them and its reply (or None). Every
+        # other request from them is rejected, so their caches can be dropped.
+        self.retired_sessions = {}
         self.locomotion_enabled = False
 
     def _fresh(self, now):
@@ -154,11 +160,20 @@ class HarnessControl:
             self.interrupt(f"operator_override:{reason}", time.monotonic())
         else:
             self.epoch = self.hooks.invalidate_policy_actions()
-        self.owner = None
+        self._retire_owner()
         self.reset, self.planner = None, None
         self.hold_confirmed = False
         self.phase = "IDLE" if reason == "i" else "INTERRUPTED"
         self.reason = f"operator_override:{reason}"
+
+    def _retire_owner(self):
+        """End ownership: reject the session from now on, then drop its retry caches."""
+        if self.owner is not None:
+            session = self.owner["session_id"]
+            self.retired_sessions.setdefault(session, None)
+            self.replies = {key: value for key, value in self.replies.items() if key[0] != session}
+            self.heartbeat = None
+        self.owner = None
 
     def _lease(self, req, now):
         if (
@@ -169,7 +184,7 @@ class HarnessControl:
             raise ControlError("NOT_OWNER", "No matching owner")
         if now >= self.owner["expires_at"]:
             self.interrupt("lease_expired", now)
-            self.owner = None
+            self._retire_owner()
             raise ControlError("EXPIRED_LEASE", "Ownership expired")
 
     def _execution(self):
@@ -202,6 +217,14 @@ class HarnessControl:
                 raise ControlError("STALE_RUNTIME", "Executor restarted")
             key = (req["session_id"], req["request_id"])
             canonical = json.dumps(req, sort_keys=True)
+            if req["session_id"] in self.retired_sessions and req["method"] not in {"get_status", "observe"}:
+                # Before any cache lookup: a delayed retry must not reacquire or renew control.
+                final = self.retired_sessions[req["session_id"]]
+                if final is not None and final[0] == canonical:
+                    return final[1]  # Exact retry of the request that ended the session.
+                raise ControlError("NOT_OWNER", "Session ended; claim with a new session ID")
+            if req["method"] == "heartbeat":
+                return self._heartbeat(req, canonical, response, now)
             if key in self.replies:
                 previous, cached = self.replies[key]
                 if previous != canonical:
@@ -211,11 +234,29 @@ class HarnessControl:
             response["result"] = result
             # Observe/status can be large and never actuate. Mutations are deduplicated.
             if req["method"] not in {"get_status", "observe"}:
-                self.replies[key] = (canonical, response)
+                if req["session_id"] in self.retired_sessions:
+                    self.retired_sessions[req["session_id"]] = (canonical, response)
+                else:
+                    self.replies[key] = (canonical, response)
         except ControlError as exc:
             response["error"] = dict(code=exc.code, message=str(exc))
         except (ValueError, TypeError, KeyError) as exc:
             response["error"] = dict(code="INVALID_REQUEST", message=str(exc))
+        return response
+
+    def _heartbeat(self, req, canonical, response, now):
+        """Renew once per sequence number; replay the last reply for its exact retry."""
+        sequence = req["params"]["sequence"]
+        if self.heartbeat is not None and self.heartbeat[0] == req["session_id"]:
+            _, last, previous, cached = self.heartbeat
+            if sequence == last:
+                if previous != canonical:
+                    raise ControlError("REQUEST_CONFLICT", "Heartbeat sequence reused with a different request")
+                return cached
+            if sequence < last:
+                raise ControlError("REQUEST_CONFLICT", "Heartbeat sequence must increase")
+        response["result"] = self._dispatch(req, now)
+        self.heartbeat = (req["session_id"], sequence, canonical, response)
         return response
 
     def _dispatch(self, req, now):
@@ -278,7 +319,7 @@ class HarnessControl:
             if self.profile.handover and self._handover_enabled():
                 self._hold(now)
                 if self.phase == "FAULT":
-                    self.owner = None
+                    self._retire_owner()
                     raise ControlError("FAULT", "Cannot establish initial handover hold")
             return self.owner.copy()
         self._lease(req, now)
@@ -288,7 +329,7 @@ class HarnessControl:
         if method == "release_control":
             if not self.hold_confirmed or self.phase not in {"IDLE", "PAUSED", "COMPLETED", "INTERRUPTED", "FAULT"}:
                 raise ControlError("NOT_READY", "Release requires a confirmed planner hold")
-            self.owner = None
+            self._retire_owner()
             return self.status(now)
         if method == "start_manipulation":
             try:
@@ -395,17 +436,17 @@ class HarnessControl:
                     self.owner is not None or self.phase in {"MANIPULATING", "RESETTING", "WALKING", "TURNING"}
                 ):
                     self.interrupt("incompatible_controller_telemetry", now)
-                    self.owner = None
+                    self._retire_owner()
                     self.phase = "FAULT"
                     return
             elif type(index) is int and self.feedback_index is not None and index < self.feedback_index:
                 self.feedback, self.feedback_time, self.feedback_index = None, None, index
                 self.interrupt("telemetry_stream_restarted", now)
-                self.owner = None
+                self._retire_owner()
                 self.hold_started = None
         if self.owner and now >= self.owner["expires_at"]:
             self.interrupt("lease_expired", now)
-            self.owner = None
+            self._retire_owner()
         if self.phase in {"MANIPULATING", "RESETTING", "WALKING", "TURNING"} and not self._fresh(now):
             self.interrupt("stale_feedback", now)
         if not self._fresh(now):

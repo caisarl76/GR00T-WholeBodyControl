@@ -56,8 +56,8 @@ def test_only_one_owner():
 def test_lease_expires_without_motion_replay():
     c, h = make()
     start(c)
-    request(c, "heartbeat", now=0.1, rid="hb")
-    request(c, "heartbeat", now=1.9, rid="hb")
+    request(c, "heartbeat", {"sequence": 1}, now=0.1, rid="hb")
+    request(c, "heartbeat", {"sequence": 1}, now=1.9, rid="hb")  # Retry: no renewal.
     c.tick(2.11, state(2), 2.11)
     assert c.owner is None
     assert not h.enabled
@@ -122,3 +122,40 @@ def test_local_rpc_and_second_server_does_not_unlink_live_socket(tmp_path):
         assert replies[0]["runtime_id"] == "boot"
     finally:
         server.close()
+
+
+def test_heartbeat_retry_replays_without_renewal_and_old_sequences_are_rejected():
+    c, _ = make()
+    start(c)
+    lease_s = c.profile.limits.lease_s
+    first = request(c, "heartbeat", {"sequence": 1}, now=0.5, rid="hb1")
+    assert first["error"] is None and c.owner["expires_at"] == pytest.approx(0.5 + lease_s)
+    assert request(c, "heartbeat", {"sequence": 1}, now=1.0, rid="hb1") == first  # Exact retry.
+    assert c.owner["expires_at"] == pytest.approx(0.5 + lease_s)
+    conflict = request(c, "heartbeat", {"sequence": 1}, now=1.0, rid="hb1-other")
+    assert conflict["error"]["code"] == "REQUEST_CONFLICT"
+    assert request(c, "heartbeat", {"sequence": 2}, now=1.2, rid="hb2")["error"] is None
+    renewed = c.owner["expires_at"]
+    assert renewed == pytest.approx(1.2 + lease_s)
+    delayed = request(c, "heartbeat", {"sequence": 1}, now=1.4, rid="hb1")  # Delayed retry after a newer one.
+    assert delayed["error"]["code"] == "REQUEST_CONFLICT" and c.owner["expires_at"] == renewed
+
+
+@pytest.mark.parametrize("sequence", [0, -1, True, 1.0, "1"])
+def test_heartbeat_requires_a_positive_integer_sequence(sequence):
+    c, _ = make()
+    start(c)
+    expires = c.owner["expires_at"]
+    assert request(c, "heartbeat", {"sequence": sequence}, now=0.5)["error"]["code"] == "INVALID_REQUEST"
+    assert request(c, "heartbeat", {}, now=0.5)["error"]["code"] == "INVALID_REQUEST"
+    assert c.owner["expires_at"] == expires
+
+
+def test_heartbeats_keep_retry_state_bounded():
+    c, _ = make()
+    start(c)
+    cached = len(c.replies)
+    for sequence in range(1, 10_001):
+        assert request(c, "heartbeat", {"sequence": sequence}, now=0.1, rid=f"hb{sequence}")["error"] is None
+    assert len(c.replies) == cached
+    assert c.heartbeat[1] == 10_000 and not c.retired_sessions

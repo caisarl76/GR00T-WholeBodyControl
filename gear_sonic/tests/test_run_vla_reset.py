@@ -105,7 +105,7 @@ def test_harness_refills_before_capture_deadline_and_rejects_late_results(
             self.count += 1
             if self.count < 2:
                 return
-            method, params = "heartbeat", {}
+            method, params = "heartbeat", {"sequence": self.count}
             if self.count == 2:
                 method, params = "claim_control", {"registry_sha256": control.profile.registry_sha256}
             elif self.count == 3:

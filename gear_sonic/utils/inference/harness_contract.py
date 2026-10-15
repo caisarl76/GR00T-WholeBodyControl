@@ -34,7 +34,7 @@ ERROR_CODES = {
 PARAMS = {
     "get_status": {},
     "observe": {},
-    "heartbeat": {},
+    "heartbeat": {"sequence": int},
     "release_control": {},
     "claim_control": {"registry_sha256": str},
     "start_manipulation": {"skill_id": str},
@@ -94,6 +94,8 @@ def validate_params(method: str, params: dict) -> None:
             )
         ):
             raise ValueError(f"Empty {key}")
+    if method == "heartbeat" and params["sequence"] < 1:
+        raise ValueError("Heartbeat sequence starts at 1")
     if method == "walk_for":
         if (
             params["direction"] not in {"forward", "backward", "left", "right"}

@@ -11,7 +11,7 @@ def test_planner_timeout_invalidates_reset_and_preserves_hands():
     eid = start(c)
     request(c, "pause_manipulation", {"execution_id": eid}, 0.1)
     request(c, "reset_standing", {"execution_id": eid, "open_hands": True}, 0.2)
-    request(c, "heartbeat", {}, 1.9)
+    request(c, "heartbeat", {"sequence": 1}, 1.9)
     old_epoch = c.epoch
     c.tick(2.3, state(2, 0), 2.3)
     assert c.phase == "FAULT" and c.reason == "planner_activation_timeout"

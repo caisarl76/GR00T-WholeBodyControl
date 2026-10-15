@@ -256,3 +256,35 @@ def test_lift_rejects_invalid_waypoint(waypoint):
     with pytest.raises(ValueError):
         StandingReset(s, s["left_hand_q_measured"], np.zeros(7),
                       right_arm_target=TARGET, right_arm_waypoint=waypoint)
+
+
+def test_delayed_requests_from_an_ended_session_cannot_regain_control(tmp_path):
+    c = make_ready(tmp_path)  # Session "s" claimed with request "claim_control-0.0".
+    c.tick(.1, state(2), .1)
+    lease = c.owner["lease_id"]
+    assert request(c, "heartbeat", {"sequence": 1}, now=.1)["error"] is None
+    release = request(c, "release_control", now=.1)
+    assert release["error"] is None and c.owner is None
+    # The exact retry of the request that ended the session still gets its reply.
+    assert request(c, "release_control", now=.1, lease=lease) == release
+    # Delayed claim, heartbeat and motion replays are rejected without a cache lookup.
+    claim = {"registry_sha256": c.profile.registry_sha256}
+    assert request(c, "claim_control", claim, now=0., rid="claim_control-0.0")["error"]["code"] == "NOT_OWNER"
+    assert request(c, "heartbeat", {"sequence": 1}, now=.2, lease=lease)["error"]["code"] == "NOT_OWNER"
+    assert request(c, "heartbeat", {"sequence": 2}, now=.2, lease=lease)["error"]["code"] == "NOT_OWNER"
+    assert c.owner is None and len(c.hooks.holds) == 1
+    assert not [key for key in c.replies if key[0] == "s"] and c.heartbeat is None
+    # A new session can claim the same executor.
+    assert request(c, "claim_control", claim, now=.3, session="s2")["error"] is None
+    assert c.owner["session_id"] == "s2"
+
+
+def test_lease_expiry_retires_the_session(tmp_path):
+    c = make_ready(tmp_path)
+    c.tick(.1, state(2), .1)
+    lease = c.owner["lease_id"]
+    c.tick(2.5, state(3), 2.5)
+    assert c.owner is None
+    claim = {"registry_sha256": c.profile.registry_sha256}
+    assert request(c, "claim_control", claim, now=2.6, rid="claim_control-0.0")["error"]["code"] == "NOT_OWNER"
+    assert request(c, "heartbeat", {"sequence": 1}, now=2.6, lease=lease)["error"]["code"] == "NOT_OWNER"

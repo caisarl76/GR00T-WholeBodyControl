@@ -70,7 +70,9 @@
       "session_id": "session-1",
       "lease_id": "lease-1",
       "method": "heartbeat",
-      "params": {}
+      "params": {
+        "sequence": 1
+      }
     },
     {
       "version": 1,
