@@ -78,9 +78,9 @@ class HandoverSettings:
     ready_pose_reviewed: bool
     ready_right_arm_joints: dict[str, float]
     raised_right_arm_joints: dict[str, float]
-    # Optional desk pose in the pelvis frame; when set, the raise is skipped if the
-    # direct return keeps clear of the desk (ready_clearance.py). Absent: always raise.
-    desk_top_above_pelvis_m: float | None = None
+    # Optional desk: top height above the floor and near edge ahead of the pelvis.
+    # When set, the raise may be skipped (ready_clearance.py). Absent: always raise.
+    desk_top_above_floor_m: float | None = None
     desk_front_from_pelvis_m: float | None = None
     # Send the right shoulder yaw's gravity torque as tau during ready returns
     # (ready_feedforward.py). Simulation-tested only; unvalidated on hardware.
@@ -200,7 +200,7 @@ def load_profile(path: Path) -> G1Profile:
             "ready_right_arm_joints",
             "raised_right_arm_joints",
         }
-        desk = {"desk_top_above_pelvis_m", "desk_front_from_pelvis_m"}
+        desk = {"desk_top_above_floor_m", "desk_front_from_pelvis_m"}
         if (
             not isinstance(h, dict)
             or not required <= h.keys() <= required | desk | {"ready_gravity_feedforward"}
@@ -222,7 +222,7 @@ def load_profile(path: Path) -> G1Profile:
                     raise ValueError(f"{field} outside G1 bounds: {name}")
         if desk <= h.keys() and not (
             all(finite_number(h[key]) for key in desk)
-            and -1.0 < h["desk_top_above_pelvis_m"] < 1.0
+            and 0.3 < h["desk_top_above_floor_m"] < 1.5
             and 0.0 < h["desk_front_from_pelvis_m"] < 2.0
         ):
             raise ValueError("Invalid handover desk pose")

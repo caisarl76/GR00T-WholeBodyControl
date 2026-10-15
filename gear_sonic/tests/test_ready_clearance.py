@@ -14,8 +14,8 @@ from gear_sonic.utils.inference.harness_profile import load_profile
 
 READY = [-0.10413093119859695, -0.08507601171731949, 0.30275747179985046, -0.21820877492427826,
          1.70130455493927, -0.09610150009393692, -0.07287607342004776]
-# 85 cm desk with the 0.787 m standing pelvis height used in simulation; 40 cm near edge (provisional).
-DESK = dict(desk_top_above_pelvis_m=0.063, desk_front_from_pelvis_m=0.40)
+# 85 cm desk; the provisional 40 cm near edge used in the first simulations.
+DESK = dict(desk_top_above_floor_m=0.85, desk_front_from_pelvis_m=0.40)
 # Motor-order body joints and thumb-first right-hand joints. The recorded entries are the
 # last frames of user-confirmed handovers; standing is the simulator's grounded entry.
 ENTRIES = {
@@ -38,8 +38,8 @@ ENTRIES = {
 MJCF = Path(rc.__file__).parents[2] / "data/robot_model/model_data/g1/g1_29dof_with_hand.xml"
 
 
-def feedback(body, hand):
-    return {"body_q_measured_motor": list(body), "right_hand_q_measured": list(hand)}
+def feedback(body, hand, base_quat=(1.0, 0.0, 0.0, 0.0)):
+    return {"body_q_measured_motor": list(body), "right_hand_q_measured": list(hand), "base_quat": list(base_quat)}
 
 
 def profile(tmp_path, **desk):
@@ -55,23 +55,39 @@ def profile(tmp_path, **desk):
 
 
 @pytest.fixture(scope="module")
-def link_boxes():
-    return rc.right_arm_link_boxes(instantiate_g1_robot_model(waist_location="lower_and_upper_body"))
+def clearance_model():
+    return instantiate_g1_robot_model(waist_location="lower_and_upper_body")
+
+
+@pytest.fixture(scope="module")
+def link_boxes(clearance_model):
+    return rc.right_arm_link_boxes(clearance_model)
+
+
+@pytest.fixture(scope="module")
+def pelvis_height(clearance_model):
+    return rc.pelvis_height_estimator(clearance_model)
+
+
+def level_top(pelvis_height, entry, desk=DESK):
+    # The desk top in the level pelvis frame for an upright entry.
+    return desk["desk_top_above_floor_m"] - pelvis_height(np.asarray(ENTRIES[entry][0]), np.eye(3))
 
 
 @pytest.mark.parametrize("entry", ["source15_f431", "source30_f420"])
-def test_recorded_post_handover_entries_return_directly(link_boxes, entry):
-    gap = rc.direct_return_desk_gap(link_boxes, feedback(*ENTRIES[entry]), READY,
-                                    DESK["desk_top_above_pelvis_m"], DESK["desk_front_from_pelvis_m"])
-    assert gap >= rc.DESK_MARGIN_M
+def test_recorded_post_handover_entries_return_directly(link_boxes, pelvis_height, tmp_path, entry):
+    handover = profile(tmp_path, **DESK).handover
+    waypoint, reason = rc.ready_decision(handover, feedback(*ENTRIES[entry]), link_boxes, pelvis_height)
+    assert waypoint is None, reason
 
 
-def test_grounded_standing_entry_still_raises(link_boxes, tmp_path):
+def test_grounded_standing_entry_still_raises(link_boxes, pelvis_height, tmp_path):
     handover = profile(tmp_path, **DESK).handover
     gap = rc.direct_return_desk_gap(link_boxes, feedback(*ENTRIES["grounded_standing"]), READY,
-                                    DESK["desk_top_above_pelvis_m"], DESK["desk_front_from_pelvis_m"])
+                                    level_top(pelvis_height, "grounded_standing"), DESK["desk_front_from_pelvis_m"])
     assert gap < rc.DESK_MARGIN_M
-    assert rc.ready_waypoint(handover, feedback(*ENTRIES["grounded_standing"]), link_boxes) == tuple(RAISED)
+    assert rc.ready_waypoint(handover, feedback(*ENTRIES["grounded_standing"]), link_boxes,
+                             pelvis_height) == tuple(RAISED)
 
 
 def test_direct_return_checks_the_whole_rate_limited_path():
@@ -102,23 +118,26 @@ def test_desk_gap_is_box_to_region_separation():
     assert rc.desk_gap([above, beside, corner], top, front) == pytest.approx(0.05)
 
 
-MEASURED_DESK = dict(desk_top_above_pelvis_m=0.063, desk_front_from_pelvis_m=0.15)
+MEASURED_DESK = dict(desk_top_above_floor_m=0.85, desk_front_from_pelvis_m=0.15)
 
 
 @pytest.mark.parametrize("entry", ["source15_f431", "source30_f420"])
-def test_offer_hand_above_desk_top_skips_raise_at_close_desk(link_boxes, tmp_path, entry):
+def test_offer_hand_above_desk_top_skips_raise_at_close_desk(link_boxes, pelvis_height, tmp_path, entry):
     # At the measured 0.15 m edge the direct path misses the 3 cm margin, but the hand
     # starts above the desk top, so there is nothing to lift over.
     state = feedback(*ENTRIES[entry])
-    assert rc.direct_return_desk_gap(link_boxes, state, READY, *MEASURED_DESK.values()) < rc.DESK_MARGIN_M
-    assert rc.hand_above_desk_top(link_boxes, state, MEASURED_DESK["desk_top_above_pelvis_m"])
-    assert rc.ready_waypoint(profile(tmp_path, **MEASURED_DESK).handover, state, link_boxes) is None
+    top = level_top(pelvis_height, entry, MEASURED_DESK)
+    assert rc.direct_return_desk_gap(link_boxes, state, READY, top, 0.15) < rc.DESK_MARGIN_M
+    assert rc.hand_above_desk_top(link_boxes, state, top)
+    waypoint, reason = rc.ready_decision(profile(tmp_path, **MEASURED_DESK).handover, state, link_boxes, pelvis_height)
+    assert waypoint is None and reason.startswith("hand above desk top")
 
 
-def test_hand_below_desk_top_still_needs_a_clear_direct_path(link_boxes, tmp_path):
+def test_hand_below_desk_top_still_needs_a_clear_direct_path(link_boxes, pelvis_height, tmp_path):
     state = feedback(*ENTRIES["grounded_standing"])
-    assert not rc.hand_above_desk_top(link_boxes, state, MEASURED_DESK["desk_top_above_pelvis_m"])
-    assert rc.ready_waypoint(profile(tmp_path, **MEASURED_DESK).handover, state, link_boxes) == tuple(RAISED)
+    assert not rc.hand_above_desk_top(link_boxes, state, level_top(pelvis_height, "grounded_standing", MEASURED_DESK))
+    assert rc.ready_waypoint(profile(tmp_path, **MEASURED_DESK).handover, state, link_boxes,
+                             pelvis_height) == tuple(RAISED)
     # The elbow alone below the desk top does not count; any wrist or hand link does.
     def boxes(body, hand):
         low = [0.01 if name == "right_elbow_link" else 0.1 for name in rc.RIGHT_ARM_LINK_BOXES]
@@ -130,28 +149,98 @@ def test_hand_below_desk_top_still_needs_a_clear_direct_path(link_boxes, tmp_pat
     assert not rc.hand_above_desk_top(boxes, feedback(body, np.zeros(7)), 0.063)
 
 
-def test_ready_waypoint_skips_raise_only_when_direct_path_clears(link_boxes, tmp_path):
-    configured = profile(tmp_path, **DESK).handover
-    for entry in ("source15_f431", "source30_f420"):
-        assert rc.ready_waypoint(configured, feedback(*ENTRIES[entry]), link_boxes) is None
+def test_ready_waypoint_raises_without_a_configured_desk(link_boxes, pelvis_height, tmp_path):
     unconfigured = profile(tmp_path).handover
-    assert rc.ready_waypoint(unconfigured, feedback(*ENTRIES["source30_f420"]), link_boxes) == tuple(RAISED)
+    assert rc.ready_waypoint(unconfigured, feedback(*ENTRIES["source30_f420"]), link_boxes,
+                             pelvis_height) == tuple(RAISED)
+
+
+def test_desk_top_follows_the_estimated_pelvis_height(link_boxes, tmp_path):
+    # The same arm pose skips the raise when the pelvis stands high enough above an
+    # 85 cm desk, and raises when knee bend lowers the pelvis so the hand is below it.
+    handover = profile(tmp_path, **MEASURED_DESK).handover
+    state = feedback(*ENTRIES["source15_f431"])
+    assert rc.ready_waypoint(handover, state, link_boxes, lambda body, tilt: 0.787) is None
+    assert rc.ready_waypoint(handover, state, link_boxes, lambda body, tilt: 0.74) == tuple(RAISED)
+
+
+def test_pelvis_tilt_moves_the_arm_against_the_desk(link_boxes, pelvis_height, tmp_path):
+    # Pitching the pelvis forward lowers the outstretched hand below the desk top.
+    handover = profile(tmp_path, **MEASURED_DESK).handover
+    body, hand = ENTRIES["source15_f431"]
+    pitch = np.radians(6)
+    forward = (np.cos(pitch / 2), 0.0, np.sin(pitch / 2), 0.0)
+    assert rc.ready_waypoint(handover, feedback(body, hand), link_boxes, pelvis_height) is None
+    assert rc.ready_waypoint(handover, feedback(body, hand, forward), link_boxes, pelvis_height) == tuple(RAISED)
+
+
+def test_pelvis_height_matches_mujoco_sole_contact(pelvis_height):
+    # Upright and pitched, with symmetric legs, against MuJoCo's foot collision boxes.
+    model = mujoco.MjModel.from_xml_path(str(MJCF))
+    data = mujoco.MjData(model)
+    motors = [j for j in (model.actuator(i).trnid[0] for i in range(model.nu)) if "hand" not in model.joint(j).name]
+    body = np.zeros(29)
+    for knee in (0.3, 0.7):
+        body[[0, 6]], body[[3, 9]], body[[4, 10]] = -knee / 2, knee, -knee / 2
+        for pitch in (0.0, np.radians(3)):
+            quat = np.array([np.cos(pitch / 2), 0.0, np.sin(pitch / 2), 0.0])
+            data.qpos[:] = 0
+            data.qpos[3:7] = quat
+            for i, joint in enumerate(motors):
+                data.qpos[model.jnt_qposadr[joint]] = body[i]
+            mujoco.mj_forward(model, data)
+            soles = []
+            for side in ("left", "right"):
+                foot = model.body(f"{side}_ankle_roll_link").id
+                geom = next(g for g in range(model.ngeom) if model.geom_bodyid[g] == foot and model.geom_contype[g])
+                corners = np.array(list(product((-1, 1), repeat=3))) * model.geom_size[geom]
+                soles.append((corners @ data.geom_xmat[geom].reshape(3, 3).T + data.geom_xpos[geom])[:, 2].min())
+            truth = data.body("pelvis").xpos[2] - min(soles)
+            assert pelvis_height(body, rc.level_tilt(quat)) == pytest.approx(truth, abs=0.01)
+
+
+def test_ankle_to_sole_matches_the_foot_collision_box():
+    model = mujoco.MjModel.from_xml_path(str(MJCF))
+    for side in ("left", "right"):
+        foot = model.body(f"{side}_ankle_roll_link").id
+        geom = next(g for g in range(model.ngeom) if model.geom_bodyid[g] == foot and model.geom_contype[g])
+        assert model.geom_pos[geom][2] - model.geom_size[geom][2] == pytest.approx(-rc.ANKLE_TO_SOLE_M)
+
+
+@pytest.mark.parametrize("bad_legs", ["lifted_foot", "crouched"])
+def test_unknown_pelvis_height_keeps_the_raise(link_boxes, pelvis_height, tmp_path, bad_legs):
+    body, hand = ENTRIES["source30_f420"]
+    body = np.array(body)
+    if bad_legs == "lifted_foot":
+        body[3] += 0.6  # Left knee only: that foot leaves the floor.
+    else:
+        body[[0, 6]], body[[3, 9]], body[[4, 10]] = -1.0, 2.0, -1.0
+    with pytest.raises(ValueError):
+        pelvis_height(body, np.eye(3))
+    waypoint, reason = rc.ready_decision(profile(tmp_path, **MEASURED_DESK).handover, feedback(body, hand),
+                                         link_boxes, pelvis_height)
+    assert waypoint == tuple(RAISED) and reason.startswith("unknown geometry")
 
 
 @pytest.mark.parametrize("bad", [
     {}, {"body_q_measured_motor": [0.0] * 28, "right_hand_q_measured": [0.0] * 7},
     {"body_q_measured_motor": [float("nan")] * 29, "right_hand_q_measured": [0.0] * 7},
 ])
-def test_ready_waypoint_raises_when_feedback_is_invalid(link_boxes, tmp_path, bad):
-    assert rc.ready_waypoint(profile(tmp_path, **DESK).handover, bad, link_boxes) == tuple(RAISED)
+def test_ready_waypoint_raises_when_feedback_is_invalid(link_boxes, pelvis_height, tmp_path, bad):
+    assert rc.ready_waypoint(profile(tmp_path, **DESK).handover, bad, link_boxes, pelvis_height) == tuple(RAISED)
+    good = feedback(*ENTRIES["source30_f420"])
+    for quat in ([0.0] * 4, [float("nan")] * 4, [1.0, 0.0, 0.0]):
+        assert rc.ready_waypoint(profile(tmp_path, **DESK).handover, {**good, "base_quat": quat}, link_boxes,
+                                 pelvis_height) == tuple(RAISED)
 
 
 @pytest.mark.parametrize("desk", [
-    dict(desk_top_above_pelvis_m=0.063),
+    dict(desk_top_above_floor_m=0.85),
     dict(desk_front_from_pelvis_m=0.40),
-    dict(desk_top_above_pelvis_m=float("nan"), desk_front_from_pelvis_m=0.40),
-    dict(desk_top_above_pelvis_m=True, desk_front_from_pelvis_m=0.40),
-    dict(desk_top_above_pelvis_m=0.063, desk_front_from_pelvis_m=-0.1),
+    dict(desk_top_above_floor_m=float("nan"), desk_front_from_pelvis_m=0.40),
+    dict(desk_top_above_floor_m=True, desk_front_from_pelvis_m=0.40),
+    dict(desk_top_above_floor_m=0.063, desk_front_from_pelvis_m=0.40),
+    dict(desk_top_above_floor_m=0.85, desk_front_from_pelvis_m=-0.1),
 ])
 def test_profile_requires_both_finite_desk_fields(tmp_path, desk):
     with pytest.raises(ValueError):
@@ -159,9 +248,9 @@ def test_profile_requires_both_finite_desk_fields(tmp_path, desk):
 
 
 def test_profile_desk_fields_are_optional(tmp_path):
-    assert profile(tmp_path).handover.desk_top_above_pelvis_m is None
+    assert profile(tmp_path).handover.desk_top_above_floor_m is None
     handover = profile(tmp_path, **DESK).handover
-    assert (handover.desk_top_above_pelvis_m, handover.desk_front_from_pelvis_m) == (0.063, 0.40)
+    assert (handover.desk_top_above_floor_m, handover.desk_front_from_pelvis_m) == (0.85, 0.40)
 
 
 def test_link_boxes_contain_model_collision_geometry():
