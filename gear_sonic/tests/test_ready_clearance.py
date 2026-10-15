@@ -102,6 +102,34 @@ def test_desk_gap_is_box_to_region_separation():
     assert rc.desk_gap([above, beside, corner], top, front) == pytest.approx(0.05)
 
 
+MEASURED_DESK = dict(desk_top_above_pelvis_m=0.063, desk_front_from_pelvis_m=0.15)
+
+
+@pytest.mark.parametrize("entry", ["source15_f431", "source30_f420"])
+def test_offer_hand_above_desk_top_skips_raise_at_close_desk(link_boxes, tmp_path, entry):
+    # At the measured 0.15 m edge the direct path misses the 3 cm margin, but the hand
+    # starts above the desk top, so there is nothing to lift over.
+    state = feedback(*ENTRIES[entry])
+    assert rc.direct_return_desk_gap(link_boxes, state, READY, *MEASURED_DESK.values()) < rc.DESK_MARGIN_M
+    assert rc.hand_above_desk_top(link_boxes, state, MEASURED_DESK["desk_top_above_pelvis_m"])
+    assert rc.ready_waypoint(profile(tmp_path, **MEASURED_DESK).handover, state, link_boxes) is None
+
+
+def test_hand_below_desk_top_still_needs_a_clear_direct_path(link_boxes, tmp_path):
+    state = feedback(*ENTRIES["grounded_standing"])
+    assert not rc.hand_above_desk_top(link_boxes, state, MEASURED_DESK["desk_top_above_pelvis_m"])
+    assert rc.ready_waypoint(profile(tmp_path, **MEASURED_DESK).handover, state, link_boxes) == tuple(RAISED)
+    # The elbow alone below the desk top does not count; any wrist or hand link does.
+    def boxes(body, hand):
+        low = [0.01 if name == "right_elbow_link" else 0.1 for name in rc.RIGHT_ARM_LINK_BOXES]
+        low[1] -= body[0]
+        return [(np.array([0.0, 0.0, z]), np.array([0.1, 0.0, z + 0.01])) for z in low]
+    assert rc.hand_above_desk_top(boxes, feedback(np.zeros(29), np.zeros(7)), 0.063)
+    body = np.zeros(29)
+    body[0] = 0.05
+    assert not rc.hand_above_desk_top(boxes, feedback(body, np.zeros(7)), 0.063)
+
+
 def test_ready_waypoint_skips_raise_only_when_direct_path_clears(link_boxes, tmp_path):
     configured = profile(tmp_path, **DESK).handover
     for entry in ("source15_f431", "source30_f420"):

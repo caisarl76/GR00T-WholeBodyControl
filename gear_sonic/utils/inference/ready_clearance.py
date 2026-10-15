@@ -2,10 +2,14 @@
 
 The raise exists to lift a low hand over the desk edge. From an offer pose the
 hand is already beside or above the desk, and raising can drive it into the
-desk instead. Skip the raise only when forward kinematics shows the right
-elbow, wrist and hand staying at least DESK_MARGIN_M from the desk along the
-whole direct StandingReset reference: right arm to its target and right hand
-opening, each joint at 0.5 rad/s, everything else held.
+desk instead. Skip the raise when either:
+- the right wrist and hand links all start at or above the desk top, so there is
+  nothing to lift over. At a close desk, simulation showed the raise lowering the
+  fingers onto it while the direct return cleared; or
+- forward kinematics shows the right elbow, wrist and hand staying at least
+  DESK_MARGIN_M from the desk along the whole direct StandingReset reference:
+  right arm to its target and right hand opening, each joint at 0.5 rad/s,
+  everything else held.
 
 Frames are the fixed-base model's pelvis frame with neutral orientation. The
 desk is the region x >= front, z <= top, unbounded sideways, behind and below.
@@ -37,6 +41,7 @@ RIGHT_ARM_LINK_BOXES = {
     "right_hand_index_1_link": ((-0.0071, -0.009, -0.0132), (0.052, 0.0088, 0.0129)),
 }
 _CORNERS = {name: np.array(list(product(*zip(low, high)))) for name, (low, high) in RIGHT_ARM_LINK_BOXES.items()}
+_HAND_LINKS = [i for i, name in enumerate(RIGHT_ARM_LINK_BOXES) if name != "right_elbow_link"]
 
 
 def right_arm_link_boxes(robot_model):
@@ -91,11 +96,19 @@ def direct_return_desk_gap(link_boxes, state, right_arm_target, desk_top, desk_f
         t += _STEP_S
 
 
+def hand_above_desk_top(link_boxes, state, desk_top):
+    """Whether every right wrist and hand link box starts at or above the desk top."""
+    boxes = link_boxes(_finite(state["body_q_measured_motor"], 29), _finite(state["right_hand_q_measured"], 7))
+    return all(boxes[i][0][2] >= desk_top for i in _HAND_LINKS)
+
+
 def ready_waypoint(handover, state, link_boxes):
     """The profile's raised waypoint, or None when the direct path keeps the desk margin."""
     if handover.desk_top_above_pelvis_m is None:
         return handover.right_arm_waypoint
     try:
+        if hand_above_desk_top(link_boxes, state, handover.desk_top_above_pelvis_m):
+            return None
         gap = direct_return_desk_gap(link_boxes, state, handover.right_arm_target,
                                      handover.desk_top_above_pelvis_m, handover.desk_front_from_pelvis_m)
     except (KeyError, TypeError, ValueError):
