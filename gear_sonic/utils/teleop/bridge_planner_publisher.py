@@ -27,6 +27,7 @@ class PlannerCommand:
     upper_body_velocity: Sequence[float]
     left_hand_position: Sequence[float] | None = None
     right_hand_position: Sequence[float] | None = None
+    upper_body_tau: Sequence[float] | None = None
 
     def encode(self) -> bytes:
         try:
@@ -40,6 +41,7 @@ class PlannerCommand:
                 upper_body_velocity=self.upper_body_velocity,
                 left_hand_position=self.left_hand_position,
                 right_hand_position=self.right_hand_position,
+                upper_body_tau=self.upper_body_tau,
             )
         except (TypeError, ValueError, OverflowError, struct.error) as exc:
             raise PlannerPreparationError(f"invalid planner command: {exc}") from exc

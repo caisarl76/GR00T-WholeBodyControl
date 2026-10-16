@@ -25,11 +25,14 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   x  -> discard active recording (legacy data exporter keyboard mode)
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from typing import Literal
+import uuid
 
 import numpy as np
 import tyro
@@ -156,6 +159,13 @@ class InferenceConfig:
     verbose_timing: bool = False
     """Whether to always print timing info (not just when loop is slow)."""
 
+    harness_endpoint: str | None = None
+    """Opt-in local IPC control endpoint; pair with harness_profile."""
+    harness_profile: str | None = None
+    """Shared validated G1 profile. Authoritative for policy settings in harness mode."""
+    harness_locomotion: bool = False
+    """Enable bounded planner skills after simulation validation."""
+
 
 def print_green(x):
     print(f"\033[92m{x}\033[0m")
@@ -203,9 +213,7 @@ def pack_latent_action_message(
         left_hand_joints = np.asarray(left_hand_joints, dtype=np.float32)
         if left_hand_joints.ndim == 1:
             if left_hand_joints.shape[0] != 7:
-                raise ValueError(
-                    f"left_hand_joints must have shape [7], got {left_hand_joints.shape}"
-                )
+                raise ValueError(f"left_hand_joints must have shape [7], got {left_hand_joints.shape}")
             left_hand_joints = left_hand_joints.reshape(1, 7)
         pose_data["left_hand_joints"] = left_hand_joints
 
@@ -213,9 +221,7 @@ def pack_latent_action_message(
         right_hand_joints = np.asarray(right_hand_joints, dtype=np.float32)
         if right_hand_joints.ndim == 1:
             if right_hand_joints.shape[0] != 7:
-                raise ValueError(
-                    f"right_hand_joints must have shape [7], got {right_hand_joints.shape}"
-                )
+                raise ValueError(f"right_hand_joints must have shape [7], got {right_hand_joints.shape}")
             right_hand_joints = right_hand_joints.reshape(1, 7)
         pose_data["right_hand_joints"] = right_hand_joints
 
@@ -267,10 +273,8 @@ def prepare_observation_from_sensors(
 
     cam_img = camera_msg["images"]["ego_view"]
 
-    # Copy index finger data to middle finger (hardware coupling)
-    state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
-    state_msg["left_hand_q"][6] = state_msg["left_hand_q"][4]
-
+    # Training's data exporter uses all measured hand joints unchanged.
+    # Preserve those measurements here, including independently measured fingers.
     qpos = robot_model.get_configuration_from_actuated_joints(
         body_actuated_joint_values=state_msg["body_q"],
         left_hand_actuated_joint_values=state_msg["left_hand_q"],
@@ -300,9 +304,9 @@ def prepare_observation_from_sensors(
     base_quat = np.asarray(state_msg["base_quat"], dtype=np.float64)
     assert base_quat.shape == (4,), "base_quat must have shape (4,)"
     projected_gravity = compute_projected_gravity(base_quat)
-    observation["state"]["projected_gravity"] = np.asarray(
-        projected_gravity, dtype=np.float32
-    )[np.newaxis, np.newaxis]
+    observation["state"]["projected_gravity"] = np.asarray(projected_gravity, dtype=np.float32)[
+        np.newaxis, np.newaxis
+    ]
 
     return observation
 
@@ -345,6 +349,8 @@ def _inference_worker_loop(
     busy_event: threading.Event,
     prepare_obs_fn,
     inference_fn,
+    close_fn=None,
+    report_failures=False,
 ):
     """Persistent worker thread for async inference."""
     while not stop_event.is_set():
@@ -359,12 +365,17 @@ def _inference_worker_loop(
                 inference_start_time = time.monotonic()
                 observation = prepare_obs_fn()
                 if observation is None:
+                    if report_failures:
+                        raise ValueError("Policy observation unavailable")
                     print("[DEBUG] Worker thread: Observation is None, skipping", flush=True)
                     continue
 
+                if isinstance(observation, dict):
+                    inference_start_time = observation.pop("_harness_captured_at", inference_start_time)
+
                 processed_action = inference_fn(observation)
 
-                if processed_action is not None:
+                if processed_action is not None or report_failures:
                     try:
                         result_queue.put_nowait((processed_action, inference_start_time, epoch))
                     except queue.Full:
@@ -373,6 +384,15 @@ def _inference_worker_loop(
                             result_queue.put_nowait((processed_action, inference_start_time, epoch))
                         except queue.Empty:
                             result_queue.put_nowait((processed_action, inference_start_time, epoch))
+            except Exception:
+                if report_failures:
+                    try:
+                        result_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    result_queue.put_nowait((None, inference_start_time, epoch))
+                else:
+                    raise
             finally:
                 busy_event.clear()
         except Exception as e:
@@ -380,6 +400,9 @@ def _inference_worker_loop(
             import traceback
 
             traceback.print_exc()
+
+    if close_fn is not None:
+        close_fn()
 
 
 # ---------------------------------------------------------------------------
@@ -397,48 +420,92 @@ def _compute_closed_hand_joints(side: str) -> np.ndarray:
 def main(config: InferenceConfig):
     pause_loop = True
 
+    harness_enabled = config.harness_endpoint is not None
+    if harness_enabled != (config.harness_profile is not None):
+        raise ValueError("harness_endpoint and harness_profile must be supplied together")
+    harness_control = None
+    harness_rpc = None
+    snapshots = None
+    harness_planner_command = None
+    policy_ready = False
+    prewarm_epoch = None
+    prewarm_started = None
+    cached_capture_time = 0.0
+    if harness_enabled:
+        from gear_sonic.utils.inference.harness_control import HarnessControl, RuntimeFacts, validate_native_action
+        from gear_sonic.utils.inference.harness_profile import load_profile
+        from gear_sonic.utils.inference.harness_rpc import HarnessRPCServer
+        from gear_sonic.utils.inference.observation_snapshot import ObservationSnapshotCache
+
+        profile = load_profile(Path(config.harness_profile))
+        config.host, config.port = profile.policy_host, profile.policy_port
+        config.embodiment_tag = profile.embodiment
+        config.action_horizon, config.action_publish_rate = profile.action_horizon, profile.publish_rate
+        config.prompt = next(iter(profile.skills.values())).prompt
+
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
+    ready_link_boxes = ready_pelvis_height = None
+    if harness_enabled and profile.handover is not None and profile.handover.desk_top_above_floor_m is not None:
+        from gear_sonic.utils.inference.ready_clearance import (
+            pelvis_height_estimator,
+            ready_decision,
+            right_arm_link_boxes,
+        )
+
+        # Own instance: forward kinematics overwrites the cache robot_model shares with inference.
+        clearance_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
+        ready_link_boxes = right_arm_link_boxes(clearance_model)
+        ready_pelvis_height = pelvis_height_estimator(clearance_model)
+    ready_yaw_tau = None
+    if harness_enabled and profile.handover is not None and profile.handover.ready_gravity_feedforward:
+        from gear_sonic.utils.inference.ready_feedforward import right_yaw_gravity_tau
+
+        ready_yaw_tau = right_yaw_gravity_tau(instantiate_g1_robot_model(waist_location="lower_and_upper_body"))
 
     # Isaac-GR00T PolicyClient
     from gr00t.policy.server_client import PolicyClient
 
-    n1_policy = PolicyClient(host=config.host, port=config.port)
+    n1_policy = None if harness_enabled else PolicyClient(host=config.host, port=config.port)
 
     print(f"Connecting to PolicyServer at {config.host}:{config.port}...")
-    if n1_policy.ping():
+    if harness_enabled:
+        print("Harness policy connects and prewarms on its inference worker; outputs stay paused.")
+    elif n1_policy.ping():
         print_green("PolicyServer is reachable.")
     else:
         print("WARNING: PolicyServer not reachable. Inference will fail until server is up.")
 
-    state_subscriber = ZMQStateSubscriber(
-        host=config.state_zmq_host,
-        port=config.state_zmq_port,
+    state_subscriber = (
+        None
+        if harness_enabled
+        else ZMQStateSubscriber(
+            host=config.state_zmq_host,
+            port=config.state_zmq_port,
+        )
     )
     # Separate socket: the inference worker owns state_subscriber's reads.
-    reset_state_subscriber = ZMQStateSubscriber(
-        host=config.state_zmq_host, port=config.state_zmq_port
-    )
+    reset_state_subscriber = ZMQStateSubscriber(host=config.state_zmq_host, port=config.state_zmq_port)
     reset_feedback = None
+    reset_feedback_index = None
     reset_feedback_time = float("-inf")
     standing_reset = None
+    feedforward_reset = None  # The ready return that carries ready_yaw_tau, while it is standing_reset.
     manual_planner = None
 
-    camera_subscriber = ComposedCameraClientSensor(
-        server_ip=config.camera_host, port=config.camera_port
+    camera_subscriber = (
+        None
+        if harness_enabled
+        else ComposedCameraClientSensor(server_ip=config.camera_host, port=config.camera_port)
     )
 
     zmq_context = zmq.Context()
     zmq_socket = zmq_context.socket(zmq.PUB)
     zmq_socket.bind(f"tcp://{config.action_zmq_host}:{config.action_zmq_port}")
     time.sleep(0.1)
-    print_green(
-        f"ZMQ action socket bound to tcp://{config.action_zmq_host}:{config.action_zmq_port}"
-    )
+    print_green(f"ZMQ action socket bound to tcp://{config.action_zmq_host}:{config.action_zmq_port}")
     print_green(f"Using embodiment tag: {config.embodiment_tag}")
 
-    keyboard_listener = ZMQKeyboardSubscriber(
-        port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
-    )
+    keyboard_listener = ZMQKeyboardSubscriber(port=config.keyboard_zmq_port, host=config.keyboard_zmq_host)
 
     telemetry = Telemetry(window_size=100)
 
@@ -622,14 +689,10 @@ def main(config: InferenceConfig):
             print("Cannot initialize: waiting for POSE feedback. Retry 'i' after the mode switch settles.")
             return False
         left_hand = (
-            _compute_closed_hand_joints("L")
-            if initial_pose_left_hand_closed
-            else np.zeros(7, dtype=np.float32)
+            _compute_closed_hand_joints("L") if initial_pose_left_hand_closed else np.zeros(7, dtype=np.float32)
         )
         right_hand = (
-            _compute_closed_hand_joints("R")
-            if initial_pose_right_hand_closed
-            else np.zeros(7, dtype=np.float32)
+            _compute_closed_hand_joints("R") if initial_pose_right_hand_closed else np.zeros(7, dtype=np.float32)
         )
         try:
             reset = StandingReset(reset_feedback, left_hand, right_hand)
@@ -663,8 +726,9 @@ def main(config: InferenceConfig):
         try:
             message = planner_command_in_reference_frame(command, reset_feedback).encode()
         except ValueError:
-            return
+            return False
         zmq_socket.send(message)
+        return True
 
     def send_cpp_control_command(start: bool, planner: bool = False):
         """Send C++ control loop start/stop commands via ZMQ."""
@@ -672,7 +736,8 @@ def main(config: InferenceConfig):
         try:
             cmd_msg = build_command_message(start=start, stop=not start, planner=planner)
             zmq_socket.send(cmd_msg)
-            time.sleep(0.01)
+            if not harness_enabled:
+                time.sleep(0.01)
             action_str = "start" if start else "stop"
             mode_str = "planner" if planner else "pose"
             cpp_loop_running = start
@@ -713,6 +778,7 @@ def main(config: InferenceConfig):
                     pending.get_nowait()
                 except queue.Empty:
                     break
+        return inference_epoch
 
     def check_keyboard_input():
         nonlocal pause_loop, cpp_loop_running, cpp_mode, initial_pose_ready
@@ -725,8 +791,19 @@ def main(config: InferenceConfig):
         if key is None:
             return
 
+        if harness_control is not None and (
+            key.startswith(PROMPT_MSG_PREFIX)
+            or key in {"i", "m", "p", "k", "[", "]"}
+            or (manual_planner is not None and key in {"w", "s", "a", "d", "q", "e", "z"})
+        ):
+            was_owned = harness_control.owner is not None
+            harness_control.operator_override(key)
+            if key == "p" and was_owned:
+                print("Agent ownership revoked; policy remains paused.")
+                return
+
         if key.startswith(PROMPT_MSG_PREFIX):
-            new_prompt = key[len(PROMPT_MSG_PREFIX):]
+            new_prompt = key[len(PROMPT_MSG_PREFIX) :]
             if new_prompt:
                 old_prompt = language_prompt_ref[0]
                 language_prompt_ref[0] = new_prompt
@@ -843,6 +920,9 @@ def main(config: InferenceConfig):
             active = manual_planner.active_key
             print_green(f"Manual movement: {active or 'STOPPED'} (same key or z stops)")
         elif key == "p":
+            if harness_enabled and not policy_ready and pause_loop:
+                print("Policy prewarm not ready; keep policy paused.")
+                return
             if manual_planner is not None:
                 print("Policy stays paused during manual repositioning - press 'm' to exit first")
                 return
@@ -950,15 +1030,10 @@ def main(config: InferenceConfig):
             print("Stopped C++ control loop after standing ramp")
         elif key == "[":
             initial_pose_left_hand_closed = not initial_pose_left_hand_closed
-            print(
-                f"Initial pose left hand: {'closed' if initial_pose_left_hand_closed else 'open'}"
-            )
+            print(f"Initial pose left hand: {'closed' if initial_pose_left_hand_closed else 'open'}")
         elif key == "]":
             initial_pose_right_hand_closed = not initial_pose_right_hand_closed
-            print(
-                f"Initial pose right hand: "
-                f"{'closed' if initial_pose_right_hand_closed else 'open'}"
-            )
+            print(f"Initial pose right hand: {'closed' if initial_pose_right_hand_closed else 'open'}")
 
     # Mutable prompt container (single-writer from keyboard, single-reader from inference)
     language_prompt_ref: list[str] = [config.prompt]
@@ -969,6 +1044,165 @@ def main(config: InferenceConfig):
     inference_stop_event = threading.Event()
     inference_busy_event = threading.Event()
 
+    worker_sensors = {}
+
+    def prepare_worker_observation():
+        if not harness_enabled:
+            return prepare_observation_from_sensors(
+                camera_subscriber, state_subscriber, robot_model, language_prompt_ref[0], True
+            )
+        if not worker_sensors:
+            worker_sensors["state"] = ZMQStateSubscriber(host=config.state_zmq_host, port=config.state_zmq_port)
+            worker_sensors["policy"] = PolicyClient(
+                host=config.host, port=config.port, timeout_ms=int(profile.limits.prewarm_deadline_s * 1000)
+            )
+        state_msg = worker_sensors["state"].get_msg()
+        now = time.monotonic()
+        camera_snapshot = snapshots.latest_camera(now)
+        if camera_snapshot is None or state_msg is None or not harness_control._fresh(now):
+            return None
+        camera_msg, captured = camera_snapshot
+        observation = prepare_observation_from_sensors(
+            SimpleNamespace(read=lambda: camera_msg),
+            SimpleNamespace(get_msg=lambda: state_msg),
+            robot_model,
+            language_prompt_ref[0],
+            True,
+        )
+        if observation is not None:
+            observation["_harness_captured_at"] = captured
+        return observation
+
+    def close_worker_sensors():
+        for sensor in worker_sensors.values():
+            close = getattr(sensor, "close", None) or getattr(sensor, "close_client", None)
+            if close:
+                close()
+
+    if harness_enabled:
+
+        class LoopHooks:
+            def runtime_facts(self):
+                operator_busy = manual_planner is not None or (
+                    standing_reset is not None
+                    and harness_control.owner is None
+                    and (
+                        reset_feedback is None
+                        or not standing_reset.is_settled(
+                            reset_feedback,
+                            profile.limits.reset_joint_tolerance_rad,
+                            profile.limits.reset_yaw_tolerance_rad,
+                        )
+                    )
+                )
+                return RuntimeFacts(
+                    cpp_loop_running,
+                    not pause_loop,
+                    policy_ready,
+                    inference_busy_event.is_set() or not inference_queue.empty(),
+                    cpp_mode,
+                    operator_busy,
+                )
+
+            def invalidate_policy_actions(self):
+                return invalidate_policy_actions()
+
+            def set_policy_prompt(self, prompt):
+                language_prompt_ref[0] = prompt
+
+            def set_policy_enabled(self, enabled):
+                nonlocal pause_loop, standing_reset, manual_planner, harness_planner_command
+                if enabled:
+                    if not cpp_loop_running or not send_cpp_control_command(start=True, planner=False):
+                        raise ValueError("Controller is not running")
+                    standing_reset, manual_planner, harness_planner_command = None, None, None
+                pause_loop = not enabled
+
+            def request_planner_hold(self, feedback, open_hands):
+                nonlocal standing_reset, manual_planner, harness_planner_command
+                reset = StandingReset(
+                    feedback,
+                    feedback.get("left_hand_q_measured", feedback.get("left_hand_q")),
+                    feedback.get("right_hand_q_measured", feedback.get("right_hand_q")),
+                )
+                standing_reset, manual_planner = None, None
+                harness_planner_command = reset.command
+                if not publish_planner_command(harness_planner_command):
+                    raise ValueError("Cannot encode measured planner hold")
+                if not cpp_loop_running or not send_cpp_control_command(start=True, planner=True):
+                    raise ValueError("Cannot activate planner hold")
+
+            def begin_standing_reset(self, feedback, open_hands):
+                nonlocal standing_reset, manual_planner, harness_planner_command
+                left = (
+                    np.zeros(7)
+                    if open_hands
+                    else feedback.get("left_hand_q_measured", feedback.get("left_hand_q"))
+                )
+                right = (
+                    np.zeros(7)
+                    if open_hands
+                    else feedback.get("right_hand_q_measured", feedback.get("right_hand_q"))
+                )
+                reset = StandingReset(
+                    feedback, left, right, compensate_tracking_bias=True,
+                    joint_tolerance_rad=harness_control.profile.limits.reset_joint_tolerance_rad,
+                )
+                if not publish_planner_command(reset.command):
+                    raise ValueError("Cannot encode standing reset")
+                if not cpp_loop_running or not send_cpp_control_command(start=True, planner=True):
+                    raise ValueError("Cannot activate planner")
+                standing_reset, manual_planner, harness_planner_command = reset, None, None
+                return reset
+
+            def set_planner_command(self, command):
+                nonlocal harness_planner_command, standing_reset
+                planner_command_in_reference_frame(command, reset_feedback).encode()
+                harness_planner_command, standing_reset = command, None
+
+            def begin_ready_reset(self, feedback, right_arm_target, right_arm_waypoint):
+                nonlocal standing_reset, manual_planner, harness_planner_command, feedforward_reset
+                if ready_link_boxes is not None:
+                    right_arm_waypoint, reason = ready_decision(
+                        harness_control.profile.handover, feedback, ready_link_boxes, ready_pelvis_height)
+                    print(f"[harness] ready return: {'direct' if right_arm_waypoint is None else 'raise first'}"
+                          f" ({reason})", flush=True)
+                reset = StandingReset(
+                    feedback, feedback["left_hand_q_measured"], np.zeros(7),
+                    right_arm_target=right_arm_target, compensate_tracking_bias=True,
+                    right_arm_waypoint=right_arm_waypoint,
+                    joint_tolerance_rad=harness_control.profile.limits.reset_joint_tolerance_rad,
+                    yaw_tolerance_rad=harness_control.profile.limits.reset_yaw_tolerance_rad,
+                    settle_dwell_s=harness_control.profile.limits.settle_dwell_s,
+                )
+                if not publish_planner_command(reset.command):
+                    raise ValueError("Cannot encode ready reset")
+                if not cpp_loop_running or not send_cpp_control_command(start=True, planner=True):
+                    raise ValueError("Cannot activate ready planner")
+                standing_reset, manual_planner, harness_planner_command = reset, None, None
+                feedforward_reset = reset if ready_yaw_tau is not None else None
+                return reset
+
+            def stop_planner_motion(self):
+                nonlocal harness_planner_command, standing_reset, manual_planner
+                command = harness_planner_command
+                if command is None and standing_reset is not None:
+                    command = standing_reset.command
+                if command is not None:
+                    harness_planner_command = replace(command, mode=0, movement=(0.0, 0.0, 0.0), speed=0.0)
+                standing_reset, manual_planner = None, None
+
+        harness_control = HarnessControl(Path(config.harness_profile), LoopHooks(), uuid.uuid4().hex)
+        harness_control.locomotion_enabled = config.harness_locomotion
+        snapshots = ObservationSnapshotCache(
+            lambda: ComposedCameraClientSensor(server_ip=config.camera_host, port=config.camera_port),
+            "ego_view",
+            profile.limits.camera_max_age_s,
+        )
+        harness_rpc = HarnessRPCServer(config.harness_endpoint, snapshots)
+        snapshots.start()
+        harness_rpc.start()
+
     inference_worker_thread = threading.Thread(
         target=_inference_worker_loop,
         args=(
@@ -976,19 +1210,15 @@ def main(config: InferenceConfig):
             result_queue,
             inference_stop_event,
             inference_busy_event,
-            lambda: prepare_observation_from_sensors(
-                camera_subscriber=camera_subscriber,
-                state_subscriber=state_subscriber,
-                robot_model=robot_model,
-                language_prompt=language_prompt_ref[0],
-                log_errors=True,
-            ),
+            prepare_worker_observation,
             lambda obs: run_policy_inference_and_process(
-                policy=n1_policy,
+                policy=worker_sensors["policy"] if harness_enabled else n1_policy,
                 observation=obs,
                 robot_model=robot_model,
             ),
+            close_worker_sensors,
         ),
+        kwargs={"report_failures": harness_enabled},
         daemon=True,
     )
     inference_worker_thread.start()
@@ -999,16 +1229,77 @@ def main(config: InferenceConfig):
             t_start = time.monotonic()
             feedback = reset_state_subscriber.get_msg()
             if feedback is not None:
-                reset_feedback = feedback
-                reset_feedback_time = t_start
+                if not harness_enabled or reset_feedback is None or feedback.get("index") != reset_feedback_index:
+                    reset_feedback = feedback
+                    reset_feedback_index = feedback.get("index")
+                    reset_feedback_time = t_start
             check_keyboard_input()
+
+            if harness_control is not None:
+                harness_control.tick(t_start, reset_feedback, reset_feedback_time)
+                harness_rpc.drain(harness_control, t_start)
+                if pause_loop:
+                    try:
+                        warm_action, _, warm_epoch = result_queue.get_nowait()
+                        if prewarm_epoch is not None and warm_epoch == prewarm_epoch:
+                            policy_ready = (
+                                validate_native_action(warm_action)
+                                and time.monotonic() - prewarm_started <= profile.limits.prewarm_deadline_s
+                            )
+                            prewarm_epoch = None
+                    except queue.Empty:
+                        pass
+                    if (
+                        not policy_ready
+                        and not inference_busy_event.is_set()
+                        and inference_queue.empty()
+                        and harness_control.observation is not None
+                        and harness_control._fresh(t_start)
+                    ):
+                        if prewarm_started is None:
+                            prewarm_started = t_start
+                        if t_start - prewarm_started <= profile.limits.prewarm_deadline_s:
+                            prewarm_epoch = inference_epoch
+                            inference_queue.put_nowait(prewarm_epoch)
 
             if standing_reset is not None and cpp_loop_running and cpp_mode == "PLANNER":
                 fresh_feedback = reset_feedback if t_start - reset_feedback_time <= 0.5 else None
-                command = standing_reset.advance(fresh_feedback, t_start - last_reset_tick)
+                if (
+                    harness_control is not None
+                    and harness_control.owner is not None
+                    and (harness_control.phase != "RESETTING" or not harness_control.hold_confirmed)
+                ):
+                    fresh_feedback = None
+                try:
+                    command = standing_reset.advance(fresh_feedback, t_start - last_reset_tick)
+                except ValueError as error:
+                    if harness_control is not None and harness_control.owner is not None:
+                        harness_control.interrupt("reset_reference_lead_exceeded", t_start)
+                    else:
+                        pause_loop = True
+                        invalidate_policy_actions()
+                        try:
+                            hold = StandingReset(
+                                reset_feedback,
+                                reset_feedback.get("left_hand_q_measured", reset_feedback.get("left_hand_q")),
+                                reset_feedback.get("right_hand_q_measured", reset_feedback.get("right_hand_q")),
+                            ).command
+                        except (TypeError, ValueError):
+                            hold = standing_reset.command
+                        standing_reset, manual_planner, harness_planner_command = None, None, hold
+                        publish_planner_command(hold)
+                    print(f"Standing reset interrupted: {error}")
+                    last_reset_tick = t_start
+                    _sleep_remaining(t_start, loop_period)
+                    continue
                 if manual_planner is not None:
                     command = manual_planner.command(command, fresh_heading())
+                if standing_reset is feedforward_reset and fresh_feedback is not None:
+                    # Stale feedback sends none; the deploy then applies zero.
+                    command = replace(command, upper_body_tau=ready_yaw_tau(fresh_feedback))
                 publish_planner_command(command)
+            elif harness_planner_command is not None and cpp_loop_running and cpp_mode == "PLANNER":
+                publish_planner_command(harness_planner_command)
             last_reset_tick = t_start
 
             if pause_loop:
@@ -1034,15 +1325,38 @@ def main(config: InferenceConfig):
                     # A request already in flight during pause/reset cannot be reused.
                     _sleep_remaining(t_start, loop_period)
                     continue
+                if (
+                    harness_control is not None
+                    and harness_control.owner is not None
+                    and not harness_control.accept_policy_result(
+                        result_epoch, inference_start_time, processed_action, time.monotonic()
+                    )
+                ):
+                    _sleep_remaining(t_start, loop_period)
+                    continue
+                if harness_enabled and (
+                    processed_action is None
+                    or not validate_native_action(processed_action)
+                    or not 0
+                    <= time.monotonic() - inference_start_time
+                    < config.action_horizon / config.action_publish_rate
+                ):
+                    harness_control.interrupt("invalid_or_failed_policy_result", time.monotonic())
+                    _sleep_remaining(t_start, loop_period)
+                    continue
                 inference_delay = time.monotonic() - inference_start_time
                 action_chunk_index = calculate_latency_compensated_index(
                     inference_delay, config.action_publish_rate, config.action_horizon
                 )
                 cached_action_chunk = processed_action
-                last_inference_time = time.monotonic()
+                cached_capture_time = inference_start_time
+                # Harness chunks expire from observation capture, so start the
+                # next query on that cadence too. Waiting a full interval after
+                # acceptance needlessly spends the preceding query's latency
+                # a second time and can exhaust otherwise fresh chunks.
+                last_inference_time = inference_start_time if harness_enabled else time.monotonic()
                 print_green(
-                    f'New action chunk (prompt: "{language_prompt_ref[0]}", '
-                    f"latency: {inference_delay:.3f}s)"
+                    f'New action chunk (prompt: "{language_prompt_ref[0]}", latency: {inference_delay:.3f}s)'
                 )
             except queue.Empty:
                 pass
@@ -1056,6 +1370,15 @@ def main(config: InferenceConfig):
             )
 
             if should_start:
+                if harness_enabled and (
+                    not harness_control._fresh(time.monotonic())
+                    or harness_control.observation is None
+                    or time.monotonic() - harness_control.observation["received_at"]
+                    > profile.limits.camera_max_age_s
+                ):
+                    harness_control.interrupt("stale_policy_observation", time.monotonic())
+                    _sleep_remaining(t_start, loop_period)
+                    continue
                 try:
                     inference_queue.put_nowait(inference_epoch)
                 except queue.Full:
@@ -1072,6 +1395,14 @@ def main(config: InferenceConfig):
                 if processed_action is None or not processed_action:
                     print("[DEBUG] processed_action is None or empty, skipping", flush=True)
                 else:
+                    if harness_enabled and (
+                        action_chunk_index >= config.action_horizon
+                        or time.monotonic() - cached_capture_time
+                        >= config.action_horizon / config.action_publish_rate
+                    ):
+                        harness_control.interrupt("action_chunk_exhausted", time.monotonic())
+                        _sleep_remaining(t_start, loop_period)
+                        continue
                     motion_token = np.asarray(
                         get_action_field(processed_action, "motion_token"),
                         dtype=np.float32,
@@ -1124,21 +1455,21 @@ def main(config: InferenceConfig):
                     last_sent_motion_token = motion_token.copy()
                     if zmq_frame_counter % 50 == 0:
                         print_green(
-                            f"ZMQ: Sent latent action - "
-                            f"frame: {frame_index[0]}, "
-                            f"token shape: {motion_token.shape}"
+                            f"ZMQ: Sent latent action - frame: {frame_index[0]}, token shape: {motion_token.shape}"
                         )
 
-                action_chunk_index = min(action_chunk_index + 1, config.action_horizon - 1)
+                action_chunk_index = (
+                    action_chunk_index + 1
+                    if harness_enabled
+                    else min(action_chunk_index + 1, config.action_horizon - 1)
+                )
 
             end_time = time.monotonic()
 
             if config.verbose_timing:
                 telemetry.log_timing_info(context="VLA Inference Loop", threshold=0.0)
             elif (end_time - t_start) > (1 / config.rate):
-                telemetry.log_timing_info(
-                    context="VLA Inference Loop Missed", threshold=0.001
-                )
+                telemetry.log_timing_info(context="VLA Inference Loop Missed", threshold=0.001)
 
             _sleep_remaining(t_start, loop_period)
 
@@ -1148,9 +1479,14 @@ def main(config: InferenceConfig):
     finally:
         inference_stop_event.set()
         inference_worker_thread.join(timeout=1.0)
+        if harness_rpc is not None:
+            harness_rpc.close()
+        if snapshots is not None:
+            snapshots.close()
         zmq_socket.close()
         zmq_context.term()
-        state_subscriber.close()
+        if state_subscriber is not None:
+            state_subscriber.close()
         reset_state_subscriber.close()
         keyboard_listener.close()
         print("Shutdown complete.")

@@ -126,6 +126,30 @@ just run g1_deploy_onnx_ref lo policy/release/model_decoder.onnx reference/examp
 
 ## Logging (Details)
 
+### Planner memory trace (loopback simulation)
+
+`--planner-trace-file <path>` enables a bounded diagnostic for the planner and
+control boundary. It requires DDS interface `lo`, `--disable-crc-check`,
+`--input-type zmq_manager` and `--planner-file`. The parent directory must exist;
+the output and its `.partial` file must be new. It is disabled by default.
+
+The controller allocates fixed buffers before starting its threads. During the
+trial it copies effective facing/context, generated and blended root trajectories,
+active frame/heading correction, measured pose, motor targets and host timestamps.
+It retains up to 512 plans, 512 merges and 8192 control samples; metadata reports
+overflow. Quaternion arrays use `w,x,y,z`. `observation_window_frames` is the
+encoder lookahead window span, while `frame` identifies the active root frame.
+The encoder also observes later frames. Initialization phase timings are null.
+
+After the trial, the existing `O/o` operator stop lets main freeze the buffers and
+write JSONL, close it and rename the `.partial` file to the requested path. Killing
+the process directly with SIGTERM does not flush the trace. State publication
+timestamps are separate from the 500 Hz DDS motor writer, and the movement-buffer
+timestamp is a local update identity rather than a sender sequence number.
+This option changes observability; command generation and safety limits remain
+the same. Memory copying adds some overhead, so compare timings before making
+causal claims about controller behavior.
+
 The system provides multiple logging capabilities for debugging, analysis, and replay.
 
 ### Motion Logging
