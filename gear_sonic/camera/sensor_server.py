@@ -114,12 +114,18 @@ class ImageMessageSchema:
 
     timestamps: dict[str, float]
     images: dict[str, np.ndarray]
+    intrinsics: dict[str, dict] = field(default_factory=dict)
 
     def serialize(self) -> dict[str, Any]:
         serialized_msg: dict[str, Any] = {"timestamps": self.timestamps, "images": {}}
+        if self.intrinsics:
+            serialized_msg["intrinsics"] = self.intrinsics
         for key, image in self.images.items():
             if isinstance(image, bytes | bytearray):
                 serialized_msg["images"][key] = image
+            elif isinstance(image, np.ndarray) and image.dtype == np.uint16:
+                # Depth (z16) must stay lossless: msgpack-numpy dict, not JPEG.
+                serialized_msg["images"][key] = m.encode(image)
             else:
                 serialized_msg["images"][key] = ImageUtils.encode_image(image)
         return serialized_msg
@@ -140,7 +146,9 @@ class ImageMessageSchema:
                 images[key] = m.decode(value)
             else:
                 images[key] = value
-        return ImageMessageSchema(timestamps=timestamps, images=images)
+        return ImageMessageSchema(
+            timestamps=timestamps, images=images, intrinsics=data.get("intrinsics", {})
+        )
 
     def asdict(self) -> dict[str, Any]:
         return {"timestamps": self.timestamps, "images": self.images}

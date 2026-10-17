@@ -464,10 +464,14 @@ class ComposedCameraSensor(Sensor, SensorServer):
         """Merge per-camera data into a single ImageMessageSchema."""
         all_timestamps = {}
         all_images = {}
+        all_intrinsics = {}
         for _mount, camera_data in message.items():
             all_timestamps.update(camera_data.get("timestamps", {}))
             all_images.update(camera_data.get("images", {}))
-        img_schema = ImageMessageSchema(timestamps=all_timestamps, images=all_images)
+            all_intrinsics.update(camera_data.get("intrinsics", {}))
+        img_schema = ImageMessageSchema(
+            timestamps=all_timestamps, images=all_images, intrinsics=all_intrinsics
+        )
         return img_schema.serialize()
 
     def run_server(self):
