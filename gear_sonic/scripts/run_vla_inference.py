@@ -1310,6 +1310,8 @@ def main(config: InferenceConfig):
                     and initial_pose_ready
                     and standing_reset is None
                     and manual_planner is None
+                    # A harness hold owns the planner; its measured targets must not be replaced.
+                    and harness_planner_command is None
                 ):
                     now = time.monotonic()
                     if now - last_calib_full_hold_time >= 0.2:

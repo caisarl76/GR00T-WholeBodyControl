@@ -558,3 +558,82 @@ def test_reset_does_not_reuse_active_reference_from_before_pose_switch(monkeypat
     assert unpack_bridge_message(messages[-2], topic="command")["planner"][0] == 0
     assert messages[-1].startswith(b"pose")
     assert "waiting for POSE feedback" in capsys.readouterr().out
+
+
+def test_calib_full_refresh_never_replaces_the_harness_hold(monkeypatch, tmp_path):
+    # Default calib_full start: once the harness requests its measured hold, the paused
+    # loop must keep publishing that hold, not the open-hand calibration pose.
+    from pathlib import Path
+
+    from gear_sonic.utils.inference import harness_rpc, observation_snapshot
+
+    clock, instances = [0.0], []
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock[0])
+    snapshots = SimpleNamespace(start=lambda: None, close=lambda: None, latest=lambda now: dict(
+        camera_key="ego_view", source_timestamp=now, frame_id=str(now),
+        received_at=now, age_s=0.0, jpeg_rgb_b64="unused",
+    ))
+    monkeypatch.setattr(observation_snapshot, "ObservationSnapshotCache", lambda *args: snapshots)
+
+    class RPC:
+        def __init__(self, *args):
+            self.count, self.responses, self.claimed_at = 0, [], None
+            instances.append(self)
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+        def drain(self, control, now):
+            control.observation = snapshots.latest(now)
+            self.count += 1
+            # Claim after the operator prepared calib_full ('i'), as on the robot.
+            if self.count < 20:
+                return
+            if control.owner is None and not self.responses or control.owner is None and self.responses[-1]["error"]:
+                self.responses.append(control.dispatch(dict(
+                    version=1, request_id=f"claim{self.count}", runtime_id=control.runtime_id, session_id="s",
+                    lease_id=None, method="claim_control",
+                    params={"registry_sha256": control.profile.registry_sha256}), now))
+                # Messages sent before the claim, which publishes the measured hold.
+                self.claimed_at = runner.zmq.Context().socket().send.call_count
+            elif control.owner is not None:
+                control.dispatch(dict(
+                    version=1, request_id=f"hb{self.count}", runtime_id=control.runtime_id, session_id="s",
+                    lease_id=control.owner["lease_id"] if control.owner else None, method="heartbeat",
+                    params={"sequence": self.count}), now)
+
+    monkeypatch.setattr(harness_rpc, "HarnessRPCServer", RPC)
+    held = np.full(7, 0.4)
+    measured = dict(index=0, body_q=np.zeros(29), body_q_measured_motor=np.zeros(29),
+                    harness_planner_hold_enabled=[1], left_hand_q=held, right_hand_q=held,
+                    left_hand_q_measured=held, right_hand_q_measured=held, base_quat=[1, 0, 0, 0])
+
+    def on_key(index, args):
+        clock[0] = (index + 1) * .02
+        measured["index"] += 1
+
+    # A verified handover claim requests the measured planner hold.
+    import yaml
+    from test_handover_ready import NAMES, RAISED, TARGET
+
+    data = yaml.safe_load((Path(__file__).parent / "fixtures/g1_profile.yaml").read_text())
+    data["skills"] = {"bottle_handover": dict(prompt="test-only handover",
+        completion_criteria="Stable offer", completion_action="hold")}
+    data["handover"] = dict(skill_id="bottle_handover", checkpoint_verified=True, ready_pose_reviewed=True,
+        ready_right_arm_joints=dict(zip(NAMES, TARGET)), raised_right_arm_joints=dict(zip(NAMES, RAISED)))
+    profile = tmp_path / "handover.yaml"
+    profile.write_text(yaml.safe_dump(data))
+    messages = run_keys(
+        monkeypatch, ["k", "i"] + [None] * 158, measured, on_key,
+        runner.InferenceConfig(harness_endpoint="ipc:///tmp/unused-test.sock", harness_profile=str(profile)),
+    )
+    rpc = instances[0]
+    assert rpc.responses and rpc.responses[-1]["error"] is None, rpc.responses[-1]
+    after = [unpack_bridge_message(raw, topic="planner") for raw in messages[rpc.claimed_at:]
+             if raw.startswith(b"planner")]
+    assert len(after) > 20
+    assert all(np.allclose(m["right_hand_joints"], 0.4) and np.allclose(m["upper_body_position"], 0.0)
+               for m in after), "calibration pose replaced the measured harness hold"
