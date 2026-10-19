@@ -133,7 +133,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 4. In Terminal 2 (C++ deployment), press **`]`** to start the control system.
 5. In the MuJoCo window (sim only), press **`9`** to drop the robot to the ground.
 6. Back in Terminal 2, press **`ENTER`** to enable ZMQ streaming. The terminal prints `ZMQ STREAMING MODE: ENABLED`. The robot begins tracking your PICO poses in real time.
-7. Move your body — the robot mirrors your motions. Use the **Trigger** button on each PICO controller to close the corresponding robot hand.
+7. Move your body — the robot mirrors your motions. Use the index-finger **Trigger** for grasp or the middle-finger **Grip/Squeeze** for thumb–middle pinch on the corresponding Dex3 hand.
 8. To **pause** streaming (e.g., to reposition yourself), press **`ENTER`** again. The terminal prints `ZMQ STREAMING MODE: DISABLED`. The robot holds its last pose and stops tracking. You can move freely without affecting the robot.
 9. To **resume**, press **`ENTER`** once more. The robot will snap to your current pose — **move back close to the robot's current pose before resuming** to avoid sudden jumps.
 10. When done, press **`O`** to stop control and exit.
@@ -152,8 +152,15 @@ In `--input-type zmq` mode, the C++ deployment side does **not** process PICO co
 | **A + B + X + Y** | Calibrate body tracking in the streamer. Press once to initialize; press again to stop streaming (emergency stop on the streamer side). |
 | **A + X** | Toggle Pose mode in the streamer — starts or stops publishing pose data. When stopped, the robot holds its last pose. **Works as pause/resume.** |
 | **Menu (hold)** | Pauses pose streaming in the streamer while held. The robot holds its last pose until you release. **Works as pause.** Move back close to the robot's current pose before releasing. |
-| **Trigger** | Hand grasp — processed by the streamer and sent as `left_hand_joints` / `right_hand_joints` in the stream. |
+| **Trigger** | Analog hand grasp — processed by the streamer and sent as `left_hand_joints` / `right_hand_joints` in the stream. |
+| **Grip/Squeeze** | Analog thumb–middle pinch on the corresponding Dex3 hand. Available in Pose and VR 3PT modes. |
 | **B + Y** | Toggle Pose mode in the streamer (same effect as A+X) — starts or stops publishing pose data. **Works as pause/resume.** |
+
+Each hand is controlled independently. The index-finger Trigger takes priority
+when pressed above `0.05` and interpolates from all-open to the closed grasp in
+proportion to its depth. Otherwise, the middle-finger Grip/Squeeze interpolates
+from all-open (`0.0`) to the calibrated pinch-ready pose (`0.2`), then to the
+closed thumb–middle pinch (`1.0`). Release Grip/Squeeze to open the hand.
 
 All mode control on the deployment side is done from the keyboard:
 

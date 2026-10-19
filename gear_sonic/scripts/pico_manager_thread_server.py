@@ -745,6 +745,83 @@ def process_smpl_joints(body_pose, global_orient, transl):
     }
 
 
+_PINCH_OPEN_GRIP = 0.2
+# Dex3 deployment motor_cmd order, shared with dex3_hands.hpp.
+DEX3_MOTOR_ORDER = (
+    "thumb0",
+    "thumb1",
+    "thumb2",
+    "middle0",
+    "middle1",
+    "index0",
+    "index1",
+)
+# Median right-hand states captured from rt/dex3/right/state.
+_RIGHT_PINCH_OPEN = np.array(
+    [
+        0.40253138542175293,
+        -0.1496349275112152,
+        -0.016162125393748283,
+        0.6290951371192932,
+        -0.03359885886311531,
+        -0.02111954055726528,
+        -0.030526945367455482,
+    ],
+    dtype=np.float64,
+)
+_RIGHT_PINCH_CLOSED = np.array(
+    [
+        0.4024966359138489,
+        -0.7084636688232422,
+        -0.01614512875676155,
+        1.4996159076690674,
+        -0.033972788602113724,
+        -0.021152639761567116,
+        -0.030526945367455482,
+    ],
+    dtype=np.float64,
+)
+# The captured closed pose leaves a ~5 mm thumb-middle gap on hardware. MuJoCo
+# gives ~97 mm/rad of closure on both thumb1 and middle0, so 0.03 rad each
+# closes ~6 mm (light squeeze). Tune here if the pads still miss or press hard.
+_PINCH_EXTRA_CLOSE_RAD = 0.03
+_RIGHT_PINCH_CLOSED_TARGET = _RIGHT_PINCH_CLOSED + _PINCH_EXTRA_CLOSE_RAD * np.array(
+    [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+)
+_DEX3_HAND_MIRROR = np.array(
+    [1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float64
+)
+
+
+def _pinch_endpoints(hand: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return hardware-calibrated open/closed pinch endpoints for one hand."""
+    hand = hand.lower()
+    if hand == "right":
+        return _RIGHT_PINCH_OPEN.copy(), _RIGHT_PINCH_CLOSED_TARGET.copy()
+    if hand == "left":
+        return (
+            _RIGHT_PINCH_OPEN * _DEX3_HAND_MIRROR,
+            _RIGHT_PINCH_CLOSED_TARGET * _DEX3_HAND_MIRROR,
+        )
+    raise ValueError("hand must be 'left' or 'right'")
+
+
+def compute_pinch_joints(hand: str, grip: float) -> np.ndarray:
+    """Map Grip/Squeeze to ALL_OPEN -> PINCH_OPEN -> PINCH_CLOSED."""
+    grip = float(grip)
+    if not np.isfinite(grip):
+        grip = 0.0
+    grip = float(np.clip(grip, 0.0, 1.0))
+
+    pinch_open, pinch_closed = _pinch_endpoints(hand)
+    if grip <= _PINCH_OPEN_GRIP:
+        alpha = grip / _PINCH_OPEN_GRIP
+        return alpha * pinch_open
+
+    alpha = (grip - _PINCH_OPEN_GRIP) / (1.0 - _PINCH_OPEN_GRIP)
+    return pinch_open + alpha * (pinch_closed - pinch_open)
+
+
 def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     """
     Generate finger position data from Pico controller button states.
@@ -763,8 +840,8 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     middle = 10
     # Control thumb based on shoulder button state (index 4 is thumb tip)
     fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+    # Middle tip at x=trigger gives the solver an analog grasp depth of trigger.
+    fingertips[4 + middle, 0, 3] = float(np.clip(trigger, 0.0, 1.0))
 
     return fingertips
 
@@ -979,15 +1056,29 @@ def get_abxy_buttons():
         return False, False, False, False
 
 
+# Matches the G1GripperInverseKinematicsSolver dead zone.
+_GRASP_TRIGGER_DEADZONE = 0.05
+
+
+def _compute_hand_joints_for_inputs(solver, hand, trigger, grip) -> np.ndarray:
+    """Analog index-trigger grasp takes priority over the middle-finger grip pinch."""
+    if trigger > _GRASP_TRIGGER_DEADZONE:
+        finger_data = generate_finger_data(hand, trigger, grip)
+        return solver({"position": finger_data})
+    return compute_pinch_joints(hand, grip)
+
+
 def compute_hand_joints_from_inputs(
     left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute left/right hand joints using IK solvers, or zeros if unavailable."""
+    """Map each hand to trigger grasp or calibrated Grip/Squeeze pinch."""
     if left_solver is not None and right_solver is not None:
-        left_finger_data = generate_finger_data("left", left_trigger, left_grip)
-        right_finger_data = generate_finger_data("right", right_trigger, right_grip)
-        left_hand_joints = left_solver({"position": left_finger_data})
-        right_hand_joints = right_solver({"position": right_finger_data})
+        left_hand_joints = _compute_hand_joints_for_inputs(
+            left_solver, "left", left_trigger, left_grip
+        )
+        right_hand_joints = _compute_hand_joints_for_inputs(
+            right_solver, "right", right_trigger, right_grip
+        )
     else:
         left_hand_joints = np.zeros((1, 7), dtype=np.float32)
         right_hand_joints = np.zeros((1, 7), dtype=np.float32)
