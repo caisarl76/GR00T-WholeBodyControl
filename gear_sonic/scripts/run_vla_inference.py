@@ -1171,6 +1171,7 @@ def main(config: InferenceConfig):
                     feedback, feedback["left_hand_q_measured"], np.zeros(7),
                     right_arm_target=right_arm_target, compensate_tracking_bias=True,
                     right_arm_waypoint=right_arm_waypoint,
+                    left_arm_target=harness_control.profile.handover.left_arm_target,
                     joint_tolerance_rad=harness_control.profile.limits.reset_joint_tolerance_rad,
                     yaw_tolerance_rad=harness_control.profile.limits.reset_yaw_tolerance_rad,
                     settle_dwell_s=harness_control.profile.limits.settle_dwell_s,

@@ -85,10 +85,19 @@ class HandoverSettings:
     # Send the right shoulder yaw's gravity torque as tau during ready returns
     # (ready_feedforward.py). Simulation-tested only; unvalidated on hardware.
     ready_gravity_feedforward: bool = False
+    # Optional left shoulder and elbow ready pose. When set, the ready return moves them
+    # there with the right arm; the left wrist is still held where it was measured.
+    ready_left_arm_joints: dict[str, float] | None = None
 
     @property
     def right_arm_target(self) -> tuple[float, ...]:
         return tuple(self.ready_right_arm_joints[name] for name in RIGHT_ARM_BOUNDS)
+
+    @property
+    def left_arm_target(self) -> tuple[float, ...] | None:
+        if self.ready_left_arm_joints is None:
+            return None
+        return tuple(self.ready_left_arm_joints[name] for name in LEFT_READY_JOINTS)
 
     @property
     def right_arm_waypoint(self) -> tuple[float, ...]:
@@ -105,6 +114,18 @@ RIGHT_ARM_BOUNDS = {
     "right_wrist_pitch_joint": (-1.61443, 1.61443),
     "right_wrist_yaw_joint": (-1.61443, 1.61443),
 }
+LEFT_ARM_BOUNDS = {
+    "left_shoulder_pitch_joint": (-3.0892, 2.6704),
+    "left_shoulder_roll_joint": (-1.5882, 2.2515),
+    "left_shoulder_yaw_joint": (-2.618, 2.618),
+    "left_elbow_joint": (-1.0472, 2.0944),
+    "left_wrist_roll_joint": (-1.97222, 1.97222),
+    "left_wrist_pitch_joint": (-1.61443, 1.61443),
+    "left_wrist_yaw_joint": (-1.61443, 1.61443),
+}
+# Left-arm joints a ready pose may set; the wrist joints are always held.
+LEFT_READY_JOINTS = {name: LEFT_ARM_BOUNDS[name] for name in (
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint")}
 
 
 @dataclass(frozen=True)
@@ -203,7 +224,7 @@ def load_profile(path: Path) -> G1Profile:
         desk = {"desk_top_above_floor_m", "desk_front_from_pelvis_m"}
         if (
             not isinstance(h, dict)
-            or not required <= h.keys() <= required | desk | {"ready_gravity_feedforward"}
+            or not required <= h.keys() <= required | desk | {"ready_gravity_feedforward", "ready_left_arm_joints"}
             or h.keys() & desk not in (set(), desk)
             or type(h.get("ready_gravity_feedforward", False)) is not bool
             or type(h["skill_id"]) is not str
@@ -213,11 +234,14 @@ def load_profile(path: Path) -> G1Profile:
             or type(h["ready_pose_reviewed"]) is not bool
         ):
             raise ValueError("Invalid handover settings")
-        for field in ("ready_right_arm_joints", "raised_right_arm_joints"):
+        arms = [("ready_right_arm_joints", RIGHT_ARM_BOUNDS), ("raised_right_arm_joints", RIGHT_ARM_BOUNDS)]
+        if "ready_left_arm_joints" in h:
+            arms.append(("ready_left_arm_joints", LEFT_READY_JOINTS))
+        for field, bounds in arms:
             joints = h[field]
-            if not isinstance(joints, dict) or joints.keys() != RIGHT_ARM_BOUNDS.keys():
-                raise ValueError(f"{field} requires seven named right-arm joints")
-            for name, (low, high) in RIGHT_ARM_BOUNDS.items():
+            if not isinstance(joints, dict) or joints.keys() != bounds.keys():
+                raise ValueError(f"{field} requires exactly: {', '.join(bounds)}")
+            for name, (low, high) in bounds.items():
                 if not finite_number(joints[name]) or not low <= joints[name] <= high:
                     raise ValueError(f"{field} outside G1 bounds: {name}")
         if desk <= h.keys() and not (

@@ -637,3 +637,70 @@ def test_calib_full_refresh_never_replaces_the_harness_hold(monkeypatch, tmp_pat
     assert len(after) > 20
     assert all(np.allclose(m["right_hand_joints"], 0.4) and np.allclose(m["upper_body_position"], 0.0)
                for m in after), "calibration pose replaced the measured harness hold"
+
+
+def test_ready_return_hook_passes_the_profile_left_arm_target(monkeypatch, tmp_path):
+    from pathlib import Path
+
+    import yaml
+    from test_handover_ready import LEFT_NAMES, LEFT_READY, NAMES, RAISED, TARGET
+
+    from gear_sonic.utils.inference import harness_rpc, observation_snapshot
+
+    clock, calls = [0.0], []
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock[0])
+    snapshots = SimpleNamespace(start=lambda: None, close=lambda: None, latest=lambda now: dict(
+        camera_key="ego_view", source_timestamp=now, frame_id=str(now), received_at=now, age_s=0.0,
+        jpeg_rgb_b64="unused"))
+    monkeypatch.setattr(observation_snapshot, "ObservationSnapshotCache", lambda *args: snapshots)
+    original = runner.StandingReset
+
+    def recorded(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "StandingReset", recorded)
+
+    class RPC:
+        def __init__(self, *args):
+            self.count, self.responses = 0, []
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+        def drain(self, control, now):
+            control.observation = snapshots.latest(now)
+            self.count += 1
+            if self.count < 20 or len(self.responses) >= 2:
+                return
+            method, params = (("claim_control", {"registry_sha256": control.profile.registry_sha256})
+                              if control.owner is None else ("reset_ready", {"execution_id": ""}))
+            self.responses.append(control.dispatch(dict(
+                version=1, request_id=f"r{self.count}", runtime_id=control.runtime_id, session_id="s",
+                lease_id=control.owner["lease_id"] if control.owner else None, method=method, params=params), now))
+
+    monkeypatch.setattr(harness_rpc, "HarnessRPCServer", RPC)
+    measured = dict(index=0, body_q=np.zeros(29), body_q_measured_motor=np.zeros(29),
+                    harness_planner_hold_enabled=[1], left_hand_q=np.zeros(7), right_hand_q=np.zeros(7),
+                    left_hand_q_measured=np.zeros(7), right_hand_q_measured=np.zeros(7), base_quat=[1, 0, 0, 0])
+
+    def on_key(index, args):
+        clock[0] = (index + 1) * .02
+        measured["index"] += 1
+
+    data = yaml.safe_load((Path(__file__).parent / "fixtures/g1_profile.yaml").read_text())
+    data["skills"] = {"bottle_handover": dict(prompt="test-only handover",
+        completion_criteria="Stable offer", completion_action="hold")}
+    data["handover"] = dict(skill_id="bottle_handover", checkpoint_verified=True, ready_pose_reviewed=True,
+        ready_right_arm_joints=dict(zip(NAMES, TARGET)), raised_right_arm_joints=dict(zip(NAMES, RAISED)),
+        ready_left_arm_joints=dict(zip(LEFT_NAMES, LEFT_READY)))
+    profile = tmp_path / "handover.yaml"
+    profile.write_text(yaml.safe_dump(data))
+    run_keys(monkeypatch, ["k", "i"] + [None] * 98, measured, on_key,
+             runner.InferenceConfig(harness_endpoint="ipc:///tmp/unused-test.sock", harness_profile=str(profile)))
+    ready = [kw for kw in calls if kw.get("right_arm_target") is not None]
+    assert ready, calls
+    assert ready[-1]["left_arm_target"] == tuple(LEFT_READY)
