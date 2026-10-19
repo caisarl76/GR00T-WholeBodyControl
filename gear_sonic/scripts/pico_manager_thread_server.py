@@ -884,7 +884,9 @@ class YawAccumulator:
         Returns:
             Facing direction as [x, y, 0.0]
         """
-        self.dyaw = self.yaw_gain * rx * dt
+        # Positive right-stick X is physically right and therefore turns
+        # clockwise in the planner's XY convention.
+        self.dyaw = -self.yaw_gain * rx * dt
         if abs(rx) >= self.deadzone:
             self.yaw_angle_rad += self.dyaw
             self.heading = [np.cos(self.yaw_angle_rad), np.sin(self.yaw_angle_rad), 0.0]
@@ -899,16 +901,16 @@ def compute_planner_movement_from_left_stick(
 ) -> list[float]:
     """Convert PICO left-stick axes into a planner movement vector.
 
-    XRoboToolkit/PICO reports stick-right as negative X and stick-forward as
-    positive Y. The planner expects a world-frame movement vector, so rotate the
-    stick-local command by the current commanded facing direction.
+    The planner expects positive X to mean right and positive Y to mean
+    forward in the local stick frame, then rotates the command by the current
+    commanded facing direction.
     """
     denom = float(np.hypot(lx, ly))
     if mag <= 0.0 or denom <= 0.0:
         return [0.0, 0.0, 0.0]
 
     scale = mag / denom
-    movement_local = np.array([-lx, ly], dtype=np.float64) * scale
+    movement_local = np.array([lx, ly], dtype=np.float64) * scale
     facing_xy = np.asarray(facing[:2], dtype=np.float64)
     facing_norm = float(np.linalg.norm(facing_xy))
     if facing_norm <= 1e-9:
