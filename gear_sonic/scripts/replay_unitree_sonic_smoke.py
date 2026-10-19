@@ -528,8 +528,8 @@ def validate_state_ack(
         "control_loop_type",
         "index",
         "token_state",
-        "left_hand_q_measured",
-        "right_hand_q_measured",
+        "left_hand_q_target",
+        "right_hand_q_target",
         "last_action",
     }
     if not required.issubset(message):
@@ -540,8 +540,8 @@ def validate_state_ack(
     arrays: dict[str, np.ndarray] = {}
     for name, shape in (
         ("token_state", (64,)),
-        ("left_hand_q_measured", (7,)),
-        ("right_hand_q_measured", (7,)),
+        ("left_hand_q_target", (7,)),
+        ("right_hand_q_target", (7,)),
         ("last_action", (29,)),
     ):
         value = np.asarray(message[name])
@@ -552,8 +552,8 @@ def validate_state_ack(
         return None
     if not (
         np.array_equal(arrays["token_state"].astype(np.float32), frame.motion_token)
-        and np.array_equal(arrays["left_hand_q_measured"].astype(np.float32), frame.left_hand)
-        and np.array_equal(arrays["right_hand_q_measured"].astype(np.float32), frame.right_hand)
+        and np.array_equal(arrays["left_hand_q_target"].astype(np.float32), frame.left_hand)
+        and np.array_equal(arrays["right_hand_q_target"].astype(np.float32), frame.right_hand)
     ):
         return None
     return int(index)

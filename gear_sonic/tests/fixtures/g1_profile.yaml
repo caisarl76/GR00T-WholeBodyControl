@@ -1,0 +1,15 @@
+schema_version: 1
+policy_host: 127.0.0.1
+policy_port: 15558
+checkpoint: /mnt/data/jihun/models/pnp_bottle_260916_n17_raw_gpu7/checkpoint-20000
+embodiment: unitree_g1_sonic
+camera_key: ego_view
+action_horizon: 40
+publish_rate: 50
+limits:
+  lease_s: 2.0
+  heartbeat_s: 0.25
+skills:
+  bottle_to_right_table:
+    prompt: pick drink bottle and place it on the right table
+    completion_criteria: The drink bottle is visibly resting on the right table and the robot has released it. Occlusion or a bottle still held in the hand does not establish completion.

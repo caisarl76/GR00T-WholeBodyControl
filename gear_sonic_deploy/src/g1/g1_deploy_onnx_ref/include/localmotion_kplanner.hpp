@@ -36,6 +36,7 @@
 #include <cmath>
 #include <algorithm>
 #include <mutex>
+#include <cstdint>
 #include <atomic>
 #include <optional>
 
@@ -282,6 +283,9 @@ public:
     MotionSequence planner_motion_50hz_;
     int gen_frame_;
     bool motion_available_ = false;
+    // Diagnostic identity, published with the trajectory under the same mutex.
+    std::uint64_t diagnostic_generation_ = 0;
+    int diagnostic_generation_frame_ = 0;
     uint64_t motion_generation_ = 0;  // Guarded by planner_motion_mutex_.
     uint64_t inference_generation_ = 0;  // Owned by the single planner thread.
 
@@ -534,6 +538,8 @@ public:
         {
             planner_motion_50hz_.JointVelocities(planner_motion_50hz_.timesteps-1)[joint] = planner_motion_50hz_.JointVelocities(planner_motion_50hz_.timesteps-2)[joint];
         }
+        ++diagnostic_generation_;
+        diagnostic_generation_frame_ = gen_frame_;
         motion_generation_ = inference_generation_;
         motion_available_ = true;
         return true;

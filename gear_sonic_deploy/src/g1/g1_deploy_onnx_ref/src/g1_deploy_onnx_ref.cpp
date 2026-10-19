@@ -67,6 +67,9 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <filesystem>
+#include <optional>
+#include "../include/planner_trace.hpp"
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -104,6 +107,7 @@
 // Robot parameters
 #include "../include/robot_parameters.hpp"
 #include "../include/policy_parameters.hpp"
+#include "../include/shutdown_sequence.hpp"
 #include "../include/motor_gain_scaling.hpp"
 
 // Input interface and input handlers
@@ -205,6 +209,7 @@ class G1Deploy {
     bool has_upper_body_data_ = false;
     std::array<double, 17> upper_body_joint_positions_buffer_;
     std::array<double, 17> upper_body_joint_velocities_buffer_;
+    std::array<double, 17> upper_body_tau_buffer_{};  ///< Planner-supplied feedforward, Nm.
     std::vector<double> token_state_data_;  // Token buffer (size from config)
     
     // =========================================================================
@@ -315,6 +320,9 @@ class G1Deploy {
     std::unique_ptr<std::ofstream> policy_input_file_;
     std::unique_ptr<std::ofstream> record_input_file_;
     std::unique_ptr<std::ifstream> playback_input_file_;
+    std::unique_ptr<PlannerTrace> planner_trace_;
+    std::string planner_trace_path_;
+    std::uint64_t active_trace_generation_ = 0;  // Control-thread owned.
 
     // Motion recorders for streamed and planner_motion
     MotionRecorder zmq_motion_recorder_;
@@ -2146,6 +2154,43 @@ class G1Deploy {
 
 
 
+    void RecordPlannerGeneration(double begin, double movement_buffer_at,
+                                 const std::array<float, 3>& received_facing,
+                                 bool initial = false) {
+      if (!planner_trace_) return;
+      PlannerTrace::Plan row;
+      row.initial = initial;
+      row.begin = begin;
+      row.end = PlannerTraceTime();
+      row.movement_buffer_at = movement_buffer_at;
+      row.mode = planner_->GetModeValue();
+      row.seed = planner_->GetRandomSeedValue();
+      row.speed = planner_->GetTargetVelValue();
+      row.height = planner_->GetHeightValue();
+      row.gather_us = planner_->last_timing_.gather_input_duration.count();
+      row.inference_us = planner_->last_timing_.model_duration.count();
+      row.resample_us = planner_->last_timing_.extract_duration.count();
+      for (int i = 0; i < 3; ++i) {
+        row.received_facing[i] = received_facing[i];
+        row.facing[i] = planner_->GetFacingDirectionValues()[i];
+        row.movement[i] = planner_->GetMovementDirectionValues()[i];
+      }
+      std::copy_n(planner_->GetContextBuffer(), row.context.size(), row.context.begin());
+      row.raw_frames = planner_->GetNumPredFrames();
+      std::copy_n(planner_->GetMujocoQposBuffer(),
+                  std::min(row.raw_frames, PlannerTrace::kRawFrames) * 36,
+                  row.raw_qpos.begin());
+      {
+        std::lock_guard<std::mutex> lock(planner_->planner_motion_mutex_);
+        row.generation = planner_->diagnostic_generation_;
+        row.generation_frame = planner_->diagnostic_generation_frame_;
+        row.resampled_frames = planner_->planner_motion_50hz_.timesteps;
+        for (int i = 0; i < std::min(row.resampled_frames, PlannerTrace::kMotionFrames); ++i)
+          row.resampled_quat[i] = planner_->planner_motion_50hz_.BodyQuaternions(i)[0];
+      }
+      planner_trace_->Record(row);
+    }
+
   public:
     OperatorState operator_state;
 
@@ -2180,6 +2225,8 @@ class G1Deploy {
       double initial_max_close_ratio = 1.0,
       bool enable_dex3_hands = true,
       Vr3PtSafetyFilter::Config vr3pt_filter_config = Vr3PtSafetyFilter::Config{},
+      bool harness_planner_hold = false,
+      std::string planner_trace_path = "",
       MotorGainScaleConfig motor_gain_scales = {},
       bool live_pose_playback = false)
       : time_(0.0),
@@ -2535,7 +2582,7 @@ class G1Deploy {
       else if (input_type == "zmq_manager") {
         input_interface_ = std::make_unique<ZMQManager>(
           zmq_host, zmq_port, zmq_topic, "command", "planner", zmq_conflate,
-          zmq_verbose, vr3pt_filter_config, enable_dex3_hands_
+          zmq_verbose, vr3pt_filter_config, harness_planner_hold, enable_dex3_hands_
         );
         std::cout << "Initialized ZMQ manager" << std::endl;
         std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
@@ -2623,6 +2670,15 @@ class G1Deploy {
         std::cout << "Unknown output type '" << output_type << "' - no output will be published" << std::endl;
       } else {
         std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
+        for (auto& output : output_interfaces_) {
+          output->SetHarnessPlannerHold(harness_planner_hold && input_type == "zmq_manager");
+        }
+      }
+
+      // Diagnostic storage must be allocated before any recurrent thread starts.
+      if (!planner_trace_path.empty()) {
+        planner_trace_path_ = planner_trace_path;
+        planner_trace_ = std::make_unique<PlannerTrace>();
       }
 
       // create threads
@@ -2643,6 +2699,19 @@ class G1Deploy {
     ~G1Deploy()
     {
       // CUDA resources are now cleaned up by the PolicyEngine and planner classes automatically
+    }
+
+    // Called from main after the operator stops the trial, never from a control
+    // callback. Freeze prevents later callbacks from changing the snapshot.
+    void FlushPlannerTrace() {
+      if (!planner_trace_) return;
+      planner_trace_->Freeze();
+      const std::string partial_path = planner_trace_path_ + ".partial";
+      std::ofstream out(partial_path);
+      planner_trace_->Write(out);
+      out.close();
+      if (!out) throw std::runtime_error("Failed to close planner trace");
+      std::filesystem::rename(partial_path, planner_trace_path_);
     }
 
     void SetThreadPriority() {
@@ -3033,6 +3102,7 @@ class G1Deploy {
       std::tie(has_right_hand_data_, right_hand_joint_buffer_) = input_interface_->GetHandPose(false);
       std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
       std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
+      upper_body_tau_buffer_ = input_interface_->GetUpperBodyFeedforwardTorques();
 
       auto last_update_time = input_interface_->GetLastUpdateTime();
       if (last_update_time.has_value()) {
@@ -3188,6 +3258,9 @@ class G1Deploy {
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
+      for (size_t i = 0; i < upper_body_tau_buffer_.size(); i++) {
+        motor_command_tmp.tau_ff.at(upper_body_joint_isaaclab_order_in_mujoco_index[i]) = upper_body_tau_buffer_[i];
+      }
       // Keep balance feedback and last_action consistent across source changes.
       // Smooth teleop reference targets upstream, never the policy motor output.
       apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
@@ -3223,6 +3296,8 @@ class G1Deploy {
           
           const auto &planner_motion_gen = planner_->planner_motion_50hz_;
           planner_->motion_available_ = false;
+          const int previous_frame = current_frame_;
+          int used_generation_frame = 0;
 
           // special case if this is the first time we're receiving a planner motion:
           bool is_the_first_time = false;
@@ -3255,6 +3330,7 @@ class G1Deploy {
           {
 
             auto fgen = planner_->gen_frame_;
+            used_generation_frame = fgen;
 
             // Ok, a new planner animation is available. We want to do these things:
             //  * rebase the old planner_motion_ so current_frame_ is at frame 0
@@ -3328,6 +3404,20 @@ class G1Deploy {
 
           if(success)
           {
+            if (planner_trace_) {
+              PlannerTrace::Merge row;
+              row.at = PlannerTraceTime();
+              row.generation = planner_->diagnostic_generation_;
+              row.published_generation_frame = planner_->diagnostic_generation_frame_;
+              row.used_generation_frame = used_generation_frame;
+              row.previous_frame = previous_frame;
+              row.first = is_the_first_time;
+              row.frames = planner_motion_->timesteps;
+              for (int i = 0; i < std::min(row.frames, PlannerTrace::kMotionFrames); ++i)
+                row.quat[i] = planner_motion_->BodyQuaternions(i)[0];
+              planner_trace_->Record(row);
+              active_trace_generation_ = row.generation;
+            }
             if(planner_motion_file_)
             {
               // log the motion that we just copied/blended over:
@@ -3674,9 +3764,13 @@ class G1Deploy {
                   if (prepared) initial_movement = *prepared;
                 }
               }
+              const double trace_begin = planner_trace_ ? PlannerTraceTime() : 0;
               if(!planner_->Initialize(base_quat, joint_positions, initial_movement, generation)) {
                 throw std::runtime_error("Error when initializing planner");
               }
+              RecordPlannerGeneration(trace_begin, 0, {static_cast<float>(initial_movement.facing_direction[0]),
+                                                      static_cast<float>(initial_movement.facing_direction[1]),
+                                                      static_cast<float>(initial_movement.facing_direction[2])}, true);
 
               {
                 std::lock_guard<std::mutex> lock(current_motion_mutex_);
@@ -3838,6 +3932,7 @@ class G1Deploy {
               // Update planning with current movement parameters
 
               // gotta make sure planner_motion actually has data...
+              const double trace_begin = planner_trace_ ? PlannerTraceTime() : 0;
               if(!planner_->UpdatePlanning(
                 current_frame_,
                 planner_motion_,
@@ -3851,6 +3946,9 @@ class G1Deploy {
               )) {
                 throw std::runtime_error("Error when updating planner");
               }
+              RecordPlannerGeneration(trace_begin,
+                                      PlannerTraceTime(movement_state_data.timestamp),
+                                      facing_direction);
               
             } catch (const std::exception& e) {
               std::unique_lock<std::mutex> motion_lock(current_motion_mutex_);
@@ -4017,6 +4115,11 @@ class G1Deploy {
           int current_encoder_mode_copy;
           bool current_play_copy;
           std::shared_ptr<const MotionSequence> current_motion_copy = nullptr;
+          std::optional<PlannerTrace::Control> trace_control;
+          if (planner_trace_) {
+            trace_control.emplace();
+            trace_control->begin = PlannerTraceTime(obs_start_time);
+          }
           {
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
             current_frame_copy = current_frame_;
@@ -4038,6 +4141,25 @@ class G1Deploy {
               std::cout << "Stopping control system." << std::endl;
               operator_state.stop = true;
               return;
+            }
+            if (trace_control && current_motion_copy->timesteps > 0) {
+              auto& row = *trace_control;
+              row.tick = logging_counter_;
+              row.generation = active_trace_generation_;
+              row.frame = current_frame_copy;
+              row.observation_window_frames = saved_frame_for_observation_window_;
+              row.planner_motion = current_motion_copy == planner_motion_;
+              row.active_quat = current_motion_copy->BodyQuaternions(current_frame_copy)[0];
+              auto heading_data = heading_state_buffer_.GetDataWithTime().data;
+              HeadingState heading = heading_data ? *heading_data : HeadingState();
+              row.heading_quat = quat_mul_d(euler_z_to_quat_d(heading.delta_heading),
+                quat_mul_d(calc_heading_quat_d(heading.init_base_quat),
+                           calc_heading_quat_inv_d(init_ref_data_root_rot_array_)));
+              row.target_quat = quat_mul_d(row.heading_quat, row.active_quat);
+              row.measured_quat = float_to_double<4>(used_low_state_data_.data->imu_state().quaternion());
+              row.measurement_at = PlannerTraceTime(used_low_state_data_.timestamp);
+              for (int i = 0; i < G1_NUM_MOTOR; ++i)
+                row.motor_measured[i] = used_low_state_data_.data->motor_state()[i].q();
             }
           } // Release lock after all observation-dependent operations
 
@@ -4086,6 +4208,16 @@ class G1Deploy {
                 heading_state_buffer_, current_motion_copy, current_frame_copy
               );
             }
+          }
+
+          if (trace_control) {
+            auto& row = *trace_control;
+            row.observations_end = PlannerTraceTime(obs_end_time);
+            row.policy_end = PlannerTraceTime(motor_command_end_time);
+            row.telemetry_end = PlannerTraceTime();
+            auto command = motor_command_buffer_.GetDataWithTime().data;
+            if (command) std::copy(command->q_target.begin(), command->q_target.end(), row.motor_target.begin());
+            planner_trace_->Record(row);
           }
 
           // Handle recording of streamed motion (if enabled)
@@ -4259,6 +4391,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --zmq-topic <topic>: ZMQ topic/prefix (default: pose)" << std::endl;
     std::cout << "  --zmq-conflate: enable ZMQ CONFLATE (default: disabled)" << std::endl;
     std::cout << "  --zmq-verbose: enable ZMQ subscriber verbose logs" << std::endl;
+    std::cout << "  --harness-planner-hold: retain applied arm/hand targets on planner-input timeout (zmq_manager only)" << std::endl;
+    std::cout << "  --planner-trace-file <path>: memory trace, flushed on operator stop (lo simulation only)" << std::endl;
     std::cout << "  --live-pose-playback: skip streamed backlog while retaining the observation window (default: OFF)" << std::endl;
     std::cout << "  --zmq-out-port <port>: ZMQ port for output (default: 5557)" << std::endl;
     std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
@@ -4314,6 +4448,8 @@ int main(int argc, char const* argv[]) {
   std::string zmq_topic = "pose";
   bool zmq_conflate = false;  // default off; enable with --zmq-conflate
   bool zmq_verbose = false;
+  bool harness_planner_hold = false;
+  std::string planner_trace_path;
   bool live_pose_playback = false;
   bool enableMotionRecording = false;  // default off; enable with --enable-motion-recording
   int zmq_out_port = 5557;
@@ -4327,6 +4463,15 @@ int main(int argc, char const* argv[]) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--harness-planner-hold") {
+      harness_planner_hold = true;
+    } else if (std::string(argv[i]) == "--planner-trace-file") {
+      if (i + 1 >= argc || std::string(argv[i + 1]).empty() ||
+          std::string(argv[i + 1]).starts_with("--")) {
+        std::cerr << "Error: --planner-trace-file requires a path" << std::endl;
+        return 1;
+      }
+      planner_trace_path = argv[++i];
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4602,6 +4747,18 @@ int main(int argc, char const* argv[]) {
     }
   }
 
+  try {
+    ValidatePlannerTraceOptions(planner_trace_path, networkInterface, disableCrcCheck, inputType, plannerFile);
+    if (!planner_trace_path.empty() &&
+        (std::filesystem::exists(planner_trace_path) ||
+         std::filesystem::exists(planner_trace_path + ".partial") ||
+         !std::filesystem::is_directory(std::filesystem::absolute(planner_trace_path).parent_path()))) {
+      throw std::invalid_argument("Planner trace needs an existing parent and a new output file");
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "Error: " << error.what() << std::endl;
+    return 1;
+  }
   std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
   G1Deploy custom(
     networkInterface,
@@ -4634,6 +4791,8 @@ int main(int argc, char const* argv[]) {
     initial_max_close_ratio,
     enable_dex3_hands,
     vr3pt_filter_config,
+    harness_planner_hold,
+    planner_trace_path,
     motor_gain_scales,
     live_pose_playback
   );
@@ -4656,9 +4815,9 @@ int main(int argc, char const* argv[]) {
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;
-  custom.Stop();
+  const int status = StopThenFlushDiagnostics(custom);
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
   sleep(0.5);
-  std::cout << "[DEBUG] Program exiting normally..." << std::endl;
-  return 0;
+  if (status == 0) std::cout << "[DEBUG] Program exiting normally..." << std::endl;
+  return status;
 }

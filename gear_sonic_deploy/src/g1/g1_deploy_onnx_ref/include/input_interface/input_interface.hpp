@@ -393,6 +393,10 @@ public:
         return {false, {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
     }
 
+    /// @brief Get upper-body joint feedforward torques (17 DOF, Nm, planner order).
+    /// @return Zeros unless the input supplies them.
+    virtual std::array<double, 17> GetUpperBodyFeedforwardTorques() const { return {}; }
+
     /// @brief Get the last update time of the input interface.
     virtual std::optional<std::chrono::steady_clock::time_point> GetLastUpdateTime() const {
         // Return empty optional as a default, implementers should override this if they have a timestamp

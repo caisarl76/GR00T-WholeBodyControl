@@ -40,6 +40,8 @@
 #include <memory>
 #include <array>
 #include <vector>
+#include <filesystem>
+#include <fstream>
 #include <msgpack.hpp>
 
 #include "../state_logger.hpp"
@@ -107,6 +109,8 @@ public:
      */
     virtual void publish_config() {}
 
+    void SetHarnessPlannerHold(bool enabled) { harness_planner_hold_enabled_ = enabled; }
+
 protected:
 
     /**
@@ -155,6 +159,10 @@ protected:
         static const std::string kBodyQMeasured = "body_q_measured";
         static const std::string kLeftHandQMeasured = "left_hand_q_measured";
         static const std::string kRightHandQMeasured = "right_hand_q_measured";
+        static const std::string kLeftHandQTarget = "left_hand_q_target";
+        static const std::string kRightHandQTarget = "right_hand_q_target";
+        static const std::string kRightHandReceivedAt = "right_hand_received_at";
+        static const std::string kControllerClockId = "controller_clock_id";
         static const std::string kVr3pointPosition = "vr_3point_position";
         static const std::string kVr3pointOrientation = "vr_3point_orientation";
         static const std::string kVr3pointCompliance = "vr_3point_compliance";
@@ -188,6 +196,10 @@ protected:
         for (int i = 0; i < 29; i++) {
           body_q_measured[i] = state.body_q[isaaclab_to_mujoco[i]] + default_angles[i];
         }
+        // The Python bridge projects absolute motor-order measurements into
+        // ISAAC upper-body order. Legacy fields varied across deployed binaries.
+        output_data_map_["body_q_measured_motor"].assign(body_q_measured.begin(), body_q_measured.end());
+        output_data_map_["harness_planner_hold_enabled"] = {harness_planner_hold_enabled_ ? 1.0 : 0.0};
         std::array<double, 3> base_trans_measured = {0.0, -1.0, 0.793};  // Fixed default position
         std::array<double, 4> base_quat_measured = state.base_quat;       // From IMU
 
@@ -267,8 +279,33 @@ protected:
         output_data_map_[kBaseTransMeasured].assign(base_trans_measured.begin(), base_trans_measured.end());
         output_data_map_[kBaseQuatMeasured].assign(base_quat_measured.begin(), base_quat_measured.end());
         output_data_map_[kBodyQMeasured].assign(body_q_measured.begin(), body_q_measured.end());
-        output_data_map_[kLeftHandQMeasured].assign(left_hand_joint.begin(), left_hand_joint.end());
-        output_data_map_[kRightHandQMeasured].assign(right_hand_joint.begin(), right_hand_joint.end());
+        // Genuine DDS hand state; freshness is reported by *_hand_feedback_valid.
+        output_data_map_[kLeftHandQMeasured] = state.left_hand_q;
+        output_data_map_[kRightHandQMeasured] = state.right_hand_q;
+        // This tick's hand command (last_*_hand_action is logged a tick earlier).
+        output_data_map_[kLeftHandQTarget].assign(left_hand_joint.begin(), left_hand_joint.end());
+        output_data_map_[kRightHandQTarget].assign(right_hand_joint.begin(), right_hand_joint.end());
+        const auto now = std::chrono::steady_clock::now();
+        auto fresh_hand = [now](auto received_at) {
+          return received_at != std::chrono::steady_clock::time_point{} &&
+              received_at <= now && now - received_at <= std::chrono::milliseconds(500);
+        };
+        // Preserve the DDS receipt: faster logger packets may repeat this hand sample.
+        output_data_map_[kRightHandReceivedAt] = fresh_hand(state.hand_feedback_time[1])
+            ? std::vector<double>{std::chrono::duration<double>(
+                state.hand_feedback_time[1].time_since_epoch()).count()}
+            : std::vector<double>{};
+        static const std::vector<double> clock_id = [] {
+          std::ifstream boot("/proc/sys/kernel/random/boot_id");
+          std::string boot_id;
+          std::getline(boot, boot_id);
+          std::error_code error;
+          auto time_ns = std::filesystem::read_symlink("/proc/self/ns/time", error);
+          if (!boot || boot_id.empty() || error) return std::vector<double>{};
+          const auto identity = boot_id + "|" + time_ns.string();
+          return std::vector<double>(identity.begin(), identity.end());
+        }();
+        output_data_map_[kControllerClockId] = clock_id;
 
         // write vr controller data:
         output_data_map_[kVr3pointPosition].assign(vr_3point_position_sent.begin(), vr_3point_position_sent.end());
@@ -303,6 +340,7 @@ protected:
     std::map<std::string, std::vector<double>> output_data_map_;
     /// Reusable msgpack serialisation buffer (cleared and repacked each tick).
     msgpack::sbuffer output_data_sbuf_;
+    bool harness_planner_hold_enabled_ = false;
 
 };
 

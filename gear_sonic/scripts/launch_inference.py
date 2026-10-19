@@ -141,6 +141,13 @@ class InferenceLaunchConfig:
     prompt: str = "demo"
     """Language prompt for inference."""
 
+    harness_endpoint: str | None = None
+    """Local IPC endpoint; requires harness_profile."""
+    harness_profile: str | None = None
+    """Shared G1 skill profile."""
+    harness_locomotion: bool = False
+    """Allow bounded planner skills after validation."""
+
     action_publish_rate: int = 50
     """Rate at which individual actions are published to the C++ control loop (Hz)."""
 
@@ -242,7 +249,7 @@ def _resolved_action_zmq_host(config: InferenceLaunchConfig) -> str:
 
 
 def _build_inference_command(repo_root: Path, config: InferenceLaunchConfig) -> str:
-    return (
+    cmd = (
         f"cd {_quote(repo_root)} && "
         f"source .venv_inference/bin/activate && "
         f"PYTHONPATH=. python -m gear_sonic.scripts.run_vla_inference "
@@ -262,6 +269,14 @@ def _build_inference_command(repo_root: Path, config: InferenceLaunchConfig) -> 
         f"--action-zmq-host {_quote(_resolved_action_zmq_host(config))} "
         f"--action-zmq-port {config.action_zmq_port}"
     )
+    if config.harness_endpoint:
+        cmd += (
+            f" --harness-endpoint {_quote(config.harness_endpoint)}"
+            f" --harness-profile {_quote(Path(config.harness_profile).resolve())}"
+        )
+        if config.harness_locomotion:
+            cmd += " --harness-locomotion"
+    return cmd
 
 
 def _build_deploy_command(repo_root: Path, config: InferenceLaunchConfig) -> str:
@@ -384,6 +399,10 @@ def _check_pane_alive(pane_index: int) -> bool:
 
 def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
+    if bool(config.harness_endpoint) != bool(config.harness_profile):
+        raise ValueError("harness_endpoint and harness_profile must be supplied together")
+    if config.harness_locomotion and not config.harness_endpoint:
+        raise ValueError("harness_locomotion requires harness mode")
 
     if config.sim and not config.deploy:
         print("ERROR: --sim cannot be combined with --no-deploy.")

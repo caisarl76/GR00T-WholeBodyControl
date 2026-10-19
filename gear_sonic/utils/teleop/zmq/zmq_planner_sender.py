@@ -77,6 +77,7 @@ def build_planner_message(
     vr_3pt_position: Sequence[float] | None = None,
     vr_3pt_orientation: Sequence[float] | None = None,
     vr_3pt_compliance: Sequence[float] | None = None,
+    upper_body_tau: Sequence[float] | None = None,
 ) -> bytes:
     """
     Assemble a 'planner' topic message:
@@ -119,6 +120,12 @@ def build_planner_message(
     if upper_body_velocity is not None:
         fields.append({"name": "upper_body_velocity", "dtype": "f32", "shape": [len(upper_body_velocity)]})
         for value in upper_body_velocity:
+            payload += struct.pack("<f", float(value))
+
+    # Feedforward torque (Nm, planner order) for this message only; the deploy zeroes it when absent.
+    if upper_body_tau is not None:
+        fields.append({"name": "upper_body_tau", "dtype": "f32", "shape": [len(upper_body_tau)]})
+        for value in upper_body_tau:
             payload += struct.pack("<f", float(value))
 
     if left_hand_position is not None:

@@ -35,6 +35,9 @@ def make(config, keyboard_listener, zmq_socket):
     zmq_frame_counter = 0
     last_sent_motion_token = INITIAL_TOKEN
     PROMPT_MSG_PREFIX = "prompt:"
+    harness_enabled = config.harness_endpoint is not None
+    harness_control = None
+    policy_ready = False
 """
     ).body[0]
     main_node = ast.parse(inspect.getsource(runner.main)).body[0]

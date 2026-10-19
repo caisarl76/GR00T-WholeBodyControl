@@ -1154,8 +1154,8 @@ def test_g1_debug_ack_requires_new_token_hands_and_controller_action() -> None:
         "control_loop_type": "cpp",
         "index": 8,
         "token_state": frame.motion_token.astype(np.float64),
-        "left_hand_q_measured": frame.left_hand.astype(np.float64),
-        "right_hand_q_measured": frame.right_hand.astype(np.float64),
+        "left_hand_q_target": frame.left_hand.astype(np.float64),
+        "right_hand_q_target": frame.right_hand.astype(np.float64),
         "last_left_hand_action": np.zeros(7),
         "last_right_hand_action": np.zeros(7),
         "last_action": np.zeros(29),
@@ -1176,15 +1176,15 @@ def test_g1_debug_ack_uses_current_tick_hand_buffers_not_stale_logged_actions() 
         "control_loop_type": "cpp",
         "index": 8,
         "token_state": frame.motion_token.astype(np.float64),
-        "left_hand_q_measured": frame.left_hand.astype(np.float64),
-        "right_hand_q_measured": frame.right_hand.astype(np.float64),
+        "left_hand_q_target": frame.left_hand.astype(np.float64),
+        "right_hand_q_target": frame.right_hand.astype(np.float64),
         "last_left_hand_action": np.full(7, -0.5),
         "last_right_hand_action": np.full(7, 0.5),
         "last_action": np.zeros(29),
     }
 
     assert validate_state_ack(message, frame, last_index=7) == 8
-    message["left_hand_q_measured"] = np.zeros(7)
+    message["left_hand_q_target"] = np.zeros(7)
     assert validate_state_ack(message, frame, last_index=7) is None
 
 
@@ -1194,8 +1194,8 @@ def test_runtime_ack_also_requires_all_three_simulator_command_receipts() -> Non
         "control_loop_type": "cpp",
         "index": 8,
         "token_state": frame.motion_token.astype(np.float64),
-        "left_hand_q_measured": frame.left_hand.astype(np.float64),
-        "right_hand_q_measured": frame.right_hand.astype(np.float64),
+        "left_hand_q_target": frame.left_hand.astype(np.float64),
+        "right_hand_q_target": frame.right_hand.astype(np.float64),
         "last_action": np.zeros(29),
     }
 
