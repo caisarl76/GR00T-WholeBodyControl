@@ -79,7 +79,7 @@
  *  29  | vr_3point_orientation  | double[12]   | VR orientations (3×quat wxyz).
  *  30  | vr_3point_compliance   | double[3]    | VR compliance (left arm, right arm, head).
  *  31  | reference_heading_quat  | double[4]    | Applied heading correction quaternion (empty if unavailable).
- *  32  | planner_reference_active| double[1]    | 1.0 when a valid planner_motion frame is active, else 0.0.
+ *  32  | planner_reference_active| double[1]    | 1.0 when an initialized planner owns a valid planner_motion frame, else 0.0.
  *
  * ---------------------------------------------------------------------------
  * ## `robot_config` — re-published every ~2 s
