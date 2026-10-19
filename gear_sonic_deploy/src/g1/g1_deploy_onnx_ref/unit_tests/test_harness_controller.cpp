@@ -5,6 +5,7 @@
 
 #include "../include/input_interface/zmq_manager.hpp"
 #include "../include/output_interface/output_interface.hpp"
+#include "../include/shutdown_sequence.hpp"
 
 namespace {
 class TestOutput : public OutputInterface {
@@ -331,4 +332,26 @@ TEST(HarnessFeedforward, NonFiniteWireValuesRejectedUnderDeployFlags) {
     EXPECT_EQ(delivered, uint64_t{0}) << "wire bits 0x" << std::hex << bits;
     EXPECT_EQ(tau, (std::array<double, 17>{}));
   }
+}
+
+namespace {
+struct FakeDeploy {
+  std::vector<std::string> calls;
+  bool fail_flush = false;
+  void Stop() { calls.push_back("Stop"); }
+  void FlushPlannerTrace() {
+    calls.push_back("FlushPlannerTrace");
+    if (fail_flush) throw std::runtime_error("Failed to close planner trace");
+  }
+};
+}
+
+TEST(Shutdown, TraceWriteFailureStillStopsControlFirst) {
+  FakeDeploy failing;
+  failing.fail_flush = true;
+  EXPECT_EQ(StopThenFlushDiagnostics(failing), 1);
+  EXPECT_EQ(failing.calls, (std::vector<std::string>{"Stop", "FlushPlannerTrace"}));
+  FakeDeploy ok;
+  EXPECT_EQ(StopThenFlushDiagnostics(ok), 0);
+  EXPECT_EQ(ok.calls, (std::vector<std::string>{"Stop", "FlushPlannerTrace"}));
 }

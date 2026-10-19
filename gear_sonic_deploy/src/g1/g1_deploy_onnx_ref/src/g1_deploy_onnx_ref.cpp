@@ -107,6 +107,7 @@
 // Robot parameters
 #include "../include/robot_parameters.hpp"
 #include "../include/policy_parameters.hpp"
+#include "../include/shutdown_sequence.hpp"
 #include "../include/motor_gain_scaling.hpp"
 
 // Input interface and input handlers
@@ -4814,15 +4815,9 @@ int main(int argc, char const* argv[]) {
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;
-  try {
-    custom.FlushPlannerTrace();
-  } catch (const std::exception& error) {
-    std::cerr << "Error: " << error.what() << std::endl;
-    return 1;
-  }
-  custom.Stop();
+  const int status = StopThenFlushDiagnostics(custom);
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
   sleep(0.5);
-  std::cout << "[DEBUG] Program exiting normally..." << std::endl;
-  return 0;
+  if (status == 0) std::cout << "[DEBUG] Program exiting normally..." << std::endl;
+  return status;
 }
