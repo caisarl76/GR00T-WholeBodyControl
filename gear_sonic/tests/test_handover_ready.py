@@ -398,3 +398,36 @@ def test_ready_settles_the_held_left_wrist_within_its_own_tolerance(left_offset,
     s["body_q_measured_motor"] = body.tolist()
     s["left_hand_q_measured"], s["right_hand_q_measured"] = reset.target[17:24], reset.target[24:]
     assert reset.is_settled(s, .05, .1) is settled
+
+
+@pytest.mark.parametrize("motor,bound", [
+    (15, 2.6704),  # Left shoulder pitch, a ready target joint (review of 37a742a).
+    (19, 1.97222),  # Left wrist roll, held with the 0.30 rad ready wrist trim.
+    (19, -1.97222),
+])
+def test_left_arm_compensation_never_commands_past_its_joint_limit(motor, bound):
+    s = state()
+    body = np.asarray(s["body_q_measured_motor"])
+    left = list(LEFT_READY)
+    if motor == 15:
+        left[0] = bound
+    body[15:19] = left
+    body[motor] = bound
+    body[22:29] = TARGET
+    s["body_q_measured_motor"] = body.tolist()
+    reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=TARGET,
+                          left_arm_target=left, compensate_tracking_bias=True)
+    body[motor] = bound - np.sign(bound) * .1  # Steady 0.1 rad tracking lag.
+    s["body_q_measured_motor"] = body.tolist()
+    index = G1_UPPER_BODY_JOINT_INDICES.index(motor)
+    for _ in range(40):
+        commanded = reset.advance(s, .05).upper_body_position[index]
+        assert abs(commanded) <= abs(bound) + 1e-12
+
+
+@pytest.mark.parametrize("motor,value", [(15, 2.7), (16, -1.6), (19, 2.0), (21, -1.7)])
+def test_measured_left_arm_beyond_joint_limits_is_rejected(motor, value):
+    s = state()
+    s["body_q_measured_motor"][motor] = value
+    with pytest.raises(ValueError, match="Measured arm exceeds G1 joint limits"):
+        StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=TARGET)

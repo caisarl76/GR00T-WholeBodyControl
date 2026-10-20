@@ -161,5 +161,5 @@ def test_reset_rejects_tracking_loss_that_cannot_meet_rate_and_lead_bounds():
 def test_measured_hold_rejects_out_of_bounds_right_arm(direction):
     state = feedback(0.)
     state["body_q_measured"][26] = direction * 2.12722
-    with pytest.raises(ValueError, match="Measured right-arm"):
+    with pytest.raises(ValueError, match="Measured arm"):
         StandingReset(state, state["left_hand_q_measured"], state["right_hand_q_measured"])
