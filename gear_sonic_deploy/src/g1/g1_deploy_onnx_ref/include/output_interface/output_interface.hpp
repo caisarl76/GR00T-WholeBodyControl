@@ -110,6 +110,8 @@ public:
     virtual void publish_config() {}
 
     void SetHarnessPlannerHold(bool enabled) { harness_planner_hold_enabled_ = enabled; }
+    /// Token-only POSE leaves the last planner frame current, so frame validity alone cannot say who owns it.
+    void SetPlannerOwnsReference(bool owns) { planner_owns_reference_ = owns; }
 
 protected:
 
@@ -133,7 +135,7 @@ protected:
      *   vr_3point_orientation  | 12   | VR orientations (passed through).
      *   vr_3point_compliance   |  3   | VR compliance values (passed through).
      *   reference_heading_quat  |  4   | Applied heading correction quaternion (empty if unavailable).
-     *   planner_reference_active|  1   | 1.0 when a valid planner_motion frame is active, else 0.0.
+     *   planner_reference_active|  1   | 1.0 when an initialized planner owns a valid planner_motion frame, else 0.0.
      *
      * Joint ordering uses `isaaclab_to_mujoco` remapping and `default_angles`
      * offsets from policy_parameters.hpp.
@@ -318,7 +320,7 @@ protected:
           output_data_map_[kReferenceHeadingQuat].clear();
         }
         output_data_map_[kPlannerReferenceActive] = {
-          motion_frame_valid && current_motion->name == "planner_motion" ? 1.0 : 0.0
+          planner_owns_reference_ && motion_frame_valid && current_motion->name == "planner_motion" ? 1.0 : 0.0
         };
     }
 
@@ -341,6 +343,7 @@ protected:
     /// Reusable msgpack serialisation buffer (cleared and repacked each tick).
     msgpack::sbuffer output_data_sbuf_;
     bool harness_planner_hold_enabled_ = false;
+    bool planner_owns_reference_ = false;
 
 };
 

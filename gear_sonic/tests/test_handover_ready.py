@@ -4,11 +4,14 @@ from test_harness_control import PROFILE, Hooks, request, state
 import yaml
 
 from gear_sonic.utils.inference.harness_control import HarnessControl
-from gear_sonic.utils.inference.standing_reset import StandingReset
+from gear_sonic.utils.inference.standing_reset import StandingReset, _WRIST_PLANNER_INDICES
 from gear_sonic.utils.teleop.xr_upperbody_bridge import G1_UPPER_BODY_JOINT_INDICES
 
 TARGET = [-.1, -.08, .3, -.21, 1.7, -.09, -.07]
 RAISED = [.011, -.68, -.60, .16, 1.09, -.16, -.49]
+# Ready returns allow wrists twice the shoulder/elbow/finger lead.
+READY_LEAD = np.full(31, .15)
+READY_LEAD[_WRIST_PLANNER_INDICES] = .30
 NAMES = [f"right_{name}_joint" for name in (
     "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
     "wrist_roll", "wrist_pitch", "wrist_yaw",
@@ -58,7 +61,7 @@ def test_ready_preserves_other_arm_waist_heading_and_left_hand():
         cmd = reset.advance(s, .02)
         current = np.r_[cmd.upper_body_position, cmd.left_hand_position, cmd.right_hand_position]
         assert np.max(np.abs(current-last)) <= .0100001
-        assert np.max(np.abs(current - np.r_[upper, [.3]*7, [.4]*7])) <= .1500001
+        assert np.all(np.abs(current - np.r_[upper, [.3]*7, [.4]*7]) <= READY_LEAD + 1e-7)
         assert tuple(cmd.movement) == (0., 0., 0.)
         last = current
     assert not reset.is_settled(s, .05, .1)
@@ -126,7 +129,7 @@ def test_ready_rejects_outward_drift_when_joint_and_lead_intervals_do_not_inters
     s["body_q_measured_motor"][22:29] = target
     reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=target)
     before = reset.command
-    s["body_q_measured_motor"][26] += direction * .155
+    s["body_q_measured_motor"][26] += direction * .305  # Beyond the 0.30 rad ready wrist lead.
     with pytest.raises(ValueError, match="joint and lead bounds"):
         reset.advance(s, .02)
     assert reset.command == before
@@ -288,3 +291,143 @@ def test_lease_expiry_retires_the_session(tmp_path):
     claim = {"registry_sha256": c.profile.registry_sha256}
     assert request(c, "claim_control", claim, now=2.6, rid="claim_control-0.0")["error"]["code"] == "NOT_OWNER"
     assert request(c, "heartbeat", {"sequence": 1}, now=2.6, lease=lease)["error"]["code"] == "NOT_OWNER"
+
+
+LEFT_READY = [.137, .309, -.438, .700]  # Shoulder pitch/roll/yaw, elbow.
+LEFT_NAMES = [name.replace("right_", "left_") for name in NAMES[:4]]
+LEFT_INDICES = [G1_UPPER_BODY_JOINT_INDICES.index(m) for m in range(15, 19)]
+LEFT_WRIST_INDICES = [G1_UPPER_BODY_JOINT_INDICES.index(m) for m in range(19, 22)]
+RIGHT_INDICES = [G1_UPPER_BODY_JOINT_INDICES.index(m) for m in range(22, 29)]
+
+
+@pytest.mark.parametrize("waypoint", [None, RAISED])
+def test_left_ready_target_moves_shoulder_and_elbow_and_holds_waist_and_wrist(waypoint):
+    s = state()
+    s["body_q_measured_motor"] = np.linspace(-.1, .1, 29).tolist()
+    reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=TARGET,
+                          right_arm_waypoint=waypoint, left_arm_target=LEFT_READY)
+    measured = np.asarray(s["body_q_measured_motor"])[G1_UPPER_BODY_JOINT_INDICES]
+    for target in (reset.target, reset._target):  # Final, and the raise stage when present.
+        np.testing.assert_allclose(target[LEFT_INDICES], LEFT_READY)
+        np.testing.assert_allclose(target[:3], measured[:3])  # Waist stays as measured.
+        np.testing.assert_allclose(target[LEFT_WRIST_INDICES], measured[LEFT_WRIST_INDICES])  # Left wrist too.
+    np.testing.assert_allclose(reset.target[RIGHT_INDICES], TARGET)
+
+
+def test_left_arm_ready_target_is_rate_and_lead_limited():
+    s = state()
+    reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=TARGET,
+                          left_arm_target=LEFT_READY)
+    command = reset.advance(dict(s, index=2), 0.02)
+    left = np.asarray(command.upper_body_position)[LEFT_INDICES]
+    assert np.all(np.abs(left) <= 0.5 * 0.02 + 1e-9)
+    assert np.any(np.abs(left) > 0)
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(left_arm_target=LEFT_READY),  # Without a right-arm ready target.
+    dict(right_arm_target=TARGET, left_arm_target=[3.0] + LEFT_READY[1:]),
+    dict(right_arm_target=TARGET, left_arm_target=LEFT_READY[:3]),
+    dict(right_arm_target=TARGET, left_arm_target=LEFT_READY + [0.0, 0.0, 0.0]),  # Wrists cannot be set.
+])
+def test_left_arm_ready_target_rejects_invalid_targets(kwargs):
+    s = state()
+    with pytest.raises(ValueError):
+        StandingReset(s, s["left_hand_q_measured"], np.zeros(7), **kwargs)
+
+
+def test_profile_left_arm_ready_pose_is_optional_and_validated(tmp_path):
+    c = make_ready(tmp_path)
+    assert c.profile.handover.left_arm_target is None
+    data = yaml.safe_load((tmp_path / "ready.yaml").read_text())
+    data["handover"]["ready_left_arm_joints"] = dict(zip(LEFT_NAMES, LEFT_READY))
+    good = tmp_path / "left.yaml"
+    good.write_text(yaml.safe_dump(data))
+    from gear_sonic.utils.inference.harness_profile import load_profile
+    assert load_profile(good).handover.left_arm_target == tuple(LEFT_READY)
+    wrists = {n.replace("right_", "left_"): 0.0 for n in NAMES[4:]}
+    for bad in (dict(zip(NAMES, LEFT_READY)), dict(zip(LEFT_NAMES, [9.0] * 4)), dict(zip(LEFT_NAMES[:3], LEFT_READY)),
+                {**dict(zip(LEFT_NAMES, LEFT_READY)), **wrists}):
+        data["handover"]["ready_left_arm_joints"] = bad
+        (tmp_path / "bad.yaml").write_text(yaml.safe_dump(data))
+        with pytest.raises(ValueError):
+            load_profile(tmp_path / "bad.yaml")
+
+
+def test_ready_settles_a_wrist_that_lags_beyond_the_shoulder_lead():
+    # sweep2-0.20: SONIC held the right wrist roll 0.15+ rad behind the reference;
+    # a 0.15 rad lead pinned the reference there and the return timed out.
+    s = state()
+    s["body_q_measured_motor"][22:29] = RAISED
+    reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=TARGET,
+                          compensate_tracking_bias=True)
+    lag = .2  # Measured right wrist roll stays this far above the command.
+    for _ in range(1500):
+        command = reset.advance(s, .02)
+        body = np.asarray(s["body_q_measured_motor"])
+        body[G1_UPPER_BODY_JOINT_INDICES] = command.upper_body_position
+        body[26] += lag
+        s["body_q_measured_motor"] = body.tolist()
+        s["right_hand_q_measured"] = command.right_hand_position
+        if reset.is_settled(s, .05, .1):
+            break
+    assert reset.is_settled(s, .05, .1)
+    assert s["body_q_measured_motor"][26] == pytest.approx(TARGET[4], abs=.05)
+
+
+def test_standing_reset_keeps_the_shoulder_lead_for_wrists():
+    s = state()
+    s["body_q_measured_motor"][26] = 1.0  # Straight standing returns this wrist toward 0.
+    reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7))
+    for _ in range(100):
+        command = reset.advance(s, .02)
+    wrist = np.asarray(command.upper_body_position)[G1_UPPER_BODY_JOINT_INDICES.index(26)]
+    assert 1.0 - wrist == pytest.approx(.15)
+
+
+@pytest.mark.parametrize("left_offset,right_offset,settled", [
+    (.14, 0., True), (.16, 0., False), (0., .06, False)])
+def test_ready_settles_the_held_left_wrist_within_its_own_tolerance(left_offset, right_offset, settled):
+    s = state()
+    reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=TARGET,
+                          left_arm_target=LEFT_READY)
+    body = np.asarray(s["body_q_measured_motor"])
+    body[G1_UPPER_BODY_JOINT_INDICES] = reset.target[:17]
+    body[19] += left_offset  # Held left wrist roll.
+    body[26] += right_offset  # Targeted right wrist roll.
+    s["body_q_measured_motor"] = body.tolist()
+    s["left_hand_q_measured"], s["right_hand_q_measured"] = reset.target[17:24], reset.target[24:]
+    assert reset.is_settled(s, .05, .1) is settled
+
+
+@pytest.mark.parametrize("motor,bound", [
+    (15, 2.6704),  # Left shoulder pitch, a ready target joint (review of 37a742a).
+    (19, 1.97222),  # Left wrist roll, held with the 0.30 rad ready wrist trim.
+    (19, -1.97222),
+])
+def test_left_arm_compensation_never_commands_past_its_joint_limit(motor, bound):
+    s = state()
+    body = np.asarray(s["body_q_measured_motor"])
+    left = list(LEFT_READY)
+    if motor == 15:
+        left[0] = bound
+    body[15:19] = left
+    body[motor] = bound
+    body[22:29] = TARGET
+    s["body_q_measured_motor"] = body.tolist()
+    reset = StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=TARGET,
+                          left_arm_target=left, compensate_tracking_bias=True)
+    body[motor] = bound - np.sign(bound) * .1  # Steady 0.1 rad tracking lag.
+    s["body_q_measured_motor"] = body.tolist()
+    index = G1_UPPER_BODY_JOINT_INDICES.index(motor)
+    for _ in range(40):
+        commanded = reset.advance(s, .05).upper_body_position[index]
+        assert abs(commanded) <= abs(bound) + 1e-12
+
+
+@pytest.mark.parametrize("motor,value", [(15, 2.7), (16, -1.6), (19, 2.0), (21, -1.7)])
+def test_measured_left_arm_beyond_joint_limits_is_rejected(motor, value):
+    s = state()
+    s["body_q_measured_motor"][motor] = value
+    with pytest.raises(ValueError, match="Measured arm exceeds G1 joint limits"):
+        StandingReset(s, s["left_hand_q_measured"], np.zeros(7), right_arm_target=TARGET)

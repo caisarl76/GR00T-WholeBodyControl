@@ -17,6 +17,22 @@ from gear_sonic.utils.teleop.xr_upperbody_bridge import (
 _RIGHT_ARM_PLANNER_INDICES = [
     G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(22, 29)
 ]
+# Left shoulder pitch/roll/yaw and elbow (motors 15-18); the left wrist is always held.
+_LEFT_READY_PLANNER_INDICES = [
+    G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(15, 19)
+]
+# Both arms, motors 15-28 in motor order, matching LEFT_ARM_BOUNDS + RIGHT_ARM_BOUNDS.
+_ARM_PLANNER_INDICES = [G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(15, 29)]
+_LEFT_WRIST_PLANNER_INDICES = [G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(19, 22)]
+_WRIST_PLANNER_INDICES = _LEFT_WRIST_PLANNER_INDICES + [
+    G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(26, 29)
+]
+LEAD_RAD = 0.15
+# Ready returns only: SONIC can lag a wrist by more than LEAD_RAD in simulation,
+# which would stall the reference before trim engages.
+READY_WRIST_LEAD_RAD = 0.30
+# A ready return holds the left wrist; it need only stay near where it started.
+HELD_WRIST_TOLERANCE_RAD = 0.15
 
 
 def _vector(value, size):
@@ -45,28 +61,33 @@ class StandingReset:
     the way to its endpoint before the robot has started following it.
     Missing/invalid feedback holds the last command; it never advances the ramp.
     Harness resets may compensate a steady upper-body tracking offset after
-    reaching the nominal reference. Trim is capped at 0.15 rad; the same rate
-    and measured-lead caps apply. The physical settling target never changes.
+    reaching the nominal reference. Trim is capped at the joint's lead limit; the
+    same rate and measured-lead caps apply. The physical settling target never changes.
+    Ready returns allow wrists a 0.30 rad lead and trim, and settle the held left
+    wrist within 0.15 rad; shoulders, elbows, waist and fingers keep 0.15 rad.
 
     Handover returns can first raise to a reviewed right-arm waypoint, retaining
     entry fingers until fresh upper-body and heading measurements settle. The
-    final target then opens the hand. Bounds do not certify obstacle clearance.
+    final target then opens the hand. An optional left shoulder/elbow ready target
+    moves those four joints with the right arm, under the same rate and lead limits,
+    instead of holding them as measured; the left wrist stays held. Bounds do not certify obstacle clearance.
     """
 
     def __init__(
         self, state, left_hand_target, right_hand_target, *,
         compensate_tracking_bias=False, joint_tolerance_rad=0.05,
-        right_arm_target=None, right_arm_waypoint=None,
+        right_arm_target=None, right_arm_waypoint=None, left_arm_target=None,
         yaw_tolerance_rad=np.pi / 36, settle_dwell_s=0.5,
     ):
         self._position = _measured_joints(state)
-        from .harness_profile import RIGHT_ARM_BOUNDS
+        from .harness_profile import LEFT_ARM_BOUNDS, RIGHT_ARM_BOUNDS
 
         self._right_arm_bounds = np.asarray(list(RIGHT_ARM_BOUNDS.values())).T
+        self._arm_bounds = np.asarray(list(LEFT_ARM_BOUNDS.values()) + list(RIGHT_ARM_BOUNDS.values())).T
         low, high = self._right_arm_bounds
-        measured_arm = self._position[_RIGHT_ARM_PLANNER_INDICES]
-        if np.any(measured_arm < low) or np.any(measured_arm > high):
-            raise ValueError("Measured right-arm exceeds G1 joint limits")
+        measured_arm = self._position[_ARM_PLANNER_INDICES]
+        if np.any(measured_arm < self._arm_bounds[0]) or np.any(measured_arm > self._arm_bounds[1]):
+            raise ValueError("Measured arm exceeds G1 joint limits")
         self._compensate_tracking_bias = compensate_tracking_bias
         if not np.isfinite(joint_tolerance_rad) or joint_tolerance_rad <= 0:
             raise ValueError("Standing reset requires a positive finite joint tolerance")
@@ -81,6 +102,11 @@ class StandingReset:
         self._last_lift_index = None
         self.stage = 1
         self._tracking_trim = np.zeros(17)
+        self._lead = np.full(31, LEAD_RAD)
+        self._settle_floor = np.zeros(31)
+        if right_arm_target is not None:
+            self._lead[_WRIST_PLANNER_INDICES] = READY_WRIST_LEAD_RAD
+            self._settle_floor[_LEFT_WRIST_PLANNER_INDICES] = HELD_WRIST_TOLERANCE_RAD
         self._nominal_reached = False
         yaw = feedback_payload_heading_yaw(state)
         if yaw is None:
@@ -101,6 +127,16 @@ class StandingReset:
             if (np.any(self._target[_RIGHT_ARM_PLANNER_INDICES] < low)
                     or np.any(self._target[_RIGHT_ARM_PLANNER_INDICES] > high)):
                 raise ValueError("Ready target exceeds G1 right-arm joint limits")
+        if left_arm_target is not None:
+            if right_arm_target is None:
+                raise ValueError("Left-arm ready target requires a right-arm ready target")
+            from .harness_profile import LEFT_READY_JOINTS
+
+            left = _vector(left_arm_target, 4)
+            left_low, left_high = np.asarray(list(LEFT_READY_JOINTS.values())).T
+            if np.any(left < left_low) or np.any(left > left_high):
+                raise ValueError("Ready target exceeds G1 left-arm joint limits")
+            self._target[_LEFT_READY_PLANNER_INDICES] = left
         self._final_target = self._target.copy()
         if right_arm_waypoint is not None:
             if right_arm_target is None:
@@ -128,7 +164,8 @@ class StandingReset:
                 return False
             yaw_error = np.arctan2(np.sin(yaw - self._yaw), np.cos(yaw - self._yaw))
             return bool(
-                np.max(np.abs(measured - self._target)) <= joint_tolerance and abs(yaw_error) <= yaw_tolerance_rad
+                np.all(np.abs(measured - self._target) <= np.maximum(joint_tolerance, self._settle_floor))
+                and abs(yaw_error) <= yaw_tolerance_rad
             )
         except (TypeError, ValueError):
             return False
@@ -169,25 +206,22 @@ class StandingReset:
             if self._nominal_reached:
                 error = self._target[:17] - measured[:17]
                 error = np.where(np.abs(error) > self._tracking_deadband, error, 0.0)
-                self._tracking_trim = np.clip(self._tracking_trim + dt * error, -0.15, 0.15)
+                self._tracking_trim = np.clip(self._tracking_trim + dt * error, -self._lead[:17], self._lead[:17])
                 reference[:17] += self._tracking_trim
-        if self._right_arm_bounds is not None:
-            reference[_RIGHT_ARM_PLANNER_INDICES] = np.clip(
-                reference[_RIGHT_ARM_PLANNER_INDICES], *self._right_arm_bounds
-            )
+        reference[_ARM_PLANNER_INDICES] = np.clip(reference[_ARM_PLANNER_INDICES], *self._arm_bounds)
         # A measured joint can fall back after reaching a reference. Retract
         # toward the feasible interval rather than freezing an excessive lead.
-        lower, upper = measured - 0.15, measured + 0.15
-        lower[_RIGHT_ARM_PLANNER_INDICES] = np.maximum(lower[_RIGHT_ARM_PLANNER_INDICES], self._right_arm_bounds[0])
-        upper[_RIGHT_ARM_PLANNER_INDICES] = np.minimum(upper[_RIGHT_ARM_PLANNER_INDICES], self._right_arm_bounds[1])
+        lower, upper = measured - self._lead, measured + self._lead
+        lower[_ARM_PLANNER_INDICES] = np.maximum(lower[_ARM_PLANNER_INDICES], self._arm_bounds[0])
+        upper[_ARM_PLANNER_INDICES] = np.minimum(upper[_ARM_PLANNER_INDICES], self._arm_bounds[1])
         if np.any(lower > upper):
             raise ValueError("Joint feedback cannot satisfy G1 joint and lead bounds")
         bounded_reference = np.clip(reference, lower, upper)
         candidate = self._position + np.clip(bounded_reference - self._position, -step, step)
-        if np.max(np.abs(candidate - measured)) > 0.15 + 1e-8:
+        if np.any(np.abs(candidate - measured) > self._lead + 1e-8):
             raise ValueError("Joint feedback moved beyond the rate-limited lead bound")
-        arm = candidate[_RIGHT_ARM_PLANNER_INDICES]
-        if np.any(arm < self._right_arm_bounds[0]) or np.any(arm > self._right_arm_bounds[1]):
+        arm = candidate[_ARM_PLANNER_INDICES]
+        if np.any(arm < self._arm_bounds[0]) or np.any(arm > self._arm_bounds[1]):
             raise ValueError("Joint feedback cannot satisfy G1 joint and lead bounds")
         self._position = candidate
         if self.stage == 0:
@@ -196,7 +230,8 @@ class StandingReset:
             # Intermediate settling covers the preserved upper body and heading.
             # Final settling still requires all arm and finger measurements.
             raised = (yaw_error is not None and abs(yaw_error) <= self._yaw_tolerance
-                      and np.max(np.abs(measured[:17] - self._target[:17])) <= self._joint_tolerance)
+                      and np.all(np.abs(measured[:17] - self._target[:17])
+                                 <= np.maximum(self._joint_tolerance, self._settle_floor[:17])))
             if raised:
                 self._lift_dwell = 0.0 if self._lift_dwell is None else self._lift_dwell + dt
             else:

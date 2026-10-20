@@ -4200,8 +4200,11 @@ class G1Deploy {
           auto hand_joint_end_time = std::chrono::steady_clock::now();
 
           // Publish output data (state logger data, robot config, command/motion data) to all output interfaces
+          const bool planner_owns_reference =
+              planner_ && planner_->planner_state_.enabled && planner_->planner_state_.initialized;
           for (auto& output_interface : output_interfaces_) {
             if (output_interface) {
+              output_interface->SetPlannerOwnsReference(planner_owns_reference);
               output_interface->publish(
                 vr_3point_position_buffer_, vr_3point_orientation_buffer_, vr_3point_compliance_buffer_,
                 left_hand_joint_buffer_, right_hand_joint_buffer_, init_ref_data_root_rot_array_,

@@ -116,6 +116,32 @@ TEST(HarnessTelemetry, AbsoluteMotorOrderingAndEffectiveCapability) {
   EXPECT_TRUE(output.data().at("right_hand_received_at").empty());
 }
 
+TEST(HarnessTelemetry, PlannerReferenceActiveOnlyWhileAnInitializedPlannerOwnsIt) {
+  StateLogger logger("", 2, 29, 29, 0.02, false);
+  std::array<double, 29> body{};
+  std::array<double, 7> hands{};
+  std::span<double> q(body), hand(hands), empty;
+  const std::array<double, 4> identity{1,0,0,0};
+  const auto now = std::chrono::steady_clock::now();
+  logger.LogFullState(identity, {}, {}, identity, {}, {}, q,q,q,empty,empty,empty,
+                      hand,hand,hand,hand,hand,hand,0.0,{now,now});
+  auto planner_motion = std::make_shared<MotionSequence>();
+  planner_motion->ReserveCapacity(10, 29, 1, 1, 0, 0);
+  planner_motion->timesteps = 10;
+  planner_motion->name = "planner_motion";
+  TestOutput output(logger);
+  DataBuffer<HeadingState> heading;
+  // Token-only POSE disables the planner but leaves its last frame current.
+  output.publish({}, {}, {}, {}, {}, identity, heading, planner_motion, 3);
+  EXPECT_EQ(output.data().at("planner_reference_active"), std::vector<double>{0});
+  output.SetPlannerOwnsReference(true);
+  output.publish({}, {}, {}, {}, {}, identity, heading, planner_motion, 3);
+  EXPECT_EQ(output.data().at("planner_reference_active"), std::vector<double>{1});
+  planner_motion->timesteps = 0;  // Reinitializing: no frame yet.
+  output.publish({}, {}, {}, {}, {}, identity, heading, planner_motion, 0);
+  EXPECT_EQ(output.data().at("planner_reference_active"), std::vector<double>{0});
+}
+
 TEST(HarnessTimeout, RetainsOnlyOptedInTargetsAndZerosVelocity) {
   for (bool enabled : {false, true}) {
     Publisher publisher;
