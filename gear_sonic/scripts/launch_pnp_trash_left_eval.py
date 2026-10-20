@@ -40,8 +40,6 @@ def main():
         sys.executable,
         str(repo_root / "gear_sonic/scripts/launch_inference.py"),
         "--no-deploy",
-        "--initial-pose",
-        "planner_standing",
         "--policy-host",
         args.policy_host,
         "--policy-port",
