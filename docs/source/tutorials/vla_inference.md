@@ -74,6 +74,90 @@ See [Data Collection](data_collection.md) for camera server setup.
 
 The `gear_sonic_deploy` binary must be built. See the main README.
 
+### SONIC v1.1 Checkpoint
+
+Use the `sonic_v1_1/` checkpoint when the VLA policy was trained against
+the robot-heading-normalized SONIC controller. It uses a 10-frame SMPL/wrist
+reference horizon and was trained with wrist-pose augmentation. It is not the
+low-latency checkpoint.
+
+```bash
+python download_from_hf.py --sonic-v1-1
+```
+
+Launch the matching C++ controller:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/sonic_v1_1/model \
+    --obs-config policy/sonic_v1_1/observation_config.yaml \
+    --input-type zmq_manager \
+    --motor-kp-scale 4,10=1.5 \
+    --motor-kd-scale 4,10=1.5 \
+    real
+```
+
+This v1.1 tuning scales the left and right ankle-pitch motors (hardware
+indices `4` and `10`). The resulting whole-body stability improves observed
+wrist tracking; it does not directly scale the wrist motors.
+
+Or pass the same model pair to the Python launcher:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/sonic_v1_1/model \
+    --deploy-obs-config policy/sonic_v1_1/observation_config.yaml \
+    --deploy-motor-kp-scale 4,10=1.5 \
+    --deploy-motor-kd-scale 4,10=1.5 \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
+
+### Low-Latency Teleoperation Checkpoint
+
+The `low_latency/` checkpoint is configured for responsive whole-body
+teleoperation. Its SMPL encoder uses 4 future reference frames at 50 Hz
+(approximately 80 ms of reference lookahead), compared with 10 frames
+(approximately 200 ms) in the default release. This is reference lookahead,
+not total end-to-end system latency.
+
+Download the deployment files from Hugging Face:
+
+```bash
+python download_from_hf.py --low-latency
+```
+
+Then launch `gear_sonic_deploy` with the low-latency model prefix and matching
+observation config:
+
+**C++ deploy:**
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
+```
+
+For simulation, replace `real` with `sim`. The `--cp` value is a model prefix:
+`deploy.sh` appends `_encoder.onnx` and `_decoder.onnx` internally.
+
+**Python launcher:**
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/low_latency/model \
+    --deploy-obs-config policy/low_latency/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the cup"
+```
+
+The Python launcher starts the same C++ deploy command in a tmux pane, then runs
+the Python VLA inference client, keyboard publisher, and optional data exporter.
+
 ## Action Space
 
 The Sonic embodiment (`unitree_g1_sonic`) uses a 78-dimensional action
@@ -99,6 +183,13 @@ python gear_sonic/scripts/launch_inference.py \
     --prompt "pick up the apple"
 ```
 
+The launcher defaults to `--initial-pose calib_full`. In that mode, `i` ramps
+to the configured SONIC initial pose and holds PLANNER mode. Pressing `p`
+resumes inference; the first policy action switches to POSE mode. The
+feedback-paced straight-standing workflow below applies when you explicitly
+launch with `--initial-pose planner_standing` (the PnP evaluation presets use
+that mode).
+
 The launcher creates a tmux session with four panes:
 
 | Pane | Component | Description |
@@ -115,15 +206,14 @@ Type these keys in the **Keyboard Publisher** pane (pane 1):
 | Key | Action |
 |-----|--------|
 | `k` | Start / stop the C++ control loop |
-| `i` | Pause policy and return to straight standing in PLANNER mode |
-| `m` | Enter manual planner repositioning / return to paused POSE mode |
+| `i` | Reset according to `--initial-pose`: ramp to CALIB_FULL by default, or return to planner standing in `planner_standing` mode |
+| `m` | Enter manual planner repositioning / stop movement and hold PLANNER mode |
 | `p` | Pause / resume policy inference |
 | `[` | Toggle left hand open/closed (initial pose) |
 | `]` | Toggle right hand open/closed (initial pose) |
 | `t <text>` | Change the inference prompt (e.g., `t pick up the cup`) |
-| `c` | Start recording an episode (data exporter) |
-| `s` | Stop recording — success (data exporter) |
-| `f` | Stop recording — failure / discard (data exporter) |
+| `c` | Start recording; press again to finish and save (data exporter) |
+| `x` | Discard an active recording (data exporter) |
 
 ### Typical Workflow
 
@@ -131,45 +221,57 @@ Type these keys in the **Keyboard Publisher** pane (pane 1):
 2. Click on **pane 0** (C++ Deploy) and press Enter to confirm deployment
 3. Switch to **pane 1** (Keyboard Publisher)
 4. Press `k` to start the C++ control loop (starts in PLANNER mode)
-5. Press `i` to return to straight standing in PLANNER mode. Wait until the
+5. Press `i` to ramp to the configured initial pose and hold PLANNER mode.
+   The default CALIB_FULL ramp takes 2 seconds. If your
+   task starts from a different pose than the default, see
+   [Customizing the Initial Pose](#customizing-the-initial-pose) below.
+6. Press `p` to unpause the inference loop; the first policy action enters POSE mode
+7. The robot will begin executing VLA-predicted actions
+8. Press `p` to pause, `k` to stop the control loop when done
+
+For PnP evaluation, launch with `--initial-pose planner_standing` (the
+evaluation presets select this explicitly), then use this reset sequence:
+
+1. Press `i` to return to straight standing in PLANNER mode. Wait until the
    robot has settled before continuing. This uses the existing `straight`
    planner preset: upright waist, shoulder pitch 0.2 rad, shoulder roll
    ±0.2 rad, and elbows 0.6 rad. SONIC controls the legs and balance.
    The return starts from measured joints, preserves heading, and opens both
    hands unless `[` / `]` selected closed hands. Fresh robot state is required.
-6. Press `p` to switch to POSE mode and evaluate using fresh observations
-7. The robot will begin executing VLA-predicted actions
-8. Press `p` to pause, `k` to stop the control loop when done
+2. Press `p` to resume inference using fresh observations. The first policy
+   action switches to POSE mode.
 
-Between attempts, use `p` (pause) → `i` (return to standing) → wait for the
-robot to settle → `p` (evaluate). Every `i` pauses the policy and discards
-cached and in-flight policy results. The standing target advances at up to
+Between attempts in `planner_standing` mode, use `p` (pause) → `i` (return to
+standing) → wait for the robot to settle → `p` (evaluate). Every `i` pauses
+the policy and discards cached and in-flight policy results. The standing target advances at up to
 0.5 rad/s per joint and stays within 0.15 rad ahead of measured feedback;
 stale feedback holds the last target. `k` remains available during the return.
 Restart the inference client to load changes to this keyboard behavior.
 
-The posture reset preserves the measured world heading at `i`. The client
-uses deploy's `reference_heading_quat` feedback to convert that heading into
+The planner-standing reset preserves the measured world heading at `i`. This
+heading and feedback behavior applies when `--initial-pose planner_standing`
+is selected. The client uses deploy's `reference_heading_quat` feedback to convert that heading into
 the current planner reference frame on every publication, including after a
 POSE → PLANNER reinitialization. This also keeps manual movement directions
 consistent after turning. Rebuild/restart deploy and restart the inference
 client together for this heading fix; `deploy.sh` builds before launching.
 Older deploy binaries without this telemetry are rejected by the reset with
 an explicit rebuild message.
-If `i` arrives before the POSE switch is reflected in feedback, the client
-remains paused and asks you to retry after the switch settles; it never uses
+In `planner_standing` mode, if `i` arrives before the POSE switch is reflected
+in feedback, the client remains paused and asks you to retry after the switch settles; it never uses
 the previous planner session's heading reference for the new reset.
 
 ### Keyboard repositioning between trials
 
 Keep the original `--input-type zmq_manager` deployment. The inference client
-translates keyboard commands into ZMQ planner messages; no deploy rebuild or
-input-handler change is needed. Enter each key followed by **Enter** in the
+translates keyboard commands into ZMQ planner messages. Once deploy supplies
+the heading telemetry described above, no input-handler change is needed.
+Enter each key followed by **Enter** in the
 inference keyboard pane:
 
 | Key | Action in manual planner mode |
 |-----|-------------------------------|
-| `m` | Enter manual mode / return to paused POSE mode |
+| `m` | Enter manual mode / stop movement and hold PLANNER mode |
 | `w` / `s` | Toggle forward / backward |
 | `a` / `d` | Toggle left / right |
 | `q` / `e` | Toggle turning left / right |
@@ -183,11 +285,12 @@ timeout.** Translation commands 0.2 m/s relative to the measured heading when
 selected. Turning continuously keeps a small ±5° target ahead of measured yaw.
 Missing/stale robot feedback cancels movement without replay on recovery.
 
-`m` sends idle before returning to paused POSE mode. `p` is blocked during
+`m` sends idle before holding paused PLANNER mode. Press `i` and then `p` for
+the next trial. `p` is blocked during
 manual mode; `i` cancels movement and resets standing; `k` stops the controller.
 If `i` cannot reset because feedback is unavailable, the cancelled manual hold
 remains active until reset succeeds or you exit with `m`. The recorder still
-uses `c` to toggle recording and `x` to discard; these are not movement keys.
+uses `c` to start or save a recording and `x` to discard; these are not movement keys.
 
 Restart the workstation inference client and keyboard publisher to load these
 controls. No H100 server change is required.
@@ -212,6 +315,27 @@ uv run python gr00t/eval/run_gr00t_server.py \
 ```bash
 cd gear_sonic_deploy
 ./deploy.sh --input-type zmq_manager real
+```
+
+Low-latency variant:
+
+```bash
+python gear_sonic/scripts/launch_inference.py \
+    --deploy-checkpoint policy/low_latency/model \
+    --deploy-obs-config policy/low_latency/observation_config.yaml \
+    --camera-host 192.168.123.164 \
+    --prompt "pick up the apple"
+```
+
+Manual C++ deploy equivalent:
+
+```bash
+cd gear_sonic_deploy
+./deploy.sh \
+    --cp policy/low_latency/model \
+    --obs-config policy/low_latency/observation_config.yaml \
+    --input-type zmq_manager \
+    real
 ```
 
 ### Terminal 3 — VLA Inference
@@ -250,11 +374,14 @@ python gear_sonic/scripts/run_data_exporter.py \
 | `--rate` | `2.5` | Inference rate (Hz) |
 | `--camera-host` | `localhost` | Camera server host |
 | `--camera-port` | `5555` | Camera server port |
+| `--initial-pose-blend-duration` | `1.0` | Seconds to blend to initial pose (0 = instant snap) |
 | `--verbose-timing` | `false` | Always print loop timing |
 
 ### tmux Launcher (`launch_inference.py`)
 
 The launcher exposes all the above flags plus deploy and data exporter options.
+Use `--deploy-motor-kp-scale` and `--deploy-motor-kd-scale` to forward hardware
+gain specifications to the C++ controller.
 Run `python gear_sonic/scripts/launch_inference.py --help` for the full list.
 
 ## Remote PolicyServer
@@ -342,7 +469,7 @@ t put it in to the trash bin
 Use task completion to choose prompt transitions on the real robot. The dataset's
 recorded transition timestamps are for recorded-video evaluation.
 
-Recording starts with `c`; finish with `s` for success or `f` to discard. Each
+Recording starts with `c`; press `c` again to finish and save, or `x` to discard. Each
 launch records under a fresh `outputs/pnp_trash_left_eval_<variant>_<object>_<UTC>/`
 directory, labeled with the full task prompt. The recorder does not add the live
 subtask prompt transitions as per-frame labels.
@@ -386,3 +513,64 @@ When a new action chunk arrives, the system calculates how many actions in the
 chunk are already "stale" based on the time elapsed since inference started,
 and skips to the appropriate action index. This is controlled by `--action-publish-rate`
 and `--action-horizon`.
+
+## Customizing the Initial Pose
+
+When you press `i`, the inference client blends the robot smoothly from its
+current configuration to a predefined **initial pose** encoded as a 64-dim
+latent motion token. This pose should match the starting configuration your
+demonstrations typically begin from.
+
+### When to Change the Initial Pose
+
+You should update the initial motion token if:
+
+- Your collected demonstrations start from a pose far from the default
+  (e.g., arms raised, holding an object, or a different standing stance)
+- You switch to a different SONIC checkpoint (each checkpoint has its own
+  latent space — the same token produces different poses across checkpoints)
+- The robot is snapping to a dangerous or unstable configuration on `i` press
+
+### Where to Change It
+
+Edit `gear_sonic/utils/inference/initial_poses.py`:
+
+```python
+LATENT_INITIAL_MOTION_TOKEN = np.array(
+    [
+        # Replace with your 64-dim token
+        ...
+    ],
+    dtype=np.float32,
+)
+```
+
+### How to Find a Good Token
+
+1. **From data collection:** Look at the first action frame of a good demonstration
+   episode. The `action.motion_token` column in the parquet file at `frame_index=0`
+   gives you the latent token for that pose.
+
+2. **From the C++ deploy:** Put the robot in the desired starting pose via teleop,
+   then read the most recent latent token published on the ZMQ action channel.
+
+### Blend Duration
+
+The blend duration controls how quickly the robot transitions to the initial pose:
+
+```bash
+# Default: 1 second smooth blend
+python gear_sonic/scripts/run_vla_inference.py --initial-pose-blend-duration 1.0
+
+# Faster blend (0.5 seconds)
+python gear_sonic/scripts/run_vla_inference.py --initial-pose-blend-duration 0.5
+
+# Instant snap (no interpolation, legacy behavior)
+python gear_sonic/scripts/run_vla_inference.py --initial-pose-blend-duration 0
+```
+
+```{warning}
+Setting `--initial-pose-blend-duration` too low (or to 0) can cause jerky motion,
+especially if the robot's current pose is far from the initial pose. The default
+1-second blend is safe for most configurations.
+```

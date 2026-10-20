@@ -1,0 +1,12 @@
+--- a/Assets/Scripts/TrackingData.cs
++++ b/Assets/Scripts/TrackingData.cs
+@@ -399,6 +399,9 @@
+             json["isActive"] = handJoint.isActive;
+             json["count"] = handJoint.jointCount;
+             json["scale"] = handJoint.handScale;
++            // Advance only after this side GetJointLocations succeeds. Cached sides
++            // retain their timestamp when the other hand/body continues streaming.
++            json["timeStampNs"] = Utils.GetCurrentTimestamp();
+ 
+             JsonData jointLocationsJson;
+             if (json.ContainsKey("HandJointLocations"))

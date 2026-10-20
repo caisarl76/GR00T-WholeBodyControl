@@ -26,9 +26,15 @@ from collections import defaultdict, deque
 from enum import Enum, IntEnum
 import json
 import os
+from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
+import uuid
+
+# Direct script launches must use this checkout, even with another editable install.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import msgpack
 import numpy as np
@@ -36,7 +42,7 @@ from scipy.spatial.transform import Rotation as R, Rotation as sRot
 import torch
 import zmq
 
-from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
+from gear_sonic.utils.teleop import input_readers
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -46,6 +52,15 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_angle_axis,
     quaternion_to_rotation_matrix,
 )
+from gear_sonic.utils.teleop.inspire_ftp import map_pico_controls
+from gear_sonic.utils.teleop.pico_controls import ControllerChords, ManagerKeyboard, read_controllers
+from gear_sonic.utils.teleop.pico_hand_log import HandCaptureLog
+from gear_sonic.utils.teleop.pico_hand_runtime import PicoHandRuntime, PicoPublisher
+from gear_sonic.utils.teleop.pico_recording import (
+    ManagerRecording, RecordingCommand, RecordingState, recording_mode_allowed,
+)
+from gear_sonic.utils.teleop.zmq.zmq_planner_sender import unpack_pose_message
+from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 
 try:
     from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -822,28 +837,76 @@ def compute_pinch_joints(hand: str, grip: float) -> np.ndarray:
     return pinch_open + alpha * (pinch_closed - pinch_open)
 
 
-def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
-    """
-    Generate finger position data from Pico controller button states.
-
-    Args:
-        hand: "left" or "right"
-        trigger: Trigger button value (0-1)
-        grip: Grip button value (0-1)
-
-    Returns:
-        Array of shape [25, 4, 4] representing fingertip positions
-    """
+def generate_grasp_finger_data(hand: str, trigger: float) -> np.ndarray:
+    """Generate synthetic fingertip data for the existing Dex3 grasp."""
     fingertips = np.zeros([25, 4, 4])
 
     thumb = 0
     middle = 10
-    # Control thumb based on shoulder button state (index 4 is thumb tip)
-    fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
+    fingertips[4 + thumb, 0, 3] = 1.0
     # Middle tip at x=trigger gives the solver an analog grasp depth of trigger.
     fingertips[4 + middle, 0, 3] = float(np.clip(trigger, 0.0, 1.0))
 
     return fingertips
+
+
+class DataCollectionChordTracker:
+    """Recognize recording chords without consuming multi-button controls."""
+
+    _COLLECTION = "collection"
+    _ABORT = "abort"
+    _INVALID = "invalid"
+
+    def __init__(self):
+        self._candidate = None
+
+    def update(
+        self,
+        a_pressed: bool,
+        b_pressed: bool,
+        x_pressed: bool,
+        y_pressed: bool,
+        left_grip: float,
+    ) -> tuple[bool, bool]:
+        """Commit a clean Grip+A or Grip+B gesture when face buttons release."""
+        a_pressed = bool(a_pressed)
+        b_pressed = bool(b_pressed)
+        x_pressed = bool(x_pressed)
+        y_pressed = bool(y_pressed)
+        face_buttons_pressed = a_pressed or b_pressed or x_pressed or y_pressed
+        grip_active = left_grip > 0.5
+
+        if not face_buttons_pressed:
+            result = (
+                self._candidate == self._COLLECTION and grip_active,
+                self._candidate == self._ABORT and grip_active,
+            )
+            self._candidate = None
+            return result
+
+        if self._candidate == self._INVALID:
+            return False, False
+
+        if not grip_active:
+            self._candidate = self._INVALID
+            return False, False
+
+        collection_chord = a_pressed and not (b_pressed or x_pressed or y_pressed)
+        abort_chord = b_pressed and not (a_pressed or x_pressed or y_pressed)
+
+        if self._candidate is None:
+            if collection_chord:
+                self._candidate = self._COLLECTION
+            elif abort_chord:
+                self._candidate = self._ABORT
+            else:
+                self._candidate = self._INVALID
+        elif self._candidate == self._COLLECTION and not collection_chord:
+            self._candidate = self._INVALID
+        elif self._candidate == self._ABORT and not abort_chord:
+            self._candidate = self._INVALID
+
+        return False, False
 
 
 # Joystick deadzone threshold
@@ -972,8 +1035,26 @@ def init_hand_ik_solvers():
     return None, None
 
 
-def get_controller_inputs():
-    """Fetch controller button/trigger states from XRoboToolkit."""
+# Readers that expose `get_controller_data()` returning the IsaacTeleop
+# controller_data dict schema (left/right trigger/squeeze, thumbstick, clicks).
+# Tuple form keeps the dispatch sites uniform if/when a second reader speaks
+# the same schema.
+_ISAAC_TELEOP_READERS = (input_readers.IsaacTeleopReader,)
+
+
+def get_controller_inputs(reader=None):
+    """Fetch controller button/trigger states from XRoboToolkit or IsaacTeleop."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, 0.0, 0.0, 0.0, 0.0
+        return (
+            False,
+            float(ctrl.get("left_trigger_value", 0.0)),
+            float(ctrl.get("right_trigger_value", 0.0)),
+            float(ctrl.get("left_squeeze_value", 0.0)),
+            float(ctrl.get("right_squeeze_value", 0.0)),
+        )
     left_trigger = xrt.get_left_trigger()
     right_trigger = xrt.get_right_trigger()
     left_grip = xrt.get_left_grip()
@@ -982,8 +1063,20 @@ def get_controller_inputs():
     return left_menu_button, left_trigger, right_trigger, left_grip, right_grip
 
 
-def get_controller_axes():
+def get_controller_axes(reader=None):
     """Fetch joystick axes (lx, ly, rx, ry). Falls back to zeros if not available."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return 0.0, 0.0, 0.0, 0.0
+        left_thumbstick = ctrl.get("left_thumbstick", [0.0, 0.0])
+        right_thumbstick = ctrl.get("right_thumbstick", [0.0, 0.0])
+        return (
+            float(left_thumbstick[0]),
+            float(left_thumbstick[1]),
+            float(right_thumbstick[0]),
+            float(right_thumbstick[1]),
+        )
     if xrt is None:
         return 0.0, 0.0, 0.0, 0.0
     try:
@@ -998,8 +1091,10 @@ def get_controller_axes():
         return 0.0, 0.0, 0.0, 0.0
 
 
-def get_menu_buttons():
+def get_menu_buttons(reader=None):
     """Fetch both menu buttons (left, right). Falls back to False if not available."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        return False, False
     if xrt is None:
         return False, False
 
@@ -1015,8 +1110,16 @@ def get_menu_buttons():
     return left, right
 
 
-def get_axis_clicks():
+def get_axis_clicks(reader=None):
     """Fetch both axis click buttons (left, right). Falls back to False if not available."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, False
+        return (
+            float(ctrl.get("left_thumbstick_click", 0.0)) > 0.5,
+            float(ctrl.get("right_thumbstick_click", 0.0)) > 0.5,
+        )
     if xrt is None:
         return False, False
 
@@ -1032,8 +1135,16 @@ def get_axis_clicks():
     return left, right
 
 
-def get_face_buttons():
+def get_face_buttons(reader=None):
     """Fetch primary face buttons A and X. Returns (a_pressed, x_pressed)."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, False
+        return (
+            float(ctrl.get("right_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_primary_click", 0.0)) > 0.5,
+        )
     if xrt is None:
         return False, False
     try:
@@ -1044,8 +1155,18 @@ def get_face_buttons():
         return False, False
 
 
-def get_abxy_buttons():
+def get_abxy_buttons(reader=None):
     """Fetch A,B,X,Y face buttons as booleans (a,b,x,y)."""
+    if isinstance(reader, _ISAAC_TELEOP_READERS):
+        ctrl = reader.get_controller_data()
+        if ctrl is None:
+            return False, False, False, False
+        return (
+            float(ctrl.get("right_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("right_secondary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_primary_click", 0.0)) > 0.5,
+            float(ctrl.get("left_secondary_click", 0.0)) > 0.5,
+        )
     if xrt is None:
         return False, False, False, False
     try:
@@ -1065,15 +1186,30 @@ _GRASP_TRIGGER_DEADZONE = 0.05
 def _compute_hand_joints_for_inputs(solver, hand, trigger, grip) -> np.ndarray:
     """Analog index-trigger grasp takes priority over the middle-finger grip pinch."""
     if trigger > _GRASP_TRIGGER_DEADZONE:
-        finger_data = generate_finger_data(hand, trigger, grip)
+        finger_data = generate_grasp_finger_data(hand, trigger)
         return solver({"position": finger_data})
     return compute_pinch_joints(hand, grip)
 
 
 def compute_hand_joints_from_inputs(
-    left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
+    left_solver,
+    right_solver,
+    left_trigger,
+    left_grip,
+    right_trigger,
+    right_grip,
+    hand_profile: str = "dex3",
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Map each hand to trigger grasp or calibrated Grip/Squeeze pinch."""
+    """Map controller inputs to the selected end-effector command contract."""
+    if hand_profile == "inspire_ftp":
+        left_hand_joints = map_pico_controls(left_trigger, left_grip).astype(np.float32)[None, :]
+        right_hand_joints = map_pico_controls(right_trigger, right_grip).astype(np.float32)[
+            None, :
+        ]
+        return left_hand_joints, right_hand_joints
+    if hand_profile != "dex3":
+        raise ValueError(f"unsupported hand profile: {hand_profile}")
+
     if left_solver is not None and right_solver is not None:
         left_hand_joints = _compute_hand_joints_for_inputs(
             left_solver, "left", left_trigger, left_grip
@@ -1143,6 +1279,18 @@ class PicoReader:
     def get_latest(self):
         with self._lock:
             return self._latest
+
+    @property
+    def disconnected(self) -> bool:
+        return False
+
+    def clear_disconnect(self):
+        pass
+
+    def get_timestamp_ns(self) -> int:
+        if xrt is None:
+            return 0
+        return int(xrt.get_time_stamp_ns())
 
     def _run(self):
         last_report = time.time()
@@ -1390,16 +1538,19 @@ def _pose_stream_common(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    reader=None,
+    hand_profile: str = "dex3",
 ):
     """Shared pose streaming loop used by run_pico."""
-    if xrt is None:
-        raise ImportError(
-            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run pose streaming."
-        )
+    if reader is None:
+        if xrt is None:
+            raise ImportError(
+                "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run pose streaming."
+            )
 
-    # Create reader and start it
-    reader = PicoReader(max_queue_size=buffer_size)
-    reader.start()
+        # Create reader and start it
+        reader = PicoReader(max_queue_size=buffer_size)
+        reader.start()
 
     # Create 3-point pose processor with visualization settings
     three_point = ThreePointPose(
@@ -1420,6 +1571,7 @@ def _pose_stream_common(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix=log_prefix,
+        hand_profile=hand_profile,
     )
 
     if stop_event is None:
@@ -1806,10 +1958,13 @@ class ThreePointPose:
 class PoseStreamer:
     """Encapsulates the pose streaming loop state and logic."""
 
+    managed = False
+    control_frame = None
+
     def __init__(
         self,
         socket,
-        reader: PicoReader,
+        reader: "PicoReader | input_readers.IsaacTeleopReader",
         three_point: ThreePointPose,
         num_frames_to_send: int,
         target_fps: int,
@@ -1817,6 +1972,8 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        hand_profile: str = "dex3",
+        hand_input: str = "controller",
     ):
         self.socket = socket
         self.reader = reader
@@ -1824,20 +1981,25 @@ class PoseStreamer:
         self.target_fps = target_fps
         self.record_dir = record_dir
         self.log_prefix = log_prefix
+        self.hand_profile = hand_profile
 
         # Injected dependencies
         self.reader = reader
         self.three_point = three_point
 
-        self.device = (
-            torch.device("cuda") if use_cuda and torch.cuda.is_available() else torch.device("cpu")
-        )
+        self.device = torch.device("cuda") if use_cuda and torch.cuda.is_available() else torch.device("cpu")
 
         if record_dir:
             os.makedirs(record_dir, exist_ok=True)
         self.record_idx = 0
 
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        self.hand_input = hand_input
+        if hand_input != "controller" or hand_profile == "inspire_ftp":
+            self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
+        elif hand_profile == "dex3":
+            self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        else:
+            raise ValueError(f"unsupported hand profile: {hand_profile}")
         self.parent_indices = [
             -1,
             0,
@@ -1881,13 +2043,9 @@ class PoseStreamer:
         self.next_target_ns = None
         self.frame_start = time.time()
 
-        # Data collection button state tracking (edge-triggered)
-        self.toggle_data_collection_last = False
-        self.toggle_data_abort_last = False
+        self.data_collection_chords = DataCollectionChordTracker()
 
-        self.buffer_cleared = (
-            True  # Start with buffer cleared - wait for full buffer before first send
-        )
+        self.buffer_cleared = True  # Start with buffer cleared - wait for full buffer before first send
         self.yaw_accumulator = YawAccumulator()
 
     def reset_yaw(self):
@@ -1905,52 +2063,57 @@ class PoseStreamer:
         self.buffer_cleared = True
         self.step = 0
 
-    def run_once(self):
-        """Execute one iteration of the pose streaming loop."""
-        sample = self.reader.get_latest()
-
-        if sample is None:
-            time.sleep(0.005)
-            return
-
-        latest_data = compute_from_body_poses(
-            self.parent_indices, self.device, sample["body_poses_np"]
-        )
-        (left_menu_button, left_trigger, right_trigger, left_grip, right_grip) = (
-            get_controller_inputs()
-        )
-        # Get A and B button states for data collection control
-        a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
-
-        # Data collection toggle logic (edge-triggered)
-        # Left grip + A = toggle_data_collection
-        # Left grip + B = toggle_data_abort
-        toggle_data_collection_tmp = a_pressed and left_grip > 0.5
-        toggle_data_abort_tmp = b_pressed and left_grip > 0.5
-
-        # Detect rising edge
-        toggle_data_collection = toggle_data_collection_tmp and not self.toggle_data_collection_last
-        toggle_data_abort = toggle_data_abort_tmp and not self.toggle_data_abort_last
-        self.toggle_data_collection_last = toggle_data_collection_tmp
-        self.toggle_data_abort_last = toggle_data_abort_tmp
-
-        left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
+    def compute_hand_joints(
+        self,
+        left_trigger: float,
+        left_grip: float,
+        right_trigger: float,
+        right_grip: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return compute_hand_joints_from_inputs(
             self.left_hand_ik_solver,
             self.right_hand_ik_solver,
             left_trigger,
             left_grip,
             right_trigger,
             right_grip,
+            hand_profile=self.hand_profile,
         )
-        smpl_pose_np = (
-            latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
-        ).astype(np.float32)
-        smpl_joints_np = (
-            latest_data["smpl_joints_local"].detach().cpu().numpy()[0].astype(np.float32)
+
+    def run_once(self):
+        """Execute one iteration of the pose streaming loop."""
+        sample = self.reader.get_latest()
+
+        if sample is None:
+            if not self.managed:
+                time.sleep(0.005)
+            return
+
+        latest_data = compute_from_body_poses(self.parent_indices, self.device, sample["body_poses_np"])
+        (left_menu_button, left_trigger, right_trigger, left_grip, right_grip) = (
+            get_controller_inputs(self.reader) if self.control_frame is None else self.control_frame["inputs"]
         )
-        body_quat_np = (
-            latest_data["global_orient_quat"].detach().cpu().numpy()[0].astype(np.float32)
+        # Get A and B button states for data collection control
+        a_pressed, b_pressed, x_pressed, y_pressed = (
+            get_abxy_buttons(self.reader) if self.control_frame is None else self.control_frame["abxy"]
         )
+
+        toggle_data_collection, toggle_data_abort = self.data_collection_chords.update(
+            a_pressed,
+            b_pressed,
+            x_pressed,
+            y_pressed,
+            left_grip,
+        )
+
+        left_hand_joints, right_hand_joints = self.compute_hand_joints(
+            left_trigger, left_grip, right_trigger, right_grip
+        )
+        smpl_pose_np = (latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]).astype(
+            np.float32
+        )
+        smpl_joints_np = latest_data["smpl_joints_local"].detach().cpu().numpy()[0].astype(np.float32)
+        body_quat_np = latest_data["global_orient_quat"].detach().cpu().numpy()[0].astype(np.float32)
         curr_stamp_ns = int(sample.get("timestamp_ns", 0))
         step_ns = int(1e9 / max(1, self.target_fps))
         if self.prev_stamp_ns is None:
@@ -1975,12 +2138,8 @@ class PoseStreamer:
         elif alpha > 1.0:
             alpha = 1.0
         use_joints = (1.0 - alpha) * self.prev_smpl_joints_np + alpha * smpl_joints_np
-        use_pose = _interp_pose_axis_angle(self.prev_smpl_pose_np, smpl_pose_np, alpha).astype(
-            np.float32
-        )
-        use_body_quat = _quat_lerp_normalized(self.prev_body_quat_np, body_quat_np, alpha).astype(
-            np.float32
-        )
+        use_pose = _interp_pose_axis_angle(self.prev_smpl_pose_np, smpl_pose_np, alpha).astype(np.float32)
+        use_body_quat = _quat_lerp_normalized(self.prev_body_quat_np, body_quat_np, alpha).astype(np.float32)
         N = len(self.frame_buffer["frame_index"])
 
         ##### From @Jiefeng for directly setting the joint position ######
@@ -2007,22 +2166,14 @@ class PoseStreamer:
         smpl_r_wrist_aa = body_pose[:, SMPL_R_WRIST_IDX]
 
         g1_l_elbow_axis = np.array([0, 1, 0])
-        g1_l_elbow_q_twist, g1_l_elbow_q_swing = decompose_rotation_aa(
-            smpl_l_elbow_aa, g1_l_elbow_axis
-        )
+        g1_l_elbow_q_twist, g1_l_elbow_q_swing = decompose_rotation_aa(smpl_l_elbow_aa, g1_l_elbow_axis)
 
         g1_r_elbow_axis = np.array([0, 1, 0])
-        g1_r_elbow_q_twist, g1_r_elbow_q_swing = decompose_rotation_aa(
-            smpl_r_elbow_aa, g1_r_elbow_axis
-        )
+        g1_r_elbow_q_twist, g1_r_elbow_q_swing = decompose_rotation_aa(smpl_r_elbow_aa, g1_r_elbow_axis)
 
         # Move elbow roll/yaw into wrist while preserving wrist pitch from SMPL
-        l_elbow_swing_euler = R.from_quat(g1_l_elbow_q_swing[:, [1, 2, 3, 0]]).as_euler(
-            "XYZ", degrees=False
-        )
-        r_elbow_swing_euler = R.from_quat(g1_r_elbow_q_swing[:, [1, 2, 3, 0]]).as_euler(
-            "XYZ", degrees=False
-        )
+        l_elbow_swing_euler = R.from_quat(g1_l_elbow_q_swing[:, [1, 2, 3, 0]]).as_euler("XYZ", degrees=False)
+        r_elbow_swing_euler = R.from_quat(g1_r_elbow_q_swing[:, [1, 2, 3, 0]]).as_euler("XYZ", degrees=False)
 
         l_wrist_euler = R.from_rotvec(smpl_l_wrist_aa).as_euler("XYZ", degrees=False)
         r_wrist_euler = R.from_rotvec(smpl_r_wrist_aa).as_euler("XYZ", degrees=False)
@@ -2071,7 +2222,7 @@ class PoseStreamer:
             self.buffer_cleared = False
 
         # Get joystick axes for yaw accumulation
-        _, _, rx, _ = get_controller_axes()
+        _, _, rx, _ = get_controller_axes(self.reader) if self.control_frame is None else self.control_frame["axes"]
         self.yaw_accumulator.update(rx, self.frame_time)
 
         # Only send if buffer is full and we're not waiting for fresh data
@@ -2091,19 +2242,13 @@ class PoseStreamer:
                 "right_grip": np.array([right_grip], dtype=np.float32),
                 "pico_dt": np.array([pico_dt], dtype=np.float32),
                 "pico_fps": np.array([pico_fps], dtype=np.float32),
-                "timestamp_realtime": np.array(
-                    [sample.get("timestamp_realtime", 0.0)], dtype=np.float64
-                ),
-                "timestamp_monotonic": np.array(
-                    [sample.get("timestamp_monotonic", 0.0)], dtype=np.float64
-                ),
+                "timestamp_realtime": np.array([sample.get("timestamp_realtime", 0.0)], dtype=np.float64),
+                "timestamp_monotonic": np.array([sample.get("timestamp_monotonic", 0.0)], dtype=np.float64),
                 "left_hand_joints": left_hand_joints.reshape(-1).astype(np.float32),
                 "right_hand_joints": right_hand_joints.reshape(-1).astype(np.float32),
                 "toggle_data_collection": np.array([toggle_data_collection], dtype=bool),
                 "toggle_data_abort": np.array([toggle_data_abort], dtype=bool),
-                "heading_increment": np.array(
-                    [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
-                ),
+                "heading_increment": np.array([self.yaw_accumulator.yaw_angle_change()], dtype=np.float32),
             }
 
             packed_message = pack_pose_message(numpy_data, topic="pose")
@@ -2128,9 +2273,40 @@ class PoseStreamer:
             self.fps_counter = 0
             self.last_fps_report = current_time
         elapsed = time.time() - self.frame_start
-        if elapsed < self.frame_time:
+        if not self.managed and elapsed < self.frame_time:
             time.sleep(self.frame_time - elapsed)
         self.frame_start = time.time()
+
+
+def _init_input_source(
+    input_source: str,
+    buffer_size: int,
+) -> "PicoReader | input_readers.IsaacTeleopReader":
+    """Create, start, and wait for readiness of the requested teleop input source."""
+    if input_source == "isaac-teleop":
+        reader = input_readers.IsaacTeleopReader(max_queue_size=buffer_size)
+        reader.start()
+        print("Using Isaac Teleop (in-process CloudXR / DeviceIO), waiting for data...")
+        while reader.get_latest() is None:
+            print("waiting for Isaac Teleop body data (connect the headset to CloudXR)...")
+            time.sleep(1)
+        return reader
+
+    if xrt is None:
+        raise ImportError(
+            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
+        )
+
+    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
+    xrt.init()
+    print("Waiting for body tracking data...")
+    while not xrt.is_body_data_available():
+        print("waiting for body data...")
+        time.sleep(1)
+
+    reader = PicoReader(max_queue_size=buffer_size)
+    reader.start()
+    return reader
 
 
 def run_pico(
@@ -2145,18 +2321,11 @@ def run_pico(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    hand_profile: str = "dex3",
+    input_source: str = "xrt",
 ):
-    """Run Pico body tracking with real-time visualization and ZMQ streaming."""
-    if xrt is None:
-        raise ImportError(
-            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run Pico streaming."
-        )
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
-    xrt.init()
-    print("Waiting for body tracking data...")
-    while not xrt.is_body_data_available():
-        print("waiting for body data...")
-        time.sleep(1)
+    """Run body tracking with real-time visualization and ZMQ streaming."""
+    reader = _init_input_source(input_source, buffer_size)
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
@@ -2183,6 +2352,8 @@ def run_pico(
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
+            hand_profile=hand_profile,
+            reader=reader,
         )
     finally:
         socket.close()
@@ -2547,10 +2718,13 @@ def evaluate_vr3pt_entry_gate(
 class PlannerStreamer:
     """Encapsulates the planner control loop state and logic."""
 
+    managed = False
+    control_frame = None
+
     def __init__(
         self,
         socket,
-        reader: PicoReader,
+        reader: "PicoReader | input_readers.IsaacTeleopReader",
         three_point: ThreePointPose,
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
@@ -2561,6 +2735,8 @@ class PlannerStreamer:
         vr3pt_entry_wrist_pos_max_m: float = 0.25,
         vr3pt_entry_torso_pos_max_m: float = 0.20,
         vr3pt_entry_wrist_orn_max_deg: float = 45.0,
+        hand_profile: str = "dex3",
+        hand_input: str = "controller",
     ):
         self.socket = socket
         self.reader = reader
@@ -2571,6 +2747,7 @@ class PlannerStreamer:
         self.vr3pt_entry_wrist_pos_max_m = float(vr3pt_entry_wrist_pos_max_m)
         self.vr3pt_entry_torso_pos_max_m = float(vr3pt_entry_torso_pos_max_m)
         self.vr3pt_entry_wrist_orn_max_deg = float(vr3pt_entry_wrist_orn_max_deg)
+        self.hand_profile = hand_profile
         self.feedback_reader = FeedbackReader(
             zmq_feedback_host=zmq_feedback_host, zmq_feedback_port=zmq_feedback_port
         )
@@ -2585,8 +2762,14 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
 
-        # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        self.hand_input = hand_input
+        # Hand IK solvers for Dex3 trigger grasp and grip/squeeze pinch in VR 3PT mode
+        if hand_input != "controller" or hand_profile == "inspire_ftp":
+            self.left_hand_ik_solver, self.right_hand_ik_solver = None, None
+        elif hand_profile == "dex3":
+            self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        else:
+            raise ValueError(f"unsupported hand profile: {hand_profile}")
         self._vr3pt_ramp_start_pose: np.ndarray | None = None
         self._vr3pt_ramp_start_time: float | None = None
         self._vr3pt_ramp_active = False
@@ -2594,6 +2777,23 @@ class PlannerStreamer:
         self.freeze_vr3pt_target_once = False
         self._vr3pt_entry_gate_passed = False
         self._vr3pt_recalibrated_since_gate = False
+
+    def compute_hand_joints(
+        self,
+        left_trigger: float,
+        left_grip: float,
+        right_trigger: float,
+        right_grip: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return compute_hand_joints_from_inputs(
+            self.left_hand_ik_solver,
+            self.right_hand_ik_solver,
+            left_trigger,
+            left_grip,
+            right_trigger,
+            right_grip,
+            hand_profile=self.hand_profile,
+        )
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -2746,7 +2946,7 @@ class PlannerStreamer:
                 xrt_timestamp = latest_sample.get("timestamp_ns")
             else:
                 latest_sample = None
-                xrt_timestamp = xrt.get_time_stamp_ns()
+                xrt_timestamp = self.reader.get_timestamp_ns()
             duplicate_xr_sample = xrt_timestamp == self.last_xrt_timestamp
             can_freeze_vr3pt = (
                 stream_mode == StreamMode.PLANNER_VR_3PT
@@ -2758,20 +2958,22 @@ class PlannerStreamer:
             self.last_xrt_timestamp = xrt_timestamp
 
             # A+B => next mode; X+Y => previous mode (rising edges)
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+            a_pressed, b_pressed, x_pressed, y_pressed = (
+                get_abxy_buttons(self.reader) if self.control_frame is None else self.control_frame["abxy"]
+            )
             ab_now = bool(a_pressed) and bool(b_pressed) and not bool(x_pressed) and not bool(y_pressed)
             xy_now = bool(x_pressed) and bool(y_pressed) and not bool(a_pressed) and not bool(b_pressed)
-            if ab_now and not self.prev_ab:
+            if not self.managed and ab_now and not self.prev_ab:
                 self.mode = LocomotionMode(min(LocomotionMode.INJURED_WALK, self.mode + 1))
                 print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
-            if xy_now and not self.prev_xy:
+            if not self.managed and xy_now and not self.prev_xy:
                 self.mode = LocomotionMode(max(LocomotionMode.IDLE, self.mode - 1))
                 print(f"[PlannerLoop] Mode -> {self.mode.value}: {self.mode.name}")
             self.prev_ab = ab_now
             self.prev_xy = xy_now
 
             # Read axes/joysticks to control movement, facing, speed and mode
-            lx, ly, rx, ry = get_controller_axes()
+            lx, ly, rx, ry = get_controller_axes(self.reader) if self.control_frame is None else self.control_frame["axes"]
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
             facing = self.yaw_accumulator.update(rx, self.dt)
@@ -2821,9 +3023,7 @@ class PlannerStreamer:
                     print("[PlannerLoop] Sending VR 3-point pose as target")
                     if self.controller_3pt:
                         raw_vr_3pt_pose = sample["vr_3pt_pose_np"]
-                        vr_3pt_pose = self.three_point.process_vr_3pt_pose(
-                            raw_vr_3pt_pose
-                        )
+                        vr_3pt_pose = self.three_point.process_vr_3pt_pose(raw_vr_3pt_pose)
                         if self.controller_3pt_logger is not None:
                             self.controller_3pt_logger.maybe_log(
                                 "vr3pt_stream",
@@ -2850,14 +3050,9 @@ class PlannerStreamer:
                     right_trigger,
                     left_grip,
                     right_grip,
-                ) = get_controller_inputs()
-                lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                    self.left_hand_ik_solver,
-                    self.right_hand_ik_solver,
-                    left_trigger,
-                    left_grip,
-                    right_trigger,
-                    right_grip,
+                ) = get_controller_inputs(self.reader) if self.control_frame is None else self.control_frame["inputs"]
+                lh_joints, rh_joints = self.compute_hand_joints(
+                    left_trigger, left_grip, right_trigger, right_grip
                 )
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
@@ -2886,7 +3081,7 @@ class PlannerStreamer:
         # pacing
         now = time.time()
         sleep_t = self.dt - (now - self.last_send)
-        if sleep_t > 0:
+        if not self.managed and sleep_t > 0:
             time.sleep(sleep_t)
         self.last_send = time.time()
 
@@ -2919,6 +3114,15 @@ def run_pico_manager(
     controller_3pt_log_dir: str = "",
     controller_3pt_log_interval: float = 1.0,
     disable_xr_staleness_watchdog: bool = False,
+    hand_profile: str = "dex3",
+    input_source: str = "xrt",
+    hand_input: str = "controller",
+    hand_max_rate: float | None = None,
+    hand_log_dir: str = "",
+    recording_status_host: str = "127.0.0.1",
+    recording_status_port: int = 5562,
+    inspire_status_host: str = "127.0.0.1",
+    inspire_status_port: int = 5563,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2926,29 +3130,42 @@ def run_pico_manager(
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
     """
-    if xrt is None:
-        raise ImportError(
-            "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run the manager."
-        )
-    subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
-    xrt.init()
+    if hand_input not in ("optical", "controller", "off") or hand_profile not in ("dex3", "inspire_ftp"):
+        raise ValueError("Invalid hand input/profile")
+    if hand_input == "optical" and controller_3pt:
+        raise ValueError("Optical full-body mode requires body/wrist trackers, not controller-only 3PT")
+    if hand_log_dir and hand_input != "optical":
+        raise ValueError("--hand-log-dir requires optical input")
+    if target_fps != 50:
+        raise ValueError("Managed teleoperation uses a fixed 50 Hz safety/control tick")
+    if hand_input == "optical":
+        if input_source != "xrt":
+            raise ValueError("Optical hands require --input-source xrt")
+        for side in ("left", "right"):
+            for kind in ("hand", "controller"):
+                if not callable(getattr(xrt, f"get_{side}_{kind}_snapshot", None)):
+                    raise RuntimeError("Rebuild XRoboToolkit binding for atomic optical/controller snapshots")
     if controller_3pt:
+        if input_source != "xrt":
+            raise ValueError("--controller_3pt requires --input-source xrt")
+        if xrt is None:
+            raise ImportError(
+                "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run the manager."
+            )
+        subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
+        xrt.init()
         print("Controller 3PT mode enabled: using headset + two controller poses only.")
         print("Full-body POSE mode is disabled; use PLANNER and VR_3PT modes.")
         print(
-            "Controller EE offsets (deg): "
-            f"left={left_controller_offset_rpy}, right={right_controller_offset_rpy}"
+            f"Controller EE offsets (deg): left={left_controller_offset_rpy}, right={right_controller_offset_rpy}"
         )
         print(f"Controller pose convention: {controller_pose_convention}")
         print(f"Headset pose convention: {headset_pose_convention}")
-        headset_orientation_convention = (
-            headset_orientation_convention or headset_pose_convention
-        )
+        headset_orientation_convention = headset_orientation_convention or headset_pose_convention
         print(f"Headset orientation convention: {headset_orientation_convention}")
         if no_vr3pt_recalib_on_switch:
             print(
-                "WARNING: VR_3PT per-switch recalibration disabled. "
-                "Use only for testing, not real robot teleop."
+                "WARNING: VR_3PT per-switch recalibration disabled. Use only for testing, not real robot teleop."
             )
         if (
             vr3pt_entry_wrist_pos_max_m <= 0.0
@@ -2959,16 +3176,35 @@ def run_pico_manager(
         if not controller_3pt_log_dir:
             controller_3pt_log_dir = os.path.join("outputs", "controller_3pt_calibration")
     else:
-        print("Waiting for body tracking data...")
-        while not xrt.is_body_data_available():
-            print("waiting for body data...")
-            time.sleep(1)
+        reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
     time.sleep(0.1)
     print(f"[Manager] ZMQ socket bound to port {port}")
+
+    recorder = ManagerRecording(uuid.uuid4().bytes, hand_profile)
+    recorder_status = context.socket(zmq.SUB)
+    recorder_status.setsockopt_string(zmq.SUBSCRIBE, "recording_status")
+    recorder_status.setsockopt(zmq.LINGER, 0)
+    recorder_status.connect(f"tcp://{recording_status_host}:{recording_status_port}")
+    hands = None
+    if hand_input == "optical":
+        endpoint = (
+            f"tcp://{zmq_feedback_host}:{zmq_feedback_port}"
+            if hand_profile == "dex3"
+            else f"tcp://{inspire_status_host}:{inspire_status_port}"
+        )
+        hands = PicoHandRuntime(xrt, context, hand_profile, endpoint, max_rate=hand_max_rate)
+    publisher = PicoPublisher(socket, hand_input, hand_profile, hands)
+    hand_input_code = {"optical": 0, "controller": 1, "off": 2}[hand_input]
+    keyboard = ManagerKeyboard()
+    chords = ControllerChords()
+    mode_epoch = 0
+    sample_generation = 0
+    hand_log = HandCaptureLog(hand_log_dir, hand_profile) if hand_log_dir else None
+    hand_log_failed = False
 
     # Print available locomotion modes
     try:
@@ -2978,9 +3214,9 @@ def run_pico_manager(
     except Exception:
         pass
 
-    # Create shared reader and 3-point pose processor
-    reader = (
-        ControllerPoseReader(
+    # Controller-only tracking must not wait for full-body data.
+    if controller_3pt:
+        reader = ControllerPoseReader(
             max_queue_size=buffer_size,
             left_controller_offset_rpy=left_controller_offset_rpy,
             right_controller_offset_rpy=right_controller_offset_rpy,
@@ -2988,10 +3224,7 @@ def run_pico_manager(
             headset_pose_convention=headset_pose_convention,
             headset_orientation_convention=headset_orientation_convention,
         )
-        if controller_3pt
-        else PicoReader(max_queue_size=buffer_size)
-    )
-    reader.start()
+        reader.start()
 
     three_point = ThreePointPose(
         enable_vis_vr3pt=enable_vis_vr3pt,
@@ -3012,7 +3245,7 @@ def run_pico_manager(
     )
 
     pose_streamer = PoseStreamer(
-        socket=socket,
+        socket=publisher,
         reader=reader,
         three_point=three_point,
         num_frames_to_send=num_frames_to_send,
@@ -3021,12 +3254,14 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        hand_profile=hand_profile,
+        hand_input=hand_input,
     )
     planner_streamer = PlannerStreamer(
-        socket=socket,
+        socket=publisher,
         reader=reader,
         three_point=three_point,
-        poll_hz=20,
+        poll_hz=50,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
         controller_3pt=controller_3pt,
@@ -3035,7 +3270,10 @@ def run_pico_manager(
         vr3pt_entry_wrist_pos_max_m=vr3pt_entry_wrist_pos_max_m,
         vr3pt_entry_torso_pos_max_m=vr3pt_entry_torso_pos_max_m,
         vr3pt_entry_wrist_orn_max_deg=vr3pt_entry_wrist_orn_max_deg,
+        hand_profile=hand_profile,
+        hand_input=hand_input,
     )
+    pose_streamer.managed = planner_streamer.managed = True
 
     # State machine diagram:
     #
@@ -3059,43 +3297,84 @@ def run_pico_manager(
             "B+Y=freeze upper body, "
             "Right Stick Click=advance calibration posture marker"
         )
-        print(
-            "Posture marker sequence: "
-            + " -> ".join(Controller3PtPostureMarker.LABELS)
-        )
+        print("Posture marker sequence: " + " -> ".join(Controller3PtPostureMarker.LABELS))
     else:
         print("Manager controls: A+X=toggle mode, B+Y=freeze upper body, A+B+X+Y=start/stop policy")
+    print("Controller chords: release all buttons and grips first, then hold the chord for at least 0.3 s.")
     current_mode = StreamMode.OFF
+    pending_mode = None
+    pending_since_ns = None
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
-    prev_toggle_dc = False
-    prev_toggle_da = False
     xr_watchdog = XRStalenessWatchdog()
     if disable_xr_staleness_watchdog:
         print("WARNING: XR staleness watchdog disabled.")
     try:
+        keyboard.open()
         prev_ax_pressed = False
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
         prev_right_axis_click = False
         while True:
-            # Poll Pico controller for buttons/axes
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
-
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs()
-
-            left_axis_click, right_axis_click = get_axis_clicks()
-
-            # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
-            ax_pressed = bool(a_pressed) and bool(x_pressed) and not bool(b_pressed) and not bool(y_pressed)
-
-            # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
-            by_pressed = bool(b_pressed) and bool(y_pressed) and not bool(a_pressed) and not bool(x_pressed)
-
-            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
-            start_combo = bool(a_pressed) and bool(b_pressed) and bool(x_pressed) and bool(y_pressed)
+            tick_ns = time.monotonic_ns()
+            for _ in range(32):
+                try:
+                    status = unpack_pose_message(recorder_status.recv(zmq.NOBLOCK), "recording_status")
+                    if status["version"] == 1:
+                        recorder.receive_status(status, tick_ns)
+                except zmq.Again:
+                    break
+                except (ValueError, KeyError, TypeError):
+                    continue
+            keys = keyboard.poll()
+            if input_source == "xrt" and callable(getattr(xrt, "get_left_controller_snapshot", None)):
+                control_frame = read_controllers(xrt)
+            else:
+                # Existing controller-only installs retain their legacy SDK API.
+                a, b, x, y = get_abxy_buttons(reader)
+                inputs = get_controller_inputs(reader)
+                control_frame = {
+                    "buttons": {"a": a, "b": b, "x": x, "y": y, "grip": inputs[3] > 0.5},
+                    "abxy": (a, b, x, y),
+                    "inputs": inputs,
+                    "axes": get_controller_axes(reader),
+                    "clicks": get_axis_clicks(reader),
+                    "fresh": True,
+                }
+            pose_streamer.control_frame = planner_streamer.control_frame = control_frame
+            action = chords.poll(control_frame["buttons"], tick_ns, fresh=control_frame["fresh"])
+            if action is not None:
+                print(f"[Manager] Controller action: {action}")
+            left_menu_button = control_frame["inputs"][0]
+            left_axis_click, right_axis_click = control_frame["clicks"]
+            ax_pressed = action == "tracking" or "t" in keys
+            by_pressed = action == "freeze"
+            start_combo = action == "sonic"
+            if action in ("locomotion_next", "locomotion_previous"):
+                direction = 1 if action == "locomotion_next" else -1
+                planner_streamer.mode = LocomotionMode(
+                    max(0, min(int(LocomotionMode.INJURED_WALK), int(planner_streamer.mode) + direction))
+                )
+            tracking = current_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT)
+            recordable = recording_mode_allowed(current_mode.value, recorder.profile, hand_input_code)
+            if (
+                hand_profile == "dex3" and hand_input == "optical"
+                and current_mode == StreamMode.PLANNER_VR_3PT
+                and (action == "record" or "c" in keys)
+            ):
+                print("[Manager] Optical Dex3 recording requires POSE; VR_3PT uses the native planner fist")
+            if action in ("record", "abort"):
+                command = RecordingCommand.TOGGLE if action == "record" else RecordingCommand.ABORT
+                recorder.enqueue(command, tick_ns, tracking=recordable)
+            for key in keys:
+                if key in "cs":
+                    command = RecordingCommand.START if key == "c" else RecordingCommand.STOP_AND_SAVE
+                    if not recorder.enqueue(command, tick_ns, tracking=recordable):
+                        print("[Manager] Recording command unavailable; wait for recorder ACK/status")
+            if hands is not None:
+                hands.poll_feedback(tick_ns)
 
             if not disable_xr_staleness_watchdog:
                 xr_state = xr_watchdog.poll(
@@ -3112,12 +3391,7 @@ def run_pico_manager(
                     socket.send(build_command_message(start=False, stop=True, planner=True))
                     exit()
 
-            if (
-                controller_3pt
-                and right_axis_click
-                and not prev_right_axis_click
-                and posture_marker is not None
-            ):
+            if controller_3pt and right_axis_click and not prev_right_axis_click and posture_marker is not None:
                 posture_marker.advance()
                 sample = reader.get_latest()
                 if sample is not None and controller_3pt_logger is not None:
@@ -3131,7 +3405,7 @@ def run_pico_manager(
                         planner_streamer.feedback_reader.full_body_q_measured,
                     )
 
-            new_mode = current_mode
+            new_mode = pending_mode if pending_mode is not None else current_mode
             if current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.PLANNER
@@ -3203,7 +3477,77 @@ def run_pico_manager(
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY
 
-            # Handle mode transitions before running loop
+            # T/A+X is a full-body tracking toggle regardless of the planner chain.
+            if ax_pressed and not start_combo and current_mode != StreamMode.OFF:
+                new_mode = (
+                    current_mode
+                    if pending_mode is not None
+                    else StreamMode.PLANNER
+                    if tracking
+                    else StreamMode.POSE
+                )
+            if by_pressed and pending_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                new_mode = current_mode
+            if (
+                recordable
+                and new_mode != StreamMode.OFF
+                and not recording_mode_allowed(new_mode.value, recorder.profile, hand_input_code)
+                and not recorder.may_exit_tracking(tick_ns)
+            ):
+                print("[Manager] Stop/save recording and wait for IDLE ACK before disabling tracking")
+                new_mode = current_mode
+            entering_optical = (
+                new_mode == StreamMode.POSE and current_mode != StreamMode.POSE
+                if hand_profile == "dex3"
+                else new_mode in (StreamMode.POSE, StreamMode.PLANNER_VR_3PT) and not tracking
+            )
+            if hands is not None and entering_optical and not hands.ready(tick_ns):
+                print("[Manager] Waiting for fresh measured hand feedback before optical tracking")
+                for blocker in hands.feedback_blockers(tick_ns):
+                    print(f"[Manager]   {blocker}")
+                new_mode = current_mode
+
+            # Prepare the destination without publishing it under the old mode's
+            # provenance. Continue the current streamer while its peer warms up.
+            prepared_body = None
+            if pending_mode is not None and new_mode != pending_mode:
+                if pending_mode == StreamMode.POSE:
+                    pose_streamer.on_mode_exit()
+                pending_mode = None
+                pending_since_ns = None
+            prepare_transition = not controller_3pt and (
+                new_mode == StreamMode.POSE
+                and current_mode
+                in (StreamMode.PLANNER, StreamMode.PLANNER_FROZEN_UPPER_BODY, StreamMode.PLANNER_VR_3PT)
+                or current_mode == StreamMode.POSE
+                and new_mode in (StreamMode.PLANNER, StreamMode.PLANNER_FROZEN_UPPER_BODY)
+            )
+            if prepare_transition:
+                destination = pose_streamer if new_mode == StreamMode.POSE else planner_streamer
+                if pending_mode is None:
+                    pending_mode, pending_since_ns = new_mode, tick_ns
+                    destination.reset_yaw()
+                    if new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                        planner_streamer.save_upper_body_position_target()
+                    print(f"[Manager] Preparing {new_mode.name}; continuing {current_mode.name}")
+                if tick_ns - pending_since_ns >= 1_000_000_000:
+                    print(f"[Manager] {new_mode.name} preparation timed out; continuing {current_mode.name}")
+                    if pending_mode == StreamMode.POSE:
+                        pose_streamer.on_mode_exit()
+                    pending_mode = pending_since_ns = None
+                    new_mode = current_mode
+                else:
+                    prepared_body = publisher.prepare_body(
+                        destination.run_once
+                        if new_mode == StreamMode.POSE
+                        else lambda: destination.run_once(new_mode)
+                    )
+                    if prepared_body is None:
+                        new_mode = current_mode
+                    else:
+                        pending_mode = pending_since_ns = None
+
+            # Handle mode transitions before publishing the prepared packet.
             if new_mode != current_mode:
                 if controller_3pt and new_mode == StreamMode.POSE:
                     if current_mode == StreamMode.PLANNER_VR_3PT:
@@ -3229,19 +3573,19 @@ def run_pico_manager(
                         print(f"[Manager] VR_3PT parent: {vr3pt_parent_mode.name}")
 
                     if new_mode == StreamMode.POSE:
-                        pose_streamer.reset_yaw()
+                        if prepared_body is None:
+                            pose_streamer.reset_yaw()
                     elif new_mode == StreamMode.PLANNER and current_mode != StreamMode.PLANNER_VR_3PT:
                         # Only reset yaw when freshly entering PLANNER from POSE,
                         # not when returning from VR_3PT sub-mode
-                        planner_streamer.reset_yaw()
-                    elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                        if current_mode != StreamMode.PLANNER_VR_3PT:
-                            # Freshly entering from POSE: reset yaw and grab initial targets
+                        if prepared_body is None:
                             planner_streamer.reset_yaw()
-                        # Always re-grab the latest robot state as frozen targets,
-                        # whether entering from POSE or returning from VR_3PT
-                        # (the old targets are stale after VR_3PT moved the arms)
-                        planner_streamer.save_upper_body_position_target()
+                    elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                        if prepared_body is None:
+                            if current_mode != StreamMode.PLANNER_VR_3PT:
+                                planner_streamer.reset_yaw()
+                            # VR_3PT may have moved the arms since the last freeze.
+                            planner_streamer.save_upper_body_position_target()
                     elif new_mode == StreamMode.PLANNER_VR_3PT:
                         # Recalibrate VR tracking against the robot's actual current pose
                         # (read via g1_debug feedback + FK) to prevent sudden jumps
@@ -3249,12 +3593,37 @@ def run_pico_manager(
                             print("[Manager] Skipping VR_3PT per-switch recalibration")
                         else:
                             planner_streamer.recalibrate_for_vr3pt()
-                        planner_streamer.start_vr3pt_ramp(
-                            require_recalibration=not no_vr3pt_recalib_on_switch
-                        )
+                        planner_streamer.start_vr3pt_ramp(require_recalibration=not no_vr3pt_recalib_on_switch)
+
+            if new_mode != current_mode:
+                if mode_epoch == np.iinfo(np.int64).max:
+                    raise RuntimeError("Manager mode epoch exhausted")
+                mode_epoch += 1
+            if new_mode == StreamMode.OFF and current_mode != StreamMode.OFF:
+                recorder.enqueue(RecordingCommand.ABORT, tick_ns, tracking=tracking)
+            state_fields = recorder.fields(mode_epoch, new_mode.value)
+            state_fields["hand_input"] = np.array([hand_input_code], dtype=np.int32)
+            # State provenance must precede body and Inspire packets on this socket.
+            socket.send(pack_pose_message(state_fields, "manager_state", version=4))
+            publisher.pv = state_fields["pv"]
+            publisher.generation = sample_generation
+            publisher.body_sent = False
+            optical_enabled = new_mode == StreamMode.POSE or (
+                hand_profile != "dex3" and new_mode == StreamMode.PLANNER_VR_3PT
+            )
+            # Advance each optical hand once per tick, independent of body arrivals.
+            if hands is not None:
+                hands.step(
+                    reader.get_latest(), tick_ns, enabled=optical_enabled,
+                    # Use the same feedback snapshot admitted above. Polling
+                    # again could invalidate the first POSE hand baseline.
+                    poll_feedback=False,
+                )
 
             # Run one iteration of the new mode
-            if new_mode == StreamMode.POSE:
+            if prepared_body is not None:
+                publisher.send(prepared_body)
+            elif new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
             elif (
                 new_mode == StreamMode.PLANNER
@@ -3263,11 +3632,12 @@ def run_pico_manager(
             ):
                 planner_streamer.run_once(new_mode)
 
-            # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
+            # Commit only after the prepared body packet and its provenance were sent.
+            # Deployment must also handle cross-subscriber delivery order.
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
-                    exit()
+                    break
                 elif (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
@@ -3280,43 +3650,128 @@ def run_pico_manager(
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
 
-            # Mode-independent: send manager_state for data exporter
-            toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
-            toggle_da_tmp = bool(b_pressed) and left_grip_mgr > 0.5
-            toggle_dc = toggle_dc_tmp and not prev_toggle_dc
-            toggle_da = toggle_da_tmp and not prev_toggle_da
-            prev_toggle_dc = toggle_dc_tmp
-            prev_toggle_da = toggle_da_tmp
-            socket.send(
-                pack_pose_message(
-                    {
-                        "stream_mode": np.array([current_mode.value], dtype=np.int32),
-                        "toggle_data_collection": np.array([toggle_dc], dtype=bool),
-                        "toggle_data_abort": np.array([toggle_da], dtype=bool),
-                    },
-                    topic="manager_state",
+            diagnostics = None
+            hand_sent = [False, False]
+            if hands is not None:
+                diagnostics = hands.diagnostics(
+                    state_fields["pv"], sample_generation, body_sent=publisher.body_sent
                 )
-            )
+                if current_mode != StreamMode.OFF:
+                    inspire = hands.inspire_command(state_fields["pv"], sample_generation)
+                    if inspire is not None:
+                        socket.send(pack_pose_message(inspire, "inspire_hand", version=1))
+                        hand_sent = [True, True]
+                        if diagnostics is not None:
+                            diagnostics["inspire_message_seq"] = inspire["message_seq"]
+            elif (
+                hand_input == "controller"
+                and publisher.body_sent
+                and all(q is not None for q in publisher.last_commands)
+            ):
+                diagnostics = {
+                    "pv": state_fields["pv"],
+                    "sample_generation": np.array([sample_generation], dtype=np.int64),
+                    "hand_profile": np.array([hand_profile == "inspire_ftp"], dtype=np.int32),
+                    "body_sent": np.array([True], dtype=bool),
+                }
+                for side, q in zip(("left", "right"), publisher.last_commands):
+                    diagnostics.update(
+                        {
+                            f"{side}_state": np.array([3], dtype=np.int32),
+                            f"{side}_source_epoch": np.array([0], dtype=np.int64),
+                            f"{side}_source_timestamp_ns": np.array([tick_ns], dtype=np.int64),
+                            f"{side}_valid": np.array([control_frame["fresh"]], dtype=bool),
+                            f"{side}_command": q,
+                        }
+                    )
+            if diagnostics is not None:
+                diagnostics["hand_input"] = state_fields["hand_input"]
+                socket.send(pack_pose_message(diagnostics, "hand_tracking", version=1))
+
+            if hand_log is not None and not hand_log_failed:
+                if hand_profile == "dex3" and publisher.body_sent:
+                    hand_sent = [q is not None for q in publisher.last_commands]
+                try:
+                    hand_log.record(
+                        tick_ns,
+                        hands.snapshots,
+                        hands.body_wrists,
+                        hands.measured_inputs,
+                        hands.outputs,
+                        enabled=optical_enabled,
+                        body_sent=publisher.body_sent,
+                        hand_sent=hand_sent,
+                        pv=state_fields["pv"],
+                        sample_generation=sample_generation,
+                    )
+                except (OSError, ValueError, TypeError, KeyError, RuntimeError, OverflowError) as exc:
+                    hand_log_failed = True
+                    print(f"[Manager] Hand capture disabled after error: {exc}")
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
             prev_right_axis_click = right_axis_click
+            sample_generation += 1
+            if sample_generation > np.iinfo(np.int64).max:
+                raise RuntimeError("Manager sample generation exhausted")
+            remaining = (tick_ns + 20_000_000 - time.monotonic_ns()) * 1e-9
+            if remaining > 0:
+                time.sleep(remaining)
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
+        if recorder.recording_may_be_active or recorder.capture_active:
+            save_requested = recorder.enqueue(RecordingCommand.STOP_AND_SAVE, time.monotonic_ns(), tracking=True)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                socket.send(
+                    pack_pose_message(recorder.fields(mode_epoch, current_mode.value), "manager_state", version=4)
+                )
+                try:
+                    for _ in range(32):
+                        raw_status = recorder_status.recv(zmq.NOBLOCK)
+                        try:
+                            status = unpack_pose_message(raw_status, "recording_status")
+                            if status["version"] == 1:
+                                recorder.receive_status(status, time.monotonic_ns())
+                        except (ValueError, TypeError, KeyError, OverflowError):
+                            pass
+                except zmq.Again:
+                    pass
+                if (
+                    recorder.may_exit_tracking(time.monotonic_ns())
+                    and recorder.recording_state == RecordingState.IDLE
+                ):
+                    break
+                if not save_requested:
+                    save_requested = recorder.enqueue(
+                        RecordingCommand.STOP_AND_SAVE, time.monotonic_ns(), tracking=True
+                    )
+                time.sleep(0.02)
+            else:
+                print("[Manager] Recording save was not acknowledged within 2 seconds; check exporter status")
     finally:
         # Cleanup resources
+        keyboard.close()
+        recorder_status.close()
+        if hands is not None:
+            hands.close()
+        planner_streamer.feedback_reader.poller.close()
         reader.stop()
         three_point.close()
         socket.close()
         context.term()
+        if hand_log is not None:
+            try:
+                hand_log.close()
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"[Manager] Hand capture could not finish: {exc}")
         print("[Manager] Shutdown complete")
 
 
 if __name__ == "__main__":
-
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -3326,9 +3781,7 @@ if __name__ == "__main__":
         "--num_frames_to_send", type=int, default=5, help="Number of frames to send (default: 200)"
     )
     parser.add_argument("--target_fps", type=int, default=50, help="Target loop FPS (default: 50)")
-    parser.add_argument(
-        "--cuda", action="store_true", help="Use CUDA for tensors and model (default: CPU)"
-    )
+    parser.add_argument("--cuda", action="store_true", help="Use CUDA for tensors and model (default: CPU)")
     parser.add_argument(
         "--record_dir",
         type=str,
@@ -3345,6 +3798,12 @@ if __name__ == "__main__":
         "--manager",
         action="store_true",
         help="Run manager with planner and pose threads (interactive)",
+    )
+    parser.add_argument(
+        "--hand-profile",
+        choices=("dex3", "inspire_ftp"),
+        default="dex3",
+        help="Hand command contract published in pose/planner messages (default: dex3)",
     )
     parser.add_argument(
         "--zmq_feedback_host",
@@ -3475,18 +3934,14 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
         help=(
-            "Seconds to ramp VR_3PT teleop targets after entering teleoperation mode. "
-            "Set to 0 to disable ramping."
+            "Seconds to ramp VR_3PT teleop targets after entering teleoperation mode. Set to 0 to disable ramping."
         ),
     )
     parser.add_argument(
         "--vr3pt_entry_max_mismatch",
         type=float,
         default=None,
-        help=(
-            "Deprecated alias for --vr3pt_entry_wrist_pos_max_m. "
-            "Kept for old commands."
-        ),
+        help=("Deprecated alias for --vr3pt_entry_wrist_pos_max_m. Kept for old commands."),
     )
     parser.add_argument(
         "--vr3pt_entry_wrist_pos_max_m",
@@ -3526,7 +3981,31 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable manager-side XR stale-frame stop/freeze checks. Use only for harnessed diagnostics.",
     )
+    parser.add_argument(
+        "--input-source",
+        type=str,
+        default="xrt",
+        choices=["xrt", "isaac-teleop"],
+        help=(
+            "Input source: 'xrt' for XRoboToolkit SDK (default), "
+            "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
+        ),
+    )
+    parser.add_argument("--hand-input", choices=("optical", "controller", "off"), default="controller")
+    parser.add_argument(
+        "--hand-max-rate",
+        type=float,
+        default=None,
+        help="Optical joint rate limit (rad/s Dex3, normalized units/s Inspire)",
+    )
+    parser.add_argument("--hand-log-dir", default="", help="New directory for exact optical capture/replay inputs")
+    parser.add_argument("--recording-status-host", default="127.0.0.1")
+    parser.add_argument("--recording-status-port", type=int, default=5562)
+    parser.add_argument("--inspire-status-host", default="127.0.0.1")
+    parser.add_argument("--inspire-status-port", type=int, default=5563)
     args = parser.parse_args()
+    if not args.manager and args.hand_input != "controller":
+        parser.error("--hand-input optical/off requires --manager")
 
     # Standalone VR3Pt test modes (exit after finishing)
     if args.vr3pt_test:
@@ -3584,6 +4063,15 @@ if __name__ == "__main__":
             controller_3pt_log_dir=args.controller_3pt_log_dir,
             controller_3pt_log_interval=args.controller_3pt_log_interval,
             disable_xr_staleness_watchdog=args.disable_xr_staleness_watchdog,
+            hand_input=args.hand_input,
+            hand_profile=args.hand_profile,
+            hand_max_rate=args.hand_max_rate,
+            hand_log_dir=args.hand_log_dir,
+            recording_status_host=args.recording_status_host,
+            recording_status_port=args.recording_status_port,
+            inspire_status_host=args.inspire_status_host,
+            inspire_status_port=args.inspire_status_port,
+            input_source=args.input_source,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -3599,4 +4087,6 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            hand_profile=args.hand_profile,
+            input_source=args.input_source,
         )

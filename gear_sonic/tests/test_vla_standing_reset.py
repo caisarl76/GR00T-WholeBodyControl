@@ -17,6 +17,17 @@ def feedback(value=0.8):
     }
 
 
+def test_explicit_absolute_motor_measurement_wins_over_legacy_joint_fields():
+    state = feedback(-9.0)
+    state["body_q"] = np.arange(29) * -2.0
+    state["body_q_measured_motor"] = np.arange(29) * 0.01
+    reset = StandingReset(state, np.zeros(7), np.zeros(7))
+    np.testing.assert_allclose(
+        reset.command.upper_body_position,
+        state["body_q_measured_motor"][G1_UPPER_BODY_JOINT_INDICES],
+    )
+
+
 def test_standing_reset_starts_at_measured_pose_and_reaches_straight_preset():
     state = feedback()
     reset = StandingReset(state, np.zeros(7), np.zeros(7))
@@ -66,3 +77,89 @@ def test_repeat_reset_captures_new_pose_and_preserves_closed_hand_target():
         state["left_hand_q_measured"] = command.left_hand_position
         state["right_hand_q_measured"] = command.right_hand_position
     np.testing.assert_allclose(command.left_hand_position, 0.4)
+
+
+@pytest.mark.parametrize("bias", [0.08, -0.08])
+def test_harness_reset_compensates_steady_tracking_bias_with_existing_motion_limits(bias):
+    state = feedback(0.0)
+    state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES] = G1_STANDING_UPPER_BODY
+    reset = StandingReset(state, np.zeros(7), np.zeros(7), compensate_tracking_bias=True)
+    for _ in range(400):
+        before = np.asarray(reset.command.upper_body_position)
+        measured = state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES].copy()
+        command = reset.advance(state, 0.02)
+        reference = np.asarray(command.upper_body_position)
+        assert np.max(np.abs(reference - before)) <= 0.010001
+        assert np.max(np.abs(reference - measured)) <= 0.150001
+        assert np.max(np.abs(reference - G1_STANDING_UPPER_BODY)) <= 0.150001
+        # A lagging plant with an offset at rest: the old exact-reference ramp
+        # reaches its endpoint but leaves the physical joints outside tolerance.
+        state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES] += 0.2 * (reference - bias - measured)
+    assert reset.is_settled(state, 0.05, np.deg2rad(5))
+    np.testing.assert_allclose(reset.target[:17], G1_STANDING_UPPER_BODY)
+    before = reset.command
+    assert reset.advance(None, 10) == before
+
+
+def test_tracking_correction_cannot_wind_up_beyond_feedback_lead_or_claim_settling():
+    state = feedback(0.0)
+    state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES] = G1_STANDING_UPPER_BODY
+    reset = StandingReset(state, np.zeros(7), np.zeros(7), compensate_tracking_bias=True)
+    command = reset.advance(state, 0.02)
+    state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES] -= 0.1
+    measured = state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES].copy()
+    for _ in range(1000):
+        before = np.asarray(command.upper_body_position)
+        command = reset.advance(state, 0.02)
+        reference = np.asarray(command.upper_body_position)
+        assert np.max(np.abs(reference - before)) <= 0.010001
+        assert np.max(np.abs(reference - measured)) <= 0.150001
+    assert not reset.is_settled(state, 0.05, np.deg2rad(5))
+
+
+def test_tracking_deadband_honors_a_tighter_profile_tolerance():
+    state = feedback(0.0)
+    state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES] = G1_STANDING_UPPER_BODY
+    reset = StandingReset(
+        state, np.zeros(7), np.zeros(7), compensate_tracking_bias=True,
+        joint_tolerance_rad=0.01,
+    )
+    for _ in range(500):
+        command = reset.advance(state, 0.02)
+        measured = state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES].copy()
+        state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES] += 0.2 * (
+            np.asarray(command.upper_body_position) - 0.02 - measured
+        )
+    assert reset.is_settled(state, 0.01, np.deg2rad(5))
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_reset_retracts_reference_when_measured_tracking_falls_back(direction):
+    state = feedback(0.)
+    state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES] = G1_STANDING_UPPER_BODY
+    reset = StandingReset(state, np.zeros(7), np.zeros(7))
+    before = np.asarray(reset.command.upper_body_position)
+    state["body_q_measured"][22] += direction * .155
+    measured = state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES]
+    reference = np.asarray(reset.advance(state, .02).upper_body_position)
+    assert np.max(np.abs(reference - measured)) <= .15000001
+    assert np.max(np.abs(reference - before)) <= .01000001
+
+
+def test_reset_rejects_tracking_loss_that_cannot_meet_rate_and_lead_bounds():
+    state = feedback(0.)
+    state["body_q_measured"][G1_UPPER_BODY_JOINT_INDICES] = G1_STANDING_UPPER_BODY
+    reset = StandingReset(state, np.zeros(7), np.zeros(7))
+    before = reset.command
+    state["body_q_measured"][22] += .18
+    with pytest.raises(ValueError, match="rate-limited lead bound"):
+        reset.advance(state, .02)
+    assert reset.command == before
+
+
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_measured_hold_rejects_out_of_bounds_right_arm(direction):
+    state = feedback(0.)
+    state["body_q_measured"][26] = direction * 2.12722
+    with pytest.raises(ValueError, match="Measured right-arm"):
+        StandingReset(state, state["left_hand_q_measured"], state["right_hand_q_measured"])

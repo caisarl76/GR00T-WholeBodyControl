@@ -133,7 +133,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 4. In Terminal 2 (C++ deployment), press **`]`** to start the control system.
 5. In the MuJoCo window (sim only), press **`9`** to drop the robot to the ground.
 6. Back in Terminal 2, press **`ENTER`** to enable ZMQ streaming. The terminal prints `ZMQ STREAMING MODE: ENABLED`. The robot begins tracking your PICO poses in real time.
-7. Move your body — the robot mirrors your motions. Use the index-finger **Trigger** for grasp or the middle-finger **Grip/Squeeze** for thumb–middle pinch on the corresponding Dex3 hand.
+7. Move your body — the robot mirrors your motions. Use the **Trigger** button on each PICO controller for grasp and the **Grip/Squeeze** button for pinch on the corresponding robot hand.
 8. To **pause** streaming (e.g., to reposition yourself), press **`ENTER`** again. The terminal prints `ZMQ STREAMING MODE: DISABLED`. The robot holds its last pose and stops tracking. You can move freely without affecting the robot.
 9. To **resume**, press **`ENTER`** once more. The robot will snap to your current pose — **move back close to the robot's current pose before resuming** to avoid sudden jumps.
 10. When done, press **`O`** to stop control and exit.
@@ -153,14 +153,28 @@ In `--input-type zmq` mode, the C++ deployment side does **not** process PICO co
 | **A + X** | Toggle Pose mode in the streamer — starts or stops publishing pose data. When stopped, the robot holds its last pose. **Works as pause/resume.** |
 | **Menu (hold)** | Pauses pose streaming in the streamer while held. The robot holds its last pose until you release. **Works as pause.** Move back close to the robot's current pose before releasing. |
 | **Trigger** | Analog hand grasp — processed by the streamer and sent as `left_hand_joints` / `right_hand_joints` in the stream. |
-| **Grip/Squeeze** | Analog thumb–middle pinch on the corresponding Dex3 hand. Available in Pose and VR 3PT modes. |
+| **Grip/Squeeze** | Hand pinch — processed by the streamer and sent as `left_hand_joints` / `right_hand_joints` in the stream. |
 | **B + Y** | Toggle Pose mode in the streamer (same effect as A+X) — starts or stops publishing pose data. **Works as pause/resume.** |
 
-Each hand is controlled independently. The index-finger Trigger takes priority
-when pressed above `0.05` and interpolates from all-open to the closed grasp in
-proportion to its depth. Otherwise, the middle-finger Grip/Squeeze interpolates
-from all-open (`0.0`) to the calibrated pinch-ready pose (`0.2`), then to the
-closed thumb–middle pinch (`1.0`). Release Grip/Squeeze to open the hand.
+For the default `dex3` hand profile, the hand controls are evaluated independently per side. The index-finger **Trigger** has
+priority whenever its value is above `0.05`, even if Grip/Squeeze is also held, and
+closes the existing grasp in proportion to its depth. Otherwise the analog **Grip/Squeeze** value drives a
+calibrated two-stage thumb-middle pinch: `0.0` is the all-open idle hand, `0.2` is
+the thumb-middle pinch-open pre-shape, and `1.0` brings the thumb and middle
+fingertips together. Motion is linearly interpolated from all-open to pinch-open
+over `0.0–0.2`, then from pinch-open to pinch-closed over `0.2–1.0`.
+
+To inspect the calibrated right-hand stages without starting deployment, install the
+`gear_sonic[sim]` dependencies and fetch the repository's Git LFS hand meshes, then run
+from the repository root:
+
+```sh
+PYTHONPATH=. MUJOCO_GL=egl python gear_sonic/scripts/render_dex3_pinch_primitive.py \
+  --output outputs/dex3_thumb_middle_pinch.png
+```
+
+The static image shows all-open, pinch-open, intermediate, and pinch-closed poses
+with the seven motor commands. `MUJOCO_GL=egl` selects headless rendering on Linux.
 
 All mode control on the deployment side is done from the keyboard:
 

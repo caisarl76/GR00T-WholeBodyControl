@@ -4,16 +4,21 @@ Parses a YAML-based WBC config via tyro CLI, instantiates the G1 robot model,
 and launches the simulator (optionally with offscreen image publishing).
 """
 
+from pathlib import Path
+import sys
 from typing import Dict
+
+# Direct script launches must use this checkout, even with another editable install.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import tyro
 
-from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory, init_channel
-from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
 from gear_sonic.data.robot_model.instantiation.g1 import (
     instantiate_g1_robot_model,
 )
 from gear_sonic.data.robot_model.robot_model import RobotModel
+from gear_sonic.utils.mujoco_sim.configs import SimLoopConfig
+from gear_sonic.utils.mujoco_sim.simulator_factory import SimulatorFactory
 
 ArgsConfig = SimLoopConfig
 
@@ -22,8 +27,6 @@ class SimWrapper:
     def __init__(self, robot_model: RobotModel, env_name: str, config: Dict[str, any], **kwargs):
         self.robot_model = robot_model
         self.config = config
-
-        init_channel(config=self.config)
 
         # Create simulator using factory
         self.sim = SimulatorFactory.create_simulator(
@@ -39,9 +42,7 @@ def main(config: ArgsConfig):
     wbc_config["ENV_NAME"] = config.env_name
 
     if config.enable_image_publish:
-        assert (
-            config.enable_offscreen
-        ), "enable_offscreen must be True when enable_image_publish is True"
+        assert config.enable_offscreen, "enable_offscreen must be True when enable_image_publish is True"
 
     robot_model = instantiate_g1_robot_model()
 

@@ -44,6 +44,8 @@
  *   --disable-crc-check   | Skip CRC validation (for MuJoCo sim)
  *   --planner-fp16        | Use FP16 for planner TensorRT engine
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
+ *   --motor-kp-scale      | Scale selected hardware motor Kp gains
+ *   --motor-kd-scale      | Scale selected hardware motor Kd gains
  */
 #include <cmath>
 #include <cuda_runtime_api.h>
@@ -65,6 +67,9 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <filesystem>
+#include <optional>
+#include "../include/planner_trace.hpp"
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -84,6 +89,7 @@
 
 // Motion Data Reader
 #include "../include/motion_data_reader.hpp"
+#include "../include/streamed_motion_playback.hpp"
 
 // Math utilities
 #include "../include/math_utils.hpp"
@@ -101,6 +107,8 @@
 // Robot parameters
 #include "../include/robot_parameters.hpp"
 #include "../include/policy_parameters.hpp"
+#include "../include/shutdown_sequence.hpp"
+#include "../include/motor_gain_scaling.hpp"
 
 // Input interface and input handlers
 #include "../include/input_interface/keyboard_handler.hpp"
@@ -201,6 +209,7 @@ class G1Deploy {
     bool has_upper_body_data_ = false;
     std::array<double, 17> upper_body_joint_positions_buffer_;
     std::array<double, 17> upper_body_joint_velocities_buffer_;
+    std::array<double, 17> upper_body_tau_buffer_{};  ///< Planner-supplied feedforward, Nm.
     std::vector<double> token_state_data_;  // Token buffer (size from config)
     
     // =========================================================================
@@ -213,6 +222,7 @@ class G1Deploy {
     std::shared_ptr<const MotionSequence> current_motion_ = nullptr;
     int current_frame_ = 0;
     int saved_frame_for_observation_window_ = 0; // for observation window
+    bool live_pose_playback_ = false;
     std::mutex current_motion_mutex_; // for current motion and frame synchronization
     
     // =========================================================================
@@ -295,15 +305,11 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds LOW_STATE_LATE_THRESHOLD{50};
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
     ProgramState program_state_;
+    MotorGainScaleConfig motor_gain_scales_;
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
 
-    static constexpr double kTeleopOutputRampDuration = 1.0;
-    bool last_has_vr_3point_data_ = false;
-    bool teleop_output_ramp_active_ = false;
-    double teleop_output_ramp_elapsed_ = 0.0;
-    std::array<double, G1_NUM_MOTOR> teleop_output_ramp_start_q_{};
     bool enable_dex3_hands_ = true;
     
     // =========================================================================
@@ -314,6 +320,9 @@ class G1Deploy {
     std::unique_ptr<std::ofstream> policy_input_file_;
     std::unique_ptr<std::ofstream> record_input_file_;
     std::unique_ptr<std::ifstream> playback_input_file_;
+    std::unique_ptr<PlannerTrace> planner_trace_;
+    std::string planner_trace_path_;
+    std::uint64_t active_trace_generation_ = 0;  // Control-thread owned.
 
     // Motion recorders for streamed and planner_motion
     MotionRecorder zmq_motion_recorder_;
@@ -563,6 +572,16 @@ class G1Deploy {
       if (!current_motion_ || current_motion_->timesteps == 0) { return; }
       if (current_motion_->GetNumBodyQuaternions() == 0) { return; }
       if (!state_logger_) { return; }
+
+      if (planner_ && planner_->planner_state_.heading_handoff) {
+        if (!reinitialize_heading_) {
+          const auto heading = heading_state_buffer_.GetDataWithTime().data;
+          heading_state_buffer_.SetData(planner_->planner_state_.heading_handoff->Rebase(
+              heading ? *heading : HeadingState(), init_ref_data_root_rot_array_));
+        }
+        // An explicit heading reset takes precedence over a pending handoff.
+        planner_->planner_state_.heading_handoff.reset();
+      }
 
       if (reinitialize_heading_) {
         double sample_dt = control_dt_;
@@ -1745,6 +1764,7 @@ class G1Deploy {
               {"motion_joint_velocities_lowerbody_10frame_step1", 120, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 10, 1, lower_body_joint_mujoco_order_in_isaaclab_index); }},
               {"motion_joint_positions_wrists_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 10, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},
               {"motion_joint_positions_wrists_2frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 2, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},
+              {"motion_joint_positions_wrists_4frame_step1", 24, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 4, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},  // low-latency SONIC (smpl 4-frame)
               {"motion_joint_velocities_wrists_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 10, 1, wrist_joint_isaaclab_order_in_isaaclab_index); }},
               {"motion_joint_positions_5frame_step5", 145, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointPositionsMultiFrame(buf, offset, 5, 5); }},
               {"motion_joint_velocities_5frame_step5", 145, [this](std::vector<double>& buf, size_t offset) { return GatherMotionJointVelocitiesMultiFrame(buf, offset, 5, 5); }},
@@ -1754,7 +1774,8 @@ class G1Deploy {
               {"smpl_joints_10frame_step5", 720, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 10, 5); }},  // 24*3*10
               {"smpl_joints_10frame_step1", 720, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 10, 1); }},  // 24*3*10
               {"smpl_joints_lower_10frame_step1", 270, [this](std::vector<double>& buf, size_t offset) {return GatherMotionSmplJointsMultiFrame(buf, offset, 10, 1, {0,1,2,4,5,7,8,10,11}); }},  // 9*3*10 lower body joints
-              {"smpl_joints_2frame_step1", 144, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 2, 1); }},  // 24*3*10
+              {"smpl_joints_2frame_step1", 144, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 2, 1); }},  // 24*3*2
+              {"smpl_joints_4frame_step1", 288, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplJointsMultiFrame(buf, offset, 4, 1); }},  // 24*3*4, low-latency SONIC
               {"smpl_pose", 63, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 1, 1); }},  // 21*3
               {"smpl_pose_5frame_step5", 315, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 5, 5); }},  // 21*3*5
               {"smpl_pose_10frame_step5", 630, [this](std::vector<double>& buf, size_t offset) { return GatherMotionSmplPosesMultiFrame(buf, offset, 10, 5); }},  // 21*3*10
@@ -1763,6 +1784,7 @@ class G1Deploy {
               {"smpl_root_z_10frame_step1", 10, [this](std::vector<double>& buf, size_t offset) { return GatherMotionRootZPositionMultiFrame(buf, offset, 10, 1); }},
               {"smpl_anchor_orientation_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1); }},
               {"smpl_anchor_orientation_2frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 2, 1); }},
+              {"smpl_anchor_orientation_4frame_step1", 24, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 4, 1); }},  // low-latency SONIC (smpl 4-frame)
               // SMPL heading-only variants (mode=1, matches Python smpl_root_ori_heading_multi_future)
               {"smpl_anchor_orientation_heading_10frame_step1", 60, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 10, 1, 1); }},
               {"smpl_anchor_orientation_heading_2frame_step1", 12, [this](std::vector<double>& buf, size_t offset) { return GatherMotionAnchorOrientationMutiFrame(buf, offset, 2, 1, 1); }},
@@ -2132,6 +2154,43 @@ class G1Deploy {
 
 
 
+    void RecordPlannerGeneration(double begin, double movement_buffer_at,
+                                 const std::array<float, 3>& received_facing,
+                                 bool initial = false) {
+      if (!planner_trace_) return;
+      PlannerTrace::Plan row;
+      row.initial = initial;
+      row.begin = begin;
+      row.end = PlannerTraceTime();
+      row.movement_buffer_at = movement_buffer_at;
+      row.mode = planner_->GetModeValue();
+      row.seed = planner_->GetRandomSeedValue();
+      row.speed = planner_->GetTargetVelValue();
+      row.height = planner_->GetHeightValue();
+      row.gather_us = planner_->last_timing_.gather_input_duration.count();
+      row.inference_us = planner_->last_timing_.model_duration.count();
+      row.resample_us = planner_->last_timing_.extract_duration.count();
+      for (int i = 0; i < 3; ++i) {
+        row.received_facing[i] = received_facing[i];
+        row.facing[i] = planner_->GetFacingDirectionValues()[i];
+        row.movement[i] = planner_->GetMovementDirectionValues()[i];
+      }
+      std::copy_n(planner_->GetContextBuffer(), row.context.size(), row.context.begin());
+      row.raw_frames = planner_->GetNumPredFrames();
+      std::copy_n(planner_->GetMujocoQposBuffer(),
+                  std::min(row.raw_frames, PlannerTrace::kRawFrames) * 36,
+                  row.raw_qpos.begin());
+      {
+        std::lock_guard<std::mutex> lock(planner_->planner_motion_mutex_);
+        row.generation = planner_->diagnostic_generation_;
+        row.generation_frame = planner_->diagnostic_generation_frame_;
+        row.resampled_frames = planner_->planner_motion_50hz_.timesteps;
+        for (int i = 0; i < std::min(row.resampled_frames, PlannerTrace::kMotionFrames); ++i)
+          row.resampled_quat[i] = planner_->planner_motion_50hz_.BodyQuaternions(i)[0];
+      }
+      planner_trace_->Record(row);
+    }
+
   public:
     OperatorState operator_state;
 
@@ -2165,7 +2224,11 @@ class G1Deploy {
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
       bool enable_dex3_hands = true,
-      Vr3PtSafetyFilter::Config vr3pt_filter_config = Vr3PtSafetyFilter::Config{})
+      Vr3PtSafetyFilter::Config vr3pt_filter_config = Vr3PtSafetyFilter::Config{},
+      bool harness_planner_hold = false,
+      std::string planner_trace_path = "",
+      MotorGainScaleConfig motor_gain_scales = {},
+      bool live_pose_playback = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2175,8 +2238,10 @@ class G1Deploy {
         counter_(0),
         mode_pr_(Mode::PR),
         mode_machine_(0),
+        live_pose_playback_(live_pose_playback),
         disable_crc_check_(disable_crc_check),
         program_state_(ProgramState::INIT),
+        motor_gain_scales_(motor_gain_scales),
         last_action {0.0},
         last_left_hand_action {0.0},
         last_right_hand_action {0.0},
@@ -2187,6 +2252,22 @@ class G1Deploy {
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
+
+      if (live_pose_playback_) {
+        std::cout << "[INFO] Live pose playback enabled: skip streamed backlog while retaining the observation window"
+                  << std::endl;
+      }
+
+      const auto kp_scales = format_motor_gain_scales(motor_gain_scales_.kp);
+      const auto kd_scales = format_motor_gain_scales(motor_gain_scales_.kd);
+      if (!kp_scales.empty()) {
+        std::cout << "[INFO] Motor Kp scales (hardware indices): "
+                  << kp_scales << std::endl;
+      }
+      if (!kd_scales.empty()) {
+        std::cout << "[INFO] Motor Kd scales (hardware indices): "
+                  << kd_scales << std::endl;
+      }
       
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
@@ -2489,7 +2570,8 @@ class G1Deploy {
       }
       else if (input_type == "zmq") {
         input_interface_ = std::make_unique<ZMQEndpointInterface>(
-          zmq_host, zmq_port, zmq_topic, zmq_conflate, zmq_verbose
+          zmq_host, zmq_port, zmq_topic, zmq_conflate, zmq_verbose,
+          enable_dex3_hands_
         );
         std::cout << "Initialized ZMQ endpoint interface" << std::endl;
         std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
@@ -2500,7 +2582,7 @@ class G1Deploy {
       else if (input_type == "zmq_manager") {
         input_interface_ = std::make_unique<ZMQManager>(
           zmq_host, zmq_port, zmq_topic, "command", "planner", zmq_conflate,
-          zmq_verbose, vr3pt_filter_config
+          zmq_verbose, vr3pt_filter_config, harness_planner_hold, enable_dex3_hands_
         );
         std::cout << "Initialized ZMQ manager" << std::endl;
         std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
@@ -2588,6 +2670,15 @@ class G1Deploy {
         std::cout << "Unknown output type '" << output_type << "' - no output will be published" << std::endl;
       } else {
         std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
+        for (auto& output : output_interfaces_) {
+          output->SetHarnessPlannerHold(harness_planner_hold && input_type == "zmq_manager");
+        }
+      }
+
+      // Diagnostic storage must be allocated before any recurrent thread starts.
+      if (!planner_trace_path.empty()) {
+        planner_trace_path_ = planner_trace_path;
+        planner_trace_ = std::make_unique<PlannerTrace>();
       }
 
       // create threads
@@ -2608,6 +2699,19 @@ class G1Deploy {
     ~G1Deploy()
     {
       // CUDA resources are now cleaned up by the PolicyEngine and planner classes automatically
+    }
+
+    // Called from main after the operator stops the trial, never from a control
+    // callback. Freeze prevents later callbacks from changing the snapshot.
+    void FlushPlannerTrace() {
+      if (!planner_trace_) return;
+      planner_trace_->Freeze();
+      const std::string partial_path = planner_trace_path_ + ".partial";
+      std::ofstream out(partial_path);
+      planner_trace_->Write(out);
+      out.close();
+      if (!out) throw std::runtime_error("Failed to close planner trace");
+      std::filesystem::rename(partial_path, planner_trace_path_);
     }
 
     void SetThreadPriority() {
@@ -2926,16 +3030,21 @@ class G1Deploy {
       std::array<double, 7> right_hand_q = {0.0};
       std::array<double, 7> right_hand_dq = {0.0};
       
-      auto left_hand_state_ptr = enable_dex3_hands_ ? dex3_hands_.getState(true) : nullptr;
-      if (left_hand_state_ptr) {
+      const auto left_hand_data = dex3_hands_.getStateWithTime(true);
+      const auto right_hand_data = dex3_hands_.getStateWithTime(false);
+      std::array<std::chrono::steady_clock::time_point, 2> hand_feedback_time{};
+      auto left_hand_state_ptr = enable_dex3_hands_ ? left_hand_data.data : nullptr;
+      if (left_hand_state_ptr && left_hand_state_ptr->motor_state().size() == 7) {
+        hand_feedback_time[0] = left_hand_data.timestamp;
         for (int i = 0; i < 7; ++i) {
           left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
           left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
         }
       }
       
-      auto right_hand_state_ptr = enable_dex3_hands_ ? dex3_hands_.getState(false) : nullptr;
-      if (right_hand_state_ptr) {
+      auto right_hand_state_ptr = enable_dex3_hands_ ? right_hand_data.data : nullptr;
+      if (right_hand_state_ptr && right_hand_state_ptr->motor_state().size() == 7) {
+        hand_feedback_time[1] = right_hand_data.timestamp;
         for (int i = 0; i < 7; ++i) {
           right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
           right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
@@ -2959,51 +3068,9 @@ class G1Deploy {
                                     std::span(right_hand_dq),
                                     std::span(last_left_hand_action),
                                     std::span(last_right_hand_action),
-                                    ros_timestamp);
+                                    ros_timestamp, hand_feedback_time);
       }
       return true;
-    }
-
-    void StartTeleopOutputRamp(const char* reason) {
-      auto low_state_data = low_state_buffer_.GetDataWithTime();
-      const std::shared_ptr<const LowState_> ls = low_state_data.data;
-      if (ls) {
-        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-          teleop_output_ramp_start_q_[i] = ls->motor_state()[i].q();
-        }
-      } else {
-        const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
-        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-          teleop_output_ramp_start_q_[i] = mc ? mc->q_target.at(i) : default_angles[i];
-        }
-      }
-
-      teleop_output_ramp_elapsed_ = 0.0;
-      teleop_output_ramp_active_ = kTeleopOutputRampDuration > 0.0;
-      if (teleop_output_ramp_active_) {
-        std::cout << "[Control] Teleop output ramp started ("
-                  << kTeleopOutputRampDuration << "s, " << reason << ")" << std::endl;
-      }
-    }
-
-    void ApplyTeleopOutputRamp(MotorCommand& motor_command) {
-      if (!teleop_output_ramp_active_) { return; }
-
-      teleop_output_ramp_elapsed_ += control_dt_;
-      double alpha = std::clamp(
-          teleop_output_ramp_elapsed_ / kTeleopOutputRampDuration, 0.0, 1.0);
-      alpha = alpha * alpha * (3.0 - 2.0 * alpha);
-
-      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-        const double target = motor_command.q_target.at(i);
-        motor_command.q_target.at(i) = static_cast<float>(
-            teleop_output_ramp_start_q_[i] * (1.0 - alpha) + target * alpha);
-      }
-
-      if (alpha >= 1.0) {
-        teleop_output_ramp_active_ = false;
-        std::cout << "[Control] Teleop output ramp complete" << std::endl;
-      }
     }
 
     /**
@@ -3035,12 +3102,7 @@ class G1Deploy {
       std::tie(has_right_hand_data_, right_hand_joint_buffer_) = input_interface_->GetHandPose(false);
       std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
       std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
-
-      if (has_vr_3point_data_ != last_has_vr_3point_data_) {
-        StartTeleopOutputRamp(
-            has_vr_3point_data_ ? "enter VR_3PT" : "exit VR_3PT");
-      }
-      last_has_vr_3point_data_ = has_vr_3point_data_;
+      upper_body_tau_buffer_ = input_interface_->GetUpperBodyFeedforwardTorques();
 
       auto last_update_time = input_interface_->GetLastUpdateTime();
       if (last_update_time.has_value()) {
@@ -3196,7 +3258,12 @@ class G1Deploy {
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
-      ApplyTeleopOutputRamp(motor_command_tmp);
+      for (size_t i = 0; i < upper_body_tau_buffer_.size(); i++) {
+        motor_command_tmp.tau_ff.at(upper_body_joint_isaaclab_order_in_mujoco_index[i]) = upper_body_tau_buffer_[i];
+      }
+      // Keep balance feedback and last_action consistent across source changes.
+      // Smooth teleop reference targets upstream, never the policy motor output.
+      apply_motor_gain_scales(motor_gain_scales_, motor_command_tmp);
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
     }
@@ -3212,7 +3279,8 @@ class G1Deploy {
      *
      * 2. **Reference-motion mode**: Advances current_frame_ by 1.  Clamps or
      *    resets to 0 when the motion ends (except for "streamed" motions,
-     *    which hold the last valid frame while waiting for new data).
+     *    which hold the last valid frame while waiting for new data, or skip
+     *    to the latest frame with enough future context in live pose mode).
      *
      * @return True on success.
      */
@@ -3223,10 +3291,13 @@ class G1Deploy {
         std::lock_guard<std::mutex> planner_lock(planner_->planner_motion_mutex_);
         
         // Check if the planner thread has finished generating a valid animation:
-        if (planner_->motion_available_ && planner_->planner_motion_50hz_.timesteps > 0) {
+        if (planner_->motion_available_ && planner_->planner_motion_50hz_.timesteps > 0 &&
+            planner_->motion_generation_ == planner_->planner_state_.generation.load()) {
           
           const auto &planner_motion_gen = planner_->planner_motion_50hz_;
           planner_->motion_available_ = false;
+          const int previous_frame = current_frame_;
+          int used_generation_frame = 0;
 
           // special case if this is the first time we're receiving a planner motion:
           bool is_the_first_time = false;
@@ -3259,6 +3330,7 @@ class G1Deploy {
           {
 
             auto fgen = planner_->gen_frame_;
+            used_generation_frame = fgen;
 
             // Ok, a new planner animation is available. We want to do these things:
             //  * rebase the old planner_motion_ so current_frame_ is at frame 0
@@ -3332,6 +3404,20 @@ class G1Deploy {
 
           if(success)
           {
+            if (planner_trace_) {
+              PlannerTrace::Merge row;
+              row.at = PlannerTraceTime();
+              row.generation = planner_->diagnostic_generation_;
+              row.published_generation_frame = planner_->diagnostic_generation_frame_;
+              row.used_generation_frame = used_generation_frame;
+              row.previous_frame = previous_frame;
+              row.first = is_the_first_time;
+              row.frames = planner_motion_->timesteps;
+              for (int i = 0; i < std::min(row.frames, PlannerTrace::kMotionFrames); ++i)
+                row.quat[i] = planner_motion_->BodyQuaternions(i)[0];
+              planner_trace_->Record(row);
+              active_trace_generation_ = row.generation;
+            }
             if(planner_motion_file_)
             {
               // log the motion that we just copied/blended over:
@@ -3356,13 +3442,26 @@ class G1Deploy {
               (*planner_motion_file_) << std::endl;
             }
 
+            // Capture the outgoing yaw before changing ownership. The control
+            // observation step consumes this pair and preserves world heading.
+            if (is_the_first_time && planner_->planner_state_.preserve_heading_on_init &&
+                current_motion_->timesteps > 0 && current_motion_->GetNumBodyQuaternions() > 0) {
+              planner_->planner_state_.QueueHeadingHandoff(
+                  current_motion_->BodyQuaternions(std::clamp(current_frame_, 0, current_motion_->timesteps - 1))[0],
+                  planner_motion_->BodyQuaternions(0)[0]);
+            }
             // switch the current motion to planner_motion:
             current_frame_ = 0;
             // Assign shared_ptr directly - planner_motion_ is already a shared_ptr
             current_motion_ = planner_motion_;
+            input_interface_->OnPlannerReferenceCommitted();
             idle_readapt_stored_ = false;
             if(is_the_first_time) {
-              reinitialize_heading_ = true;
+              if (planner_->planner_state_.preserve_heading_on_init) {
+                planner_->planner_state_.preserve_heading_on_init = false;
+              } else {
+                reinitialize_heading_ = true;
+              }
             }
           }
         }
@@ -3461,8 +3560,11 @@ class G1Deploy {
             std::cout << "Reset to frame 0." << std::endl;
           }
         } else {
-          if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
-            current_frame_ = current_frame_ - 1;
+          const int previous_frame = current_frame_ - 1;
+          current_frame_ = SelectStreamedPlaybackFrame(
+              previous_frame, current_motion_->timesteps,
+              saved_frame_for_observation_window_, live_pose_playback_);
+          if (current_frame_ == previous_frame) {
             std::cout << "Motion " << current_motion_->name << " completed and waiting following motion" << std::endl;                    
           }
         }
@@ -3589,8 +3691,8 @@ class G1Deploy {
         (*record_input_file_) << operator_state.start << ",";
         (*record_input_file_) << operator_state.stop << ",";
 
-        (*record_input_file_) << planner_state.enabled << ",";
-        (*record_input_file_) << planner_state.initialized << ",";
+        (*record_input_file_) << planner_state.enabled.load() << ",";
+        (*record_input_file_) << planner_state.initialized.load() << ",";
         
         (*record_input_file_) << movement_state_data.data->locomotion_mode << ",";
         (*record_input_file_) << movement_state_data.data->movement_direction[0] << ",";
@@ -3633,13 +3735,20 @@ class G1Deploy {
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
       
       if (planner_ && planner_->planner_state_.enabled) {
+        // Pin ownership before choosing an init/replan path or reading its inputs.
+        const auto generation = planner_->planner_state_.generation.load();
         if (ls) {
           if (!planner_->planner_state_.initialized) {
             try {
               std::cout << "Initializing planner..." << std::endl;
-              planner_motion_->timesteps = 0;
+              {
+                std::lock_guard<std::mutex> lock(current_motion_mutex_);
+                if (!planner_->planner_state_.enabled ||
+                    generation != planner_->planner_state_.generation.load()) return;
+                planner_motion_->timesteps = 0;
+                planner_motion_->SetEncodeMode(initial_encoder_mode_);
+              }
               std::cout << "Setting planner_motion encode mode to " << initial_encoder_mode_ << std::endl;
-              planner_motion_->SetEncodeMode(initial_encoder_mode_);
               // Get base quaternion and joint positions from robot state
               std::array<double, 4> base_quat = float_to_double<4>(ls->imu_state().quaternion());
               std::array<double, 29> joint_positions;
@@ -3647,10 +3756,30 @@ class G1Deploy {
                 joint_positions[i] = ls->motor_state()[i].q();
               }
               // Initialize planner with robot state
-              if(!planner_->Initialize(base_quat, joint_positions)) {
+              MovementState initial_movement(0, {0, 0, 0}, {1, 0, 0}, -1, -1);
+              {
+                std::lock_guard<std::mutex> lock(current_motion_mutex_);
+                if (planner_->planner_state_.preserve_heading_on_init) {
+                  const auto prepared = movement_state_buffer_.GetDataWithTime().data;
+                  if (prepared) initial_movement = *prepared;
+                }
+              }
+              const double trace_begin = planner_trace_ ? PlannerTraceTime() : 0;
+              if(!planner_->Initialize(base_quat, joint_positions, initial_movement, generation)) {
                 throw std::runtime_error("Error when initializing planner");
               }
+              RecordPlannerGeneration(trace_begin, 0, {static_cast<float>(initial_movement.facing_direction[0]),
+                                                      static_cast<float>(initial_movement.facing_direction[1]),
+                                                      static_cast<float>(initial_movement.facing_direction[2])}, true);
 
+              {
+                std::lock_guard<std::mutex> lock(current_motion_mutex_);
+                if (!planner_->planner_state_.enabled ||
+                    generation != planner_->planner_state_.generation.load()) {
+                  planner_->planner_state_.initialized = false;
+                  return;  // This inference belongs to an abandoned mode.
+                }
+              }
               std::cout << "Planner initialized successfully!" << std::endl;
               
               // Start recording session for planner motion (if enabled)
@@ -3662,6 +3791,9 @@ class G1Deploy {
               }
               
             } catch (const std::exception& e) {
+              std::unique_lock<std::mutex> motion_lock(current_motion_mutex_);
+              if (!planner_->planner_state_.enabled ||
+                  generation != planner_->planner_state_.generation.load()) return;
               std::cout << "✗ Error initializing planner: " << e.what() << std::endl;
               std::cout << "Disabling planner to prevent further errors..." << std::endl;
               planner_->planner_state_.enabled = false;
@@ -3669,7 +3801,6 @@ class G1Deploy {
               planner_motion_->timesteps = 0;
               // reset operator state and current motion and frame
               {
-                std::lock_guard<std::mutex> lock(current_motion_mutex_);
                 operator_state.play = false;
                 current_frame_ = 0;
                 current_motion_ = motion_reader_.GetMotionShared(motion_reader_.current_motion_index_);
@@ -3801,6 +3932,7 @@ class G1Deploy {
               // Update planning with current movement parameters
 
               // gotta make sure planner_motion actually has data...
+              const double trace_begin = planner_trace_ ? PlannerTraceTime() : 0;
               if(!planner_->UpdatePlanning(
                 current_frame_,
                 planner_motion_,
@@ -3808,12 +3940,20 @@ class G1Deploy {
                 movement_speed,
                 target_height,
                 movement_direction,
-                facing_direction
+                facing_direction,
+                -1,
+                generation
               )) {
                 throw std::runtime_error("Error when updating planner");
               }
+              RecordPlannerGeneration(trace_begin,
+                                      PlannerTraceTime(movement_state_data.timestamp),
+                                      facing_direction);
               
             } catch (const std::exception& e) {
+              std::unique_lock<std::mutex> motion_lock(current_motion_mutex_);
+              if (!planner_->planner_state_.enabled ||
+                  generation != planner_->planner_state_.generation.load()) return;
               std::cout << "✗ Error during planning update: " << e.what() << std::endl;
               std::cout << "Disabling planner to prevent further errors..." << std::endl;
               planner_->planner_state_.enabled = false;
@@ -3821,7 +3961,6 @@ class G1Deploy {
               planner_motion_->timesteps = 0;
               // reset operator state and current motion and frame
               {
-                std::lock_guard<std::mutex> lock(current_motion_mutex_);
                 operator_state.play = false;
                 current_frame_ = 0;
                 current_motion_ = motion_reader_.GetMotionShared(motion_reader_.current_motion_index_);
@@ -3976,6 +4115,11 @@ class G1Deploy {
           int current_encoder_mode_copy;
           bool current_play_copy;
           std::shared_ptr<const MotionSequence> current_motion_copy = nullptr;
+          std::optional<PlannerTrace::Control> trace_control;
+          if (planner_trace_) {
+            trace_control.emplace();
+            trace_control->begin = PlannerTraceTime(obs_start_time);
+          }
           {
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
             current_frame_copy = current_frame_;
@@ -3997,6 +4141,25 @@ class G1Deploy {
               std::cout << "Stopping control system." << std::endl;
               operator_state.stop = true;
               return;
+            }
+            if (trace_control && current_motion_copy->timesteps > 0) {
+              auto& row = *trace_control;
+              row.tick = logging_counter_;
+              row.generation = active_trace_generation_;
+              row.frame = current_frame_copy;
+              row.observation_window_frames = saved_frame_for_observation_window_;
+              row.planner_motion = current_motion_copy == planner_motion_;
+              row.active_quat = current_motion_copy->BodyQuaternions(current_frame_copy)[0];
+              auto heading_data = heading_state_buffer_.GetDataWithTime().data;
+              HeadingState heading = heading_data ? *heading_data : HeadingState();
+              row.heading_quat = quat_mul_d(euler_z_to_quat_d(heading.delta_heading),
+                quat_mul_d(calc_heading_quat_d(heading.init_base_quat),
+                           calc_heading_quat_inv_d(init_ref_data_root_rot_array_)));
+              row.target_quat = quat_mul_d(row.heading_quat, row.active_quat);
+              row.measured_quat = float_to_double<4>(used_low_state_data_.data->imu_state().quaternion());
+              row.measurement_at = PlannerTraceTime(used_low_state_data_.timestamp);
+              for (int i = 0; i < G1_NUM_MOTOR; ++i)
+                row.motor_measured[i] = used_low_state_data_.data->motor_state()[i].q();
             }
           } // Release lock after all observation-dependent operations
 
@@ -4045,6 +4208,16 @@ class G1Deploy {
                 heading_state_buffer_, current_motion_copy, current_frame_copy
               );
             }
+          }
+
+          if (trace_control) {
+            auto& row = *trace_control;
+            row.observations_end = PlannerTraceTime(obs_end_time);
+            row.policy_end = PlannerTraceTime(motor_command_end_time);
+            row.telemetry_end = PlannerTraceTime();
+            auto command = motor_command_buffer_.GetDataWithTime().data;
+            if (command) std::copy(command->q_target.begin(), command->q_target.end(), row.motor_target.begin());
+            planner_trace_->Record(row);
           }
 
           // Handle recording of streamed motion (if enabled)
@@ -4155,6 +4328,23 @@ class G1Deploy {
     }
 };
 
+static bool parse_motor_gain_scale_flag(
+    int argc, char const* argv[], int& index,
+    std::span<std::optional<float>, G1_NUM_MOTOR> scales) {
+  const char* flag = argv[index];
+  if (index + 1 >= argc) {
+    std::cerr << "Error: " << flag << " requires <motor-list>=<factor>"
+              << std::endl;
+    return false;
+  }
+  const auto error = add_motor_gain_scale(argv[++index], scales);
+  if (error) {
+    std::cerr << "Error: invalid " << flag << ": " << *error << std::endl;
+    return false;
+  }
+  return true;
+}
+
 /**
  * @brief Entry point: parse CLI arguments and run the G1 deployment application.
  *
@@ -4194,11 +4384,16 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
     std::cout << "  --policy-precision <16|32>: specify precision to run the policy model at (default: 32)" << std::endl;
+    std::cout << "  --motor-kp-scale <motors>=<factor>: scale Kp for hardware motor indices/ranges" << std::endl;
+    std::cout << "  --motor-kd-scale <motors>=<factor>: scale Kd for hardware motor indices/ranges" << std::endl;
     std::cout << "  --zmq-host <host>: ZMQ server host (default: localhost)" << std::endl;
     std::cout << "  --zmq-port <port>: ZMQ server port (default: 5556)" << std::endl;
     std::cout << "  --zmq-topic <topic>: ZMQ topic/prefix (default: pose)" << std::endl;
     std::cout << "  --zmq-conflate: enable ZMQ CONFLATE (default: disabled)" << std::endl;
     std::cout << "  --zmq-verbose: enable ZMQ subscriber verbose logs" << std::endl;
+    std::cout << "  --harness-planner-hold: retain applied arm/hand targets on planner-input timeout (zmq_manager only)" << std::endl;
+    std::cout << "  --planner-trace-file <path>: memory trace, flushed on operator stop (lo simulation only)" << std::endl;
+    std::cout << "  --live-pose-playback: skip streamed backlog while retaining the observation window (default: OFF)" << std::endl;
     std::cout << "  --zmq-out-port <port>: ZMQ port for output (default: 5557)" << std::endl;
     std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
     std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
@@ -4253,6 +4448,9 @@ int main(int argc, char const* argv[]) {
   std::string zmq_topic = "pose";
   bool zmq_conflate = false;  // default off; enable with --zmq-conflate
   bool zmq_verbose = false;
+  bool harness_planner_hold = false;
+  std::string planner_trace_path;
+  bool live_pose_playback = false;
   bool enableMotionRecording = false;  // default off; enable with --enable-motion-recording
   int zmq_out_port = 5557;
   std::string zmq_out_topic = "g1_debug";
@@ -4260,10 +4458,20 @@ int main(int argc, char const* argv[]) {
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
   bool enable_dex3_hands = true;
   Vr3PtSafetyFilter::Config vr3pt_filter_config;
+  MotorGainScaleConfig motor_gain_scales;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--harness-planner-hold") {
+      harness_planner_hold = true;
+    } else if (std::string(argv[i]) == "--planner-trace-file") {
+      if (i + 1 >= argc || std::string(argv[i + 1]).empty() ||
+          std::string(argv[i + 1]).starts_with("--")) {
+        std::cerr << "Error: --planner-trace-file requires a path" << std::endl;
+        return 1;
+      }
+      planner_trace_path = argv[++i];
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4412,6 +4620,14 @@ int main(int argc, char const* argv[]) {
       else{
         std::cerr << "old and weak" << std::endl;
       }
+    } else if (std::string(argv[i]) == "--motor-kp-scale") {
+      if (!parse_motor_gain_scale_flag(argc, argv, i, motor_gain_scales.kp)) {
+        return 1;
+      }
+    } else if (std::string(argv[i]) == "--motor-kd-scale") {
+      if (!parse_motor_gain_scale_flag(argc, argv, i, motor_gain_scales.kd)) {
+        return 1;
+      }
     } else if (std::string(argv[i]) == "--enable-csv-logs") {
       enableCsvLogs = true;
       std::cout << "[INFO] CSV logging enabled" << std::endl;
@@ -4434,6 +4650,8 @@ int main(int argc, char const* argv[]) {
       zmq_conflate = true;
     } else if (std::string(argv[i]) == "--zmq-verbose") {
       zmq_verbose = true;
+    } else if (std::string(argv[i]) == "--live-pose-playback") {
+      live_pose_playback = true;
     } else if (std::string(argv[i]) == "--enable-motion-recording") {
       enableMotionRecording = true;
       std::cout << "[INFO] Motion recording enabled" << std::endl;
@@ -4529,6 +4747,18 @@ int main(int argc, char const* argv[]) {
     }
   }
 
+  try {
+    ValidatePlannerTraceOptions(planner_trace_path, networkInterface, disableCrcCheck, inputType, plannerFile);
+    if (!planner_trace_path.empty() &&
+        (std::filesystem::exists(planner_trace_path) ||
+         std::filesystem::exists(planner_trace_path + ".partial") ||
+         !std::filesystem::is_directory(std::filesystem::absolute(planner_trace_path).parent_path()))) {
+      throw std::invalid_argument("Planner trace needs an existing parent and a new output file");
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "Error: " << error.what() << std::endl;
+    return 1;
+  }
   std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
   G1Deploy custom(
     networkInterface,
@@ -4560,7 +4790,11 @@ int main(int argc, char const* argv[]) {
     initial_compliance,
     initial_max_close_ratio,
     enable_dex3_hands,
-    vr3pt_filter_config
+    vr3pt_filter_config,
+    harness_planner_hold,
+    planner_trace_path,
+    motor_gain_scales,
+    live_pose_playback
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
@@ -4581,9 +4815,9 @@ int main(int argc, char const* argv[]) {
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;
-  custom.Stop();
+  const int status = StopThenFlushDiagnostics(custom);
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
   sleep(0.5);
-  std::cout << "[DEBUG] Program exiting normally..." << std::endl;
-  return 0;
+  if (status == 0) std::cout << "[DEBUG] Program exiting normally..." << std::endl;
+  return status;
 }

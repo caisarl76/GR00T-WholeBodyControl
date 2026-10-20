@@ -106,6 +106,9 @@ public:
                             std::mutex& current_motion_mutex,
                             bool& report_temperature) = 0;
 
+    // Called under the current-motion mutex at the actual planner reference commit.
+    virtual void OnPlannerReferenceCommitted() {}
+
     // ------------------------------------------------------------------
     // Capability queries – overridden by sub-classes as needed
     // ------------------------------------------------------------------
@@ -389,6 +392,10 @@ public:
         }
         return {false, {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
     }
+
+    /// @brief Get upper-body joint feedforward torques (17 DOF, Nm, planner order).
+    /// @return Zeros unless the input supplies them.
+    virtual std::array<double, 17> GetUpperBodyFeedforwardTorques() const { return {}; }
 
     /// @brief Get the last update time of the input interface.
     virtual std::optional<std::chrono::steady_clock::time_point> GetLastUpdateTime() const {

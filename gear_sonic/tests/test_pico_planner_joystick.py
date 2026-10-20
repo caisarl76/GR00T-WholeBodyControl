@@ -67,12 +67,13 @@ def test_left_stick_deadzone_zeroes_movement():
 )
 def test_planner_publishes_slow_walk_speed(monkeypatch, axes, expected_mode, expected_speed):
     sent = []
-    monkeypatch.setattr(pico, "get_controller_axes", lambda: axes)
-    monkeypatch.setattr(pico, "get_abxy_buttons", lambda: (False, False, False, False))
+    monkeypatch.setattr(pico, "get_controller_axes", lambda reader=None: axes)
+    monkeypatch.setattr(pico, "get_abxy_buttons", lambda reader=None: (False, False, False, False))
     monkeypatch.setattr(pico, "xrt", SimpleNamespace(get_time_stamp_ns=lambda: 1))
     streamer = PlannerStreamer.__new__(PlannerStreamer)
     streamer.controller_3pt = False
-    streamer.reader = None
+    streamer.reader = SimpleNamespace(get_timestamp_ns=lambda: 1)
+    streamer.control_frame = None
     streamer.socket = SimpleNamespace(send=sent.append)
     streamer.dt = 0.0
     streamer.last_send = 0.0

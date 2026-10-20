@@ -81,7 +81,7 @@ class XrClient:
     def get_hand_tracking_state(self, hand: str) -> np.ndarray | None:
         """Returns the hand tracking state for the specified hand.
         Valid hands: "left", "right".
-        State is a 27 x 7 numpy array, where each row is [x, y, z, qx, qy, qz, qw] for each joint.
+        State is a 26 x 7 numpy array, where each row is [x, y, z, qx, qy, qz, qw] for each joint.
         Returns None if hand tracking is inactive (low quality).
         """
         if hand.lower() == "left":
@@ -95,6 +95,27 @@ class XrClient:
         else:
             raise ValueError(f"Invalid hand: {hand}. Valid hands are: 'left', 'right'.")
 
+    def get_hand_snapshot(self, hand: str) -> dict:
+        """Return one atomic optical hand snapshot from the XR binding."""
+        if hand.lower() == "left":
+            snapshot = xrt.get_left_hand_snapshot()
+        elif hand.lower() == "right":
+            snapshot = xrt.get_right_hand_snapshot()
+        else:
+            raise ValueError(f"Invalid hand: {hand}. Valid hands are: 'left', 'right'.")
+        snapshot["pose"] = np.asarray(snapshot["pose"], dtype=np.float64)
+        snapshot["location_flags"] = np.asarray(snapshot["location_flags"], dtype=np.uint64)
+        snapshot["radius"] = np.asarray(snapshot["radius"], dtype=np.float64)
+        return snapshot
+
+    def get_controller_snapshot(self, controller: str) -> dict:
+        """Return controller pose, inputs and local receipt age from one sample."""
+        if controller.lower() == "left":
+            return xrt.get_left_controller_snapshot()
+        elif controller.lower() == "right":
+            return xrt.get_right_controller_snapshot()
+        raise ValueError(f"Invalid controller: {controller}. Valid controllers are: 'left', 'right'.")
+
     def get_joystick_state(self, controller: str) -> list[float]:
         """Returns the joystick state for the specified controller.
         Valid controllers: "left", "right".
@@ -105,9 +126,7 @@ class XrClient:
         elif controller.lower() == "right":
             return xrt.get_right_axis()
         else:
-            raise ValueError(
-                f"Invalid controller: {controller}. Valid controllers are: 'left', 'right'."
-            )
+            raise ValueError(f"Invalid controller: {controller}. Valid controllers are: 'left', 'right'.")
 
     def get_motion_tracker_data(self) -> dict:
         """Returns a dictionary of motion tracker data, where the keys are the tracker serial numbers.

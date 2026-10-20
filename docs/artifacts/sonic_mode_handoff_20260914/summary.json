@@ -1,0 +1,178 @@
+{
+  "baseline": {
+    "completed": true,
+    "falls": [],
+    "control_seconds": 38.01667498599272,
+    "measured_seconds": 33.01667498599272,
+    "min_root_height_m": 0.7818090666901163,
+    "max_root_tilt_deg": 8.363453944664752,
+    "physics_wall_ratio": 0.9665236051941621,
+    "transitions": [
+      {
+        "to": "pose",
+        "at_seconds": 8.008952198986663,
+        "min_height_m": 0.7843114078006074,
+        "max_tilt_deg": 8.363453944664752
+      },
+      {
+        "to": "planner",
+        "at_seconds": 13.006368192989612,
+        "min_height_m": 0.7860699313277418,
+        "max_tilt_deg": 3.686469511908128
+      },
+      {
+        "to": "pose",
+        "at_seconds": 18.005080558010377,
+        "min_height_m": 0.7848339687224835,
+        "max_tilt_deg": 7.261353371587225
+      },
+      {
+        "to": "planner",
+        "at_seconds": 23.002756262983894,
+        "min_height_m": 0.7861866333949191,
+        "max_tilt_deg": 3.526780946694892
+      },
+      {
+        "to": "pose",
+        "at_seconds": 28.020441519009182,
+        "min_height_m": 0.7843781687819393,
+        "max_tilt_deg": 7.629278441297683
+      },
+      {
+        "to": "planner",
+        "at_seconds": 33.018472505995305,
+        "min_height_m": 0.7861986276003068,
+        "max_tilt_deg": 3.505185466782315
+      }
+    ]
+  },
+  "patched": {
+    "completed": true,
+    "falls": [],
+    "control_seconds": 38.001993035984924,
+    "measured_seconds": 33.001993035984924,
+    "min_root_height_m": 0.780352082060395,
+    "max_root_tilt_deg": 7.651194719274417,
+    "physics_wall_ratio": 0.9630350199543275,
+    "transitions": [
+      {
+        "to": "pose",
+        "at_seconds": 8.00973935300135,
+        "min_height_m": 0.7847769945336704,
+        "max_tilt_deg": 7.651194719274417
+      },
+      {
+        "to": "planner",
+        "at_seconds": 13.007522240979597,
+        "min_height_m": 0.7865178820713346,
+        "max_tilt_deg": 3.8369838798707914
+      },
+      {
+        "to": "pose",
+        "at_seconds": 18.01058666498284,
+        "min_height_m": 0.7845445117267856,
+        "max_tilt_deg": 7.534959207426585
+      },
+      {
+        "to": "planner",
+        "at_seconds": 23.008729658991797,
+        "min_height_m": 0.7862928179543686,
+        "max_tilt_deg": 3.741624382867979
+      },
+      {
+        "to": "pose",
+        "at_seconds": 28.006460225005867,
+        "min_height_m": 0.7847450312862345,
+        "max_tilt_deg": 6.924411762139236
+      },
+      {
+        "to": "planner",
+        "at_seconds": 33.00421319398447,
+        "min_height_m": 0.7860151473996592,
+        "max_tilt_deg": 3.8014660476267355
+      }
+    ]
+  },
+  "baseline_stress": {
+    "completed": true,
+    "falls": [],
+    "control_seconds": 36.01794754801085,
+    "measured_seconds": 31.017947548010852,
+    "min_root_height_m": 0.7655138771379719,
+    "max_root_tilt_deg": 7.984253562668536,
+    "physics_wall_ratio": 0.9625281916225406,
+    "transitions": [
+      {
+        "to": "pose",
+        "at_seconds": 12.005111136997584,
+        "min_height_m": 0.784166018789467,
+        "max_tilt_deg": 7.395383374368782,
+        "destination_latency_ms": 127.45276403427124
+      },
+      {
+        "to": "planner",
+        "at_seconds": 17.00565196701791,
+        "min_height_m": 0.7852980669080176,
+        "max_tilt_deg": 3.1423898292667856,
+        "destination_latency_ms": 106.90793401002884
+      },
+      {
+        "to": "pose",
+        "at_seconds": 26.020092979015317,
+        "min_height_m": 0.7813621226842296,
+        "max_tilt_deg": 7.984253562668536,
+        "destination_latency_ms": 112.47592198848724
+      },
+      {
+        "to": "planner",
+        "at_seconds": 31.01834927703021,
+        "min_height_m": 0.7819764536926282,
+        "max_tilt_deg": 4.056475344752813,
+        "destination_latency_ms": 94.21662399172783
+      }
+    ],
+    "paused_control_ticks_after_settling": 21,
+    "logged_control_ticks_after_settling": 1551
+  },
+  "patched_stress": {
+    "completed": true,
+    "falls": [],
+    "control_seconds": 36.016400347987656,
+    "measured_seconds": 31.016400347987656,
+    "min_root_height_m": 0.7810424103598079,
+    "max_root_tilt_deg": 8.345683768043836,
+    "physics_wall_ratio": 0.963286544929155,
+    "transitions": [
+      {
+        "to": "pose",
+        "at_seconds": 12.108889321971219,
+        "min_height_m": 0.7835755037636718,
+        "max_tilt_deg": 8.09351091934286,
+        "destination_latency_ms": 37.53571102023125
+      },
+      {
+        "to": "planner",
+        "at_seconds": 17.008069108007476,
+        "min_height_m": 0.7844797083290066,
+        "max_tilt_deg": 3.3714348130308136,
+        "destination_latency_ms": 118.33792495727539
+      },
+      {
+        "to": "pose",
+        "at_seconds": 26.120518409996293,
+        "min_height_m": 0.7810424103598079,
+        "max_tilt_deg": 8.345683768043836,
+        "destination_latency_ms": 25.93462297320366
+      },
+      {
+        "to": "planner",
+        "at_seconds": 31.018936507985927,
+        "min_height_m": 0.7837478585086965,
+        "max_tilt_deg": 4.0026946245011805,
+        "destination_latency_ms": 107.51652500033379
+      }
+    ],
+    "paused_control_ticks_after_settling": 0,
+    "logged_control_ticks_after_settling": 1551
+  }
+}

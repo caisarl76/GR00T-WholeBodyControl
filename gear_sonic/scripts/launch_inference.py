@@ -30,8 +30,11 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_inference.py                        # real robot
     python gear_sonic/scripts/launch_inference.py --sim                  # MuJoCo sim
     python gear_sonic/scripts/launch_inference.py --no-data-exporter     # no recording pane
+    python gear_sonic/scripts/launch_inference.py --no-deploy            # deploy runs elsewhere
     python gear_sonic/scripts/launch_pnp_trash_left_eval.py full         # external PC2 deploy
 """
+
+from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
@@ -44,6 +47,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from typing import Literal
 
 
 def _bootstrap_venv():
@@ -93,16 +97,10 @@ class InferenceLaunchConfig:
     sim: bool = False
     """Run against MuJoCo sim instead of real robot."""
 
-    deploy: bool = True
-    """Start the local C++ deploy process."""
-
-    state_zmq_host: str = "localhost"
-    """Host serving robot state."""
-
-    action_zmq_host: str = "localhost"
-    """Local address to bind the action publisher; the external controller subscribes here."""
-
     # C++ deploy options
+    deploy: bool = True
+    """Start local gear_sonic_deploy in the tmux session. Disable when deploy runs externally."""
+
     deploy_input_type: str = "zmq_manager"
     """Input type for the C++ deploy."""
 
@@ -124,6 +122,12 @@ class InferenceLaunchConfig:
     deploy_output_type: str = ""
     """Output type for deploy.sh. Leave empty for default."""
 
+    deploy_motor_kp_scale: str = ""
+    """Kp scale specification for hardware motor indices (for example, 4,10=1.5)."""
+
+    deploy_motor_kd_scale: str = ""
+    """Kd scale specification for hardware motor indices (for example, 4,10=1.5)."""
+
     # VLA inference options
     policy_host: str = "localhost"
     """Isaac-GR00T PolicyServer host."""
@@ -137,11 +141,27 @@ class InferenceLaunchConfig:
     prompt: str = "demo"
     """Language prompt for inference."""
 
+    harness_endpoint: str | None = None
+    """Local IPC endpoint; requires harness_profile."""
+    harness_profile: str | None = None
+    """Shared G1 skill profile."""
+    harness_locomotion: bool = False
+    """Allow bounded planner skills after validation."""
+
     action_publish_rate: int = 50
     """Rate at which individual actions are published to the C++ control loop (Hz)."""
 
     action_horizon: int = 40
     """Action horizon of the VLA policy."""
+
+    initial_pose: Literal["calib_full", "standing", "planner_standing"] = "calib_full"
+    """Initial pose for VLA inference; planner_standing uses feedback-paced planner reset."""
+
+    initial_pose_ramp_s: float = 2.0
+    """Seconds for standing-to-CALIB_FULL ramp when initial_pose is calib_full."""
+
+    standing_ramp_s: float = 2.0
+    """Seconds for CALIB_FULL-to-standing ramp when stopping inference."""
 
     # Camera
     camera_host: str = "localhost"
@@ -149,6 +169,22 @@ class InferenceLaunchConfig:
 
     camera_port: int = 5555
     """Camera server port."""
+
+    # ZMQ: Robot state and action bridge
+    state_zmq_host: str = ""
+    """Robot state ZMQ host. Empty = localhost for local deploy, camera_host for --no-deploy."""
+
+    state_zmq_port: int = 5557
+    """Robot state ZMQ port from C++ deploy."""
+
+    action_zmq_host: str = ""
+    """Action PUB bind host. Empty = localhost for local deploy, '*' for --no-deploy."""
+
+    action_zmq_port: int = 5556
+    """Action PUB bind port consumed by C++ deploy."""
+
+    episode_video_path: str = ""
+    """Optional mp4 path to publish as ego_view camera in sim instead of simulator images."""
 
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
@@ -167,6 +203,108 @@ class InferenceLaunchConfig:
 SESSION_NAME = "sonic_inference"
 
 
+def _quote(value: str | Path) -> str:
+    return shlex.quote(str(value))
+
+
+def _build_sim_command(repo_root: Path, config: InferenceLaunchConfig) -> str:
+    image_publish_flag = "" if config.episode_video_path else "--enable-image-publish "
+    return (
+        f"cd {_quote(repo_root)} && "
+        f"source .venv_sim/bin/activate && "
+        f"python gear_sonic/scripts/run_sim_loop.py "
+        f"{image_publish_flag}--enable-offscreen "
+        f"--camera-port {config.camera_port}"
+    )
+
+
+def _build_episode_video_camera_command(repo_root: Path, config: InferenceLaunchConfig) -> str:
+    return (
+        f"cd {_quote(repo_root)} && "
+        f"source .venv_inference/bin/activate && "
+        f"PYTHONPATH=. python -m gear_sonic.camera.composed_camera "
+        f"--ego-view-camera {_quote(config.episode_video_path)} "
+        f"--port {config.camera_port}"
+    )
+
+
+def _should_start_deploy(config: InferenceLaunchConfig) -> bool:
+    return config.deploy
+
+
+def _resolved_state_zmq_host(config: InferenceLaunchConfig) -> str:
+    if config.state_zmq_host:
+        return config.state_zmq_host
+    if _should_start_deploy(config):
+        return "localhost"
+    return config.camera_host
+
+
+def _resolved_action_zmq_host(config: InferenceLaunchConfig) -> str:
+    if config.action_zmq_host:
+        return config.action_zmq_host
+    if _should_start_deploy(config):
+        return "localhost"
+    return "*"
+
+
+def _build_inference_command(repo_root: Path, config: InferenceLaunchConfig) -> str:
+    cmd = (
+        f"cd {_quote(repo_root)} && "
+        f"source .venv_inference/bin/activate && "
+        f"PYTHONPATH=. python -m gear_sonic.scripts.run_vla_inference "
+        f"--host {_quote(config.policy_host)} "
+        f"--port {config.policy_port} "
+        f"--embodiment-tag {_quote(config.embodiment_tag)} "
+        f"--prompt {_quote(config.prompt)} "
+        f"--action-publish-rate {config.action_publish_rate} "
+        f"--action-horizon {config.action_horizon} "
+        f"--initial-pose {config.initial_pose} "
+        f"--initial-pose-ramp-s {config.initial_pose_ramp_s} "
+        f"--standing-ramp-s {config.standing_ramp_s} "
+        f"--camera-host {_quote(config.camera_host)} "
+        f"--camera-port {config.camera_port} "
+        f"--state-zmq-host {_quote(_resolved_state_zmq_host(config))} "
+        f"--state-zmq-port {config.state_zmq_port} "
+        f"--action-zmq-host {_quote(_resolved_action_zmq_host(config))} "
+        f"--action-zmq-port {config.action_zmq_port}"
+    )
+    if config.harness_endpoint:
+        cmd += (
+            f" --harness-endpoint {_quote(config.harness_endpoint)}"
+            f" --harness-profile {_quote(Path(config.harness_profile).resolve())}"
+        )
+        if config.harness_locomotion:
+            cmd += " --harness-locomotion"
+    return cmd
+
+
+def _build_deploy_command(repo_root: Path, config: InferenceLaunchConfig) -> str:
+    deploy_mode = "sim" if config.sim else "real"
+    deploy_cmd = (
+        f"cd {_quote(repo_root / 'gear_sonic_deploy')} && "
+        f"./deploy.sh "
+        f"--input-type {_quote(config.deploy_input_type)} "
+        f"--zmq-host {_quote(config.deploy_zmq_host)} "
+    )
+    if config.deploy_checkpoint:
+        deploy_cmd += f"--cp {_quote(config.deploy_checkpoint)} "
+    if config.deploy_obs_config:
+        deploy_cmd += f"--obs-config {_quote(config.deploy_obs_config)} "
+    if config.deploy_planner:
+        deploy_cmd += f"--planner {_quote(config.deploy_planner)} "
+    if config.deploy_motion_data:
+        deploy_cmd += f"--motion-data {_quote(config.deploy_motion_data)} "
+    if config.deploy_output_type:
+        deploy_cmd += f"--output-type {_quote(config.deploy_output_type)} "
+    if config.deploy_motor_kp_scale:
+        deploy_cmd += f"--motor-kp-scale {config.deploy_motor_kp_scale} "
+    if config.deploy_motor_kd_scale:
+        deploy_cmd += f"--motor-kd-scale {config.deploy_motor_kd_scale} "
+    deploy_cmd += deploy_mode
+    return deploy_cmd
+
+
 def _check_prerequisites(config: InferenceLaunchConfig):
     """Verify that required tools and venvs exist."""
     errors = []
@@ -179,11 +317,13 @@ def _check_prerequisites(config: InferenceLaunchConfig):
     if not (repo_root / ".venv_inference" / "bin" / "activate").exists():
         errors.append(".venv_inference not found. Run: bash install_scripts/install_inference.sh")
 
-    deploy_dir = repo_root / "gear_sonic_deploy"
-    if config.deploy and not (deploy_dir / "deploy.sh").exists():
-        errors.append(
-            f"gear_sonic_deploy/deploy.sh not found at {deploy_dir}. Ensure the deploy directory is set up."
-        )
+    if _should_start_deploy(config):
+        deploy_dir = repo_root / "gear_sonic_deploy"
+        if not (deploy_dir / "deploy.sh").exists():
+            errors.append(
+                f"gear_sonic_deploy/deploy.sh not found at {deploy_dir}. "
+                "Ensure the deploy directory is set up."
+            )
 
     if config.data_exporter:
         if not (repo_root / ".venv_data_collection" / "bin" / "activate").exists():
@@ -194,6 +334,12 @@ def _check_prerequisites(config: InferenceLaunchConfig):
 
     if config.sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
         errors.append(".venv_sim not found. Set up the simulation venv first.")
+
+    if config.episode_video_path:
+        if not config.sim:
+            errors.append("--episode-video-path is only supported with --sim")
+        if not Path(config.episode_video_path).exists():
+            errors.append(f"episode video not found: {config.episode_video_path}")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -253,6 +399,10 @@ def _check_pane_alive(pane_index: int) -> bool:
 
 def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
+    if bool(config.harness_endpoint) != bool(config.harness_profile):
+        raise ValueError("harness_endpoint and harness_profile must be supplied together")
+    if config.harness_locomotion and not config.harness_endpoint:
+        raise ValueError("harness_locomotion requires harness mode")
 
     if config.sim and not config.deploy:
         print("ERROR: --sim cannot be combined with --no-deploy.")
@@ -273,7 +423,21 @@ def main(config: InferenceLaunchConfig):
     print(f"  Prompt:          {config.prompt}")
     print(f"  Action rate:     {config.action_publish_rate} Hz")
     print(f"  Action horizon:  {config.action_horizon}")
+    print(f"  Initial pose:    {config.initial_pose} ({config.initial_pose_ramp_s:.2f}s ramp)")
+    print(f"  Standing ramp:   {config.standing_ramp_s:.2f}s")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
+    print(
+        f"  GEAR-SONIC:      "
+        f"{'Local tmux deploy' if _should_start_deploy(config) else 'External deploy (not started)'}"
+    )
+    print(
+        f"  Action ZMQ:      bind tcp://{_resolved_action_zmq_host(config)}:{config.action_zmq_port}"
+    )
+    print(
+        f"  State ZMQ:       subscribe tcp://{_resolved_state_zmq_host(config)}:{config.state_zmq_port}"
+    )
+    if config.episode_video_path:
+        print(f"  Camera override: {config.episode_video_path}")
     print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
     if config.data_exporter:
         print(f"    DC frequency:  {config.data_exporter_frequency} Hz")
@@ -289,13 +453,7 @@ def main(config: InferenceLaunchConfig):
         subprocess.run(
             ["tmux", "new-window", "-t", SESSION_NAME, "-n", "sim"],
         )
-        sim_cmd = (
-            f"cd {shlex.quote(str(repo_root))} && "
-            f"source .venv_sim/bin/activate && "
-            f"python gear_sonic/scripts/run_sim_loop.py "
-            f"--enable-image-publish --enable-offscreen "
-            f"--camera-port {config.camera_port}"
-        )
+        sim_cmd = _build_sim_command(repo_root, config)
         sim_target = f"{SESSION_NAME}:sim"
         subprocess.run(
             ["tmux", "send-keys", "-t", sim_target, sim_cmd, "C-m"],
@@ -303,42 +461,44 @@ def main(config: InferenceLaunchConfig):
         print("Starting MuJoCo simulator (window: sim)...")
         time.sleep(3.0)
 
+        if config.episode_video_path:
+            subprocess.run(
+                ["tmux", "new-window", "-t", SESSION_NAME, "-n", "camera"],
+            )
+            camera_cmd = _build_episode_video_camera_command(repo_root, config)
+            camera_target = f"{SESSION_NAME}:camera"
+            subprocess.run(
+                ["tmux", "send-keys", "-t", camera_target, camera_cmd, "C-m"],
+            )
+            print("Starting episode video ego_view camera replay (window: camera)...")
+            time.sleep(2.0)
+
         subprocess.run(
             ["tmux", "select-window", "-t", f"{SESSION_NAME}:inference"],
         )
 
-    # --- Pane 0 (top-left): C++ Deploy ---
-    if config.deploy:
-        deploy_mode = "sim" if config.sim else "real"
-        deploy_cmd = (
-            f"cd {shlex.quote(str(repo_root / 'gear_sonic_deploy'))} && ./deploy.sh "
-            f"--input-type {shlex.quote(config.deploy_input_type)} "
-            f"--zmq-host {shlex.quote(config.deploy_zmq_host)} "
-        )
-        deploy_options = (
-            ("--cp", config.deploy_checkpoint),
-            ("--obs-config", config.deploy_obs_config),
-            ("--planner", config.deploy_planner),
-            ("--motion-data", config.deploy_motion_data),
-            ("--output-type", config.deploy_output_type),
-        )
-        for option, value in deploy_options:
-            if value:
-                deploy_cmd += f"{option} {shlex.quote(value)} "
-        deploy_cmd += deploy_mode
+    # --- Pane 0 (top-left): C++ Deploy / external deploy notice ---
+    if _should_start_deploy(config):
+        deploy_cmd = _build_deploy_command(repo_root, config)
         print("Starting C++ deploy (pane 0)...")
         _send_to_pane(0, deploy_cmd, wait=3.0)
+        if not _check_pane_alive(0):
+            print("WARNING: C++ deploy pane may have failed to start.")
     else:
-        note = (
-            f"External PC2 {config.state_zmq_host}: keep the existing SONIC v1.1 console open. "
-            f"It must use --input-type zmq_manager --zmq-host {config.action_zmq_host} "
-            f"--output-type zmq (actions: {config.action_zmq_host}:5556; "
-            f"state: {config.state_zmq_host}:5557)."
-        )
-        _send_to_pane(0, f"echo {shlex.quote(note)}", wait=0.2)
-
-    if config.deploy and not _check_pane_alive(0):
-        print("WARNING: C++ deploy pane may have failed to start.")
+        local_ip = _get_local_ip()
+        external_note = textwrap.dedent(
+            f"""\
+            printf '%s\\n' \\
+              'External GEAR-SONIC deploy mode.' \\
+              'This tmux session did not start gear_sonic_deploy.' \\
+              'On PC2, run GEAR-SONIC with --input-type zmq_manager and --zmq-host {local_ip}.' \\
+              'Keep the existing SONIC console open and use --output-type zmq.' \\
+              'Local VLA action socket: tcp://{_resolved_action_zmq_host(config)}:{config.action_zmq_port}' \\
+              'Robot state expected from: tcp://{_resolved_state_zmq_host(config)}:{config.state_zmq_port}'
+            """
+        ).strip()
+        print("Skipping C++ deploy (pane 0); expecting external GEAR-SONIC deploy.")
+        _send_to_pane(0, external_note, wait=0.2)
 
     # --- Pane 1 (bottom-left): Keyboard Publisher ---
     keyboard_script = textwrap.dedent("""\
@@ -348,9 +508,10 @@ def main(config: InferenceLaunchConfig):
         pub.bind('tcp://localhost:5580')
         time.sleep(0.5)
         print('Keyboard publisher ready. Enter after each command.')
-        print('p=pause, k=start/stop, i=standing, m=manual planner, [/]=hands, c=record, x=discard, t=prompt')
+        print('p=pause, k=start/stop, i=initial pose, m=manual planner, [/]=hands, t=prompt')
         print('Manual planner: w/s=forward/back, a/d=left/right, q/e=turn, z=stop.')
         print('Movement stays on. Same key toggles off; z stops all.')
+        print('Recording: c=start/save, x=discard (when data exporter is enabled).')
         while True:
             key = input()
             if key.startswith('t '):
@@ -378,10 +539,13 @@ def main(config: InferenceLaunchConfig):
             f"python -m gear_sonic.scripts.run_data_exporter "
             f"--task-prompt {shlex.quote(exporter_prompt)} "
             f"--data-collection-frequency {config.data_exporter_frequency} "
-            f"--camera-host {shlex.quote(config.camera_host)} "
+            f"--camera-host {_quote(config.camera_host)} "
             f"--camera-port {config.camera_port} "
-            f"--state-zmq-host {shlex.quote(config.state_zmq_host)} "
-            f"--sonic-zmq-host {shlex.quote(config.action_zmq_host)}"
+            f"--state-zmq-host {_quote(_resolved_state_zmq_host(config))} "
+            f"--state-zmq-port {config.state_zmq_port} "
+            f"--sonic-zmq-host {_quote(config.action_zmq_host or 'localhost')} "
+            f"--sonic-zmq-port {config.action_zmq_port} "
+            f"--legacy-recording-controls"
         )
         if config.dataset_name:
             exporter_cmd += f" --dataset-name {shlex.quote(config.dataset_name)}"
@@ -390,21 +554,7 @@ def main(config: InferenceLaunchConfig):
         _send_to_pane(3, exporter_cmd, wait=2.0)
 
     # --- Pane 2 (top-right): VLA Inference ---
-    inference_cmd = (
-        f"cd {shlex.quote(str(repo_root))} && "
-        f"source .venv_inference/bin/activate && "
-        f"python -m gear_sonic.scripts.run_vla_inference "
-        f"--host {shlex.quote(config.policy_host)} "
-        f"--port {config.policy_port} "
-        f"--embodiment-tag {shlex.quote(config.embodiment_tag)} "
-        f"--prompt {shlex.quote(config.prompt)} "
-        f"--action-publish-rate {config.action_publish_rate} "
-        f"--action-horizon {config.action_horizon} "
-        f"--camera-host {shlex.quote(config.camera_host)} "
-        f"--camera-port {config.camera_port} "
-        f"--state-zmq-host {shlex.quote(config.state_zmq_host)} "
-        f"--action-zmq-host {shlex.quote(config.action_zmq_host)}"
-    )
+    inference_cmd = _build_inference_command(repo_root, config)
 
     print("Starting VLA inference (pane 2)...")
     _send_to_pane(2, inference_cmd, wait=1.0)
@@ -424,30 +574,41 @@ def main(config: InferenceLaunchConfig):
         print("  Window 'sim':")
         print("    MuJoCo Simulator (.venv_sim)")
         print()
+        if config.episode_video_path:
+            print("  Window 'camera':")
+            print("    Episode video ego_view replay (.venv_inference)")
+            print()
     print("  Window 'inference':")
-    print("    Pane 0 (top-left):     " + ("C++ Deploy" if config.deploy else "PC2 deployment notes"))
+    if _should_start_deploy(config):
+        print("    Pane 0 (top-left):     C++ Deploy")
+    else:
+        print("    Pane 0 (top-left):     External Deploy Notice")
     print("    Pane 1 (bottom-left):  Keyboard Publisher")
     print("    Pane 2 (top-right):    VLA Inference  <-- you are here")
     if config.data_exporter:
         print("    Pane 3 (bottom-right): Data Exporter")
     print()
-    if config.deploy:
+    if _should_start_deploy(config):
         print("  ** deploy.sh (pane 0) is waiting for confirmation --")
         print("     click on pane 0 and press Enter to proceed **")
-    print()
+        print()
+    else:
+        print("  ** gear_sonic_deploy is not started in this tmux session **")
+        print("     Start it on PC2 and point --zmq-host to this workstation IP.")
+        print()
     print("  Keyboard controls (type in pane 1):")
     print("    p        - Pause / resume inference")
     print("    k        - Start / stop C++ control loop")
-    print("    i        - Pause policy and return to straight standing")
-    print("    m        - Toggle manual planner / paused POSE mode")
+    print(f"    i        - Prepare initial pose ({config.initial_pose})")
+    print("    m        - Toggle manual planner / paused PLANNER hold")
     print("    w/s a/d  - Toggle forward/back and left/right (Enter after each key)")
     print("    q/e z    - Manual turn left/right and stop")
     print("    [        - Toggle left hand open/closed (initial pose)")
     print("    ]        - Toggle right hand open/closed (initial pose)")
     print("    t <text> - Change inference prompt")
     if config.data_exporter:
-        print("    c        - Toggle recording: start episode / save episode")
-        print("    x        - Discard the current episode")
+        print("    c        - Start / finish recording (save)")
+        print("    x        - Discard active recording")
     print()
     print("  Navigation:")
     print("    Ctrl+b, arrow keys  - Switch between panes")

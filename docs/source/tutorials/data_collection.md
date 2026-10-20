@@ -10,6 +10,8 @@ Everything runs **offboard on your workstation** except the **camera server**, w
 ```{admonition} Supported cameras
 :class: note
 The tested and supported camera setup uses **Luxonis OAK cameras** (OAK-D, OAK-1, etc.). This includes a head/ego-view OAK camera and optional OAK wrist cameras. Other camera drivers (RealSense, USB webcam) are included in the codebase but have not been tested recently.
+
+A 3D-printable mount for the head/ego-view **OAK-D W** camera is available under [`hardware/camera_mount/`](https://github.com/NVlabs/GR00T-WholeBodyControl/blob/main/hardware/camera_mount/README.md) — see its README for print settings, the bill of materials, and how it mounts on the G1.
 ```
 
 ```{admonition} Prerequisites
@@ -276,6 +278,8 @@ Common options:
 | `--deploy-obs-config` | *(default)* | Custom observation config for deploy.sh |
 | `--deploy-planner` | *(default)* | Custom planner model path for deploy.sh |
 | `--deploy-motion-data` | *(default)* | Custom motion data path for deploy.sh |
+| `--deploy-motor-kp-scale` | *(disabled)* | Hardware motor Kp scale specification forwarded to deploy.sh |
+| `--deploy-motor-kd-scale` | *(disabled)* | Hardware motor Kd scale specification forwarded to deploy.sh |
 | `--record-wrist-cameras` | `False` | Record left/right wrist camera streams in the dataset |
 | `--no-text-to-speech` | *(on)* | Disable voice feedback via espeak |
 
@@ -359,27 +363,32 @@ is not specified, a timestamped name is generated automatically.
 
 ### Recording Controls
 
-There are two ways to control recording: **PICO VR controllers** (recommended during teleop) or **keyboard over ZMQ**.
+The manager and exporter now use acknowledged recording commands by default.
+Run both from the same revision and select the same `--hand-profile`.
+The exporter publishes its recording status on port `5562`. Recording is
+available in POSE or PLANNER_VR_3PT with hand input enabled; first start SONIC
+and enable tracking, then wait for fresh exporter status.
 
-**PICO VR Controllers (via `manager_state` topic):**
-
-| Input | Action |
+| Input in the manager | Action |
 |---|---|
-| **Left Grip + A** | **Toggle** recording — starts a new episode, or stops and saves the current one |
-| **Left Grip + B** | **Discard** the current episode without saving |
+| **Left Grip + A** | Toggle recording |
+| **Left Grip + B** | Abort the current episode without saving |
+| Terminal `c` | Start recording |
+| Terminal `s` | Stop and save recording |
 
-These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent of the mode-switching controls.
+Release all buttons/grips between controller chords and hold each chord for
+at least 0.3 seconds. A+X, B+Y and A+B+X+Y remain reserved for tracking, freeze,
+and policy control. Wait for the exporter’s RECORDING acknowledgement before
+collecting a demonstration and its IDLE acknowledgement after saving. IDLE
+means the save completed, rather than merely accepting a stop request.
+Tracking exit is blocked while recording or save status is uncertain.
 
-**Keyboard over ZMQ:**
-
-| Key | Action |
-|---|---|
-| `c` | **Toggle** recording (same as Left Grip + A) |
-| `x` | **Discard** episode (same as Left Grip + B) |
-
-```{note}
-Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.
-```
+The old keyboard ZMQ channel on port `5580` is **not enabled by default**.
+`--legacy-recording-controls` opts the exporter into the old toggle/discard
+interface for older producers, including keyboard `c`/`x`. It rejects the
+new managed protocol; do not pair that flag with the current managed streamer.
+See [PICO optical hand tracking](../pico_optical_hand_tracking.md) for hand
+profiles, recorder startup, and raw hand capture independent of dataset recording.
 
 ---
 
@@ -486,6 +495,20 @@ All commands below run in the **data collection virtual environment**:
 source .venv_data_collection/bin/activate
 ```
 
+### Remove Discarded Episodes
+
+Episodes discarded during collection (`x` key or Left Grip + B) are saved to disk
+but flagged in `meta/info.json`. By default, the processing script removes these
+flagged episodes so they are excluded from fine-tuning:
+
+```bash
+# Clean a single dataset (removes discarded episodes + stale SMPL frames)
+python gear_sonic/scripts/process_dataset.py \
+    --dataset-path outputs/my_dataset \
+    --output-path outputs/my_dataset_cleaned
+```
+
+To keep discarded episodes (e.g., for inspection), pass `--no-remove-discarded`.
 ### Apply XLSX validity and language annotations
 
 For the PnP trash recordings, create two independent LeRobot v2.1 datasets
@@ -578,6 +601,18 @@ python gear_sonic/scripts/process_dataset.py \
 python gear_sonic/scripts/process_dataset.py \
     --dataset-path outputs/my_dataset \
     --output-path outputs/my_dataset_cleaned
+```
+
+```{warning}
+If you collected data using **VR 3-point tracking mode** (VR_3PT), the
+`teleop.smpl_pose` column will be all zeros because VR_3PT uses raw VR
+positions/orientations instead of SMPL body parameters. In this case, you
+**must** disable SMPL cleaning to avoid dropping all frames:
+
+    python gear_sonic/scripts/process_dataset.py \
+        --dataset-path outputs/my_dataset \
+        --output-path outputs/my_dataset_cleaned \
+        --no-remove-stale-smpl
 ```
 
 ### Merge Multiple Datasets

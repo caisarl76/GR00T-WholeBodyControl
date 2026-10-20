@@ -1,0 +1,24 @@
+GR00T-WholeBodyControl Environment Check
+Platform: Linux x86_64
+Python:   /home/jihun/work/VoLoAgent/.worktrees/g1-harness-native/.venv/bin/python
+
+Basic:
+  [X] Python version: 3.10.20 (training requires 3.11.x — Isaac Lab requirement)
+  [X] Git LFS: decoupled_wbc/sim2mujoco/resources/robots/g1/policy/GR00T-WholeBodyControl-Balance.onnx is 132 bytes (LFS pointer — run 'git lfs pull')
+  [+] CUDA: NVIDIA GeForce RTX 3060 (CUDA 13.0)
+  [+] PyTorch: 2.12.0+cu130
+  [X] Disk space: 9.6 GB free (recommend 10+ GB)
+
+Training:
+  [X] Isaac Lab: not installed — see https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html
+  [+] gear_sonic: installed (0.1.0)
+  [X] hydra-core: not installed (pip install hydra-core)
+  [X] trl: not installed (pip install trl)
+  [X] transformers: not installed (pip install transformers)
+  [X] accelerate: not installed (pip install accelerate)
+  [X] wandb: not installed (pip install wandb)
+
+Deployment:
+  [+] TensorRT: found at /home/jihun/TensorRT/TensorRT-10.13.0.35
+
+Some checks failed. See above for details.
