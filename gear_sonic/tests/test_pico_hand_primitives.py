@@ -32,7 +32,7 @@ RIGHT_PINCH_CLOSED = np.array(
         -0.021152639761567116,
         -0.030526945367455482,
     ]
-)
+) + np.array([0.0, -0.03, 0.0, 0.03, 0.0, 0.0, 0.0])  # extra closure for the ~5 mm hardware gap
 DEX3_MIRROR = np.array([1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0])
 LEFT_PINCH_OPEN = RIGHT_PINCH_OPEN * DEX3_MIRROR
 LEFT_PINCH_CLOSED = RIGHT_PINCH_CLOSED * DEX3_MIRROR
@@ -58,11 +58,12 @@ class GraspFingerEncodingTest(unittest.TestCase):
         self.assertEqual(fingertips[INDEX_TIP, 0, 3], 0.0)
         self.assertEqual(fingertips[MIDDLE_TIP, 0, 3], 1.0)
 
-    def test_primitive_threshold_is_strict(self):
-        fingertips = pico_server.generate_grasp_finger_data("left", trigger=0.5)
-
-        self.assertEqual(fingertips[INDEX_TIP, 0, 3], 0.0)
-        self.assertEqual(fingertips[MIDDLE_TIP, 0, 3], 0.0)
+    def test_trigger_depth_is_analog_and_clamped(self):
+        for trigger, depth in ((0.5, 0.5), (0.25, 0.25), (-1.0, 0.0), (2.0, 1.0)):
+            with self.subTest(trigger=trigger):
+                fingertips = pico_server.generate_grasp_finger_data("left", trigger=trigger)
+                self.assertEqual(fingertips[INDEX_TIP, 0, 3], 0.0)
+                self.assertEqual(fingertips[MIDDLE_TIP, 0, 3], depth)
 
 
 class PinchPrimitiveInterpolationTest(unittest.TestCase):
@@ -317,6 +318,27 @@ class HandJointPrimitiveTest(unittest.TestCase):
 
         np.testing.assert_allclose(left, [0.0, 0.7, 0.7, -1.0, -1.5, -1.0, -1.5])
         np.testing.assert_allclose(right, [0.0, -0.7, -0.7, 1.0, 1.5, 1.0, 1.5])
+
+    def test_partial_trigger_grasps_proportionally_and_overrides_grip(self):
+        left_grasp = np.array([0.0, 0.7, 0.7, -1.0, -1.5, -1.0, -1.5])
+        for trigger, expected_left in (
+            (0.05, LEFT_PINCH_CLOSED),
+            (0.25, 0.25 * left_grasp),
+            (0.5, 0.5 * left_grasp),
+            (np.nan, LEFT_PINCH_CLOSED),
+        ):
+            with self.subTest(trigger=trigger):
+                left, right = pico_server.compute_hand_joints_from_inputs(
+                    self.left_solver,
+                    self.right_solver,
+                    left_trigger=trigger,
+                    left_grip=1.0,
+                    right_trigger=0.0,
+                    right_grip=0.2,
+                )
+
+                np.testing.assert_allclose(left, expected_left, atol=1e-9)
+                np.testing.assert_allclose(right, RIGHT_PINCH_OPEN)
 
     def test_left_and_right_controls_are_routed_independently(self):
         left, right = pico_server.compute_hand_joints_from_inputs(

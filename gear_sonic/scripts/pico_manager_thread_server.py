@@ -796,6 +796,13 @@ _RIGHT_PINCH_CLOSED = np.array(
     ],
     dtype=np.float64,
 )
+# The captured closed pose leaves a ~5 mm thumb-middle gap on hardware. MuJoCo
+# gives ~97 mm/rad of closure on both thumb1 and middle0, so 0.03 rad each
+# closes ~6 mm (light squeeze). Tune here if the pads still miss or press hard.
+_PINCH_EXTRA_CLOSE_RAD = 0.03
+_RIGHT_PINCH_CLOSED_TARGET = _RIGHT_PINCH_CLOSED + _PINCH_EXTRA_CLOSE_RAD * np.array(
+    [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+)
 _DEX3_HAND_MIRROR = np.array(
     [1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0], dtype=np.float64
 )
@@ -805,11 +812,11 @@ def _pinch_endpoints(hand: str) -> tuple[np.ndarray, np.ndarray]:
     """Return hardware-calibrated open/closed pinch endpoints for one hand."""
     hand = hand.lower()
     if hand == "right":
-        return _RIGHT_PINCH_OPEN.copy(), _RIGHT_PINCH_CLOSED.copy()
+        return _RIGHT_PINCH_OPEN.copy(), _RIGHT_PINCH_CLOSED_TARGET.copy()
     if hand == "left":
         return (
             _RIGHT_PINCH_OPEN * _DEX3_HAND_MIRROR,
-            _RIGHT_PINCH_CLOSED * _DEX3_HAND_MIRROR,
+            _RIGHT_PINCH_CLOSED_TARGET * _DEX3_HAND_MIRROR,
         )
     raise ValueError("hand must be 'left' or 'right'")
 
@@ -837,8 +844,8 @@ def generate_grasp_finger_data(hand: str, trigger: float) -> np.ndarray:
     thumb = 0
     middle = 10
     fingertips[4 + thumb, 0, 3] = 1.0
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0
+    # Middle tip at x=trigger gives the solver an analog grasp depth of trigger.
+    fingertips[4 + middle, 0, 3] = float(np.clip(trigger, 0.0, 1.0))
 
     return fingertips
 
@@ -940,7 +947,9 @@ class YawAccumulator:
         Returns:
             Facing direction as [x, y, 0.0]
         """
-        self.dyaw = self.yaw_gain * rx * dt
+        # Positive right-stick X is physically right and therefore turns
+        # clockwise in the planner's XY convention.
+        self.dyaw = -self.yaw_gain * rx * dt
         if abs(rx) >= self.deadzone:
             self.yaw_angle_rad += self.dyaw
             self.heading = [np.cos(self.yaw_angle_rad), np.sin(self.yaw_angle_rad), 0.0]
@@ -955,16 +964,16 @@ def compute_planner_movement_from_left_stick(
 ) -> list[float]:
     """Convert PICO left-stick axes into a planner movement vector.
 
-    XRoboToolkit/PICO reports stick-right as negative X and stick-forward as
-    positive Y. The planner expects a world-frame movement vector, so rotate the
-    stick-local command by the current commanded facing direction.
+    The planner expects positive X to mean right and positive Y to mean
+    forward in the local stick frame, then rotates the command by the current
+    commanded facing direction.
     """
     denom = float(np.hypot(lx, ly))
     if mag <= 0.0 or denom <= 0.0:
         return [0.0, 0.0, 0.0]
 
     scale = mag / denom
-    movement_local = np.array([-lx, ly], dtype=np.float64) * scale
+    movement_local = np.array([lx, ly], dtype=np.float64) * scale
     facing_xy = np.asarray(facing[:2], dtype=np.float64)
     facing_norm = float(np.linalg.norm(facing_xy))
     if facing_norm <= 1e-9:
@@ -1170,9 +1179,13 @@ def get_abxy_buttons(reader=None):
         return False, False, False, False
 
 
+# Matches the G1GripperInverseKinematicsSolver dead zone.
+_GRASP_TRIGGER_DEADZONE = 0.05
+
+
 def _compute_hand_joints_for_inputs(solver, hand, trigger, grip) -> np.ndarray:
-    """Dispatch one hand to higher-priority grasp or calibrated pinch."""
-    if trigger > 0.5:
+    """Analog index-trigger grasp takes priority over the middle-finger grip pinch."""
+    if trigger > _GRASP_TRIGGER_DEADZONE:
         finger_data = generate_grasp_finger_data(hand, trigger)
         return solver({"position": finger_data})
     return compute_pinch_joints(hand, grip)
