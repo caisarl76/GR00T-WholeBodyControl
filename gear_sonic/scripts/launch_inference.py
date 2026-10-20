@@ -348,7 +348,7 @@ def main(config: InferenceLaunchConfig):
         pub.bind('tcp://localhost:5580')
         time.sleep(0.5)
         print('Keyboard publisher ready. Enter after each command.')
-        print('p=pause, k=start/stop, i=standing, m=manual planner, [/]=hands, t=prompt')
+        print('p=pause, k=start/stop, i=standing, m=manual planner, [/]=hands, c=record, x=discard, t=prompt')
         print('Manual planner: w/s=forward/back, a/d=left/right, q/e=turn, z=stop.')
         print('Movement stays on. Same key toggles off; z stops all.')
         while True:
@@ -446,9 +446,8 @@ def main(config: InferenceLaunchConfig):
     print("    ]        - Toggle right hand open/closed (initial pose)")
     print("    t <text> - Change inference prompt")
     if config.data_exporter:
-        print("    c        - Start recording episode")
-        print("    s        - Stop recording (success)")
-        print("    f        - Stop recording (failure)")
+        print("    c        - Toggle recording: start episode / save episode")
+        print("    x        - Discard the current episode")
     print()
     print("  Navigation:")
     print("    Ctrl+b, arrow keys  - Switch between panes")

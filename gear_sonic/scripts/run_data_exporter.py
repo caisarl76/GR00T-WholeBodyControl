@@ -852,13 +852,22 @@ class GrootDataCollector:
 
     def save_and_cleanup(self):
         try:
-            self._print_and_say("saving episode done", blocking=False)
             buffer_size = self.data_exporter.episode_buffer.get("size", 0)
             if buffer_size > 0:
+                self._print_and_say("Saving episode", blocking=False)
                 self.data_exporter.save_episode()
-            self._print_and_say(
-                f"Recording complete: {self.data_exporter.meta.root}", say=False, blocking=True
-            )
+                self._print_and_say(
+                    f"Saved episode. Recording complete: {self.data_exporter.meta.root}",
+                    say=False,
+                    blocking=True,
+                )
+            else:
+                self._print_and_say(
+                    "No new episode saved; recording buffer is empty. "
+                    f"Existing saved episodes preserved: {self.data_exporter.meta.root}",
+                    say=False,
+                    blocking=True,
+                )
         except Exception as e:
             self._print_and_say(f"Error saving episode: {e}", blocking=True)
 

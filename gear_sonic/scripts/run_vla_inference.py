@@ -541,11 +541,13 @@ def main(config: InferenceConfig):
             return
 
         if key == "c":
-            print("Keyboard: 'c' (start recording -- handled by data exporter)")
+            print("Keyboard: 'c' (toggle recording start/save -- handled by data exporter)")
+        elif key == "x":
+            print("Keyboard: 'x' (discard recording -- handled by data exporter)")
         elif key == "s" and not manual_planner:
-            print("Keyboard: 's' (stop recording success -- handled by data exporter)")
+            print("Use 'c' to stop/save recording or 'x' to discard. 's' moves backward in manual planner.")
         elif key == "f":
-            print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
+            print("Use 'x' to discard recording -- handled by data exporter.")
         elif key == "i":
             pause_loop = True
             invalidate_policy_actions()
