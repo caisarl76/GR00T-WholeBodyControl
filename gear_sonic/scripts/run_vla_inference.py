@@ -754,6 +754,22 @@ def main(config: InferenceConfig):
             print(f"Warning: Failed to send {action_str} command message: {e}")
             return False
 
+    # LeRobot SONIC-token policies play like lerobot's sonic_policy_streamer.py (cross-fade, token slew limit).
+    lerobot_policy = profile.lerobot_policy if harness_enabled else None
+    token_stream = None
+    if lerobot_policy is not None:
+        from gear_sonic.utils.inference.lerobot_sonic_policy import (
+            RIGHT_SWAP,
+            LeRobotSonicPolicyClient,
+            TokenStream,
+            lerobot_state,
+        )
+
+        token_stream = TokenStream(
+            config.action_publish_rate, lerobot_policy.chunk_blend_s, lerobot_policy.max_token_step
+        )
+        lerobot_right_order = RIGHT_SWAP if lerobot_policy.dex3_right_order == "swap" else np.arange(7)
+
     # Async inference state
     cached_action_chunk = None
     action_chunk_index = 0
@@ -1053,8 +1069,10 @@ def main(config: InferenceConfig):
             )
         if not worker_sensors:
             worker_sensors["state"] = ZMQStateSubscriber(host=config.state_zmq_host, port=config.state_zmq_port)
-            worker_sensors["policy"] = PolicyClient(
-                host=config.host, port=config.port, timeout_ms=int(profile.limits.prewarm_deadline_s * 1000)
+            client = LeRobotSonicPolicyClient if lerobot_policy is not None else PolicyClient
+            options = {} if lerobot_policy is None else {"right_order": lerobot_policy.dex3_right_order}
+            worker_sensors["policy"] = client(
+                host=config.host, port=config.port, timeout_ms=int(profile.limits.prewarm_deadline_s * 1000), **options
             )
         state_msg = worker_sensors["state"].get_msg()
         now = time.monotonic()
@@ -1071,6 +1089,12 @@ def main(config: InferenceConfig):
         )
         if observation is not None:
             observation["_harness_captured_at"] = captured
+            if lerobot_policy is not None:
+                observation["lerobot"] = {
+                    "state": lerobot_state(state_msg, lerobot_right_order),
+                    "image": camera_msg["images"]["ego_view"],
+                    "task": language_prompt_ref[0],
+                }
         return observation
 
     def close_worker_sensors():
@@ -1116,6 +1140,10 @@ def main(config: InferenceConfig):
                     if not cpp_loop_running or not send_cpp_control_command(start=True, planner=False):
                         raise ValueError("Controller is not running")
                     standing_reset, manual_planner, harness_planner_command = None, None, None
+                    if token_stream is not None:
+                        # Slew from the planner token the deploy decodes now, as the streamer's handoff does.
+                        planner = np.asarray((reset_feedback or {}).get("token_state", []), np.float32).reshape(-1)
+                        token_stream.reset(start_token=planner if planner.shape == (64,) else None)
                 pause_loop = not enabled
 
             def request_planner_hold(self, feedback, open_hands):
@@ -1353,6 +1381,13 @@ def main(config: InferenceConfig):
                 )
                 cached_action_chunk = processed_action
                 cached_capture_time = inference_start_time
+                if token_stream is not None:
+                    rows = np.concatenate(
+                        [np.asarray(processed_action[key], np.float32)[0]
+                         for key in ("motion_token", "left_hand_joints", "right_hand_joints")],
+                        axis=1,
+                    )
+                    token_stream.set_chunk(rows, t0=inference_start_time, now=time.monotonic())
                 # Harness chunks expire from observation capture, so start the
                 # next query on that cadence too. Waiting a full interval after
                 # acceptance needlessly spends the preceding query's latency
@@ -1437,6 +1472,9 @@ def main(config: InferenceConfig):
                         left_hand_joints = left_hand_joints[current_idx]
                     if right_hand_joints.ndim == 2:
                         right_hand_joints = right_hand_joints[current_idx]
+                    if token_stream is not None:
+                        motion_token, hands = token_stream.at(time.monotonic())
+                        left_hand_joints, right_hand_joints = hands[:7], hands[7:]
 
                     if pose_start_pending and cpp_mode != "POSE":
                         print("Starting POSE mode on first VLA action")
