@@ -215,8 +215,10 @@ def published_tokens(monkeypatch, tmp_path, lerobot):
                 pending.append((clock[0] + 0.25, clock[0], epoch, 0.5 if len(started) % 2 == 0 else 0.2))
                 busy.set()
 
+    # A lerobot_policy profile must run without an Isaac-GR00T install (the robot PC has none).
     messages = run_keys(monkeypatch, ["k"] + [None] * 119, measured, on_key, runner.InferenceConfig(
-        harness_endpoint="ipc:///tmp/unused-test.sock", harness_profile=str(write_profile(tmp_path, lerobot))))
+        harness_endpoint="ipc:///tmp/unused-test.sock", harness_profile=str(write_profile(tmp_path, lerobot))),
+        gr00t_installed=lerobot is None)
     return np.array([unpack_bridge_message(raw, topic="pose")["token_state"][0, 0]
                      for raw in messages if raw.startswith(b"pose")])
 
