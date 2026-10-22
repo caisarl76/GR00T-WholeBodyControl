@@ -462,8 +462,11 @@ def main(config: InferenceConfig):
 
         ready_yaw_tau = right_yaw_gravity_tau(instantiate_g1_robot_model(waist_location="lower_and_upper_body"))
 
-    # Isaac-GR00T PolicyClient
-    from gr00t.policy.server_client import PolicyClient
+    # Isaac-GR00T PolicyClient; a lerobot_policy profile talks to lerobot's server and needs no gr00t install.
+    if harness_enabled and profile.lerobot_policy is not None:
+        PolicyClient = None
+    else:
+        from gr00t.policy.server_client import PolicyClient
 
     n1_policy = None if harness_enabled else PolicyClient(host=config.host, port=config.port)
 

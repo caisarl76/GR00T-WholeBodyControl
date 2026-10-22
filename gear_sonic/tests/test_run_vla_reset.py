@@ -19,7 +19,7 @@ def policy_action(value):
     }
 
 
-def run_keys(monkeypatch, keys, state=None, on_key=None, config=None):
+def run_keys(monkeypatch, keys, state=None, on_key=None, config=None, gr00t_installed=True):
     if state is not None:
         state.setdefault("reference_heading_quat", [1, 0, 0, 0])
         state.setdefault("planner_reference_active", [1])
@@ -56,7 +56,8 @@ def run_keys(monkeypatch, keys, state=None, on_key=None, config=None):
         return key
 
     keyboard.read_msg.side_effect = read_key
-    monkeypatch.setitem(sys.modules, "gr00t.policy.server_client", SimpleNamespace(PolicyClient=MagicMock()))
+    monkeypatch.setitem(sys.modules, "gr00t.policy.server_client",
+                        SimpleNamespace(PolicyClient=MagicMock()) if gr00t_installed else None)  # None: ImportError
     runner.main(config or runner.InferenceConfig(initial_pose="planner_standing"))
     return [call.args[0] for call in socket.send.call_args_list]
 
