@@ -106,6 +106,19 @@ class ComposedCameraConfig:
     realsense_enable_depth: bool = False
     """Publish RealSense depth images in addition to color."""
 
+    realsense_color_width: int = 640
+    """RealSense RGB width. 640x480 crops the D435's color view to about 56 deg
+    horizontally; 1280x720 keeps the full ~70 deg (15 fps on USB 2, 30 on USB 3)."""
+
+    realsense_color_height: int = 480
+    """RealSense RGB height."""
+
+    realsense_depth_width: int = 640
+    """RealSense depth width (depth is aligned to the color image when published)."""
+
+    realsense_depth_height: int = 480
+    """RealSense depth height."""
+
     def __post_init__(self):
         self.run_as_server = self.server
 
@@ -385,6 +398,14 @@ class ComposedCameraSensor(Sensor, SensorServer):
             realsense_config = RealSenseConfig()
             realsense_config.fps = self.config.realsense_fps
             realsense_config.enable_depth = self.config.realsense_enable_depth
+            realsense_config.color_image_dim = (
+                self.config.realsense_color_width,
+                self.config.realsense_color_height,
+            )
+            realsense_config.depth_image_dim = (
+                self.config.realsense_depth_width,
+                self.config.realsense_depth_height,
+            )
             return RealSenseSensor(
                 config=realsense_config,
                 mount_position=mount_position,
