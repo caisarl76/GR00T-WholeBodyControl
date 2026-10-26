@@ -115,17 +115,23 @@ class EpisodeGuards:
         self.max_camera_age_s, self.token_echo_timeout_s = max_camera_age_s, token_echo_timeout_s
         self.t0, self.echo_lost, self.history = None, None, []
 
-    def start(self, now: float) -> None:
-        self.t0, self.echo_lost, self.history = now, None, []
-
-    def check(self, now, state_msg, state_age_s, camera_age_s, last_chunk_at, recent_tokens):
-        if self.t0 is None:
-            raise RuntimeError("EpisodeGuards.check before start(now)")
-        arm = None
+    def record(self, now, state_msg) -> None:
+        """Append a measured arm state to the speed history only (lerobot logs the blend in at t_ep 0, so its
+        watchdog's first episode ticks measure the blend in's end)."""
         if state_msg:
             arm = lerobot_state(state_msg, np.arange(7))[:14]  # the arm slice ignores right_order
             self.history.append((arm, now))
             del self.history[: -(ARM_SPEED_TICKS + 1)]
+
+    def start(self, now: float, keep_history: bool = False) -> None:
+        self.t0, self.echo_lost = now, None
+        if not keep_history:
+            self.history = []
+
+    def check(self, now, state_msg, state_age_s, camera_age_s, last_chunk_at, recent_tokens):
+        if self.t0 is None:
+            raise RuntimeError("EpisodeGuards.check before start(now)")
+        self.record(now, state_msg)
         if now - self.t0 >= self.cap_s:
             return "end", "completed"
         if now - last_chunk_at > self.max_chunk_age_s:

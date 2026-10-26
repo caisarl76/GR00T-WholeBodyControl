@@ -76,6 +76,7 @@ class Rig:
             self.cmd, POSE, self.hooks, make_stream=lambda: SpyStream(self.set_chunks, self.cmd),
             right_order=np.arange(7), trial_args={"test": True}, model="test-model")
         self.i, self.right, self.state_age, self.camera_age = 0, 0.0, 0.0, 0.0
+        self.body = np.zeros(29)
         self.sent = []
         self.answer_after, self.asked, self.answered = 1, {}, set()
 
@@ -85,7 +86,7 @@ class Rig:
 
     def feedback(self):
         token = self.sent[-1][0] if self.sent else PLANNER
-        return dict(index=self.i, body_q=np.zeros(29), left_hand_q=np.zeros(7),
+        return dict(index=self.i, body_q=self.body.copy(), left_hand_q=np.zeros(7),
                     right_hand_q=np.full(7, self.right), token_state=token)
 
     def step(self, n=1):
@@ -184,6 +185,8 @@ def test_trial_sequence_and_handover_end(tmp_path):
     assert str(npz["episode_end"]) == "handover complete" and str(npz["model"]) == "test-model"
     assert runs(npz["phase"].tolist()) == seq[:4]  # hold_rest through to_ready, nothing after
     episode = npz["phase"] == "episode"
+    assert (npz["frame"][episode] == (npz["t_ep"][episode] * 50).astype(np.int64)).all()  # the policy rate
+    assert npz["frame"][episode].max() >= 50
     assert npz["t_ep"][episode][0] == 0.0 and (npz["t_ep"][~episode & (npz["phase"] != "blend in")] == -1).all()
 
 
@@ -221,14 +224,15 @@ def test_stale_state_freezes_not_blends(tmp_path):
     assert str(trial_npz(tmp_path)["episode_end"]) == "robot state 0.25 s old"
 
 
-def make_hc(tmp_path, *, verified=True, anchor=1.0, with_loop=True):
+def make_hc(tmp_path, *, verified=True, anchor=1.0, with_loop=True, right_order="dataset"):
     data = yaml.safe_load(PROFILE.read_text())
     data["skills"] = {"bottle_handover": dict(prompt="test-only handover",
                                               completion_criteria="Stable offer", completion_action="hold")}
     data["handover"] = dict(skill_id="bottle_handover", checkpoint_verified=verified, ready_pose_reviewed=True,
                             ready_right_arm_joints=dict(zip(NAMES, TARGET)),
                             raised_right_arm_joints=dict(zip(NAMES, RAISED)))
-    data["lerobot_policy"] = dict(chunk_blend_s=0.3, max_token_step=0.05, chunk_anchor_s=anchor)
+    data["lerobot_policy"] = dict(chunk_blend_s=0.3, max_token_step=0.05, chunk_anchor_s=anchor,
+                                  dex3_right_order=right_order)
     path = tmp_path / "loop.yaml"
     path.write_text(yaml.safe_dump(data))
     rig = Rig()
@@ -533,3 +537,23 @@ def test_malformed_state_freezes_with_invalid_robot_state(tmp_path):
     rig = Rig().take_over()  # outside a trial too
     token, _, label = rig.loop.tick(rig.now + TICK, dict(rig.feedback(), right_hand_q=np.zeros(6)), 0.0, 0.0)
     assert label == "frozen" and np.array_equal(token, PLANNER) and rig.loop.frozen_stage == "stance"
+
+
+def test_blend_in_arm_motion_ends_the_trial_on_the_first_episode_check(tmp_path):
+    rig = Rig().ready()
+    rig.loop.trial(0, str(tmp_path), rig.now)
+    rig.until("blend_in").step(46)
+    for _ in range(4):  # the blend in's last 4 ticks move arm joint 3 (body 18) at 10 rad/s
+        rig.body[18] += 0.2
+        rig.step()
+    assert rig.loop.stage == "blend_in"
+    rig.step()  # the first episode tick, arm still
+    assert rig.loop.stage == "to_ready"
+    assert rig.loop.trial_end_reason.startswith("watchdog: arm joint 3 measured at")
+
+
+def test_take_over_refuses_swapped_right_hand_order(tmp_path):
+    c, rig = make_hc(tmp_path, right_order="swap")
+    response = request(c, "loop_take_over", now=0.1)
+    assert response["error"]["code"] == "NOT_READY" and "dex3_right_order" in response["error"]["message"]
+    assert c.phase == "IDLE" and rig.loop.phase == "IDLE"

@@ -150,7 +150,10 @@ class TokenStream:
         anchor = None
         if self.anchor_s > 0 and self._chunk is not None:
             # Continue from the token being sent (itself possibly still offset) with the new chunk's motion.
-            ref = self._row_at(now)[:64] if self.last_token is None else self.last_token
+            # Evaluate the output first, as lerobot's token_at(now) does: that ends a cross-fade already complete
+            # by now, so the hands' next fade starts from the outgoing chunk itself, not a frozen sample of it.
+            current = self._row_at(now)
+            ref = current[:64] if self.last_token is None else self.last_token
             anchor = (ref - self._interpolate(rows, float(t0), now)[:64], float(now))
         if self.blend_s > 0 and self._chunk is not None:
             # Fade from what is being output now (itself possibly mid-fade) to the new chunk.

@@ -30,7 +30,6 @@ HOLD_REST_TICKS = 75  # hold_rest_s 1.5
 STANCE_HOLD_TICKS = 100  # lerobot finish(): 2 s "hold rest"
 HANDBACK_TICKS = 100  # handoff_blend_s 2.0
 REPLAN_S = 0.4
-LIVE_FPS = 30  # lerobot LiveImages.fps: the recorded frame index of an episode tick
 TRIAL_STAGES = ("hold_rest", "first_chunk", "blend_in", "episode", "to_ready")
 FRAME_STAGES = ("first_chunk", "blend_in", "episode")
 
@@ -90,7 +89,7 @@ class LoopController:
         if trial < next_trial(session_dir):  # the previous recorder is closed here, so its trial counts
             raise ControlError("INVALID_REQUEST", f"trial {trial} is already recorded in {session_dir}")
         self._recorder = TrialRecorder(session_dir, trial, self.trial_args, self.model)
-        self._stream, self._guards, self._first = self.make_stream(), EpisodeGuards(), None
+        self._stream, self._guards, self._first = self.make_stream(), None, None
         self.trial_no, self.trial_end_reason = trial, None
         p = self.ready
         self.commander.play(_rows(p.token, HOLD_REST_TICKS), _rows(p.hands, HOLD_REST_TICKS), "wait first chunk")
@@ -152,7 +151,7 @@ class LoopController:
             self.freeze("invalid policy result", time.monotonic())
             return False
         if self.stage == "first_chunk":  # lerobot begin(): 1 s blend in to row 0
-            self._first = rows
+            self._first, self._guards = rows, EpisodeGuards()  # the arm history starts with the blend in (R20b)
             self.commander.blend_to(rows[0, :64], rows[0, 64:], BLEND_TICKS, "blend in")
             self._motion("LOOP_TRIAL", "blend_in", None)
         else:
@@ -177,6 +176,8 @@ class LoopController:
                 self.freeze("invalid robot state", now)
         if self.stage == "blend_in" and not self.commander.busy:
             self._start_episode(now)
+        if self.stage == "blend_in":
+            self._guards.record(now, feedback)
         if self.stage == "episode":
             self._episode_step(now, feedback, state, feedback_age_s, camera_age_s)
         if self.stage == "first_chunk" and not self.commander.busy:  # lerobot wait_tick: the rest pose, slewed
@@ -197,7 +198,7 @@ class LoopController:
         self._next_replan = now + REPLAN_S
         self._set_chunk(self._first, now, now)
         self.commander.follow(self._stream, "episode")
-        self._guards.start(now)
+        self._guards.start(now, keep_history=True)  # cap, echo and checks start here; keep the blend in's arms
         self._detector = HandoverDetector()
         self.stage = "episode"
 
@@ -234,7 +235,8 @@ class LoopController:
             t_ep, frame = 0.0, 0
         elif label == "episode":
             t_ep = now - self._episode_t0
-            frame, chunk_t0 = int(t_ep * LIVE_FPS), self._chunk_t0 - self._episode_t0
+            # lerobot k = int(t_ep * images.fps), images.fps = --policy-fps: the stream's source rate
+            frame, chunk_t0 = int(t_ep * self._stream.source_fps), self._chunk_t0 - self._episode_t0
         self._recorder.tick(time.time(), t_ep, label, frame, token, hands, chunk_t0, state)
 
     # --- stage ends (``_then``) ---------------------------------------------------------------------------------

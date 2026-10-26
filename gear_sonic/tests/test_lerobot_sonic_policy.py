@@ -272,3 +272,24 @@ def test_native_loop_without_lerobot_section_publishes_chunk_rows_unchanged(monk
     tokens = published_tokens(monkeypatch, tmp_path, None)
     assert tokens[0] == pytest.approx(0.5)  # No slew from the planner token.
     assert np.all(np.isclose(tokens, 0.5) | np.isclose(tokens, 0.2))  # Rows switch without a cross-fade.
+
+
+def test_anchored_chunk_on_the_fade_end_tick_fades_hands_from_the_moving_chunk():
+    """lerobot's anchored set_chunk evaluates token_at(now) first, which ends a cross-fade complete by now; the
+    next fade then starts from the outgoing chunk itself (still moving), not from a frozen sample of it."""
+    stream = TokenStream(50, blend_s=0.3, max_token_step=0.0, anchor_s=1.0)
+    a, b, c = (np.zeros((40, 78), np.float32) for _ in range(3))
+    b[:, 64:] = np.arange(40)[:, None] * 0.01  # moving hands: 0.5 rad/s
+    c[:, 64:] = 1.0
+    stream.reset(start_token=np.zeros(64))
+    stream.set_chunk(a, t0=0.0, now=0.0)
+    stream.at(0.0)
+    stream.set_chunk(b, t0=0.2, now=0.2)
+    for k in range(15):  # B's 0.3 s fade is still running on every evaluated tick (w <= 0.28 / 0.3)
+        stream.at(0.2 + 0.02 * k)
+    stream.set_chunk(c, t0=0.51, now=0.51)  # the first evaluation after the fade completed (w = 1.03)
+    for t in (0.55, 0.61, 0.71):
+        w = (t - 0.51) / 0.3
+        b_hands = (t - 0.2) * 50 * 0.01
+        _, hands = stream.at(t)
+        assert hands == pytest.approx(np.full(14, (1 - w) * b_hands + w * 1.0), abs=1e-6)

@@ -198,3 +198,27 @@ def test_helpers():
     s1 = np.zeros(28)
     s1[5] = 1.0
     assert max_arm_speed(0.0, np.zeros(28), 0.5, s1) == (5, 2.0)
+
+
+def test_blend_in_history_feeds_the_first_episode_check():
+    """lerobot logs the blend in at t_ep 0, so its arm history holds the blend in's last ticks at episode start."""
+    base = (ARM_LO + ARM_HI) / 2
+    arm = base.copy()
+    for keep in (True, False):
+        g = EpisodeGuards()
+        for k in range(50):  # the blend in ends moving arm joint 3 at 10 rad/s
+            arm = base.copy()
+            arm[3] += 0.2 * max(0, k - 45)
+            g.record(100.0 + 0.02 * k, _msg(arm))
+        g.start(101.0, keep_history=keep)
+        res = _check(g, 101.0, _msg(arm))
+        if keep:
+            assert res is not None and res[0] == "end" and res[1].startswith("watchdog: arm joint 3 measured at")
+        else:
+            assert res is None
+    g = EpisodeGuards()
+    g.record(100.0, _msg(token=np.ones(64)))
+    with pytest.raises(RuntimeError):
+        _check(g, 100.0)  # record() alone does not start the checks
+    g.start(101.0, keep_history=True)
+    assert _check(g, 130.9) is None and _check(g, 131.0) == ("end", "completed")  # the cap counts from start()

@@ -446,6 +446,8 @@ class HarnessControl:
                 raise ControlError(
                     "NOT_READY", "Take-over needs IDLE/COMPLETED, a running controller, chunk anchoring, "
                     "a verified handover checkpoint and fresh telemetry")
+            if lerobot.dex3_right_order != "dataset":  # the ready pose and the wire would mix right-hand orders
+                raise ControlError("NOT_READY", "The loop supports only lerobot_policy.dex3_right_order: dataset")
             self.loop.take_over(self.feedback, now)
             self.execution, self.reset, self.planner, self.dwell = None, None, None, None
             self.hold_confirmed, self.hold_started, self.hold_index = False, None, None
