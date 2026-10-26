@@ -123,17 +123,20 @@ class TokenStream:
     ``t0 + i / source_fps``. Before t0 the first row is returned; after the last row it is held. With
     ``blend_s > 0``, a new chunk cross-fades linearly from what is being output at ``now``. ``at(t)`` then
     slew-limits the token to ``max_token_step`` per call (hands are not limited), starting from
-    ``start_token`` after ``reset``.
+    ``start_token`` after ``reset``. With ``anchor_s > 0``, a new chunk's token dims instead continue from
+    ``last_token`` (the token actually sent) and the offset decays with time constant ``anchor_s``; the hands
+    keep the cross-fade.
     """
 
-    def __init__(self, source_fps, blend_s=0.0, max_token_step=0.0):
-        if source_fps <= 0 or blend_s < 0 or max_token_step < 0:
-            raise ValueError("source_fps must be positive; blend_s and max_token_step non-negative")
+    def __init__(self, source_fps, blend_s=0.0, max_token_step=0.0, anchor_s=0.0):
+        if source_fps <= 0 or blend_s < 0 or max_token_step < 0 or anchor_s < 0:
+            raise ValueError("source_fps must be positive; blend_s, max_token_step, anchor_s non-negative")
         self.source_fps, self.blend_s, self.max_token_step = float(source_fps), float(blend_s), float(max_token_step)
+        self.anchor_s = float(anchor_s)
         self.reset()
 
     def reset(self, start_token=None):
-        self._chunk, self._t0, self._prev, self._blend = None, 0.0, None, (0.0, 0.0)
+        self._chunk, self._t0, self._prev, self._blend, self._anchor = None, 0.0, None, (0.0, 0.0), None
         self.last_token = None if start_token is None else np.asarray(start_token, np.float32).reshape(64).copy()
 
     @property
@@ -144,6 +147,12 @@ class TokenStream:
         rows = np.asarray(rows, np.float32)
         if rows.ndim != 2 or rows.shape[1] != 78 or len(rows) == 0 or not np.isfinite(rows).all():
             raise ValueError(f"expected a nonempty finite [T, 78] chunk, got {rows.shape}")
+        if self.anchor_s > 0 and self._chunk is not None:
+            # Continue from the token being sent (itself possibly still offset) with the new chunk's motion.
+            ref = self._row_at(now)[:64] if self.last_token is None else self.last_token
+            self._anchor = (ref - self._interpolate(rows, float(t0), now)[:64], float(now))
+        else:
+            self._anchor = None
         if self.blend_s > 0 and self._chunk is not None:
             # Fade from what is being output now (itself possibly mid-fade) to the new chunk.
             self._prev = (self._row_at(now)[None], now) if self._prev is not None else (self._chunk, self._t0)
@@ -161,16 +170,21 @@ class TokenStream:
         return ((1 - w) * rows[i] + w * rows[i + 1]).astype(np.float32)
 
     def _row_at(self, t):
-        new = self._interpolate(self._chunk, self._t0, t)
+        new = out = self._interpolate(self._chunk, self._t0, t)
         if self._prev is not None:
             start, duration = self._blend
             w = (t - start) / duration
             if w < 1:
                 old = self._interpolate(*self._prev, t)
                 w = max(w, 0.0)
-                return ((1 - w) * old + w * new).astype(np.float32)
-            self._prev = None
-        return new
+                out = ((1 - w) * old + w * new).astype(np.float32)
+            else:
+                self._prev = None
+        if self._anchor is not None:
+            offset, start = self._anchor
+            out = out.copy()
+            out[:64] = new[:64] + offset * np.float32(np.exp(-max(t - start, 0.0) / self.anchor_s))
+        return out
 
     def at(self, t):
         """(token 64, hands 14) to send at time t."""

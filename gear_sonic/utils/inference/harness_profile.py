@@ -69,6 +69,7 @@ class LeRobotPolicySettings:
 
     chunk_blend_s: float = 0.0
     max_token_step: float = 0.0
+    chunk_anchor_s: float = 0.0
     dex3_right_order: str = "dataset"
 
 
@@ -265,11 +266,12 @@ def load_profile(path: Path) -> G1Profile:
         lerobot = data["lerobot_policy"]
         if (
             not isinstance(lerobot, dict)
-            or lerobot.keys() - {"chunk_blend_s", "max_token_step", "dex3_right_order"}
-            or not all(finite_number(lerobot.get(key, 0.0)) for key in ("chunk_blend_s", "max_token_step"))
+            or lerobot.keys() - {"chunk_blend_s", "max_token_step", "chunk_anchor_s", "dex3_right_order"}
+            or not all(finite_number(lerobot.get(key, 0.0)) for key in ("chunk_blend_s", "max_token_step", "chunk_anchor_s"))
             # The blend and the slew limit act within one 0.8 s chunk; tokens span [-1.25, 1.25].
             or not 0 <= lerobot.get("chunk_blend_s", 0.0) <= 0.8
             or not 0 <= lerobot.get("max_token_step", 0.0) <= 2.5
+            or not 0 <= lerobot.get("chunk_anchor_s", 0.0) <= 5.0
             or lerobot.get("dex3_right_order", "dataset") not in ("dataset", "swap")
         ):
             raise ValueError("Invalid lerobot_policy settings")

@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -131,6 +132,26 @@ def test_token_stream_slew_limits_tokens_but_not_hands():
     assert unlimited.at(0.0)[0][0] == 1.0
 
 
+def test_anchoring_starts_from_sent_token_and_decays():
+    stream = TokenStream(50, max_token_step=0.5, anchor_s=1.0)
+    stream.reset(start_token=np.ones(64))
+    stream.set_chunk(np.ones((40, 78), np.float32), t0=0.0, now=0.0)
+    stream.last_token = np.full(64, 0.5, np.float32)  # The slew limit held the sent token at 0.5.
+    stream.set_chunk(np.zeros((40, 78), np.float32), t0=1.0, now=1.0)
+    assert stream.at(1.0)[0][:64] == pytest.approx(0.5, abs=1e-6)
+    stream.max_token_step = 0.0
+    assert stream.at(2.0)[0][:64] == pytest.approx(0.5 * math.exp(-1), abs=1e-5)
+
+
+def test_anchoring_leaves_hands_on_crossfade():
+    stream = TokenStream(50, blend_s=0.3, anchor_s=1.0)
+    stream.reset(start_token=np.ones(64))
+    stream.set_chunk(np.ones((40, 78), np.float32), t0=0.0, now=0.0)
+    stream.at(0.0)
+    stream.set_chunk(np.zeros((40, 78), np.float32), t0=0.2, now=0.2)
+    assert stream.at(0.35)[1] == pytest.approx(0.5)
+
+
 def write_profile(tmp_path, lerobot):
     data = yaml.safe_load(FIXTURE.read_text())
     if lerobot is not None:
@@ -149,6 +170,13 @@ def test_profile_lerobot_section_is_optional_and_validated(tmp_path):
                 dict(max_token_step=3.0), dict(dex3_right_order="mirror"), dict(rtc=True), [0.3]):
         with pytest.raises(ValueError, match="lerobot_policy"):
             load_profile(write_profile(tmp_path, bad))
+
+
+def test_profile_chunk_anchor_s_validated(tmp_path):
+    assert load_profile(write_profile(tmp_path, dict(chunk_anchor_s=1.0))).lerobot_policy.chunk_anchor_s == 1.0
+    for bad in (-0.1, 6.0):
+        with pytest.raises(ValueError, match="lerobot_policy"):
+            load_profile(write_profile(tmp_path, dict(chunk_anchor_s=bad)))
 
 
 def published_tokens(monkeypatch, tmp_path, lerobot):

@@ -769,7 +769,10 @@ def main(config: InferenceConfig):
         )
 
         token_stream = TokenStream(
-            config.action_publish_rate, lerobot_policy.chunk_blend_s, lerobot_policy.max_token_step
+            config.action_publish_rate,
+            lerobot_policy.chunk_blend_s,
+            lerobot_policy.max_token_step,
+            lerobot_policy.chunk_anchor_s,
         )
         lerobot_right_order = RIGHT_SWAP if lerobot_policy.dex3_right_order == "swap" else np.arange(7)
 
