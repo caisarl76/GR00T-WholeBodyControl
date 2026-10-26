@@ -83,16 +83,21 @@ class PoseCommander:
     def _add(self, seg: _Segment) -> None:
         if self.frozen:
             raise RuntimeError("PoseCommander is frozen; resume, hold or start first")
-        if self._queue and self._queue[0].kind == "follow":
-            self._queue.pop(0)  # a follow never completes by itself; new motion ends it
+        # a follow never completes by itself; new motion ends every queued follow
+        if seg.kind != "follow":
+            self._queue = [s for s in self._queue if s.kind != "follow"]
+        elif self._queue and self._queue[0].kind == "follow":
+            self._queue.pop(0)
         self._queue.append(seg)
 
     def blend_to(self, token, hands, ticks: int = 50, label: str = "blend") -> None:
+        if ticks < 1:
+            raise ValueError(f"blend ticks must be >= 1, got {ticks}")
         self._add(_Segment("blend", label, np.asarray(token, np.float32).reshape(64),
                            np.asarray(hands, np.float32).reshape(14), ticks))
 
     def play(self, tokens, hands, label: str) -> None:
-        tokens, hands = np.asarray(tokens, np.float32), np.asarray(hands, np.float32)
+        tokens, hands = np.array(tokens, np.float32), np.array(hands, np.float32)
         if tokens.ndim != 2 or tokens.shape[1] != 64 or hands.shape != (len(tokens), 14) or len(tokens) == 0:
             raise ValueError(f"play needs [T, 64] tokens and [T, 14] hands, got {tokens.shape}, {hands.shape}")
         self._add(_Segment("play", label, tokens, hands, len(tokens)))
@@ -107,10 +112,11 @@ class PoseCommander:
         self.frozen = False
 
     def _slew(self, target):
-        if self.max_token_step <= 0:
-            return target.astype(np.float32)
         step = self.max_token_step
-        return (self.last_token + np.clip(target - self.last_token, -step, step)).astype(np.float32)
+        delta = target - self.last_token
+        if step <= 0 or np.abs(delta).max() <= step:
+            return np.asarray(target, np.float32)
+        return (self.last_token + np.clip(delta, -step, step)).astype(np.float32)
 
     def tick(self, now: float):
         if self.frozen or not self._queue:
@@ -126,9 +132,9 @@ class PoseCommander:
                 if seg.origin is None:
                     seg.origin = (self.last_token.copy(), self.last_hands.copy())
                 if seg.kind == "blend":
-                    w = np.float32((seg.i + 1) / seg.ticks)
-                    target = seg.origin[0] + w * (seg.tokens - seg.origin[0])
-                    hands = seg.origin[1] + w * (seg.hands - seg.origin[1])
+                    w = (seg.i + 1) / seg.ticks
+                    target = np.asarray((1 - w) * seg.origin[0] + w * seg.tokens, np.float32)
+                    hands = np.asarray((1 - w) * seg.origin[1] + w * seg.hands, np.float32)
                 else:
                     target, hands = seg.tokens[seg.i], seg.hands[seg.i]
                 token = self._slew(target)

@@ -177,3 +177,38 @@ def test_recent_tokens_keeps_last_25_sent():
     sent = [c.tick(0.0)[0] for _ in range(30)]
     assert len(c.recent_tokens) == 25
     assert all(np.array_equal(x, y) for x, y in zip(c.recent_tokens, sent[-25:]))
+
+
+def test_blend_matches_lerobot_expression_exactly():
+    ready = load_ready_pose()
+    c = PoseCommander(0.0)
+    c.start(np.zeros(64, np.float32), np.zeros(14, np.float32))
+    c.blend_to(ready.token, ready.hands, ticks=50)
+    z, zh = np.zeros(64, np.float32), np.zeros(14, np.float32)
+    for i in range(50):
+        w = (i + 1) / 50
+        t, h, _ = c.tick(0.0)
+        assert np.array_equal(t, np.asarray((1 - w) * z + w * ready.token, np.float32))
+        assert np.array_equal(h, np.asarray((1 - w) * zh + w * ready.hands, np.float32))
+
+
+def test_new_motion_ends_every_queued_follow():
+    s = TokenStream(50.0)
+    s.reset()
+    s.set_chunk(np.zeros((10, 78), np.float32), 0.0, 0.0)
+    c = _cmd()
+    c.blend_to(np.ones(64) * 0.1, np.zeros(14), ticks=3, label="blend")
+    c.follow(s)
+    c.blend_to(np.zeros(64), np.zeros(14), ticks=3, label="to_ready")
+    labels = [c.tick(0.0)[2] for _ in range(7)]
+    assert labels == ["blend"] * 3 + ["to_ready"] * 3 + ["hold"]
+
+
+def test_blend_rejects_zero_ticks_and_play_copies_rows():
+    c = _cmd()
+    with pytest.raises(ValueError):
+        c.blend_to(np.zeros(64), np.zeros(14), ticks=0)
+    hands = np.ones((2, 14), np.float32)
+    c.play(_rows(2), hands, "p")
+    hands[:] = 9
+    assert c.tick(0.0)[1][0] == 1.0
