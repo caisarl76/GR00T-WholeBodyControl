@@ -25,6 +25,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   x  -> discard active recording (legacy data exporter keyboard mode)
 """
 
+import base64
 from dataclasses import dataclass, replace
 from pathlib import Path
 import queue
@@ -424,6 +425,7 @@ def main(config: InferenceConfig):
     if harness_enabled != (config.harness_profile is not None):
         raise ValueError("harness_endpoint and harness_profile must be supplied together")
     harness_control = None
+    harness_loop = None  # LoopController: in its LOOP_* phases it alone commands the robot
     harness_rpc = None
     snapshots = None
     harness_planner_command = None
@@ -813,10 +815,15 @@ def main(config: InferenceConfig):
         if key is None:
             return
 
+        loop = harness_control.loop if harness_control is not None else None
+        in_loop = loop is not None and loop.phase.startswith("LOOP_")
+        if in_loop and key.startswith(PROMPT_MSG_PREFIX):  # the loop's task is fixed for the session
+            print(f"Prompt change ignored during the autonomous loop: {key[len(PROMPT_MSG_PREFIX):]!r}")
+            return
         if harness_control is not None and (
             key.startswith(PROMPT_MSG_PREFIX)
             or key in {"i", "m", "p", "k", "[", "]"}
-            or (manual_planner is not None and key in {"w", "s", "a", "d", "q", "e", "z"})
+            or ((manual_planner is not None or in_loop) and key in {"w", "s", "a", "d", "q", "e", "z"})
         ):
             was_owned = harness_control.owner is not None
             if harness_control.operator_override(key):
@@ -1228,7 +1235,69 @@ def main(config: InferenceConfig):
                     harness_planner_command = replace(command, mode=0, movement=(0.0, 0.0, 0.0), speed=0.0)
                 standing_reset, manual_planner = None, None
 
-        harness_control = HarnessControl(Path(config.harness_profile), LoopHooks(), uuid.uuid4().hex)
+            def switch_to_pose(self):
+                send_cpp_control_command(start=True, planner=False)
+
+            def switch_to_planner(self):  # the session end's hand-back: the measured planner hold
+                try:
+                    self.request_planner_hold(reset_feedback, False)
+                except (TypeError, ValueError) as exc:  # HarnessControl's planner deadline then faults
+                    print(f"[harness] loop hand-back planner hold failed: {exc}")
+
+            def request_policy_chunk(self):
+                nonlocal inference_epoch
+                inference_epoch += 1  # a fresh epoch per request: late results of older ones are dropped
+                language_prompt_ref[0] = loop_task
+                try:
+                    inference_queue.get_nowait()  # a request the worker has not started is superseded
+                except queue.Empty:
+                    pass
+                inference_queue.put_nowait(inference_epoch)
+                return inference_epoch
+
+        harness_hooks = LoopHooks()
+        if lerobot_policy is not None and profile.handover is not None:
+            from gear_sonic.utils.inference.loop_control import HOLD_REST_TICKS, REPLAN_S, LoopController
+            from gear_sonic.utils.inference.loop_episode import EpisodeGuards, HandoverDetector
+            from gear_sonic.utils.inference.loop_motion import READY_POSE_PATH, PoseCommander, load_ready_pose
+            from gear_sonic.utils.inference.loop_records import TrialWriter
+
+            loop_task = profile.skills[profile.handover.skill_id].prompt
+            # Recorded in each trial npz under lerobot sonic_policy_streamer's argument names.
+            trial_args = dict(
+                task=loop_task,
+                action_space="sonic78",
+                policy_server=f"tcp://{profile.policy_host}:{profile.policy_port}",
+                policy_path=profile.checkpoint,
+                chunk_blend_s=lerobot_policy.chunk_blend_s,
+                chunk_anchor_s=lerobot_policy.chunk_anchor_s,
+                max_token_step=lerobot_policy.max_token_step,
+                replan_s=REPLAN_S,
+                hold_rest_s=HOLD_REST_TICKS / config.action_publish_rate,
+                end_on_handover=HandoverDetector().open_s,
+                duration_s=EpisodeGuards().cap_s,
+                start="planner",
+                end="planner",
+                ready_pose=str(READY_POSE_PATH),
+                fps=config.action_publish_rate,
+            )
+            harness_loop = LoopController(
+                PoseCommander(max_token_step=lerobot_policy.max_token_step),
+                load_ready_pose(),
+                harness_hooks,
+                make_stream=lambda: TokenStream(
+                    config.action_publish_rate,
+                    lerobot_policy.chunk_blend_s,
+                    lerobot_policy.max_token_step,
+                    lerobot_policy.chunk_anchor_s,
+                ),
+                right_order=lerobot_right_order,
+                trial_args=trial_args,
+                model=profile.checkpoint,
+            )
+        harness_control = HarnessControl(
+            Path(config.harness_profile), harness_hooks, uuid.uuid4().hex, loop=harness_loop
+        )
         harness_control.locomotion_enabled = config.harness_locomotion
         snapshots = ObservationSnapshotCache(
             lambda: ComposedCameraClientSensor(server_ip=config.camera_host, port=config.camera_port),
@@ -1259,6 +1328,7 @@ def main(config: InferenceConfig):
     )
     inference_worker_thread.start()
 
+    loop_frame_id, loop_camera_at = None, float("-inf")
     try:
         last_reset_tick = time.monotonic()
         while True:
@@ -1274,6 +1344,46 @@ def main(config: InferenceConfig):
             if harness_control is not None:
                 harness_control.tick(t_start, reset_feedback, reset_feedback_time)
                 harness_rpc.drain(harness_control, t_start)
+                if harness_control.phase.startswith("LOOP_"):
+                    # The LoopController alone commands the robot: one pose message per tick, no planner
+                    # command; policy chunks reach it only through accept_chunk.
+                    try:
+                        loop_action, captured_at, result_epoch = result_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        try:
+                            rows = np.concatenate(
+                                [np.asarray(loop_action[key], np.float32)[0]
+                                 for key in ("motion_token", "left_hand_joints", "right_hand_joints")],
+                                axis=1,
+                            )
+                        except (IndexError, KeyError, TypeError, ValueError):
+                            rows = None  # a failed inference: accept_chunk freezes ("invalid policy result")
+                        harness_loop.accept_chunk(result_epoch, captured_at, rows)
+                    observation = harness_control.observation
+                    if observation is not None and observation["frame_id"] != loop_frame_id:
+                        loop_frame_id, loop_camera_at = observation["frame_id"], observation["received_at"]
+                        harness_loop.frame(
+                            time.time() - (t_start - loop_camera_at),  # wall clock, as lerobot records frames
+                            profile.camera_key,
+                            base64.b64decode(observation["jpeg_rgb_b64"]),
+                        )
+                    token, hands, _ = harness_loop.tick(
+                        t_start, reset_feedback, t_start - reset_feedback_time, t_start - loop_camera_at
+                    )
+                    zmq_socket.send(
+                        pack_latent_action_message(
+                            token,
+                            np.array([zmq_frame_counter], dtype=np.int64),
+                            left_hand_joints=hands[:7],
+                            right_hand_joints=hands[7:],
+                        )
+                    )
+                    zmq_frame_counter += 1
+                    last_sent_motion_token, last_reset_tick = token, t_start
+                    _sleep_remaining(t_start, loop_period)
+                    continue
                 if pause_loop:
                     try:
                         warm_action, _, warm_epoch = result_queue.get_nowait()
@@ -1537,6 +1647,11 @@ def main(config: InferenceConfig):
             state_subscriber.close()
         reset_state_subscriber.close()
         keyboard_listener.close()
+        if harness_loop is not None:  # trial files are written on the TrialWriter thread
+            if not TrialWriter.flush(10):
+                print("[harness] trial files still being written after 10 s")
+            for error in TrialWriter.errors:
+                print(f"[harness] trial write failed: {error!r}")
         print("Shutdown complete.")
 
 
