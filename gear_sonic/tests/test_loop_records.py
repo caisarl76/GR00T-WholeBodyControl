@@ -105,7 +105,7 @@ def test_writer_error_does_not_kill_thread(tmp_path, monkeypatch):
     _record(tmp_path, 0).close("handover")
     assert TrialWriter.flush(5)
     assert len(TrialWriter.errors) == 1 and "disk full" in str(TrialWriter.errors[0])
-    assert next_trial(tmp_path) == 0  # failed trial is no longer pending
+    assert next_trial(tmp_path) == 1  # the failed number stays counted (R12)
     _record(tmp_path, 1).close("handover")
     assert TrialWriter.flush(5)
     assert (tmp_path / "trial_001.npz").exists()
@@ -117,4 +117,18 @@ def test_close_twice_raises(tmp_path):
     rec.close("handover")
     with pytest.raises(RuntimeError):
         rec.close("handover")
+    with pytest.raises(RuntimeError):
+        rec.tick(0.0, 0.0, "episode", 0, np.zeros(64), np.zeros(14), 0.0, np.zeros(28))
+    with pytest.raises(RuntimeError):
+        rec.frame(0.0, "head", b"x")
     assert TrialWriter.flush(5)
+
+
+def test_relative_and_absolute_session_dir_match(tmp_path, monkeypatch):
+    real = loop_records._save_npz
+    monkeypatch.setattr(loop_records, "_save_npz", lambda *a, **k: (time.sleep(0.3), real(*a, **k)))
+    monkeypatch.chdir(tmp_path)
+    _record("sess", 0).close("handover")
+    assert next_trial(tmp_path / "sess") == 1 and next_trial("sess") == 1
+    assert TrialWriter.flush(10)
+    assert next_trial("sess") == 1

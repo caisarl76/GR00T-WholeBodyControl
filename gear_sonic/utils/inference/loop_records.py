@@ -92,11 +92,12 @@ class TrialWriter:
             session_dir, trial, log, frames, extra = cls._queue.get()
             try:
                 _write_trial(session_dir, trial, log, frames, extra)
+                with cls._cond:
+                    cls._pending.discard((session_dir, trial))
             except BaseException as e:  # noqa: BLE001 - the thread must outlive any one bad write
                 logger.exception("trial %03d write to %s failed", trial, session_dir)
                 cls.errors.append(e)
-            with cls._cond:
-                cls._pending.discard((session_dir, trial))
+            with cls._cond:  # a failed trial stays pending: its number is never reused (R12)
                 cls._outstanding -= 1
                 cls._cond.notify_all()
 
@@ -106,33 +107,34 @@ class TrialWriter:
         with cls._cond:
             return cls._cond.wait_for(lambda: cls._outstanding == 0, timeout_s)
 
-    @classmethod
-    def queued(cls, session_dir: Path) -> int:
-        """Queued trials for `session_dir` whose frames file is not on disk yet."""
-        with cls._cond:
-            return sum(
-                1 for d, t in cls._pending if d == session_dir and not (d / f"trial_{t:03d}_frames.npz").exists()
-            )
-
 
 def next_trial(session_dir: Path) -> int:
-    session_dir = Path(session_dir)
-    return len(list(session_dir.glob("trial_*_frames.npz"))) + TrialWriter.queued(session_dir)
+    session_dir = Path(session_dir).resolve()
+    with TrialWriter._cond:  # invariant: a trial is counted by its frames file or by pending, never by neither
+        done = {p.name for p in session_dir.glob("trial_*_frames.npz")}  # one snapshot, taken under the lock
+        queued = sum(
+            1 for d, t in TrialWriter._pending if d == session_dir and f"trial_{t:03d}_frames.npz" not in done
+        )
+        return len(done) + queued
 
 
 class TrialRecorder:
     def __init__(self, session_dir: Path, trial: int, args: dict, model: str):
-        self.session_dir, self.trial, self.args, self.model = Path(session_dir), trial, args, model
+        self.session_dir, self.trial, self.args, self.model = Path(session_dir).resolve(), trial, args, model
         self._log: dict[str, list] | None = {k: [] for k in _LOG_KEYS}
         self._frames: list[tuple[float, str, bytes]] = []
 
     def tick(self, wall, t_ep, phase, frame, token, hands, chunk_t0, state28) -> None:
+        if self._log is None:
+            raise RuntimeError(f"trial {self.trial} already closed")
         # copy the arrays: the caller may reuse its buffers
         row = (wall, t_ep, phase, frame, np.array(token), np.array(hands), chunk_t0, np.array(state28))
         for k, v in zip(_LOG_KEYS, row, strict=True):
             self._log[k].append(v)
 
     def frame(self, t_recv: float, name: str, jpeg: bytes) -> None:
+        if self._log is None:
+            raise RuntimeError(f"trial {self.trial} already closed")
         self._frames.append((t_recv, name, jpeg))
 
     def close(self, episode_end: str) -> None:
