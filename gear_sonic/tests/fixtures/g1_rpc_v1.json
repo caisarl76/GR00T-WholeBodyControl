@@ -129,6 +129,63 @@
       "params": {
         "execution_id": ""
       }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_take_over",
+      "params": {}
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_raise",
+      "params": {}
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_trial",
+      "params": {
+        "trial": 0,
+        "session_dir": "/tmp/session"
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_freeze",
+      "params": {}
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_resume",
+      "params": {}
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_end",
+      "params": {}
     }
   ],
   "invalid_requests": [
@@ -165,6 +222,64 @@
         "duration_s": 5.01,
         "speed_mps": 0.2
       }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_trial",
+      "params": {
+        "trial": -1,
+        "session_dir": "/tmp/session"
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_trial",
+      "params": {
+        "trial": 0
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_trial",
+      "params": {
+        "trial": 0,
+        "session_dir": ""
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_trial",
+      "params": {
+        "trial": true,
+        "session_dir": "/tmp/session"
+      }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_freeze",
+      "params": {
+        "reason": "invented"
+      }
     }
   ],
   "valid_responses": [
@@ -194,7 +309,45 @@
         "reason": null,
         "locomotion_enabled": false,
         "ready_return_enabled": false,
-        "right_hand_open": null
+        "right_hand_open": null,
+        "loop_stage": null,
+        "loop_trial": null,
+        "trial_end_reason": null,
+        "frozen_stage": null
+      },
+      "error": null
+    },
+    {
+      "request_id": "loop-status",
+      "runtime_id": "boot",
+      "result": {
+        "runtime_id": "boot",
+        "phase": "LOOP_FROZEN",
+        "skill_id": null,
+        "execution_id": null,
+        "inference_epoch": 0,
+        "controller_running": true,
+        "policy_ready": true,
+        "mode_requested": "POSE",
+        "planner_reference_active": false,
+        "hold_confirmed": false,
+        "telemetry_age_s": 0.0,
+        "telemetry_index": 1,
+        "observation_age_s": 0.0,
+        "frame_id": "frame",
+        "registry_sha256": "17e415bf4ebd63e771e3befe9c0c95ce360ad36ec03c94f1f2b535a89406b71f",
+        "policy_host": "127.0.0.1",
+        "policy_port": 15558,
+        "checkpoint_expected": "/mnt/data/jihun/models/pnp_bottle_260916_n17_raw_gpu7/checkpoint-20000",
+        "owner_session_id": "session-1",
+        "reason": "operator stop",
+        "locomotion_enabled": false,
+        "ready_return_enabled": false,
+        "right_hand_open": null,
+        "loop_stage": "frozen",
+        "loop_trial": 3,
+        "trial_end_reason": "operator stop",
+        "frozen_stage": "episode"
       },
       "error": null
     }

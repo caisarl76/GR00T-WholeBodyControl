@@ -819,7 +819,8 @@ def main(config: InferenceConfig):
             or (manual_planner is not None and key in {"w", "s", "a", "d", "q", "e", "z"})
         ):
             was_owned = harness_control.owner is not None
-            harness_control.operator_override(key)
+            if harness_control.operator_override(key):
+                return  # a LOOP phase froze the loop; the key's own action is not performed
             if key == "p" and was_owned:
                 print("Agent ownership revoked; policy remains paused.")
                 return

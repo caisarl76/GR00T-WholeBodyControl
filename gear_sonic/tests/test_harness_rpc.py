@@ -71,7 +71,7 @@ def rpc_module():
 def test_native_rpc_contract():
     from pathlib import Path
 
-    from gear_sonic.utils.inference.harness_contract import decode_request
+    from gear_sonic.utils.inference.harness_contract import decode_request, decode_response
 
     fixtures = json.loads((Path(__file__).parent / "fixtures/g1_rpc_v1.json").read_text())
     for entry in fixtures["valid_requests"]:
@@ -79,6 +79,12 @@ def test_native_rpc_contract():
     for entry in fixtures["invalid_requests"]:
         with pytest.raises(ValueError):
             decode_request(json.dumps(entry).encode())
+    for entry in fixtures["valid_responses"]:
+        assert decode_response(json.dumps(entry).encode()).result.phase == entry["result"]["phase"]
+    bad = json.loads(json.dumps(fixtures["valid_responses"][-1]))
+    bad["result"]["frozen_stage"] = "invented"
+    with pytest.raises(ValueError):
+        decode_response(json.dumps(bad).encode())
 
 
 def test_local_rpc_and_second_server_does_not_unlink_live_socket(tmp_path):

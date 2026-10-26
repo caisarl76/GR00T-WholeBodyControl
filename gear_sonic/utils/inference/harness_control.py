@@ -52,6 +52,10 @@ class RuntimeHooks(Protocol):
     def begin_ready_reset(self, feedback: dict, right_arm_target, right_arm_waypoint) -> StandingReset: ...
     def set_planner_command(self, command) -> None: ...
     def stop_planner_motion(self) -> None: ...
+    # Autonomous loop (LoopController): POSE mode start, PLANNER mode start, enqueue one inference epoch.
+    def switch_to_pose(self) -> None: ...
+    def switch_to_planner(self) -> None: ...
+    def request_policy_chunk(self) -> int: ...
 
 
 def load_harness_profile(path: Path) -> dict:
@@ -76,9 +80,10 @@ class ControlError(ValueError):
 
 
 class HarnessControl:
-    def __init__(self, profile_path: Path, hooks: RuntimeHooks, runtime_id: str):
+    def __init__(self, profile_path: Path, hooks: RuntimeHooks, runtime_id: str, loop=None):
         self.profile = load_profile(profile_path)
         self.hooks, self.runtime_id = hooks, runtime_id
+        self.loop = loop  # LoopController: owns the LOOP_* phases, which self.phase mirrors
         self.owner = None
         self.execution = None
         self.phase, self.reason, self.epoch = "IDLE", None, 0
@@ -146,7 +151,21 @@ class HarnessControl:
         except (TypeError, ValueError):
             self.phase = "FAULT"
 
+    def _in_loop(self):
+        return self.loop is not None and self.phase.startswith("LOOP_")
+
+    def _sync_loop(self, now):
+        if not self._in_loop():
+            return
+        self.phase, self.reason = self.loop.phase, self.loop.reason
+        if self.phase == "COMPLETED":  # handed back to the planner: confirm it like any other hold
+            self.hold_confirmed, self.hold_index, self.hold_started = False, self.feedback_index, now
+
     def interrupt(self, reason: str, now: float):
+        if self._in_loop():  # a stop freezes the loop; the planner hold is only the session end's hand-back
+            self.loop.freeze("lease expired" if reason == "lease_expired" else f"interrupted: {reason}", now)
+            self._sync_loop(now)
+            return
         self.epoch = self.hooks.invalidate_policy_actions()
         self.hooks.set_policy_enabled(False)
         self.hooks.stop_planner_motion()
@@ -154,6 +173,12 @@ class HarnessControl:
         self._hold(now)
 
     def operator_override(self, reason: str):
+        """True when the key was consumed: in a LOOP phase it only freezes the loop (owner kept, and the caller
+        must not perform the key's own action)."""
+        if self._in_loop():
+            self.loop.freeze(f"operator override: {reason}", time.monotonic())
+            self._sync_loop(time.monotonic())
+            return True
         if self.owner is None and self.execution is None and self.phase == "IDLE":
             return
         if self.owner is not None:
@@ -303,7 +328,7 @@ class HarnessControl:
                 not facts.controller_running
                 or facts.policy_enabled
                 or getattr(facts, "operator_busy", False)
-                or self.phase not in {"IDLE", "COMPLETED", "PAUSED"}
+                or self.phase not in {"IDLE", "COMPLETED", "PAUSED", "LOOP_FROZEN"}
             ):
                 raise ControlError("NOT_READY", "Operator must start control and prepare a paused executor")
             if not self._fresh(now):
@@ -316,7 +341,7 @@ class HarnessControl:
                 lease_id=uuid.uuid4().hex,
                 expires_at=now + self.profile.limits.lease_s,
             )
-            if self.profile.handover and self._handover_enabled():
+            if self.profile.handover and self._handover_enabled() and not self._in_loop():
                 self._hold(now)
                 if self.phase == "FAULT":
                     self._retire_owner()
@@ -363,6 +388,8 @@ class HarnessControl:
             return self._execution()
         if method in {"walk_for", "turn_by"}:
             return self._begin_locomotion(method, params, now)
+        if method.startswith("loop_"):
+            return self._loop_call(method, params, now)
         standalone = method in {"reset_standing", "reset_ready"} and params["execution_id"] == ""
         if not standalone and (not self.execution or params["execution_id"] != self.execution["execution_id"]):
             raise ControlError("INVALID_REQUEST", "Execution mismatch")
@@ -396,6 +423,40 @@ class HarnessControl:
             return self._execution()
         raise ControlError("INVALID_REQUEST", "Unknown method")
 
+    def _loop_call(self, method, params, now):
+        if self.loop is None:
+            raise ControlError("UNSUPPORTED_SKILL", "Autonomous loop unavailable")
+        if method == "loop_take_over":
+            lerobot, handover = self.profile.lerobot_policy, self.profile.handover
+            if (
+                self.phase not in {"IDLE", "COMPLETED"}
+                or not self.hooks.runtime_facts().controller_running
+                or not (lerobot and lerobot.chunk_anchor_s > 0)
+                or not (handover and handover.checkpoint_verified)
+                or not self._fresh(now)
+            ):
+                raise ControlError(
+                    "NOT_READY", "Take-over needs IDLE/COMPLETED, a running controller, chunk anchoring, "
+                    "a verified handover checkpoint and fresh telemetry")
+            self.loop.take_over(self.feedback, now)
+            self.execution, self.reset, self.planner, self.dwell = None, None, None, None
+            self.hold_confirmed, self.hold_started, self.hold_index = False, None, None
+            self.phase = self.loop.phase
+        elif not self._in_loop():
+            raise ControlError("NOT_READY", "Autonomous loop not taken over")
+        elif method == "loop_raise":
+            self.loop.raise_(now)
+        elif method == "loop_trial":
+            self.loop.trial(params["trial"], params["session_dir"], now)
+        elif method == "loop_freeze":
+            self.loop.freeze("operator stop", now)
+        elif method == "loop_resume":
+            self.loop.resume(now)
+        elif method == "loop_end":
+            self.loop.end(now)
+        self._sync_loop(now)
+        return self.status(now)
+
     def _begin_locomotion(self, method, params, now):
         if not self.locomotion_enabled:
             raise ControlError("UNSUPPORTED_SKILL", "Locomotion disabled")
@@ -426,6 +487,7 @@ class HarnessControl:
         return self._execution()
 
     def tick(self, now, feedback, feedback_received_at):
+        self._sync_loop(now)  # LoopController.tick ran since the last tick
         advanced = False
         if feedback is not None:
             index = feedback.get("index")
@@ -434,10 +496,13 @@ class HarnessControl:
                 advanced = True
                 if not self._compatible_feedback(feedback) and (
                     self.owner is not None or self.phase in {"MANIPULATING", "RESETTING", "WALKING", "TURNING"}
+                    or self._in_loop()
                 ):
+                    in_loop = self._in_loop()
                     self.interrupt("incompatible_controller_telemetry", now)
                     self._retire_owner()
-                    self.phase = "FAULT"
+                    if not in_loop:  # a loop stays frozen for a reclaim
+                        self.phase = "FAULT"
                     return
             elif type(index) is int and self.feedback_index is not None and index < self.feedback_index:
                 self.feedback, self.feedback_time, self.feedback_index = None, None, index
@@ -447,7 +512,8 @@ class HarnessControl:
         if self.owner and now >= self.owner["expires_at"]:
             self.interrupt("lease_expired", now)
             self._retire_owner()
-        if self.phase in {"MANIPULATING", "RESETTING", "WALKING", "TURNING"} and not self._fresh(now):
+        active = self.phase in {"MANIPULATING", "RESETTING", "WALKING", "TURNING"} or self._in_loop()
+        if active and not self._fresh(now):
             self.interrupt("stale_feedback", now)
         if not self._fresh(now):
             self.hold_confirmed, self.dwell = False, None
@@ -464,6 +530,7 @@ class HarnessControl:
         if (
             self.hold_started is not None
             and not self.hold_confirmed
+            and not self._in_loop()
             and now - self.hold_started > self.profile.limits.planner_deadline_s
         ):
             self.interrupt("planner_activation_timeout", now)
@@ -547,4 +614,8 @@ class HarnessControl:
             ready_return_enabled=self._handover_enabled(),
             right_hand_open=(bool(np.max(np.abs(self.feedback["right_hand_q_measured"])) <= 0.05)
                              if fresh else None),
+            loop_stage=self.loop.stage if self.loop else None,
+            loop_trial=self.loop.trial_no if self.loop else None,
+            trial_end_reason=self.loop.trial_end_reason if self.loop else None,
+            frozen_stage=self.loop.frozen_stage if self.loop else None,
         )
