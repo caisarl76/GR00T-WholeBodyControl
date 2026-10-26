@@ -113,12 +113,14 @@ class EpisodeGuards:
         self.cap_s, self.max_arm_speed, self.arm_range_margin = cap_s, max_arm_speed, arm_range_margin
         self.max_chunk_age_s, self.max_state_age_s = max_chunk_age_s, max_state_age_s
         self.max_camera_age_s, self.token_echo_timeout_s = max_camera_age_s, token_echo_timeout_s
-        self.start(0.0)
+        self.t0, self.echo_lost, self.history = None, None, []
 
     def start(self, now: float) -> None:
         self.t0, self.echo_lost, self.history = now, None, []
 
     def check(self, now, state_msg, state_age_s, camera_age_s, last_chunk_at, recent_tokens):
+        if self.t0 is None:
+            raise RuntimeError("EpisodeGuards.check before start(now)")
         arm = None
         if state_msg:
             arm = lerobot_state(state_msg, np.arange(7))[:14]  # the arm slice ignores right_order

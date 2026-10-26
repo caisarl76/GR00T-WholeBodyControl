@@ -173,7 +173,13 @@ def test_start_resets_state():
     jump[1] += 1.0
     assert _check(g, 201.02, _msg(jump)) is None  # arm history cleared
     assert _check(g, 229.0) is None  # cap counts from the new start
+    assert _check(g, 230.0) == ("end", "completed")  # the cap boundary: lerobot never runs the tick at 30.0
     assert _check(g, 230.01) == ("end", "completed")
+
+
+def test_check_before_start_raises():
+    with pytest.raises(RuntimeError, match="start"):
+        EpisodeGuards().check(123456.0, None, 0.0, 0.0, 123456.0, [])
 
 
 def test_arm_range_uses_lerobot_limits():
