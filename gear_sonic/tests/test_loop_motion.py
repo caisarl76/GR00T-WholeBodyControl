@@ -182,9 +182,9 @@ def test_recent_tokens_keeps_last_25_sent():
 def test_blend_matches_lerobot_expression_exactly():
     ready = load_ready_pose()
     c = PoseCommander(0.0)
-    c.start(np.zeros(64, np.float32), np.zeros(14, np.float32))
+    z, zh = ready.lower_tokens[-1], ready.lower_hands[-1]  # a nonzero origin exercises the (1 - w) term
+    c.start(z, zh)
     c.blend_to(ready.token, ready.hands, ticks=50)
-    z, zh = np.zeros(64, np.float32), np.zeros(14, np.float32)
     for i in range(50):
         w = (i + 1) / 50
         t, h, _ = c.tick(0.0)
