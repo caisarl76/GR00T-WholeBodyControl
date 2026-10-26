@@ -1,0 +1,24 @@
+{
+  "lerobot_commit": "a6e267c6",
+  "lerobot_commit_full": "a6e267c63a3775f0b08e15e732b3bbac0a44e9f6",
+  "source": "examples/g1_dex3_training/ready_pose_261020_ep76.npz",
+  "sha256": "a6d730700e98865439bbb041d0581d0df51b163aaabf80f1af25efce7a44a97f",
+  "args": {
+    "meta": {
+      "dataset": "/mnt/data/jihun/datasets/G1_WBT_GR00T/handover_bottle_merged_sonic78_50hz_261020",
+      "episode": 76,
+      "frame": 11,
+      "arm_speed": 0.0
+    },
+    "path_meta": {
+      "raise_episode": 11,
+      "frames": [
+        0,
+        82
+      ],
+      "fps": 50,
+      "closest_to_ready_rad": 0.49842244386672974,
+      "lower": "reversed measured joints, re-encoded (joint_chunk_to_sonic, speed limits off)"
+    }
+  }
+}
