@@ -1081,8 +1081,9 @@ def main(config: InferenceConfig):
             return prepare_observation_from_sensors(
                 camera_subscriber, state_subscriber, robot_model, language_prompt_ref[0], True
             )
-        if not worker_sensors:
+        if "state" not in worker_sensors:
             worker_sensors["state"] = ZMQStateSubscriber(host=config.state_zmq_host, port=config.state_zmq_port)
+        if "policy" not in worker_sensors:  # retried on the next observation if the server was not up yet
             client = LeRobotSonicPolicyClient if lerobot_policy is not None else PolicyClient
             options = {} if lerobot_policy is None else {"right_order": lerobot_policy.dex3_right_order}
             worker_sensors["policy"] = client(
