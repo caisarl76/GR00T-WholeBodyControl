@@ -295,7 +295,7 @@ def test_failed_inference_in_loop(monkeypatch, tmp_path):
     s = session(monkeypatch, second, opening(second),
                 answer=lambda n, c: None if c.loop.stage == "episode" else action(0.1)).run(500)
     assert s.control.loop.trial_end_reason == "no valid chunk for 1 s"
-    assert s.control.phase == "LOOP_HOLD" and s.control.loop.stage == "ready"
+    assert s.control.phase == "LOOP_HOLD" and s.control.loop.stage == "await_take"  # R24
     assert len([r for r in loop_requests(s) if r[0] > s.first("episode")]) == 2  # at +0.4 s and +0.8 s
     assert_one_pose_per_loop_iteration(s)
 

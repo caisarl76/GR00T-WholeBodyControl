@@ -471,6 +471,8 @@ class HarnessControl:
             self.loop.freeze("operator stop", now)
         elif method == "loop_resume":
             self.loop.resume(now)
+        elif method == "loop_to_ready":
+            self.loop.to_ready(now)
         elif method == "loop_end":
             self.loop.end(now)
         self._sync_loop(now)

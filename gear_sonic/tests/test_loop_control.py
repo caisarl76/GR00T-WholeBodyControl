@@ -183,17 +183,27 @@ def test_trial_sequence_and_handover_end(tmp_path):
     rig.right = 0.0
     for _ in range(55):  # open 1.1 s; the detector fires after 1.0 s
         rig.step()
-        if rig.loop.stage == "to_ready":
+        if rig.loop.stage == "await_take":
             break
     assert rig.loop.trial_end_reason == "handover complete"
-    rig.step(50)
-    assert (rig.loop.phase, rig.loop.stage) == ("LOOP_HOLD", "ready")
+    assert rig.loop.phase == "LOOP_HOLD"  # R24: hold the open palm until the bottle is taken
+    held = len(rig.sent) - 1  # the end tick already holds the last episode token and hands
+    rig.step(100)
+    assert rig.labels(held) == ["hold"] * 101 and rig.labels(held - 1)[0] == "episode"
+    assert all(np.array_equal(t, rig.sent[held - 1][0]) and np.array_equal(h, rig.sent[held - 1][1])
+               for t, h, *_ in rig.sent[held:])
+    assert (rig.loop.phase, rig.loop.stage) == ("LOOP_HOLD", "await_take")
     seq = runs(rig.labels(start))
     assert seq[0] == ("wait first chunk", 76) and seq[1] == ("blend in", 50)
-    assert seq[2][0] == "episode" and seq[3] == ("to ready", 50) and seq[4][0] == "hold"
-    npz = trial_npz(tmp_path)
+    assert seq[2][0] == "episode" and seq[3] == ("hold", 101)
+    npz = trial_npz(tmp_path)  # closed at the episode end: the hold is not recorded
     assert str(npz["episode_end"]) == "handover complete" and str(npz["model"]) == "test-model"
-    assert runs(npz["phase"].tolist()) == seq[:4]  # hold_rest through to_ready, nothing after
+    assert runs(npz["phase"].tolist()) == seq[:3]
+    rig.loop.to_ready(rig.now)
+    assert (rig.loop.phase, rig.loop.stage) == ("LOOP_MOTION", "to_ready")
+    rig.step(50)
+    assert runs(rig.labels(-50)) == [("to ready", 50)]
+    assert (rig.loop.phase, rig.loop.stage) == ("LOOP_HOLD", "ready")
     episode = npz["phase"] == "episode"
     assert (npz["frame"][episode] == (npz["t_ep"][episode] * 50).astype(np.int64)).all()  # the policy rate
     assert npz["frame"][episode].max() >= 50
@@ -559,7 +569,7 @@ def test_blend_in_arm_motion_ends_the_trial_on_the_first_episode_check(tmp_path)
         rig.step()
     assert rig.loop.stage == "blend_in"
     rig.step()  # the first episode tick, arm still
-    assert rig.loop.stage == "to_ready"
+    assert rig.loop.stage == "await_take"
     assert rig.loop.trial_end_reason.startswith("watchdog: arm joint 3 measured at")
 
 
@@ -580,7 +590,7 @@ def test_failed_inference_keeps_the_last_chunk_and_requests_again(tmp_path, caps
         rig.step()
         if rig.loop.stage != "episode":
             break
-    assert rig.loop.stage == "to_ready" and rig.loop.trial_end_reason == "no valid chunk for 1 s"
+    assert rig.loop.stage == "await_take" and rig.loop.trial_end_reason == "no valid chunk for 1 s"
     assert len(rig.set_chunks) == n_chunks  # the last good chunk kept playing
     assert set(rig.labels(start)[:-1]) == {"episode"}  # never frozen
     # each failure cleared the outstanding request: the next replan (request time + 0.4 s) asked again
@@ -627,3 +637,94 @@ def test_os_error_in_a_loop_call_is_an_invalid_request(tmp_path):
         os.chmod(locked, 0o700)
     assert response["error"]["code"] == "INVALID_REQUEST" and "Permission denied" in response["error"]["message"]
     assert c.phase == "LOOP_HOLD" and rig.loop.stage == "ready"
+
+
+def ended_trial(tmp_path, rig=None):
+    """A trial ended by the chunk-age guard (every replan fails): the loop holds at await_take."""
+    rig = rig or Rig().ready()
+    rig.loop.trial(0, str(tmp_path), rig.now)
+    rig.until("episode")
+    rig.rows = lambda epoch: None
+    return rig.until("await_take", limit=80)
+
+
+def test_loop_to_ready_only_from_await_take(tmp_path):
+    rig = Rig()
+    with pytest.raises(ControlError):
+        rig.loop.to_ready(rig.now)
+    rig.ready()
+    with pytest.raises(ControlError):  # LOOP_HOLD ready
+        rig.loop.to_ready(rig.now)
+    rig.loop.trial(0, str(tmp_path), rig.now)
+    rig.until("episode")
+    with pytest.raises(ControlError):  # mid-trial
+        rig.loop.to_ready(rig.now)
+    rig.rows = lambda epoch: None
+    rig.until("await_take", limit=80)
+    for call in (lambda: rig.loop.end(rig.now), lambda: rig.loop.trial(1, str(tmp_path), rig.now)):
+        with pytest.raises(ControlError):  # end and the next trial wait for the take
+            call()
+    rig.loop.to_ready(rig.now)
+    with pytest.raises(ControlError):  # LOOP_MOTION to_ready
+        rig.loop.to_ready(rig.now)
+
+
+def test_freeze_in_await_take_resumes_to_ready(tmp_path):
+    rig = ended_trial(tmp_path)
+    held = rig.sent[-1][:2]
+    rig.loop.freeze("operator stop", rig.now)
+    assert rig.loop.frozen_stage == "await_take" and rig.loop.trial_end_reason == "no valid chunk for 1 s"
+    rig.step(5)
+    assert all(np.array_equal(t, held[0]) for t, *_ in rig.sent[-5:])
+    rig.loop.resume(rig.now)
+    assert (rig.loop.phase, rig.loop.stage) == ("LOOP_MOTION", "to_ready")
+    rig.step(50)
+    assert runs(rig.labels(-50)) == [("to ready", 50)]
+    assert (rig.loop.phase, rig.loop.stage) == ("LOOP_HOLD", "ready")
+    assert str(trial_npz(tmp_path)["episode_end"]) == "no valid chunk for 1 s"  # closed once, at the episode end
+
+
+def test_lease_expiry_in_await_take_freezes_and_rpc_to_ready(tmp_path):
+    c, rig = make_hc(tmp_path)
+    assert request(c, "loop_take_over", now=0.1)["error"] is None
+    rig.step(50)
+    assert request(c, "loop_raise", now=0.1)["error"] is None
+    rig.step(183)
+    assert request(c, "loop_to_ready", now=0.1)["error"]["code"] == "NOT_READY"  # only from await_take
+    assert request(c, "loop_trial", {"trial": 0, "session_dir": str(tmp_path / "s")}, now=0.1)["error"] is None
+    rig.until("episode")
+    rig.rows = lambda epoch: None
+    rig.until("await_take", limit=80)
+    c.tick(0.2, hc_state(2), 0.2)
+    assert c.phase == "LOOP_HOLD" and c.status(0.2)["loop_stage"] == "await_take"
+    assert request(c, "loop_to_ready", now=0.2)["error"] is None
+    assert c.phase == "LOOP_MOTION" and rig.loop.stage == "to_ready"
+    rig.step(50)
+    c.tick(0.3, hc_state(3), 0.3)
+    assert c.phase == "LOOP_HOLD" and rig.loop.stage == "ready"
+
+    (tmp_path / "second").mkdir()
+    c, rig = make_hc(tmp_path / "second")  # lease expiry while holding for the take
+    assert request(c, "loop_take_over", now=0.1)["error"] is None
+    rig.step(50)
+    assert request(c, "loop_raise", now=0.1)["error"] is None
+    rig.step(183)
+    assert request(c, "loop_trial", {"trial": 0, "session_dir": str(tmp_path / "s2")}, now=0.1)["error"] is None
+    rig.until("episode")
+    rig.rows = lambda epoch: None
+    rig.until("await_take", limit=80)
+    c.tick(2.5, hc_state(2), 2.5)  # lease_s 2.0
+    assert c.owner is None and c.phase == "LOOP_FROZEN" and rig.loop.frozen_stage == "await_take"
+    assert rig.loop.reason == "lease expired"
+
+
+def test_session_end_after_loop_to_ready(tmp_path):
+    rig = ended_trial(tmp_path)
+    rig.loop.to_ready(rig.now)
+    rig.step(50)
+    start = len(rig.sent)
+    rig.loop.end(rig.now)
+    rig.step(50 + 83 + 50 + 100 + 100)
+    assert runs(rig.labels(start)) == [("to lower start", 50), ("lower", 83), ("blend out", 50),
+                                       ("hold rest", 100), ("handback blend", 100)]
+    assert rig.loop.phase == "COMPLETED" and rig.hooks.calls[-1] == "planner"

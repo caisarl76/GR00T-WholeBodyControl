@@ -30,6 +30,7 @@ LOOP_STAGES = {
     "first_chunk",
     "blend_in",
     "episode",
+    "await_take",
     "to_ready",
     "frozen",
     "lower",
@@ -66,6 +67,7 @@ PARAMS = {
     "loop_trial": {"trial": int, "session_dir": str},
     "loop_freeze": {},
     "loop_resume": {},
+    "loop_to_ready": {},
     "loop_end": {},
 }
 

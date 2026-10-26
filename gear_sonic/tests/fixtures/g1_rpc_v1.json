@@ -184,6 +184,15 @@
       "runtime_id": "runtime-1",
       "session_id": "session-1",
       "lease_id": "lease-1",
+      "method": "loop_to_ready",
+      "params": {}
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
       "method": "loop_end",
       "params": {}
     }
@@ -280,6 +289,17 @@
       "params": {
         "reason": "invented"
       }
+    },
+    {
+      "version": 1,
+      "request_id": "request-1",
+      "runtime_id": "runtime-1",
+      "session_id": "session-1",
+      "lease_id": "lease-1",
+      "method": "loop_to_ready",
+      "params": {
+        "trial": 0
+      }
     }
   ],
   "valid_responses": [
@@ -348,6 +368,40 @@
         "loop_trial": 3,
         "trial_end_reason": "operator stop",
         "frozen_stage": "episode"
+      },
+      "error": null
+    },
+    {
+      "request_id": "loop-await-take",
+      "runtime_id": "boot",
+      "result": {
+        "runtime_id": "boot",
+        "phase": "LOOP_HOLD",
+        "skill_id": null,
+        "execution_id": null,
+        "inference_epoch": 0,
+        "controller_running": true,
+        "policy_ready": true,
+        "mode_requested": "POSE",
+        "planner_reference_active": false,
+        "hold_confirmed": false,
+        "telemetry_age_s": 0.0,
+        "telemetry_index": 1,
+        "observation_age_s": 0.0,
+        "frame_id": "frame",
+        "registry_sha256": "17e415bf4ebd63e771e3befe9c0c95ce360ad36ec03c94f1f2b535a89406b71f",
+        "policy_host": "127.0.0.1",
+        "policy_port": 15558,
+        "checkpoint_expected": "/mnt/data/jihun/models/pnp_bottle_260916_n17_raw_gpu7/checkpoint-20000",
+        "owner_session_id": "session-1",
+        "reason": null,
+        "locomotion_enabled": false,
+        "ready_return_enabled": false,
+        "right_hand_open": null,
+        "loop_stage": "await_take",
+        "loop_trial": 3,
+        "trial_end_reason": "handover complete",
+        "frozen_stage": null
       },
       "error": null
     }

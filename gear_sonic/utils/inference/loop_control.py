@@ -4,7 +4,8 @@
   take_over  50 ticks of the planner token, POSE switch, hold the stance (the planner token, hands open)
   raise_     blend to the raise start, play the raise, blend to the ready pose
   trial      hold-rest on the ready pose, one bootstrap chunk, blend in, the anchored policy episode with
-             guards and the handover detector, blend back to the ready pose
+             guards and the handover detector, then hold the last pose (await_take) until loop_to_ready
+  to_ready   blend to the ready pose once the bottle was taken (lerobot: the operator's Enter, then go_ready)
   freeze     hold the last sent token and hands; resume continues or returns to the ready pose
   end        blend to the lowering start, play the lowering, blend to the stance, hold it, blend the hand-back
              to the planner token with the hands to 0, PLANNER mode
@@ -30,7 +31,7 @@ HOLD_REST_TICKS = 75  # hold_rest_s 1.5
 STANCE_HOLD_TICKS = 100  # lerobot finish(): 2 s "hold rest"
 HANDBACK_TICKS = 100  # handoff_blend_s 2.0
 REPLAN_S = 0.4
-TRIAL_STAGES = ("hold_rest", "first_chunk", "blend_in", "episode", "to_ready")
+TRIAL_STAGES = ("hold_rest", "first_chunk", "blend_in", "episode", "await_take", "to_ready")
 FRAME_STAGES = ("first_chunk", "blend_in", "episode")
 
 
@@ -126,6 +127,12 @@ class LoopController:
         # stance, raise, lower, handback: continue the queued path from its frame; _then is still pending
         self.commander.resume()
         self.phase, self.stage = ("LOOP_MOTION" if self.commander.busy else "LOOP_HOLD"), stage
+
+    def to_ready(self, now):
+        """After a trial end: the bottle was taken (lerobot's operator Enter in finish(to_ready))."""
+        self._require(self.phase == "LOOP_HOLD" and self.stage == "await_take", "loop_to_ready")
+        self.commander.blend_to(self.ready.token, self.ready.hands, BLEND_TICKS, "to ready")
+        self._motion("LOOP_MOTION", "to_ready", self._at_ready)
 
     def end(self, now):
         self._require(self.phase == "LOOP_HOLD" and self.stage == "ready", "loop_end")
@@ -232,9 +239,12 @@ class LoopController:
             if kind == "freeze":
                 self.freeze(reason, now)
             else:
+                # R24: hold the last sent pose (the bottle may rest on the open palm) until loop_to_ready, as
+                # lerobot's finish(to_ready) holds for the operator before go_ready. The trial log ends here.
                 self.trial_end_reason, self._outstanding, self._pending = reason, None, None
-                self.commander.blend_to(self.ready.token, self.ready.hands, BLEND_TICKS, "to ready")
-                self._motion("LOOP_TRIAL", "to_ready", self._trial_done)
+                self.commander.hold()
+                self._close_recorder()
+                self._hold("await_take")
             return
         if now >= self._next_replan and self._outstanding is None:
             self._outstanding, self._requested_at = self.hooks.request_policy_chunk(), now
@@ -262,10 +272,6 @@ class LoopController:
     def _request_first_chunk(self, now):  # its chunk's t0 is the blend in's end (R11e), not this time
         self._outstanding, self._requested_at = self.hooks.request_policy_chunk(), now
         self.stage = "first_chunk"
-
-    def _trial_done(self, now):
-        self._close_recorder()
-        self._hold("ready")
 
     def _handed_back(self, now):
         self.hooks.switch_to_planner()
