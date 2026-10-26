@@ -483,6 +483,11 @@ def test_override_after_loop_completes_before_hc_tick_takes_the_normal_path(tmp_
 
     c, rig = make_hc(tmp_path)
     drive_to_completed(c, rig)
+    c.interrupt("stale_policy_observation", 0.2)  # a direct interrupt in the same window: no ControlError
+    assert c.phase == "INTERRUPTED" and rig.loop.phase == "COMPLETED"
+
+    c, rig = make_hc(tmp_path)
+    drive_to_completed(c, rig)
     assert request(c, "loop_take_over", now=0.2)["error"] is None  # the RPC sees COMPLETED, not LOOP_MOTION
     assert c.phase == "LOOP_MOTION" and rig.loop.stage == "stance"
 

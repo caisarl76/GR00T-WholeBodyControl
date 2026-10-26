@@ -162,6 +162,7 @@ class HarnessControl:
             self.hold_confirmed, self.hold_index, self.hold_started = False, self.feedback_index, now
 
     def interrupt(self, reason: str, now: float):
+        self._sync_loop(now)
         if self._in_loop():  # a stop freezes the loop; the planner hold is only the session end's hand-back
             self.loop.freeze("lease expired" if reason == "lease_expired" else f"interrupted: {reason}", now)
             self._sync_loop(now)
