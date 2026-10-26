@@ -267,7 +267,10 @@ def load_profile(path: Path) -> G1Profile:
         if (
             not isinstance(lerobot, dict)
             or lerobot.keys() - {"chunk_blend_s", "max_token_step", "chunk_anchor_s", "dex3_right_order"}
-            or not all(finite_number(lerobot.get(key, 0.0)) for key in ("chunk_blend_s", "max_token_step", "chunk_anchor_s"))
+            or not all(
+                finite_number(lerobot.get(key, 0.0))
+                for key in ("chunk_blend_s", "max_token_step", "chunk_anchor_s")
+            )
             # The blend and the slew limit act within one 0.8 s chunk; tokens span [-1.25, 1.25].
             or not 0 <= lerobot.get("chunk_blend_s", 0.0) <= 0.8
             or not 0 <= lerobot.get("max_token_step", 0.0) <= 2.5

@@ -172,6 +172,13 @@ def test_profile_lerobot_section_is_optional_and_validated(tmp_path):
             load_profile(write_profile(tmp_path, bad))
 
 
+def test_anchoring_without_a_sent_token_continues_the_old_output():
+    stream = TokenStream(50, anchor_s=1.0)
+    stream.set_chunk(np.ones((40, 78), np.float32), t0=0.0, now=0.0)
+    stream.set_chunk(np.zeros((40, 78), np.float32), t0=0.5, now=0.5)
+    assert stream.at(0.5)[0][:64] == pytest.approx(1.0, abs=1e-6)
+
+
 def test_profile_chunk_anchor_s_validated(tmp_path):
     assert load_profile(write_profile(tmp_path, dict(chunk_anchor_s=1.0))).lerobot_policy.chunk_anchor_s == 1.0
     for bad in (-0.1, 6.0):

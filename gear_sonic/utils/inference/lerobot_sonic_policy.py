@@ -147,12 +147,11 @@ class TokenStream:
         rows = np.asarray(rows, np.float32)
         if rows.ndim != 2 or rows.shape[1] != 78 or len(rows) == 0 or not np.isfinite(rows).all():
             raise ValueError(f"expected a nonempty finite [T, 78] chunk, got {rows.shape}")
+        anchor = None
         if self.anchor_s > 0 and self._chunk is not None:
             # Continue from the token being sent (itself possibly still offset) with the new chunk's motion.
             ref = self._row_at(now)[:64] if self.last_token is None else self.last_token
-            self._anchor = (ref - self._interpolate(rows, float(t0), now)[:64], float(now))
-        else:
-            self._anchor = None
+            anchor = (ref - self._interpolate(rows, float(t0), now)[:64], float(now))
         if self.blend_s > 0 and self._chunk is not None:
             # Fade from what is being output now (itself possibly mid-fade) to the new chunk.
             self._prev = (self._row_at(now)[None], now) if self._prev is not None else (self._chunk, self._t0)
@@ -160,6 +159,7 @@ class TokenStream:
         else:
             self._prev = None
         self._chunk, self._t0 = rows, float(t0)
+        self._anchor = anchor
 
     def _interpolate(self, rows, t0, t):
         x = min(max((t - t0) * self.source_fps, 0.0), len(rows) - 1)
