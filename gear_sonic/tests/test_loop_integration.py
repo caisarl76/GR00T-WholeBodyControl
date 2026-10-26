@@ -85,8 +85,12 @@ class Session:
             self.dispatch("heartbeat", {"sequence": self.sequence})
         self.stages.append((control.phase, control.loop.stage))  # what the main loop branches on
 
+    def sleep(self, seconds):  # time passes where the main loop waits out its 20 ms period
+        self.clock[0] += seconds
+
     def on_key(self, index, args):
-        self.clock[0] = (index + 1) * TICK
+        if index == 0:  # after run_keys' own no-op sleep
+            self.monkeypatch.setattr(runner.time, "sleep", self.sleep)
         sent = runner.zmq.Context().socket().send.call_args_list
         for call in sent[self.cursor:]:  # the deploy: echo POSE tokens in token_state, PLANNER's otherwise
             raw = call.args[0]
@@ -194,14 +198,15 @@ def assert_one_pose_per_loop_iteration(s):
     return loop
 
 
-def test_loop_phases_publish_every_tick(monkeypatch, tmp_path):
+def test_loop_phases_publish_every_tick(monkeypatch, tmp_path, capsys):
     steps = opening(tmp_path) + [
         (lambda c: c.loop.stage == "episode" and len(loop_requests(s)) >= 4, "loop_freeze", {}),
         (at("LOOP_FROZEN"), "loop_resume", {}),
     ]
-    s = session(monkeypatch, tmp_path, steps)
+    s = session(monkeypatch, tmp_path, steps, hook=lambda s, i: s.sleep(0.05) if i == 300 else None)
     s.run(650)
     assert not s.script, s.script
+    assert capsys.readouterr().out.count("Autonomous Loop Missed") == 1  # iteration 300 took 50 ms
     loop = assert_one_pose_per_loop_iteration(s)
     visited = [st for _, st, _ in loop]
     for stage in ("stance", "raise", "ready", "hold_rest", "first_chunk", "blend_in", "episode", "frozen",
@@ -279,16 +284,23 @@ def test_failed_inference_in_loop_freezes(monkeypatch, tmp_path):
     assert_one_pose_per_loop_iteration(s)
 
 
-def test_prompt_in_loop_is_dropped_and_motion_keys_freeze(monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize("key,own_action", [
+    ("p", ("Policy prewarm not ready", "Policy loop")),
+    ("w", ("Movement ignored", "Manual movement")),
+    ("]", ("Initial pose right hand",)),
+])
+def test_prompt_in_loop_is_dropped_and_motion_keys_freeze(monkeypatch, tmp_path, capsys, key, own_action):
     steps = opening(tmp_path)[:3]
     s = session(monkeypatch, tmp_path, steps)
-    s.run(200, keys={120: "prompt:wave hello", 150: "p"})
+    s.run(200, keys={120: "prompt:wave hello", 150: key})
     raise_iteration = next(i for i, (_, st) in enumerate(s.stages) if st == "raise")
     assert raise_iteration < 120 and s.first("frozen") == 150  # both keys arrive mid-raise; 'p' freezes at once
     out = capsys.readouterr().out
     assert "Inference prompt changed" not in out and "wave hello" in out
     assert s.stages[121][1] == "raise" and s.stages[149][1] == "raise"  # the prompt did not freeze
-    assert s.control.loop.reason == "operator override: p" and s.control.loop.frozen_stage == "raise"
+    assert s.control.loop.reason == f"operator override: {key}" and s.control.loop.frozen_stage == "raise"
+    assert not [text for text in own_action if text in out]  # the key's own action was skipped
+    assert len(s.iterations()[150][2]) == 1  # the key's iteration sent only the frozen pose
     assert_one_pose_per_loop_iteration(s)
 
 
@@ -333,3 +345,16 @@ def test_no_loop_tick_after_session_end(monkeypatch, tmp_path):
     hand_back = [unpack_bridge_message(m, topic="command") for m in its[loop[-1]][2] if m.startswith(b"command")]
     assert [int(c["planner"][0]) for c in hand_back] == [1]
     assert s.control.hold_confirmed
+
+
+def test_prewarm_lost_at_take_over_rearms_after_the_loop(monkeypatch, tmp_path):
+    steps = opening(tmp_path)[:3] + [(at("LOOP_HOLD", "ready"), "loop_end", {})]
+    s = session(monkeypatch, tmp_path, steps)
+    s.run(720)
+    take_over = next(i for i, (p, _) in enumerate(s.stages) if p.startswith("LOOP_"))
+    lost = [i for i, _, _ in s.requests if i <= take_over + 1 and s.stages[i + s.delay][0].startswith("LOOP_")]
+    assert lost  # the prewarm queued in IDLE is answered during the loop, where accept_chunk drops it
+    completed = next(i for i, (p, _) in enumerate(s.stages) if p == "COMPLETED")
+    rearmed = [i for i, _, phase in s.requests if i > completed and phase == "COMPLETED"]
+    assert rearmed, "no prewarm epoch was queued again after the loop"
+    assert s.control.phase == "COMPLETED" and s.control.hooks.runtime_facts().policy_ready

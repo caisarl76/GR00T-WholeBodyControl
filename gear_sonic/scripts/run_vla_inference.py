@@ -1279,7 +1279,6 @@ def main(config: InferenceConfig):
                 start="planner",
                 end="planner",
                 ready_pose=str(READY_POSE_PATH),
-                fps=config.action_publish_rate,
             )
             harness_loop = LoopController(
                 PoseCommander(max_token_step=lerobot_policy.max_token_step),
@@ -1347,6 +1346,7 @@ def main(config: InferenceConfig):
                 if harness_control.phase.startswith("LOOP_"):
                     # The LoopController alone commands the robot: one pose message per tick, no planner
                     # command; policy chunks reach it only through accept_chunk.
+                    prewarm_epoch = prewarm_started = None  # a prewarm lost to the loop re-arms after it
                     try:
                         loop_action, captured_at, result_epoch = result_queue.get_nowait()
                     except queue.Empty:
@@ -1382,6 +1382,9 @@ def main(config: InferenceConfig):
                     )
                     zmq_frame_counter += 1
                     last_sent_motion_token, last_reset_tick = token, t_start
+                    telemetry.record_value("loop_iteration", time.monotonic() - t_start)
+                    if telemetry.get_last_timing()["loop_iteration"] > loop_period:
+                        telemetry.log_timing_info(context="Autonomous Loop Missed", threshold=0.001)
                     _sleep_remaining(t_start, loop_period)
                     continue
                 if pause_loop:
