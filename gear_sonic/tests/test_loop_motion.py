@@ -4,7 +4,8 @@ import json
 import numpy as np
 import pytest
 
-from gear_sonic.utils.inference.loop_motion import READY_POSE_PATH, load_ready_pose
+from gear_sonic.utils.inference.lerobot_sonic_policy import TokenStream
+from gear_sonic.utils.inference.loop_motion import READY_POSE_PATH, PoseCommander, load_ready_pose
 
 SHAPES = dict(
     token=(64,), hands=(14,), state=(28,), raise_tokens=(83, 64), raise_hands=(83, 14),
@@ -52,3 +53,127 @@ def _save(tmp_path, arrays):
     path = tmp_path / "pose.npz"
     np.savez(path, **arrays)
     return path
+
+
+def _cmd(v=0.0, step=0.05):
+    c = PoseCommander(step)
+    c.start(np.full(64, v, np.float32), np.zeros(14, np.float32))
+    return c
+
+
+def _rows(n, scale=0.001):
+    return np.arange(1, n + 1, dtype=np.float32)[:, None] * scale * np.ones((1, 64), np.float32)
+
+
+def test_blend_is_linear_from_last_sent():
+    c = _cmd()
+    c.blend_to(np.ones(64), np.ones(14), ticks=50)
+    out = [c.tick(i / 50) for i in range(50)]
+    assert out[0][0][0] == pytest.approx(0.02) and out[0][2] == "blend"
+    assert out[49][0][0] == pytest.approx(1.0)
+    assert not c.busy
+
+
+def test_play_emits_one_row_per_tick():
+    c = _cmd()
+    toks, hands = _rows(5), np.arange(5, dtype=np.float32)[:, None] * np.ones((1, 14), np.float32)
+    c.play(toks, hands, "raise")
+    for i in range(5):
+        t, h, lab = c.tick(0.0)
+        assert t[0] == pytest.approx(toks[i, 0]) and h[0] == hands[i, 0] and lab == "raise"
+    assert not c.busy
+    assert c.tick(0.0)[2] == "hold"
+
+
+def test_slew_limits_token_not_hands():
+    c = _cmd()
+    c.blend_to(np.ones(64), np.ones(14), ticks=1)
+    t, h, _ = c.tick(0.0)
+    assert t[0] == pytest.approx(0.05) and h[0] == 1.0
+
+
+def test_freeze_mid_blend_holds_last_sent_token():
+    c = _cmd()
+    c.blend_to(np.ones(64), np.ones(14), ticks=50)
+    for i in range(11):
+        last = c.tick(i / 50)
+    c.freeze()
+    for i in range(20):
+        t, h, lab = c.tick(1.0)
+        assert lab == "frozen" and np.array_equal(t, last[0]) and np.array_equal(h, last[1])
+
+
+def test_resume_continues_path_from_frozen_index():
+    c = _cmd()
+    toks = _rows(60)
+    c.play(toks, np.zeros((60, 14), np.float32), "p")
+    for _ in range(31):
+        c.tick(0.0)
+    c.freeze()
+    assert c.frozen and c.busy
+    c.tick(0.0)
+    c.resume()
+    assert c.tick(0.0)[0][0] == pytest.approx(toks[31, 0])
+
+
+def test_follow_reads_stream_by_time():
+    s = TokenStream(50.0, max_token_step=0.05)
+    s.reset(np.zeros(64))
+    rows = np.zeros((10, 78), np.float32)
+    rows[:, :64] = np.linspace(0, 0.09, 10)[:, None]
+    s.set_chunk(rows, 0.0, 0.0)
+    c = _cmd()
+    c.follow(s)
+    t, _, lab = c.tick(5 / 50)
+    assert lab == "episode" and t[0] == pytest.approx(0.05)  # target 0.05, stream slew from 0
+    assert np.array_equal(c.last_token, t)
+
+
+def test_follow_anchors_stream_to_sent_token_and_yields_to_blend():
+    s = TokenStream(50.0, max_token_step=0.05)
+    s.reset()
+    s.set_chunk(np.zeros((10, 78), np.float32), 0.0, 0.0)
+    c = _cmd(0.5)
+    c.follow(s)
+    assert c.tick(0.0)[0][0] == pytest.approx(0.45)  # stream slewed from the sent 0.5, not from None
+    c.blend_to(np.zeros(64), np.zeros(14), ticks=2, label="to_ready")
+    assert c.tick(0.0)[2] == "to_ready"  # follow ended; blend starts from last sent
+    assert c.tick(0.0)[2] == "to_ready" and not c.busy
+
+
+def test_start_and_hold_clear_queue_and_frozen_and_frozen_rejects_new():
+    c = _cmd()
+    c.blend_to(np.ones(64), np.ones(14))
+    c.freeze()
+    for fn in (lambda: c.blend_to(np.ones(64), np.ones(14)), lambda: c.play(_rows(2), np.zeros((2, 14)), "p"),
+               lambda: c.follow(TokenStream(50.0))):
+        with pytest.raises(RuntimeError):
+            fn()
+    c.hold()
+    assert not c.frozen and not c.busy and c.tick(0.0)[2] == "hold"
+    c.blend_to(np.ones(64), np.ones(14))
+    c.freeze()
+    c.start(np.zeros(64), np.zeros(14))
+    assert not c.frozen and not c.busy
+
+
+def test_resumed_blend_lands_on_same_path():
+    a, b = _cmd(), _cmd()
+    for c in (a, b):
+        c.blend_to(np.ones(64), np.ones(14), ticks=40)
+    ref = [a.tick(0.0)[0] for _ in range(40)]
+    out = [b.tick(0.0)[0] for _ in range(10)]
+    b.freeze()
+    for _ in range(5):
+        b.tick(0.0)
+    b.resume()
+    out += [b.tick(0.0)[0] for _ in range(30)]
+    assert all(np.array_equal(x, y) for x, y in zip(ref, out))
+
+
+def test_recent_tokens_keeps_last_25_sent():
+    c = _cmd()
+    c.play(_rows(30), np.zeros((30, 14), np.float32), "p")
+    sent = [c.tick(0.0)[0] for _ in range(30)]
+    assert len(c.recent_tokens) == 25
+    assert all(np.array_equal(x, y) for x, y in zip(c.recent_tokens, sent[-25:]))
