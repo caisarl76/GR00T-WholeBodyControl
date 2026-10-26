@@ -1140,6 +1140,8 @@ def main(config: InferenceConfig):
                     inference_busy_event.is_set() or not inference_queue.empty(),
                     cpp_mode,
                     operator_busy,
+                    # the served checkpoint, from the worker's policy client ({"op": "info"} at its creation)
+                    getattr(worker_sensors.get("policy"), "model", None),
                 )
 
             def invalidate_policy_actions(self):
@@ -1352,14 +1354,14 @@ def main(config: InferenceConfig):
                     except queue.Empty:
                         pass
                     else:
-                        try:
-                            rows = np.concatenate(
+                        try:  # None: a failed inference (the worker reports its exceptions as None)
+                            rows = None if loop_action is None else np.concatenate(
                                 [np.asarray(loop_action[key], np.float32)[0]
                                  for key in ("motion_token", "left_hand_joints", "right_hand_joints")],
                                 axis=1,
                             )
                         except (IndexError, KeyError, TypeError, ValueError):
-                            rows = None  # a failed inference: accept_chunk freezes ("invalid policy result")
+                            rows = np.empty((0, 78), np.float32)  # malformed: accept_chunk freezes
                         harness_loop.accept_chunk(result_epoch, captured_at, rows)
                     observation = harness_control.observation
                     if observation is not None and observation["frame_id"] != loop_frame_id:

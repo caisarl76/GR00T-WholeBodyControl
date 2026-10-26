@@ -49,6 +49,7 @@ class LoopController:
         self._then = None  # called once, after the tick on which the commander's queue played out
         self._recorder = self._stream = self._guards = self._detector = self._first = None
         self._outstanding = self._pending = None  # requested epoch; accepted (rows, t0) for the next tick
+        self._requested_at = None  # now at the outstanding request: a replanned chunk's t0 (lerobot slot_t)
         self._episode_t0 = self._last_chunk_at = self._next_replan = None
         self._chunk_t0 = math.nan
 
@@ -64,12 +65,15 @@ class LoopController:
 
     # --- RPC entry points -------------------------------------------------------------------------------------
 
-    def take_over(self, feedback, now):
+    def take_over(self, feedback, now, model=None):
+        """model: the policy server's served model, recorded in each trial (the constructor's otherwise)."""
         self._require(self.phase in ("IDLE", "COMPLETED"), "loop_take_over")
         planner = np.asarray((feedback or {}).get("token_state", []), np.float32).reshape(-1)
         if planner.shape != (64,) or not np.isfinite(planner).all():
             raise ControlError("NOT_READY", "no 64D token_state from the deploy for the take-over")
         zero = np.zeros(14, np.float32)
+        if model is not None:
+            self.model = model
         self.planner, self.stance = planner.copy(), (planner.copy(), zero)  # --start planner: rest on it
         self.reason = self.frozen_stage = self.trial_no = self.trial_end_reason = None
         self.commander.start(planner, zero)
@@ -137,14 +141,21 @@ class LoopController:
     # --- policy results and camera frames (main loop) -----------------------------------------------------------
 
     def accept_chunk(self, epoch: int, captured_at: float, rows) -> bool:
-        """Take the outstanding request's [T, 78] chunk; an invalid result (rows None for a failed request)
-        freezes. Only the outstanding epoch is accepted, in stages first_chunk and episode."""
+        """Take the outstanding request's [T, 78] chunk. Only the outstanding epoch is accepted, in stages
+        first_chunk and episode. rows None (a failed inference) in the episode is lerobot's error path: keep
+        playing the last chunk and let the next replan request again (the chunk-age guard ends the trial if
+        failures persist); with no chunk yet (first_chunk) it freezes. Malformed rows freeze."""
         if self.stage not in ("first_chunk", "episode") or epoch != self._outstanding:
             return False
         self._outstanding = None
-        rows = None if rows is None else np.asarray(rows, np.float32)
+        if rows is None:
+            print(f"[loop] policy inference failed (epoch {epoch}), stage {self.stage}", flush=True)
+            if self.stage == "first_chunk":
+                self.freeze("first chunk inference failed", time.monotonic())
+            return False
+        rows = np.asarray(rows, np.float32)
         if (
-            rows is None or rows.ndim != 2 or rows.shape[1] != 78 or not len(rows)
+            rows.ndim != 2 or rows.shape[1] != 78 or not len(rows)
             or not np.isfinite(rows).all() or np.abs(rows[:, :64]).max() > TOKEN_ABS_MAX
             or not math.isfinite(captured_at)
         ):
@@ -155,7 +166,7 @@ class LoopController:
             self.commander.blend_to(rows[0, :64], rows[0, 64:], BLEND_TICKS, "blend in")
             self._motion("LOOP_TRIAL", "blend_in", None)
         else:
-            self._pending = (rows, float(captured_at))
+            self._pending = (rows, self._requested_at)  # R23a: t0 = the request time, as lerobot's slot_t
         return True
 
     def frame(self, t_recv, name, jpeg):
@@ -226,7 +237,7 @@ class LoopController:
                 self._motion("LOOP_TRIAL", "to_ready", self._trial_done)
             return
         if now >= self._next_replan and self._outstanding is None:
-            self._outstanding = self.hooks.request_policy_chunk()
+            self._outstanding, self._requested_at = self.hooks.request_policy_chunk(), now
             self._next_replan = now + REPLAN_S
 
     def _record(self, now, state, token, hands, label):
@@ -248,8 +259,8 @@ class LoopController:
     def _at_ready(self, now):
         self._hold("ready")
 
-    def _request_first_chunk(self, now):
-        self._outstanding = self.hooks.request_policy_chunk()
+    def _request_first_chunk(self, now):  # its chunk's t0 is the blend in's end (R11e), not this time
+        self._outstanding, self._requested_at = self.hooks.request_policy_chunk(), now
         self.stage = "first_chunk"
 
     def _trial_done(self, now):

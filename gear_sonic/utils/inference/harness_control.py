@@ -40,6 +40,7 @@ class RuntimeFacts:
     inference_busy: bool
     mode_requested: str | None
     operator_busy: bool = False
+    served_model: str | None = None  # the policy server's info "model"; None until its client has asked
 
 
 class RuntimeHooks(Protocol):
@@ -397,7 +398,10 @@ class HarnessControl:
         if method in {"walk_for", "turn_by"}:
             return self._begin_locomotion(method, params, now)
         if method.startswith("loop_"):
-            return self._loop_call(method, params, now)
+            try:
+                return self._loop_call(method, params, now)
+            except OSError as exc:  # e.g. loop_trial's session_dir: a bad request, never out of dispatch
+                raise ControlError("INVALID_REQUEST", str(exc)) from exc
         standalone = method in {"reset_standing", "reset_ready"} and params["execution_id"] == ""
         if not standalone and (not self.execution or params["execution_id"] != self.execution["execution_id"]):
             raise ControlError("INVALID_REQUEST", "Execution mismatch")
@@ -448,7 +452,12 @@ class HarnessControl:
                     "a verified handover checkpoint and fresh telemetry")
             if lerobot.dex3_right_order != "dataset":  # the ready pose and the wire would mix right-hand orders
                 raise ControlError("NOT_READY", "The loop supports only lerobot_policy.dex3_right_order: dataset")
-            self.loop.take_over(self.feedback, now)
+            served = getattr(self.hooks.runtime_facts(), "served_model", None)
+            if not served or os.path.normpath(served) != os.path.normpath(self.profile.checkpoint):
+                raise ControlError(
+                    "NOT_READY", f"Policy server model {served!r} is not the profile checkpoint "
+                    f"{self.profile.checkpoint!r} (None: not known yet)")
+            self.loop.take_over(self.feedback, now, model=served)
             self.execution, self.reset, self.planner, self.dwell = None, None, None, None
             self.hold_confirmed, self.hold_started, self.hold_index = False, None, None
             self.phase = self.loop.phase

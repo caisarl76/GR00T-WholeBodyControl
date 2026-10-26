@@ -1,5 +1,7 @@
 import itertools
 import json
+import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -34,10 +36,17 @@ def chunk(offset=0.0):
     return rows
 
 
+SERVED = yaml.safe_load(PROFILE.read_text())["checkpoint"]
+
+
 class LoopHooks(ReadyHooks):
     def __init__(self):
         super().__init__()
         self.calls, self.requests = [], []
+        self.served_model = SERVED  # what the policy server's info reports
+
+    def runtime_facts(self):
+        return SimpleNamespace(**vars(super().runtime_facts()), served_model=self.served_model)
 
     def switch_to_pose(self):
         self.calls.append("pose")
@@ -79,6 +88,7 @@ class Rig:
         self.body = np.zeros(29)
         self.sent = []
         self.answer_after, self.asked, self.answered = 1, {}, set()
+        self.rows = lambda epoch: chunk((epoch - 100) * 0.01)  # None: a failed inference
 
     @property
     def now(self):
@@ -100,7 +110,7 @@ class Rig:
                 for epoch, (at, i) in self.asked.items():
                     if epoch not in self.answered and self.i - i >= self.answer_after:
                         self.answered.add(epoch)
-                        self.loop.accept_chunk(epoch, at, chunk((epoch - 100) * 0.01))
+                        self.loop.accept_chunk(epoch, at, self.rows(epoch))
         return self
 
     def until(self, stage, limit=500):
@@ -371,7 +381,7 @@ def test_invalid_policy_result_freezes(tmp_path):
     assert rig.loop.phase == "LOOP_FROZEN" and rig.loop.reason == "invalid policy result"
 
 
-def test_replan_one_outstanding_and_t0_is_captured_at(tmp_path):
+def test_replan_one_outstanding_and_t0_is_the_request_time(tmp_path):
     rig = Rig().ready()
     rig.answer_after = None
     rig.loop.trial(0, str(tmp_path), rig.now)
@@ -388,7 +398,8 @@ def test_replan_one_outstanding_and_t0_is_captured_at(tmp_path):
     assert rig.loop.accept_chunk(101, captured, chunk(0.01))
     assert not rig.loop.accept_chunk(101, captured, chunk(0.01))  # no longer outstanding
     rig.step(1)
-    assert rig.set_chunks[-1][2:] == (captured, rig.now)  # t0 = captured_at, applied at the next tick
+    # lerobot: t0 = slot_t, the request time; captured_at (the camera frame time) only gates validity (R23a)
+    assert rig.set_chunks[-1][2:] == (rig.asked[101][0], rig.now)
     assert rig.hooks.requests == [100, 101, 102]  # due again: request time + 0.4 has passed
     assert rig.loop.stage == "episode"
 
@@ -557,3 +568,62 @@ def test_take_over_refuses_swapped_right_hand_order(tmp_path):
     response = request(c, "loop_take_over", now=0.1)
     assert response["error"]["code"] == "NOT_READY" and "dex3_right_order" in response["error"]["message"]
     assert c.phase == "IDLE" and rig.loop.phase == "IDLE"
+
+
+def test_failed_inference_keeps_the_last_chunk_and_requests_again(tmp_path, capsys):
+    rig = Rig().ready()
+    rig.loop.trial(0, str(tmp_path), rig.now)
+    rig.until("episode")
+    start, n_chunks, episode_start = len(rig.sent), len(rig.set_chunks), rig.now
+    rig.rows = lambda epoch: None  # every replan fails from here on (a worker exception)
+    for _ in range(80):
+        rig.step()
+        if rig.loop.stage != "episode":
+            break
+    assert rig.loop.stage == "to_ready" and rig.loop.trial_end_reason == "no valid chunk for 1 s"
+    assert len(rig.set_chunks) == n_chunks  # the last good chunk kept playing
+    assert set(rig.labels(start)[:-1]) == {"episode"}  # never frozen
+    # each failure cleared the outstanding request: the next replan (request time + 0.4 s) asked again
+    assert rig.hooks.requests == [100, 101, 102]
+    assert [rig.asked[e][0] - episode_start for e in (101, 102)] == pytest.approx([0.4, 0.8], abs=TICK + 1e-9)
+    assert "policy inference failed" in capsys.readouterr().out
+
+
+def test_failed_first_chunk_freezes(tmp_path):
+    rig = Rig().ready()
+    rig.answer_after = None
+    rig.loop.trial(0, str(tmp_path), rig.now)
+    rig.step(75)
+    assert not rig.loop.accept_chunk(100, rig.now, None)
+    assert rig.loop.phase == "LOOP_FROZEN" and rig.loop.frozen_stage == "first_chunk"
+    assert rig.loop.reason == "first chunk inference failed"
+
+
+def test_take_over_refuses_unless_the_served_model_is_the_checkpoint(tmp_path):
+    for served in ("/mnt/data/jihun/models/other/checkpoint-20000", None):
+        c, rig = make_hc(tmp_path)
+        rig.hooks.served_model = served
+        response = request(c, "loop_take_over", now=0.1)
+        assert response["error"]["code"] == "NOT_READY" and "model" in response["error"]["message"]
+        assert c.phase == "IDLE" and rig.loop.phase == "IDLE"
+    c, rig = make_hc(tmp_path)
+    rig.hooks.served_model = SERVED.replace("/checkpoint-20000", "/./checkpoint-20000/")  # same after normpath
+    assert request(c, "loop_take_over", now=0.1)["error"] is None
+    assert rig.loop.model == rig.hooks.served_model  # each trial records the served model
+
+
+def test_os_error_in_a_loop_call_is_an_invalid_request(tmp_path):
+    c, rig = make_hc(tmp_path)
+    assert request(c, "loop_take_over", now=0.1)["error"] is None
+    rig.step(50)
+    assert request(c, "loop_raise", now=0.1)["error"] is None
+    rig.step(183)
+    locked = tmp_path / "locked"
+    (locked / "session").mkdir(parents=True)
+    os.chmod(locked, 0)
+    try:
+        response = request(c, "loop_trial", {"trial": 0, "session_dir": str(locked / "session")}, now=0.2)
+    finally:
+        os.chmod(locked, 0o700)
+    assert response["error"]["code"] == "INVALID_REQUEST" and "Permission denied" in response["error"]["message"]
+    assert c.phase == "LOOP_HOLD" and rig.loop.stage == "ready"

@@ -14,7 +14,7 @@ from test_run_vla_reset import run_keys
 import yaml
 
 from gear_sonic.scripts import run_vla_inference as runner
-from gear_sonic.utils.inference import harness_rpc, loop_records, observation_snapshot
+from gear_sonic.utils.inference import harness_rpc, lerobot_sonic_policy, loop_records, observation_snapshot
 from gear_sonic.utils.inference.loop_control import LoopController
 from gear_sonic.utils.inference.loop_records import TrialWriter
 from gear_sonic.utils.teleop.xr_upperbody_bridge import unpack_bridge_message
@@ -91,6 +91,7 @@ class Session:
     def on_key(self, index, args):
         if index == 0:  # after run_keys' own no-op sleep
             self.monkeypatch.setattr(runner.time, "sleep", self.sleep)
+            args[4]()  # the worker's first observation creates its policy client (the served model is known)
         sent = runner.zmq.Context().socket().send.call_args_list
         for call in sent[self.cursor:]:  # the deploy: echo POSE tokens in token_state, PLANNER's otherwise
             raw = call.args[0]
@@ -121,7 +122,10 @@ class Session:
 
     def run(self, n, keys=None):
         self.monkeypatch.setattr(runner.time, "monotonic", lambda: self.clock[0])
-        cache = SimpleNamespace(start=lambda: None, close=lambda: None)
+        cache = SimpleNamespace(start=lambda: None, close=lambda: None, latest_camera=lambda now: None)
+        checkpoint = yaml.safe_load((Path(__file__).parent / "fixtures/g1_profile.yaml").read_text())["checkpoint"]
+        served = SimpleNamespace(model=checkpoint)  # the policy server's info: serves the profile checkpoint
+        self.monkeypatch.setattr(lerobot_sonic_policy, "LeRobotSonicPolicyClient", lambda **kw: served)
         self.monkeypatch.setattr(observation_snapshot, "ObservationSnapshotCache", lambda *a: cache)
         session = self
 
@@ -278,11 +282,21 @@ def test_loop_trial_uses_anchoring(monkeypatch, tmp_path):
         np.testing.assert_allclose(token(poses(its[i][2])[0]), token(poses(its[i - 1][2])[0]), atol=1e-6)
 
 
-def test_failed_inference_in_loop_freezes(monkeypatch, tmp_path):
+def test_failed_inference_in_loop(monkeypatch, tmp_path):
+    # a failed first chunk freezes (there is no chunk to keep playing)
     s = session(monkeypatch, tmp_path, opening(tmp_path),
                 answer=lambda n, c: None if c.phase.startswith("LOOP_") else action(0.1)).run(400)
-    assert s.control.phase == "LOOP_FROZEN" and s.control.loop.reason == "invalid policy result"
+    assert s.control.phase == "LOOP_FROZEN" and s.control.loop.reason == "first chunk inference failed"
     assert s.control.loop.frozen_stage == "first_chunk"
+    assert_one_pose_per_loop_iteration(s)
+    # failed replans: lerobot keeps the last chunk and requests again; the chunk age ends the trial (R23c)
+    second = tmp_path / "second"  # a fresh session_dir: the frozen trial 0 above is recorded
+    second.mkdir()
+    s = session(monkeypatch, second, opening(second),
+                answer=lambda n, c: None if c.loop.stage == "episode" else action(0.1)).run(500)
+    assert s.control.loop.trial_end_reason == "no valid chunk for 1 s"
+    assert s.control.phase == "LOOP_HOLD" and s.control.loop.stage == "ready"
+    assert len([r for r in loop_requests(s) if r[0] > s.first("episode")]) == 2  # at +0.4 s and +0.8 s
     assert_one_pose_per_loop_iteration(s)
 
 
