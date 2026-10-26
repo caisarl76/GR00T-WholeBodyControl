@@ -464,3 +464,67 @@ def test_loop_trial_rejects_a_recorded_trial_number(tmp_path):
         rig.loop.trial(0, str(tmp_path), rig.now)
     rig.loop.trial(1, str(tmp_path), rig.now)
     assert rig.loop.stage == "hold_rest"
+
+
+def drive_to_completed(c, rig):
+    """take-over, raise and end via RPC, played by loop.tick only: the HC is never ticked meanwhile."""
+    for method in ("loop_take_over", "loop_raise", "loop_end"):
+        assert request(c, method, now=0.1)["error"] is None
+        rig.step({"loop_take_over": 50, "loop_raise": 183, "loop_end": 383}[method])
+    assert rig.loop.phase == "COMPLETED" and c.phase == "LOOP_MOTION"  # the HC mirror is stale until synced
+
+
+def test_override_after_loop_completes_before_hc_tick_takes_the_normal_path(tmp_path):
+    c, rig = make_hc(tmp_path)
+    drive_to_completed(c, rig)
+    assert not c.operator_override("p")  # no ControlError out of the key handler: the non-loop path ran
+    assert (c.phase, c.reason, c.owner) == ("INTERRUPTED", "operator_override:p", None)
+    assert rig.loop.phase == "COMPLETED" and rig.loop.reason is None  # not frozen
+
+    c, rig = make_hc(tmp_path)
+    drive_to_completed(c, rig)
+    assert request(c, "loop_take_over", now=0.2)["error"] is None  # the RPC sees COMPLETED, not LOOP_MOTION
+    assert c.phase == "LOOP_MOTION" and rig.loop.stage == "stance"
+
+
+def test_freeze_during_take_over_aborts_it_on_resume(tmp_path):
+    c, rig = make_hc(tmp_path)
+    assert request(c, "loop_take_over", now=0.1)["error"] is None
+    rig.step(20)  # still before the POSE switch
+    assert request(c, "loop_freeze", now=0.1)["error"] is None
+    assert rig.loop.frozen_stage == "stance"
+    assert request(c, "loop_resume", now=0.1)["error"] is None
+    assert (c.phase, rig.loop.phase, rig.loop.stage, rig.hooks.calls) == ("IDLE", "IDLE", None, [])
+    assert not rig.cmd.busy and not rig.cmd.frozen
+    assert request(c, "loop_take_over", now=0.2)["error"] is None  # re-captures token_state
+    rig.step(50)
+    assert rig.hooks.calls == ["pose"] and c.status(0.2)["loop_stage"] == "stance"
+
+
+def test_release_in_loop_leaves_it_frozen_and_reclaimable(tmp_path):
+    c, rig = make_hc(tmp_path)
+    assert request(c, "loop_take_over", now=0.1)["error"] is None
+    rig.step(50)
+    holds = len(rig.hooks.holds)
+    assert request(c, "release_control", now=0.2)["error"] is None
+    assert c.owner is None and c.phase == "LOOP_FROZEN" and rig.loop.reason == "released"
+    assert rig.loop.frozen_stage == "stance" and len(rig.hooks.holds) == holds
+    claim = request(c, "claim_control", {"registry_sha256": c.profile.registry_sha256}, now=0.3, session="s2")
+    assert claim["error"] is None and c.phase == "LOOP_FROZEN"
+    assert request(c, "release_control", now=0.4, session="s2")["error"] is None  # already frozen: no-op freeze
+    assert c.owner is None and rig.loop.reason == "released"
+
+
+def test_malformed_state_freezes_with_invalid_robot_state(tmp_path):
+    rig = Rig().ready()
+    rig.loop.trial(0, str(tmp_path), rig.now)
+    rig.until("episode").step(5)
+    held = rig.sent[-1][0]
+    token, _, label = rig.loop.tick(rig.now + TICK, dict(rig.feedback(), body_q=np.zeros(28)), 0.0, 0.0)
+    assert label == "frozen" and np.array_equal(token, held)
+    assert rig.loop.reason == rig.loop.trial_end_reason == "invalid robot state"
+    assert str(trial_npz(tmp_path)["episode_end"]) == "invalid robot state"
+
+    rig = Rig().take_over()  # outside a trial too
+    token, _, label = rig.loop.tick(rig.now + TICK, dict(rig.feedback(), right_hand_q=np.zeros(6)), 0.0, 0.0)
+    assert label == "frozen" and np.array_equal(token, PLANNER) and rig.loop.frozen_stage == "stance"

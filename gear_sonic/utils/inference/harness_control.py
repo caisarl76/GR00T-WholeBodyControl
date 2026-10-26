@@ -158,7 +158,7 @@ class HarnessControl:
         if not self._in_loop():
             return
         self.phase, self.reason = self.loop.phase, self.loop.reason
-        if self.phase == "COMPLETED":  # handed back to the planner: confirm it like any other hold
+        if not self._in_loop():  # handed back (COMPLETED) or take-over aborted (IDLE): confirm the planner hold
             self.hold_confirmed, self.hold_index, self.hold_started = False, self.feedback_index, now
 
     def interrupt(self, reason: str, now: float):
@@ -175,6 +175,7 @@ class HarnessControl:
     def operator_override(self, reason: str):
         """True when the key was consumed: in a LOOP phase it only freezes the loop (owner kept, and the caller
         must not perform the key's own action)."""
+        self._sync_loop(time.monotonic())  # loop.tick may have left the LOOP phases since the last HC tick
         if self._in_loop():
             self.loop.freeze(f"operator override: {reason}", time.monotonic())
             self._sync_loop(time.monotonic())
@@ -285,6 +286,7 @@ class HarnessControl:
         return response
 
     def _dispatch(self, req, now):
+        self._sync_loop(now)  # loop.tick may have left the LOOP phases since the last HC tick
         method, params = req["method"], req["params"]
         if method == "get_status":
             return self.status(now)
@@ -350,6 +352,11 @@ class HarnessControl:
         self._lease(req, now)
         if method == "heartbeat":
             self.owner["expires_at"] = now + self.profile.limits.lease_s
+            return self.status(now)
+        if method == "release_control" and self._in_loop():  # R16b: leave the loop frozen, reclaimable
+            self.loop.freeze("released", now)
+            self._sync_loop(now)
+            self._retire_owner()
             return self.status(now)
         if method == "release_control":
             if not self.hold_confirmed or self.phase not in {"IDLE", "PAUSED", "COMPLETED", "INTERRUPTED", "FAULT"}:

@@ -111,6 +111,10 @@ class LoopController:
     def resume(self, now):
         self._require(self.phase == "LOOP_FROZEN", "loop_resume")
         stage, self.frozen_stage, self.reason = self.frozen_stage, None, None
+        if self._then == self._pose_switched:  # R16a: frozen before the POSE switch: abort the take-over
+            self.commander.hold()
+            self.phase, self.stage, self._then = "IDLE", None, None
+            return
         if stage in TRIAL_STAGES or stage == "ready":
             self.commander.hold()
             self.commander.blend_to(self.ready.token, self.ready.hands, BLEND_TICKS, "to ready")
@@ -165,17 +169,23 @@ class LoopController:
         """(token 64, hands 14, label) to publish this tick."""
         if not self.phase.startswith("LOOP_"):
             raise RuntimeError(f"LoopController.tick in {self.phase}")
+        state = np.full(28, np.nan, np.float32)
+        if feedback:
+            try:
+                state = lerobot_state(feedback, self.right_order)
+            except (KeyError, TypeError, ValueError):  # R16c: never stream on a malformed state
+                self.freeze("invalid robot state", now)
         if self.stage == "blend_in" and not self.commander.busy:
             self._start_episode(now)
         if self.stage == "episode":
-            self._episode_step(now, feedback, feedback_age_s, camera_age_s)
+            self._episode_step(now, feedback, state, feedback_age_s, camera_age_s)
         if self.stage == "first_chunk" and not self.commander.busy:  # lerobot wait_tick: the rest pose, slewed
             self.commander.play(self.ready.token[None], self.ready.hands[None], "wait first chunk")
         token, hands, label = self.commander.tick(now)
         if self.stage in ("lower", "handback"):
             self.stage = "handback" if label == "handback blend" else "lower"
         if self._recorder is not None:
-            self._record(now, feedback, token, hands, label)
+            self._record(now, state, token, hands, label)
         if self._then is not None and not self.commander.busy and not self.commander.frozen:
             then, self._then = self._then, None
             then(now)
@@ -195,7 +205,7 @@ class LoopController:
         self._stream.last_token = self.commander.last_token.copy()  # R1b: anchor on the token actually sent
         self._stream.set_chunk(rows, t0=t0, now=now)
 
-    def _episode_step(self, now, feedback, feedback_age_s, camera_age_s):
+    def _episode_step(self, now, feedback, state, feedback_age_s, camera_age_s):
         """lerobot's per-tick order: take a finished chunk, the guards, the handover detector, then replan."""
         if self._pending is not None:
             (rows, t0), self._pending = self._pending, None
@@ -203,9 +213,7 @@ class LoopController:
             self._last_chunk_at, self._chunk_t0 = now, t0
         verdict = self._guards.check(now, feedback, feedback_age_s, camera_age_s, self._last_chunk_at,
                                      self.commander.recent_tokens)
-        if verdict is None and feedback and self._detector.update(
-            float(lerobot_state(feedback, self.right_order)[21:28].mean()), now
-        ):
+        if verdict is None and feedback and self._detector.update(float(state[21:28].mean()), now):
             verdict = ("end", "handover complete")
         if verdict is not None:
             kind, reason = verdict
@@ -220,14 +228,13 @@ class LoopController:
             self._outstanding = self.hooks.request_policy_chunk()
             self._next_replan = now + REPLAN_S
 
-    def _record(self, now, feedback, token, hands, label):
+    def _record(self, now, state, token, hands, label):
         t_ep, frame, chunk_t0 = -1.0, -1, math.nan
         if label == "blend in":
             t_ep, frame = 0.0, 0
         elif label == "episode":
             t_ep = now - self._episode_t0
             frame, chunk_t0 = int(t_ep * LIVE_FPS), self._chunk_t0 - self._episode_t0
-        state = lerobot_state(feedback, self.right_order) if feedback else np.full(28, np.nan, np.float32)
         self._recorder.tick(time.time(), t_ep, label, frame, token, hands, chunk_t0, state)
 
     # --- stage ends (``_then``) ---------------------------------------------------------------------------------
