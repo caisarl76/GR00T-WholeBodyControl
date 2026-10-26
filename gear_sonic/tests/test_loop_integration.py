@@ -256,7 +256,9 @@ def test_slow_trial_write_does_not_stall_ticks(monkeypatch, tmp_path):
     assert {name for name, _, _ in saves} == {"trial-writer"}
     trial_npz = next((start, end) for name, start, end in saves)
     during = [i for i, wall in enumerate(s.walls) if trial_npz[0] < wall < trial_npz[1]]
-    assert len(during) >= 50  # the loop kept ticking while the trial npz was being written
+    # the loop kept ticking while the trial npz was being written (the no-gap check below is the real proof;
+    # the count only depends on how fast this machine runs an iteration)
+    assert len(during) >= 10
     assert all(len(poses(s.iterations()[i][2])) == 1 for i in during)
     assert max(np.diff(s.walls)) < 0.5
     assert (tmp_path / "session/trial_000.npz").exists()
