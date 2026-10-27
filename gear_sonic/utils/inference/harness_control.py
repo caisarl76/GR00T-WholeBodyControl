@@ -639,4 +639,5 @@ class HarnessControl:
             loop_trial=self.loop.trial_no if self.loop else None,
             trial_end_reason=self.loop.trial_end_reason if self.loop else None,
             frozen_stage=self.loop.frozen_stage if self.loop else None,
+            take_detected=self.loop.take_detected if self.loop and self.loop.stage == "await_take" else None,
         )

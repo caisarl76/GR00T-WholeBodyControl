@@ -21,7 +21,7 @@ import numpy as np
 
 from gear_sonic.utils.inference.harness_control import ControlError
 from gear_sonic.utils.inference.lerobot_sonic_policy import lerobot_state
-from gear_sonic.utils.inference.loop_episode import EpisodeGuards, HandoverDetector
+from gear_sonic.utils.inference.loop_episode import EpisodeGuards, HandoverDetector, TakeDetector
 from gear_sonic.utils.inference.loop_motion import TOKEN_ABS_MAX
 from gear_sonic.utils.inference.loop_records import TrialRecorder, next_trial
 
@@ -51,6 +51,12 @@ class LoopController:
         self._recorder = self._stream = self._guards = self._detector = self._first = None
         self._outstanding = self._pending = None  # requested epoch; accepted (rows, t0) for the next tick
         self._requested_at = None  # now at the outstanding request: a replanned chunk's t0 (lerobot slot_t)
+        self._take = None  # TakeDetector while in await_take (R26)
+
+    @property
+    def take_detected(self) -> bool:
+        """True once the bottle was taken in the current await_take (it only reports; the runner acts)."""
+        return self._take is not None and self._take.taken
         self._episode_t0 = self._last_chunk_at = self._next_replan = None
         self._chunk_t0 = math.nan
 
@@ -108,7 +114,7 @@ class LoopController:
             if self.trial_end_reason is None:
                 self.trial_end_reason = reason
             self._close_recorder()
-        self._outstanding = self._pending = None
+        self._outstanding = self._pending = self._take = None
         self.commander.freeze()
         self.frozen_stage, self.stage, self.phase, self.reason = self.stage, "frozen", "LOOP_FROZEN", reason
 
@@ -131,6 +137,7 @@ class LoopController:
     def to_ready(self, now):
         """After a trial end: the bottle was taken (lerobot's operator Enter in finish(to_ready))."""
         self._require(self.phase == "LOOP_HOLD" and self.stage == "await_take", "loop_to_ready")
+        self._take = None
         self.commander.blend_to(self.ready.token, self.ready.hands, BLEND_TICKS, "to ready")
         self._motion("LOOP_MOTION", "to_ready", self._at_ready)
 
@@ -196,6 +203,8 @@ class LoopController:
             self._start_episode(now)
         if self.stage == "blend_in":
             self._guards.record(now, feedback)
+        if self.stage == "await_take":
+            self._take.update(feedback, now)
         if self.stage == "episode":
             self._episode_step(now, feedback, state, feedback_age_s, camera_age_s)
         if self.stage == "first_chunk" and not self.commander.busy:  # lerobot wait_tick: the rest pose, slewed
@@ -245,6 +254,7 @@ class LoopController:
                 self.commander.hold()
                 self._close_recorder()
                 self._hold("await_take")
+                self._take = TakeDetector(now)
             return
         if now >= self._next_replan and self._outstanding is None:
             self._outstanding, self._requested_at = self.hooks.request_policy_chunk(), now

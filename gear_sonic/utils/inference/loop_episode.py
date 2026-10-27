@@ -74,6 +74,49 @@ class HandoverDetector:
         return t - self.open_since >= self.open_s
 
 
+# Bottle-taken detection in await_take from the deploy's right-arm tau_est (g1_debug "motor_torque", hardware
+# order). Session ready-A-r27 (3 holds): loaded on the palm sh_pitch -7.9..-8.3, elbow -5.0..-5.5 N*m (+-0.1);
+# after the take -5.4..-5.5 / -3.3..-3.5 (a rise toward zero of +2.4..+2.9 / +1.6..+2.2), after a ~0.5 s grab
+# spike the other way.
+TAKE_MOTORS = (22, 25)  # right shoulder pitch, right elbow
+TAKE_BASELINE_S = (1.0, 2.0)  # baseline window, seconds into the hold
+TAKE_RISE_NM = (1.5, 1.0)  # rise toward zero (unload) over the baseline, per motor
+TAKE_HOLD_S = 1.0  # both rises held continuously this long
+
+
+class TakeDetector:
+    """True once the right arm unloads: shoulder pitch and elbow torque both rise TAKE_RISE_NM over their
+    baseline (the mean over TAKE_BASELINE_S of the hold that began at ``start``) for TAKE_HOLD_S. The grab spike
+    loads the arm (more negative), so it cannot trigger. Messages without a 29-value finite motor_torque are
+    ignored; without baseline samples it never triggers."""
+
+    def __init__(self, start: float):
+        self.start, self.samples, self.baseline, self.rising_since, self.taken = start, [], None, None, False
+
+    def update(self, msg, now: float) -> bool:
+        if self.taken:
+            return True
+        tau = np.asarray((msg or {}).get("motor_torque", []), np.float64).reshape(-1)
+        if tau.shape != (29,) or not np.isfinite(tau[list(TAKE_MOTORS)]).all():
+            return False
+        arm, t = tau[list(TAKE_MOTORS)], now - self.start
+        if self.baseline is None:
+            if t < TAKE_BASELINE_S[0]:
+                return False
+            if t <= TAKE_BASELINE_S[1]:
+                self.samples.append(arm)
+                return False
+            if not self.samples:
+                return False
+            self.baseline = np.mean(self.samples, axis=0)
+        if (arm - self.baseline >= np.asarray(TAKE_RISE_NM)).all():
+            self.rising_since = now if self.rising_since is None else self.rising_since
+            self.taken = now - self.rising_since >= TAKE_HOLD_S
+        else:
+            self.rising_since = None
+        return self.taken
+
+
 def token_echo_err(token_state_msg: dict | None, recent_tokens) -> float:
     """Smallest max-abs difference between the deploy's g1_debug token_state and a recently sent token. In POSE
     mode the deploy copies each received token into token_state; a deploy fed by another command source (or

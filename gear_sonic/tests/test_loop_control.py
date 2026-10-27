@@ -86,6 +86,7 @@ class Rig:
             right_order=np.arange(7), trial_args={"test": True}, model="test-model")
         self.i, self.right, self.state_age, self.camera_age = 0, 0.0, 0.0, 0.0
         self.body = np.zeros(29)
+        self.torque = None  # motor_torque (29, hardware order) in the feedback, when set
         self.sent = []
         self.answer_after, self.asked, self.answered = 1, {}, set()
         self.rows = lambda epoch: chunk((epoch - 100) * 0.01)  # None: a failed inference
@@ -96,8 +97,11 @@ class Rig:
 
     def feedback(self):
         token = self.sent[-1][0] if self.sent else PLANNER
-        return dict(index=self.i, body_q=self.body.copy(), left_hand_q=np.zeros(7),
-                    right_hand_q=np.full(7, self.right), token_state=token)
+        msg = dict(index=self.i, body_q=self.body.copy(), left_hand_q=np.zeros(7),
+                   right_hand_q=np.full(7, self.right), token_state=token)
+        if self.torque is not None:
+            msg["motor_torque"] = self.torque.copy()
+        return msg
 
     def step(self, n=1):
         for _ in range(n):
@@ -728,3 +732,52 @@ def test_session_end_after_loop_to_ready(tmp_path):
     assert runs(rig.labels(start)) == [("to lower start", 50), ("lower", 83), ("blend out", 50),
                                        ("hold rest", 100), ("handback blend", 100)]
     assert rig.loop.phase == "COMPLETED" and rig.hooks.calls[-1] == "planner"
+
+
+def arm_torque(sh, el):
+    tau = np.zeros(29)
+    tau[22], tau[25] = sh, el
+    return tau
+
+
+def test_take_detected_in_await_take_and_reset_between_trials(tmp_path):
+    c, rig = make_hc(tmp_path)
+    assert request(c, "loop_take_over", now=0.1)["error"] is None
+    rig.step(50)
+    assert request(c, "loop_raise", now=0.1)["error"] is None
+    rig.step(183)
+    assert c.status(0.1)["take_detected"] is None  # outside await_take
+    rig.torque = arm_torque(-8.1, -5.2)  # the bottle rests on the palm
+    for trial in (0, 1):
+        session, at = str(tmp_path / "s"), 0.2 + 0.1 * trial  # request ids derive from (method, now)
+        assert request(c, "loop_trial", {"trial": trial, "session_dir": session}, now=at)["error"] is None
+        rig.until("episode")
+        assert c.status(at)["take_detected"] is None
+        rig.rows = lambda epoch: None
+        rig.until("await_take", limit=80)
+        rig.rows = lambda epoch: chunk((epoch - 100) * 0.01)
+        rig.step(150)  # 3 s of the loaded hold: baseline over +1..+2 s, no take
+        assert rig.loop.take_detected is False and c.status(at)["take_detected"] is False
+        rig.torque = arm_torque(-5.45, -3.4)  # taken: the arm unloads
+        rig.step(49)
+        assert not rig.loop.take_detected
+        rig.step(2)
+        assert rig.loop.take_detected and c.status(at)["take_detected"] is True
+        assert (rig.loop.phase, rig.loop.stage) == ("LOOP_HOLD", "await_take")  # it only reports; the runner acts
+        assert request(c, "loop_to_ready", now=at)["error"] is None
+        assert rig.loop.take_detected is False and c.status(at)["take_detected"] is None
+        rig.torque = arm_torque(-8.1, -5.2)  # the next bottle
+        rig.step(50)
+        assert rig.loop.stage == "ready"
+
+
+def test_take_detection_resets_on_a_freeze(tmp_path):
+    rig = Rig().ready()
+    rig.torque = arm_torque(-8.1, -5.2)
+    ended_trial(tmp_path, rig)
+    rig.step(150)
+    rig.torque = arm_torque(-5.45, -3.4)
+    rig.step(60)
+    assert rig.loop.take_detected
+    rig.loop.freeze("operator stop", rig.now)
+    assert not rig.loop.take_detected

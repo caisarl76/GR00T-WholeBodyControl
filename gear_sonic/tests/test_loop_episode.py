@@ -5,9 +5,11 @@ from gear_sonic.utils.inference.loop_episode import (
     ARM_HI,
     ARM_LO,
     ARM_SPEED_TICKS,
+    TAKE_HOLD_S,
     TOKEN_ECHO_TOL,
     EpisodeGuards,
     HandoverDetector,
+    TakeDetector,
     max_arm_speed,
     token_echo_err,
 )
@@ -222,3 +224,66 @@ def test_blend_in_history_feeds_the_first_episode_check():
         _check(g, 100.0)  # record() alone does not start the checks
     g.start(101.0, keep_history=True)
     assert _check(g, 130.9) is None and _check(g, 131.0) == ("end", "completed")  # the cap counts from start()
+
+
+def _torque(sh, el):
+    tau = np.zeros(29)
+    tau[22], tau[25] = sh, el  # right shoulder pitch, right elbow (hardware order)
+    return {"motor_torque": tau}
+
+
+def _r27_hold(take_at=6.0, spike=True, settle=True, duration=12.0):
+    """(t since the hold began, message): session ready-A-r27's right-arm tau_est with the bottle on the palm
+    (sh -8.1, el -5.2, +-0.1), a 0.5 s grab spike in the loading direction, a 0.2 s ramp, then the unloaded arm
+    (sh -5.45, el -3.4)."""
+    out = []
+    for k in range(int(duration * 50)):
+        t = k * 0.02
+        noise = 0.1 * np.sin(7.3 * t)
+        sh, el = -8.1, -5.2
+        if spike and take_at <= t < take_at + 0.5:
+            sh, el = -10.4, -6.0
+        elif settle and take_at + 0.5 <= t:
+            w = min(1.0, (t - take_at - 0.5) / 0.2)
+            sh, el = -10.4 + w * (10.4 - 5.45), -6.0 + w * (6.0 - 3.4)
+        out.append((t, _torque(sh + noise, el + noise)))
+    return out
+
+
+def _first_take(samples, start=50.0):
+    d = TakeDetector(start)
+    return next((t for t, msg in samples if d.update(msg, start + t)), None)
+
+
+def test_take_detector_fires_on_the_r27_unload():
+    t = _first_take(_r27_hold(take_at=6.0))
+    # rises past +1.5 / +1.0 during the 0.2 s ramp after the spike (6.5 s), then holds for TAKE_HOLD_S
+    assert t is not None and 6.5 + TAKE_HOLD_S <= t <= 6.7 + TAKE_HOLD_S + 0.02
+
+
+def test_take_detector_ignores_the_grab_spike_steady_holds_and_missing_torque():
+    assert _first_take(_r27_hold(take_at=6.0, settle=False)) is None  # spike, then back on the palm
+    assert _first_take(_r27_hold(spike=False, settle=False, duration=60.0)) is None  # steady hold
+    no_torque = [(t, {"body_q": np.zeros(29)}) for t, _ in _r27_hold()]
+    assert _first_take(no_torque) is None
+    short = [(t, {"motor_torque": np.zeros(28)}) for t, _ in _r27_hold()]
+    assert _first_take(short) is None
+    # torque only after the baseline window: no baseline, so never
+    late = [(t, msg if t > 2.0 else {}) for t, msg in _r27_hold()]
+    assert _first_take(late) is None
+    # only the shoulder unloads (the elbow stays loaded): not a take
+    one = [(t, _torque(msg["motor_torque"][22], -5.2)) for t, msg in _r27_hold()]
+    assert _first_take(one) is None
+
+
+def test_take_detector_needs_a_continuous_second_and_skips_messages_without_torque():
+    d = TakeDetector(0.0)
+    for k in range(51, 101):  # baseline over +1..+2 s
+        assert not d.update(_torque(-8.0, -5.0), k * 0.02)
+    assert not d.update(_torque(-6.0, -3.5), 3.0)
+    assert not d.update({}, 3.5)  # no torque: ignored, the timer keeps running
+    assert not d.update(_torque(-6.0, -3.5), 3.98)
+    assert not d.update(_torque(-7.0, -3.5), 4.0)  # the shoulder falls back below +1.5: restart
+    assert not d.update(_torque(-6.0, -3.5), 4.02)
+    assert not d.update(_torque(-6.0, -3.5), 5.0)
+    assert d.update(_torque(-6.0, -3.5), 5.02) and d.update({}, 5.04)  # stays taken

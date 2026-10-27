@@ -183,6 +183,7 @@ class Status:
     loop_trial: int | None = None
     trial_end_reason: str | None = None
     frozen_stage: str | None = None
+    take_detected: bool | None = None
 
 
 @dataclass(frozen=True)
