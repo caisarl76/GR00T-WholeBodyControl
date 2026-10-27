@@ -334,7 +334,8 @@
         "loop_trial": null,
         "trial_end_reason": null,
         "frozen_stage": null,
-        "take_detected": null
+        "take_detected": null,
+        "take_hand_empty": null
       },
       "error": null
     },
@@ -369,7 +370,8 @@
         "loop_trial": 3,
         "trial_end_reason": "operator stop",
         "frozen_stage": "episode",
-        "take_detected": null
+        "take_detected": null,
+        "take_hand_empty": null
       },
       "error": null
     },
@@ -404,7 +406,8 @@
         "loop_trial": 3,
         "trial_end_reason": "handover complete",
         "frozen_stage": null,
-        "take_detected": true
+        "take_detected": true,
+        "take_hand_empty": false
       },
       "error": null
     }

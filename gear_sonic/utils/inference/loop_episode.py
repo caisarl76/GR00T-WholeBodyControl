@@ -104,6 +104,11 @@ TAKE_STEADY_S = 1.0
 # 0.46. Wrist yaw at real takes r27-r34: -0.42 to -1.04; with the bottle resting on the palm it holds +-0.05;
 # a person's hand on the bottle (r33 trial 7, bottle still on the palm) dropped it 0.31. Either rule counts.
 TAKE_WRIST_DROP_NM = 0.35
+# R32 (r36 trials 7 and 8, r34 trial 0): a hand already empty when the hold starts (a missed grasp, or the bottle
+# taken as the hand opened) gives the detector nothing to see. hand_empty reports a steady wrist yaw at or below
+# TAKE_EMPTY_WRIST_NM over the last TAKE_STEADY_S: empty holds 0.16-0.27, bottle in the hand never below 0.79
+# (r36 trial 0, closed grip; r33 trial 7, a hand on the bottle). The runner acts on it only with the camera.
+TAKE_EMPTY_WRIST_NM = 0.5
 
 
 def take_torque(msg):
@@ -141,13 +146,19 @@ class TakeDetector:
         self.episode_reference = None if reference is None else np.asarray(reference, np.float64)
         self.reference, self.hold0 = None, []  # the reference is set once the hold's first TAKE_HOLD0_S is in
         self.steady_at = None  # R30: when the reference came from a steady hold window
+        self.hand_empty, self._recent = False, []  # R32: wrist yaw steady at or below TAKE_EMPTY_WRIST_NM
 
     def update(self, msg, now: float) -> bool:
-        if self.taken:
-            return True
         arm = take_torque(msg)
         if arm is None:
-            return False
+            return self.taken
+        self._recent = [(t, a) for t, a in self._recent if t >= now - TAKE_STEADY_S] + [(now, arm[2])]
+        yaw = np.array([a for _, a in self._recent])
+        self.hand_empty = bool(now - self.start >= TAKE_STEADY_S and len(yaw) >= TAKE_REFERENCE_MIN_SAMPLES
+                               and np.percentile(yaw, 90) - np.percentile(yaw, 10) <= TAKE_STEADY_SPREAD_NM
+                               and np.median(yaw) <= TAKE_EMPTY_WRIST_NM)
+        if self.taken:
+            return True
         if self.reference is None and self.episode_reference is None:  # R30
             self.hold0 = [(t, a) for t, a in self.hold0 if t >= now - TAKE_STEADY_S] + [(now, arm)]
             arms = np.array([a for _, a in self.hold0])

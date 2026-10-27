@@ -73,6 +73,12 @@ class LoopController:
         """True once the bottle was taken in the current await_take (it only reports; the runner acts)."""
         return self._take is not None and self._take.taken
 
+    @property
+    def take_hand_empty(self) -> bool:
+        """R32: the wrist carries no bottle (steady low wrist yaw) in the current await_take; the runner acts on it
+        only together with the camera."""
+        return self._take is not None and self._take.hand_empty
+
     def _require(self, ok, method):
         if not ok:
             raise ControlError("NOT_READY", f"{method} not allowed in {self.phase} (stage {self.stage})")

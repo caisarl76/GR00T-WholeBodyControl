@@ -421,3 +421,25 @@ def test_a_settling_step_in_the_first_half_second_is_not_a_reference():  # R30, 
     assert d.episode_reference is None
     assert next((t for t, msg in h if t > 0 and d.update(msg, t)), None) is None
     assert d.reference is not None and abs(d.reference[0] + 7.12) < 0.1
+
+
+def test_hand_empty_reports_a_steady_unloaded_wrist():  # R32
+    def run(yaw, end=4.0):
+        d = TakeDetector(0.0, np.array([-7.0, -4.8, 1.3]))
+        seen = []
+        for k in range(int(end * 50)):
+            d.update(_torque(-7.0, -4.8, yaw(k * 0.02) + 0.03 * np.sin(5.1 * k)), k * 0.02)
+            seen.append((k * 0.02, d.hand_empty))
+        return seen
+    # r36 trial 8: taken as the hand opened, wrist yaw +0.27 through the hold: empty after a steady second
+    empty = run(lambda t: 0.27)
+    assert not any(e for t, e in empty if t < 1.0) and all(e for t, e in empty if t >= 1.0)
+    # bottle in the hand: +1.3 (loaded), +0.79 (r36 trial 0, closed grip): never empty
+    for yaw in (1.3, 0.79):
+        assert not any(e for _, e in run(lambda t, y=yaw: y))
+    # unloading +1.3 -> +0.3 over the first second (a take in progress): empty once the window is mostly flat
+    falling = run(lambda t: max(0.3, 1.3 - t))
+    assert not any(e for t, e in falling if t < 1.3) and falling[-1][1]
+    # messages without torque leave it unchanged
+    d = TakeDetector(0.0, None)
+    assert not d.update({}, 1.0) and d.hand_empty is False

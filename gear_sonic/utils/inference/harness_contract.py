@@ -184,6 +184,7 @@ class Status:
     trial_end_reason: str | None = None
     frozen_stage: str | None = None
     take_detected: bool | None = None
+    take_hand_empty: bool | None = None
 
 
 @dataclass(frozen=True)
