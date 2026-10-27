@@ -781,3 +781,36 @@ def test_take_detection_resets_on_a_freeze(tmp_path):
     assert rig.loop.take_detected
     rig.loop.freeze("operator stop", rig.now)
     assert not rig.loop.take_detected
+
+
+def test_early_take_detected_from_the_episode_reference_and_logged(tmp_path, capsys):
+    rig = Rig().ready()
+    rig.torque = arm_torque(-8.1, -5.2)  # loaded through the episode's end
+    ended_trial(tmp_path, rig)
+    log = capsys.readouterr().out
+    assert "[loop] take reference sh/el = -8.10/-5.20 spread 0.00/0.00 n 2" in log and "(inert)" not in log
+    rig.torque = arm_torque(-5.45, -3.4)  # taken right away (r28: +0.6..1.6 s into the hold)
+    rig.step(50)
+    assert not rig.loop.take_detected
+    rig.step(2)
+    assert rig.loop.take_detected
+    assert "[loop] take detected: rise sh/el = +2.65/+1.80 after 1.0" in capsys.readouterr().out
+
+
+def test_take_detector_inert_without_episode_torque_and_ring_cleared(tmp_path, capsys):
+    rig = Rig().ready()
+    ended_trial(tmp_path, rig)  # no motor_torque during the episode
+    assert "[loop] take reference sh/el = none n 0 (inert)" in capsys.readouterr().out
+    rig.torque = arm_torque(-5.45, -3.4)
+    rig.step(150)
+    assert not rig.loop.take_detected
+    rig.loop.freeze("operator stop", rig.now)
+    assert not rig.loop._torque_ring
+    rig.loop.resume(rig.now)
+    rig.step(50)
+    rig.torque = arm_torque(-8.1, -5.2)
+    rig.loop.trial(1, str(tmp_path), rig.now)
+    assert not rig.loop._torque_ring  # a trial starts with an empty ring
+    rig.rows = lambda epoch: chunk((epoch - 100) * 0.01)
+    rig.until("episode").step(5)
+    assert len(rig.loop._torque_ring) == 6

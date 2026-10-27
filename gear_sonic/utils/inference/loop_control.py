@@ -14,6 +14,7 @@ Only the PoseCommander produces tokens; policy outputs reach it only through ``a
 TokenStream. The main loop publishes what ``tick`` returns.
 """
 
+from collections import deque
 import math
 import time
 
@@ -21,7 +22,14 @@ import numpy as np
 
 from gear_sonic.utils.inference.harness_control import ControlError
 from gear_sonic.utils.inference.lerobot_sonic_policy import lerobot_state
-from gear_sonic.utils.inference.loop_episode import EpisodeGuards, HandoverDetector, TakeDetector
+from gear_sonic.utils.inference.loop_episode import (
+    TAKE_RING_S,
+    EpisodeGuards,
+    HandoverDetector,
+    TakeDetector,
+    take_reference,
+    take_torque,
+)
 from gear_sonic.utils.inference.loop_motion import TOKEN_ABS_MAX
 from gear_sonic.utils.inference.loop_records import TrialRecorder, next_trial
 
@@ -52,6 +60,7 @@ class LoopController:
         self._outstanding = self._pending = None  # requested epoch; accepted (rows, t0) for the next tick
         self._requested_at = None  # now at the outstanding request: a replanned chunk's t0 (lerobot slot_t)
         self._take = None  # TakeDetector while in await_take (R26)
+        self._torque_ring = deque()  # (now, shoulder pitch, elbow torque) over the episode's last TAKE_RING_S
         self._episode_t0 = self._last_chunk_at = self._next_replan = None
         self._chunk_t0 = math.nan
 
@@ -102,6 +111,7 @@ class LoopController:
         self._recorder = TrialRecorder(session_dir, trial, self.trial_args, self.model)
         self._stream, self._guards, self._first = self.make_stream(), None, None
         self.trial_no, self.trial_end_reason = trial, None
+        self._torque_ring.clear()
         p = self.ready
         self.commander.play(_rows(p.token, HOLD_REST_TICKS), _rows(p.hands, HOLD_REST_TICKS), "wait first chunk")
         self._motion("LOOP_TRIAL", "hold_rest", self._request_first_chunk)
@@ -115,6 +125,7 @@ class LoopController:
                 self.trial_end_reason = reason
             self._close_recorder()
         self._outstanding = self._pending = self._take = None
+        self._torque_ring.clear()
         self.commander.freeze()
         self.frozen_stage, self.stage, self.phase, self.reason = self.stage, "frozen", "LOOP_FROZEN", reason
 
@@ -203,9 +214,16 @@ class LoopController:
             self._start_episode(now)
         if self.stage == "blend_in":
             self._guards.record(now, feedback)
-        if self.stage == "await_take":
-            self._take.update(feedback, now)
+        if self.stage == "await_take" and not self._take.taken and self._take.update(feedback, now):
+            sh, el = self._take.rise
+            print(f"[loop] take detected: rise sh/el = {sh:+.2f}/{el:+.2f} after {now - self._take.start:.2f} s",
+                  flush=True)
         if self.stage == "episode":
+            arm = take_torque(feedback)
+            if arm is not None:
+                self._torque_ring.append((now, arm))
+            while self._torque_ring and self._torque_ring[0][0] < now - TAKE_RING_S:
+                self._torque_ring.popleft()
             self._episode_step(now, feedback, state, feedback_age_s, camera_age_s)
         if self.stage == "first_chunk" and not self.commander.busy:  # lerobot wait_tick: the rest pose, slewed
             self.commander.play(self.ready.token[None], self.ready.hands[None], "wait first chunk")
@@ -254,11 +272,19 @@ class LoopController:
                 self.commander.hold()
                 self._close_recorder()
                 self._hold("await_take")
-                self._take = TakeDetector(now)
+                self._start_take_detector(now)
             return
         if now >= self._next_replan and self._outstanding is None:
             self._outstanding, self._requested_at = self.hooks.request_policy_chunk(), now
             self._next_replan = now + REPLAN_S
+
+    def _start_take_detector(self, now):
+        """R27: the reference is the loaded arm just before the hold (the episode's end); inert if unsteady."""
+        reference, median, spread, n = take_reference(self._torque_ring, now)
+        self._take = TakeDetector(now, reference)
+        values = ("none" if median is None
+                  else f"{median[0]:.2f}/{median[1]:.2f} spread {spread[0]:.2f}/{spread[1]:.2f}")
+        print(f"[loop] take reference sh/el = {values} n {n}{' (inert)' if reference is None else ''}", flush=True)
 
     def _record(self, now, state, token, hands, label):
         t_ep, frame, chunk_t0 = -1.0, -1, math.nan

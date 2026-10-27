@@ -6,11 +6,14 @@ from gear_sonic.utils.inference.loop_episode import (
     ARM_LO,
     ARM_SPEED_TICKS,
     TAKE_HOLD_S,
+    TAKE_REFERENCE_MIN_SAMPLES,
     TOKEN_ECHO_TOL,
     EpisodeGuards,
     HandoverDetector,
     TakeDetector,
     max_arm_speed,
+    take_reference,
+    take_torque,
     token_echo_err,
 )
 
@@ -232,54 +235,87 @@ def _torque(sh, el):
     return {"motor_torque": tau}
 
 
-def _r27_hold(take_at=6.0, spike=True, settle=True, duration=12.0):
-    """(t since the hold began, message): session ready-A-r27's right-arm tau_est with the bottle on the palm
-    (sh -8.1, el -5.2, +-0.1), a 0.5 s grab spike in the loading direction, a 0.2 s ramp, then the unloaded arm
-    (sh -5.45, el -3.4)."""
+LOADED, UNLOADED, SPIKE = (-8.1, -5.2), (-5.45, -3.4), (-10.4, -6.0)  # session ready-A-r27 (N*m)
+
+
+def _r27(take_at=6.5, spike=True, settle=True, duration=12.0, episode=None):
+    """(t relative to the hold start, message) at 50 Hz: the episode's last 1.0 s (t < 0; loaded, +-0.1 noise,
+    or ``episode(t)`` -> (sh, el)), then the hold: loaded on the palm, a 0.5 s grab spike in the loading direction
+    ending at ``take_at``, a 0.2 s unloading ramp, then the unloaded arm."""
     out = []
-    for k in range(int(duration * 50)):
+    for k in range(-50, int(duration * 50)):
         t = k * 0.02
         noise = 0.1 * np.sin(7.3 * t)
-        sh, el = -8.1, -5.2
-        if spike and take_at <= t < take_at + 0.5:
-            sh, el = -10.4, -6.0
-        elif settle and take_at + 0.5 <= t:
-            w = min(1.0, (t - take_at - 0.5) / 0.2)
-            sh, el = -10.4 + w * (10.4 - 5.45), -6.0 + w * (6.0 - 3.4)
+        sh, el = LOADED if episode is None or t > 0 else episode(t)
+        if spike and take_at - 0.5 <= t < take_at:
+            sh, el = SPIKE
+        elif settle and take_at <= t:
+            w = min(1.0, (t - take_at) / 0.2)
+            sh, el = SPIKE[0] + w * (UNLOADED[0] - SPIKE[0]), SPIKE[1] + w * (UNLOADED[1] - SPIKE[1])
         out.append((t, _torque(sh + noise, el + noise)))
     return out
 
 
-def _first_take(samples, start=50.0):
-    d = TakeDetector(start)
-    return next((t for t, msg in samples if d.update(msg, start + t)), None)
+def _detector(samples, start=0.0):
+    """As LoopController: the reference from the episode's samples up to the hold start, then a TakeDetector."""
+    ring = [(t, arm) for t, msg in samples if t <= start and (arm := take_torque(msg)) is not None]
+    reference = take_reference(ring, start)[0]
+    return TakeDetector(start, reference)
+
+
+def _first_take(samples):
+    d = _detector(samples)
+    return next((t for t, msg in samples if t > 0 and d.update(msg, t)), None)
 
 
 def test_take_detector_fires_on_the_r27_unload():
-    t = _first_take(_r27_hold(take_at=6.0))
-    # rises past +1.5 / +1.0 during the 0.2 s ramp after the spike (6.5 s), then holds for TAKE_HOLD_S
+    t = _first_take(_r27(take_at=6.5))
+    # rises past +1.5 / +1.0 during the 0.2 s ramp after the spike, then holds for TAKE_HOLD_S
     assert t is not None and 6.5 + TAKE_HOLD_S <= t <= 6.7 + TAKE_HOLD_S + 0.02
 
 
-def test_take_detector_ignores_the_grab_spike_steady_holds_and_missing_torque():
-    assert _first_take(_r27_hold(take_at=6.0, settle=False)) is None  # spike, then back on the palm
-    assert _first_take(_r27_hold(spike=False, settle=False, duration=60.0)) is None  # steady hold
-    no_torque = [(t, {"body_q": np.zeros(29)}) for t, _ in _r27_hold()]
-    assert _first_take(no_torque) is None
-    short = [(t, {"motor_torque": np.zeros(28)}) for t, _ in _r27_hold()]
-    assert _first_take(short) is None
-    # torque only after the baseline window: no baseline, so never
-    late = [(t, msg if t > 2.0 else {}) for t, msg in _r27_hold()]
-    assert _first_take(late) is None
+def test_take_detector_fires_on_an_early_take():
+    # r28: the bottle taken +0.6 s into the hold; the reference comes from the episode's end, so no in-hold wait
+    t = _first_take(_r27(take_at=0.6))
+    assert t is not None and 1.7 <= t <= 1.9
+
+
+def test_take_detector_ignores_the_grab_spike_and_a_steady_hold():
+    assert _first_take(_r27(take_at=6.5, settle=False)) is None  # spike, then back on the palm
+    assert _first_take(_r27(spike=False, settle=False, duration=60.0)) is None  # steady loaded hold
     # only the shoulder unloads (the elbow stays loaded): not a take
-    one = [(t, _torque(msg["motor_torque"][22], -5.2)) for t, msg in _r27_hold()]
+    one = [(t, _torque(msg["motor_torque"][22], LOADED[1])) for t, msg in _r27()]
     assert _first_take(one) is None
 
 
+def test_take_detector_is_inert_without_a_steady_reference():
+    # the arm still moving at the episode's end: p90 - p10 over the last 0.5 s > TAKE_REFERENCE_SPREAD_NM
+    moving = _r27(episode=lambda t: (LOADED[0] + 3.0 * t, LOADED[1]))  # 3 N*m/s: ~1.2 N*m spread in 0.5 s
+    assert _detector(moving).inert and _first_take(moving) is None
+    # a single outlier tick does not make the reference unsteady (p90 - p10, not max - min)
+    blip = _r27(episode=lambda t: (LOADED[0] - 3.0, LOADED[1]) if abs(t + 0.2) < 0.01 else LOADED)
+    assert not _detector(blip).inert and _first_take(blip) is not None
+    # too few samples before the hold: inert
+    few = [(t, msg) for t, msg in _r27() if t > 0 or t >= -0.02 * (TAKE_REFERENCE_MIN_SAMPLES - 2)]
+    assert _detector(few).inert and _first_take(few) is None
+    # no torque at all, or a wrong length: inert / ignored
+    for bad in ({"body_q": np.zeros(29)}, {"motor_torque": np.zeros(28)}):
+        samples = [(t, bad) for t, _ in _r27()]
+        assert _detector(samples).inert and _first_take(samples) is None
+    # torque only in the hold (none in the episode): inert, even though the hold has a clear unload
+    late = [(t, msg if t > 0 else {}) for t, msg in _r27(take_at=3.0)]
+    assert _detector(late).inert and _first_take(late) is None
+
+
+def test_take_reference_is_the_median_of_the_last_half_second():
+    ring = [(-0.02 * k, np.array([-8.0 - 0.01 * k, -5.0])) for k in range(50)]  # 1 s, newest at t = 0
+    reference, median, spread, n = take_reference(ring, 0.0)
+    assert n == 26 and np.allclose(reference, median) and np.allclose(median, [-8.125, -5.0])
+    assert spread[0] == pytest.approx(0.2) and spread[1] == 0.0
+
+
 def test_take_detector_needs_a_continuous_second_and_skips_messages_without_torque():
-    d = TakeDetector(0.0)
-    for k in range(51, 101):  # baseline over +1..+2 s
-        assert not d.update(_torque(-8.0, -5.0), k * 0.02)
+    d = TakeDetector(0.0, np.array([-8.0, -5.0]))
     assert not d.update(_torque(-6.0, -3.5), 3.0)
     assert not d.update({}, 3.5)  # no torque: ignored, the timer keeps running
     assert not d.update(_torque(-6.0, -3.5), 3.98)
@@ -287,12 +323,4 @@ def test_take_detector_needs_a_continuous_second_and_skips_messages_without_torq
     assert not d.update(_torque(-6.0, -3.5), 4.02)
     assert not d.update(_torque(-6.0, -3.5), 5.0)
     assert d.update(_torque(-6.0, -3.5), 5.02) and d.update({}, 5.04)  # stays taken
-
-
-def test_take_detector_stays_inert_when_the_baseline_window_is_not_steady():
-    # the arm still settling (or an early grab) inside +1.0..+2.0 s: no trusted baseline, the operator decides
-    settling = [(t, _torque(-9.0 + 1.2 * min(t, 2.0) / 2.0 if t <= 2.0 else -7.9, -5.0)) for t, _ in _r27_hold()]
-    det = TakeDetector(0.0)
-    assert not any(det.update(msg, t) for t, msg in settling) and det.inert
-    steady = TakeDetector(0.0)  # the r27 replay's window is steady and still fires
-    assert any(steady.update(msg, t) for t, msg in _r27_hold()) and not steady.inert
+    assert np.allclose(d.rise, [2.0, 1.5])

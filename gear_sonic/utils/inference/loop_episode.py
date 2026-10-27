@@ -77,46 +77,57 @@ class HandoverDetector:
 # Bottle-taken detection in await_take from the deploy's right-arm tau_est (g1_debug "motor_torque", hardware
 # order). Session ready-A-r27 (3 holds): loaded on the palm sh_pitch -7.9..-8.3, elbow -5.0..-5.5 N*m (+-0.1);
 # after the take -5.4..-5.5 / -3.3..-3.5 (a rise toward zero of +2.4..+2.9 / +1.6..+2.2), after a ~0.5 s grab
-# spike the other way.
+# spike the other way. r28: people take the bottle as early as +0.6 s into the hold, so the reference is the
+# loaded arm at the episode's end, not a window inside the hold (R27). r27: reference-window p90-p10 <= 0.62,
+# loaded rise in the first 4 s of the hold <= 0.44 / 0.25.
 TAKE_MOTORS = (22, 25)  # right shoulder pitch, right elbow
-TAKE_BASELINE_S = (1.0, 2.0)  # baseline window, seconds into the hold
-TAKE_RISE_NM = (1.5, 1.0)  # rise toward zero (unload) over the baseline, per motor
+TAKE_RING_S = 1.0  # the episode's last torque samples kept for the reference
+TAKE_REFERENCE_S = 0.5  # reference = median over the last 0.5 s before the hold
+TAKE_REFERENCE_MIN_SAMPLES = 10
+TAKE_REFERENCE_SPREAD_NM = 1.0  # p90 - p10 per motor over the reference window; wider: inert (operator decides)
+TAKE_RISE_NM = (1.5, 1.0)  # rise toward zero (unload) over the reference, per motor
 TAKE_HOLD_S = 1.0  # both rises held continuously this long
-TAKE_BASELINE_SPREAD_NM = 0.5  # a baseline window spanning more than this (arm still settling, an early grab) is
-# not trusted: the detector stays inert for that hold and the operator's Enter decides. r27: settled within 0.2.
+
+
+def take_torque(msg):
+    """(shoulder pitch, elbow) tau_est from a g1_debug message, or None without a 29-value finite motor_torque."""
+    tau = np.asarray((msg or {}).get("motor_torque", []), np.float64).reshape(-1)
+    if tau.shape != (29,) or not np.isfinite(tau[list(TAKE_MOTORS)]).all():
+        return None
+    return tau[list(TAKE_MOTORS)]
+
+
+def take_reference(samples, start):
+    """(reference or None, median, p90 - p10 spread, n) from (t, torque) samples in the TAKE_REFERENCE_S before
+    ``start``. The reference is None (the detector inert) with fewer than TAKE_REFERENCE_MIN_SAMPLES samples or a
+    spread over TAKE_REFERENCE_SPREAD_NM on either motor."""
+    arms = np.array([arm for t, arm in samples if start - TAKE_REFERENCE_S <= t <= start])
+    if len(arms) < TAKE_REFERENCE_MIN_SAMPLES:
+        return None, None, None, len(arms)
+    median = np.median(arms, axis=0)
+    spread = np.percentile(arms, 90, axis=0) - np.percentile(arms, 10, axis=0)
+    return (None if (spread > TAKE_REFERENCE_SPREAD_NM).any() else median), median, spread, len(arms)
 
 
 class TakeDetector:
-    """True once the right arm unloads: shoulder pitch and elbow torque both rise TAKE_RISE_NM over their
-    baseline (the mean over TAKE_BASELINE_S of the hold that began at ``start``) for TAKE_HOLD_S. The grab spike
-    loads the arm (more negative), so it cannot trigger. Messages without a 29-value finite motor_torque are
-    ignored; without baseline samples, or with a baseline window spread over TAKE_BASELINE_SPREAD_NM, it never
-    triggers."""
+    """True once the right arm unloads: shoulder pitch and elbow torque both rise TAKE_RISE_NM over ``reference``
+    (the loaded arm before the hold, take_reference) for TAKE_HOLD_S, from the hold's first tick. The grab spike
+    loads the arm (more negative), so it cannot trigger. Messages without torque are ignored; reference None makes
+    it inert (never triggers)."""
 
-    def __init__(self, start: float):
-        self.start, self.samples, self.baseline, self.rising_since, self.taken = start, [], None, None, False
-        self.inert = False  # the baseline window was not steady: never trigger in this hold
+    def __init__(self, start: float, reference):
+        self.start, self.rising_since, self.taken, self.rise = start, None, False, None
+        self.reference = None if reference is None else np.asarray(reference, np.float64)
+        self.inert = self.reference is None
 
     def update(self, msg, now: float) -> bool:
         if self.taken or self.inert:
             return self.taken
-        tau = np.asarray((msg or {}).get("motor_torque", []), np.float64).reshape(-1)
-        if tau.shape != (29,) or not np.isfinite(tau[list(TAKE_MOTORS)]).all():
+        arm = take_torque(msg)
+        if arm is None:
             return False
-        arm, t = tau[list(TAKE_MOTORS)], now - self.start
-        if self.baseline is None:
-            if t < TAKE_BASELINE_S[0]:
-                return False
-            if t <= TAKE_BASELINE_S[1]:
-                self.samples.append(arm)
-                return False
-            if not self.samples:
-                return False
-            if (np.ptp(self.samples, axis=0) > TAKE_BASELINE_SPREAD_NM).any():
-                self.inert = True
-                return False
-            self.baseline = np.mean(self.samples, axis=0)
-        if (arm - self.baseline >= np.asarray(TAKE_RISE_NM)).all():
+        self.rise = arm - self.reference
+        if (self.rise >= np.asarray(TAKE_RISE_NM)).all():
             self.rising_since = now if self.rising_since is None else self.rising_since
             self.taken = now - self.rising_since >= TAKE_HOLD_S
         else:
