@@ -327,7 +327,7 @@ def test_r33_trial_3_settling_hold_then_take():  # R30, the harness trace of rea
     d = _detector(samples)
     assert d.episode_reference is None
     t = next((t for t, msg in samples if t > 0 and d.update(msg, t)), None)
-    assert d.steady_at is not None and 1.5 <= d.steady_at - d.start <= 2.6  # a steady second, mostly after settling
+    assert d.steady_at is not None and 1.5 <= d.steady_at - d.start <= 2.6  # mostly after settling
     assert t is not None and 5.1 + TAKE_HOLD_S <= t <= 5.6 + TAKE_HOLD_S
 
 

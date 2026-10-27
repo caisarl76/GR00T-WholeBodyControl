@@ -96,7 +96,7 @@ TAKE_HOLD0_S = 0.3  # the hold's first samples also form the reference (the less
 TAKE_HOLD_S = 1.0  # both rises held continuously this long
 # R30 (r33 trial 3): the arm still settling at the episode's end (spread 1.06) left the detector inert and a clean
 # +1.06 / +0.87 take at +5.1 s to the operator. Without an episode-end reference, the reference is the median of
-# the hold's first TAKE_STEADY_S window this steady (still holds: p90 - p10 ~0.06 N*m, r27 at 50 Hz). A full second,
+# the first TAKE_STEADY_S hold window this steady (still holds: p90 - p10 ~0.06 N*m, r27 at 50 Hz). A full second,
 # not 0.5 s: r33 trial 3 still moved -8.56 -> -7.12 over the hold's first second.
 TAKE_STEADY_SPREAD_NM = 0.3
 TAKE_STEADY_S = 1.0
