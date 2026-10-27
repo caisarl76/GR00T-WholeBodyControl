@@ -288,23 +288,55 @@ def test_take_detector_ignores_the_grab_spike_and_a_steady_hold():
     assert _first_take(one) is None
 
 
-def test_take_detector_is_inert_without_a_steady_reference():
+def test_without_a_steady_episode_end_the_reference_is_a_steady_hold_window():  # R30
     # the arm still moving at the episode's end: p90 - p10 over the last 0.5 s > TAKE_REFERENCE_SPREAD_NM
     moving = _r27(episode=lambda t: (LOADED[0] + 3.0 * t, LOADED[1]))  # 3 N*m/s: ~1.2 N*m spread in 0.5 s
-    assert _detector(moving).inert and _first_take(moving) is None
-    # a single outlier tick does not make the reference unsteady (p90 - p10, not max - min)
+    d = _detector(moving)
+    assert d.episode_reference is None
+    t = _first_take(moving)
+    assert t is not None and 6.5 + TAKE_HOLD_S <= t <= 6.7 + TAKE_HOLD_S + 0.02
+    # a single outlier tick does not make the episode reference unsteady (p90 - p10, not max - min)
     blip = _r27(episode=lambda t: (LOADED[0] - 3.0, LOADED[1]) if abs(t + 0.2) < 0.01 else LOADED)
-    assert not _detector(blip).inert and _first_take(blip) is not None
-    # too few samples before the hold: inert
+    assert _detector(blip).episode_reference is not None and _first_take(blip) is not None
+    # too few samples before the hold, or torque only in the hold: the steady loaded hold becomes the reference
     few = [(t, msg) for t, msg in _r27() if t > 0 or t >= -0.02 * (TAKE_REFERENCE_MIN_SAMPLES - 2)]
-    assert _detector(few).inert and _first_take(few) is None
-    # no torque at all, or a wrong length: inert / ignored
+    assert _detector(few).episode_reference is None and _first_take(few) is not None
+    late = [(t, msg if t > 0 else {}) for t, msg in _r27(take_at=3.0)]
+    t = _first_take(late)
+    assert t is not None and 3.0 + TAKE_HOLD_S <= t <= 3.2 + TAKE_HOLD_S + 0.02
+    # no torque at all, or a wrong length: never fires
     for bad in ({"body_q": np.zeros(29)}, {"motor_torque": np.zeros(28)}):
         samples = [(t, bad) for t, _ in _r27()]
-        assert _detector(samples).inert and _first_take(samples) is None
-    # torque only in the hold (none in the episode): inert, even though the hold has a clear unload
-    late = [(t, msg if t > 0 else {}) for t, msg in _r27(take_at=3.0)]
-    assert _detector(late).inert and _first_take(late) is None
+        assert _first_take(samples) is None
+
+
+def test_r33_trial_3_settling_hold_then_take():  # R30, the harness trace of ready-A-r33 trial 3 (N*m)
+    """Episode end unsteady (spread 1.06); the hold settles from -8.56/-5.81 to -7.06/-4.75 within 1 s, stays,
+    and the take at +5.1 s unloads to -6.06/-3.94 (+1.0/+0.8). Detected about 1 s later, never before the take."""
+    def arm(t):
+        if t < 0:
+            return (-8.6 + 2.0 * (t + 1.0) * (-1) ** int(t * 25), -5.8)  # moving: p90 - p10 well over 1.0
+        if t < 1.0:
+            w = t / 1.0
+            return (-8.56 + w * 1.5, -5.81 + w * 1.06)
+        if t < 5.1:
+            return (-7.06, -4.75)
+        w = min(1.0, (t - 5.1) / 0.5)
+        return (-7.06 + w * 1.0, -4.75 + w * 0.81)
+    samples = [(k * 0.02, _torque(*(np.array(arm(k * 0.02)) + 0.03 * np.sin(5.1 * k)))) for k in range(-50, 500)]
+    d = _detector(samples)
+    assert d.episode_reference is None
+    t = next((t for t, msg in samples if t > 0 and d.update(msg, t)), None)
+    assert d.steady_at is not None and 1.0 <= d.steady_at - d.start <= 1.6
+    assert t is not None and 5.1 + TAKE_HOLD_S <= t <= 5.6 + TAKE_HOLD_S
+
+
+def test_an_unsteady_hold_never_sets_a_reference():  # R30
+    # +-0.6 N*m through the episode end and the whole hold: no reference, never fires, even on an unload
+    samples = [(k * 0.02, _torque(-7.0 + (0.6 if k % 2 else -0.6) + (2.0 if k > 300 else 0.0), -4.8))
+               for k in range(-50, 500)]
+    d = _detector(samples)
+    assert next((t for t, msg in samples if t > 0 and d.update(msg, t)), None) is None and d.reference is None
 
 
 def test_take_reference_is_the_median_of_the_last_half_second():

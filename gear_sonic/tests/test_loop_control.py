@@ -801,10 +801,11 @@ def test_early_take_detected_from_the_episode_reference_and_logged(tmp_path, cap
 def test_take_detector_inert_without_episode_torque_and_ring_cleared(tmp_path, capsys):
     rig = Rig().ready()
     ended_trial(tmp_path, rig)  # no motor_torque during the episode
-    assert "[loop] take reference sh/el = none n 0 (inert)" in capsys.readouterr().out
-    rig.torque = arm_torque(-5.45, -3.4)
+    log = capsys.readouterr().out
+    assert "[loop] take reference sh/el = none n 0 (unsteady: waiting for a steady hold)" in log
+    rig.torque = arm_torque(-5.45, -3.4)  # R30: a steady hold becomes the reference; staying there is no take
     rig.step(150)
-    assert not rig.loop.take_detected
+    assert not rig.loop.take_detected and rig.loop._take.steady_at is not None
     rig.loop.freeze("operator stop", rig.now)
     assert not rig.loop._torque_ring
     rig.loop.resume(rig.now)

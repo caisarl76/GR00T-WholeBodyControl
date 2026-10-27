@@ -92,6 +92,10 @@ TAKE_REFERENCE_SPREAD_NM = 1.0  # p90 - p10 per motor over the reference window;
 TAKE_RISE_NM = (0.8, 0.45)  # rise toward zero (unload) over the reference, per motor
 TAKE_HOLD0_S = 0.3  # the hold's first samples also form the reference (the less loaded of the two, per motor)
 TAKE_HOLD_S = 1.0  # both rises held continuously this long
+# R30 (r33 trial 3): the arm still settling at the episode's end (spread 1.06) left the detector inert and a clean
+# +1.06 / +0.87 take at +5.1 s to the operator. Without an episode-end reference, the reference is the median of
+# the hold's first TAKE_REFERENCE_S window this steady (still holds: p90 - p10 ~0.06 N*m, r27 at 50 Hz).
+TAKE_STEADY_SPREAD_NM = 0.3
 
 
 def take_torque(msg):
@@ -118,20 +122,29 @@ class TakeDetector:
     """True once the right arm unloads: shoulder pitch and elbow torque both rise TAKE_RISE_NM over the reference
     for TAKE_HOLD_S. The reference is the less loaded (per motor) of ``reference`` (the episode's end,
     take_reference) and the median of the hold's first TAKE_HOLD0_S, so detection starts after TAKE_HOLD0_S. The
-    grab spike loads the arm (more negative), so it cannot trigger. Messages without torque are ignored; reference
-    None makes it inert (never triggers)."""
+    grab spike loads the arm (more negative), so it cannot trigger. Messages without torque are ignored. With
+    ``reference`` None (R30), the reference is the median of the first TAKE_REFERENCE_S hold window whose p90 - p10
+    is within TAKE_STEADY_SPREAD_NM on both motors; until then it cannot trigger."""
 
     def __init__(self, start: float, reference):
         self.start, self.rising_since, self.taken, self.rise = start, None, False, None
         self.episode_reference = None if reference is None else np.asarray(reference, np.float64)
         self.reference, self.hold0 = None, []  # the reference is set once the hold's first TAKE_HOLD0_S is in
-        self.inert = self.episode_reference is None
+        self.steady_at = None  # R30: when the reference came from a steady hold window
 
     def update(self, msg, now: float) -> bool:
-        if self.taken or self.inert:
-            return self.taken
+        if self.taken:
+            return True
         arm = take_torque(msg)
         if arm is None:
+            return False
+        if self.reference is None and self.episode_reference is None:  # R30
+            self.hold0 = [(t, a) for t, a in self.hold0 if t >= now - TAKE_REFERENCE_S] + [(now, arm)]
+            arms = np.array([a for _, a in self.hold0])
+            spread = np.percentile(arms, 90, axis=0) - np.percentile(arms, 10, axis=0)
+            if (now - self.start >= TAKE_REFERENCE_S and len(arms) >= TAKE_REFERENCE_MIN_SAMPLES
+                    and (spread <= TAKE_STEADY_SPREAD_NM).all()):
+                self.reference, self.steady_at = np.median(arms, axis=0), now
             return False
         if self.reference is None:
             if now - self.start < TAKE_HOLD0_S:

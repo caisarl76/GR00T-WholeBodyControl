@@ -299,14 +299,16 @@ class LoopController:
             self._next_replan = now + REPLAN_S
 
     def _start_take_detector(self, now):
-        """R27: the reference is the loaded arm just before the hold (the episode's end); inert if unsteady."""
+        """R27: the reference is the loaded arm just before the hold (the episode's end); if that is unsteady, the
+        detector takes a steady hold window instead (R30)."""
         reference, median, spread, n = take_reference(self._torque_ring, now)
         self._take = TakeDetector(now, reference)
         self._take_before, self._take_at, self._hold_trace_at = median, None, now
         self._hold_ring.clear()
         values = ("none" if median is None
                   else f"{median[0]:.2f}/{median[1]:.2f} spread {spread[0]:.2f}/{spread[1]:.2f}")
-        print(f"[loop] take reference sh/el = {values} n {n}{' (inert)' if reference is None else ''}", flush=True)
+        print(f"[loop] take reference sh/el = {values} n {n}"
+              f"{' (unsteady: waiting for a steady hold)' if reference is None else ''}", flush=True)
 
     def _take_summary(self, now, how):
         """One log line per hold: the loaded arm before (the reference median), the hold's last 0.5 s, and their
@@ -319,6 +321,8 @@ class LoopController:
         diff = None if after is None or before is None else after - before
         taken_at = None if self._take is None or self._take_at is None else self._take_at - self._take.start
         detected = "no" if taken_at is None else f"at +{taken_at:.2f} s"
+        if self._take is not None and self._take.steady_at is not None:
+            detected += f" (reference from the steady hold at +{self._take.steady_at - self._take.start:.1f} s)"
         print(f"[loop] take summary: before sh/el = {fmt(before)} | hold end = {fmt(after)} | "
               f"diff = {fmt(diff)} | detected {detected} | hold {now - self._take.start:.1f} s, ended by {how}",
               flush=True)
