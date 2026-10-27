@@ -4434,7 +4434,7 @@ int main(int argc, char const* argv[]) {
   std::string plannerFile = "";
 
   // Parse optional arguments
-  bool disableCrcCheck = false;\
+  bool disableCrcCheck = false;
   int ddsDomain = 0;
   std::string obsConfigPath = "";
   std::string encoderFile = "";

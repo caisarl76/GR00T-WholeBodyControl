@@ -90,10 +90,10 @@ TAKE_RING_S = 1.0  # the hold's last torque samples kept for the take summary
 TAKE_EPISODE_RING_S = 3.0  # the episode's last samples: the reference (last 0.5 s) and the episode-end log line
 TAKE_REFERENCE_S = 0.5  # reference = median over the last 0.5 s before the hold
 TAKE_REFERENCE_MIN_SAMPLES = 10
-TAKE_REFERENCE_SPREAD_NM = 1.0  # p90 - p10 per motor over the reference window; wider: inert (operator decides)
+TAKE_REFERENCE_SPREAD_NM = 1.0  # p90 - p10 of shoulder/elbow in the reference window; wider: no episode reference
 TAKE_RISE_NM = (0.8, 0.45)  # rise toward zero (unload) over the reference, per motor
 TAKE_HOLD0_S = 0.3  # the hold's first samples also form the reference (the less loaded of the two, per motor)
-TAKE_HOLD_S = 1.0  # both rises held continuously this long
+TAKE_HOLD_S = 1.0  # one rule (shoulder and elbow, or wrist yaw) held continuously this long
 # R30 (r33 trial 3): the arm still settling at the episode's end (spread 1.06) left the detector inert and a clean
 # +1.06 / +0.87 take at +5.1 s to the operator. Without an episode-end reference, the reference is the median of
 # the first TAKE_STEADY_S hold window this steady (still holds: p90 - p10 ~0.06 N*m, r27 at 50 Hz). A full second,
@@ -122,14 +122,15 @@ def take_torque(msg):
 
 def take_reference(samples, start):
     """(reference or None, median, p90 - p10 spread, n) from (t, torque) samples in the TAKE_REFERENCE_S before
-    ``start``. The reference is None (the detector inert) with fewer than TAKE_REFERENCE_MIN_SAMPLES samples or a
-    spread over TAKE_REFERENCE_SPREAD_NM on either motor."""
+    ``start``. The reference is None (TakeDetector then waits for a steady hold, R30) with fewer than
+    TAKE_REFERENCE_MIN_SAMPLES samples or a spread over TAKE_REFERENCE_SPREAD_NM on the shoulder or elbow (R27's
+    check; the wrist yaw swings as the hand opens at the release, r36 trial 8: 0.63 N*m in 1 s)."""
     arms = np.array([arm for t, arm in samples if start - TAKE_REFERENCE_S <= t <= start])
     if len(arms) < TAKE_REFERENCE_MIN_SAMPLES:
         return None, None, None, len(arms)
     median = np.median(arms, axis=0)
     spread = np.percentile(arms, 90, axis=0) - np.percentile(arms, 10, axis=0)
-    return (None if (spread > TAKE_REFERENCE_SPREAD_NM).any() else median), median, spread, len(arms)
+    return (None if (spread[:2] > TAKE_REFERENCE_SPREAD_NM).any() else median), median, spread, len(arms)
 
 
 class TakeDetector:
@@ -142,7 +143,8 @@ class TakeDetector:
     whose p90 - p10 is within TAKE_STEADY_SPREAD_NM on every motor; until then it cannot trigger."""
 
     def __init__(self, start: float, reference):
-        self.start, self.rising_since, self.taken, self.rise = start, None, False, None
+        self.start, self.taken, self.rise = start, False, None
+        self.rising_since = [None, None]  # per rule: shoulder and elbow, wrist yaw (each must hold TAKE_HOLD_S)
         self.episode_reference = None if reference is None else np.asarray(reference, np.float64)
         self.reference, self.hold0 = None, []  # the reference is set once the hold's first TAKE_HOLD0_S is in
         self.steady_at = None  # R30: when the reference came from a steady hold window
@@ -156,7 +158,7 @@ class TakeDetector:
         yaw = np.array([a for _, a in self._recent])
         self.hand_empty = bool(now - self.start >= TAKE_STEADY_S and len(yaw) >= TAKE_REFERENCE_MIN_SAMPLES
                                and np.percentile(yaw, 90) - np.percentile(yaw, 10) <= TAKE_STEADY_SPREAD_NM
-                               and np.median(yaw) <= TAKE_EMPTY_WRIST_NM)
+                               and abs(np.median(yaw)) <= TAKE_EMPTY_WRIST_NM)  # either sign: a bottle loads it
         if self.taken:
             return True
         if self.reference is None and self.episode_reference is None:  # R30
@@ -175,11 +177,10 @@ class TakeDetector:
             ref, hold0 = TAKE_UNLOAD_SIGN * self.episode_reference, TAKE_UNLOAD_SIGN * hold0
             self.reference = TAKE_UNLOAD_SIGN * np.maximum(ref, hold0)
         self.rise = TAKE_UNLOAD_SIGN * (arm - self.reference)
-        if (self.rise[:2] >= np.asarray(TAKE_RISE_NM)).all() or self.rise[2] >= TAKE_WRIST_DROP_NM:
-            self.rising_since = now if self.rising_since is None else self.rising_since
-            self.taken = now - self.rising_since >= TAKE_HOLD_S
-        else:
-            self.rising_since = None
+        rules = ((self.rise[:2] >= np.asarray(TAKE_RISE_NM)).all(), self.rise[2] >= TAKE_WRIST_DROP_NM)
+        for k, met in enumerate(rules):
+            self.rising_since[k] = (now if self.rising_since[k] is None else self.rising_since[k]) if met else None
+        self.taken = any(t is not None and now - t >= TAKE_HOLD_S for t in self.rising_since)
         return self.taken
 
 

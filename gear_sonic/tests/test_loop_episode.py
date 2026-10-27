@@ -443,3 +443,30 @@ def test_hand_empty_reports_a_steady_unloaded_wrist():  # R32
     # messages without torque leave it unchanged
     d = TakeDetector(0.0, None)
     assert not d.update({}, 1.0) and d.hand_empty is False
+
+
+def test_each_rule_must_hold_its_own_second():  # review: one shared timer let 0.6 s + 0.4 s fire
+    d = TakeDetector(0.0, np.array([-7.0, -4.8, 1.3]))
+    t = 0.3
+    for k in range(15):  # the hold's first 0.3 s, loaded: reference -7.0/-4.8/+1.3
+        d.update(_torque(-7.0, -4.8, 1.3), k * 0.02)
+    for _ in range(5):  # alternate: the wrist rule for 0.6 s, then the shoulder/elbow rule for 0.4 s
+        for _k in range(30):
+            assert not d.update(_torque(-7.0, -4.8, 0.85), t)
+            t += 0.02
+        for _k in range(20):
+            assert not d.update(_torque(-6.0, -4.2, 1.3), t)
+            t += 0.02
+    for _k in range(52):  # the wrist rule alone for a full second fires
+        fired = d.update(_torque(-7.0, -4.8, 0.85), t)
+        t += 0.02
+    assert fired
+
+
+def test_hand_empty_ignores_the_sign_and_the_reference_ignores_wrist_spread():  # review
+    d = TakeDetector(0.0, np.array([-7.0, -4.8, -1.3]))
+    for k in range(100):  # a pose where the bottle loads the wrist yaw negative
+        d.update(_torque(-7.0, -4.8, -0.8), k * 0.02)
+    assert d.hand_empty is False
+    ring = [(-0.02 * k, np.array([-8.0, -5.0, 1.3 if k % 2 else 0.1])) for k in range(30)]  # wrist swinging 1.2
+    assert take_reference(ring, 0.0)[0] is not None

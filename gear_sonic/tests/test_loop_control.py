@@ -1,6 +1,7 @@
 import itertools
 import json
 import os
+import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -752,12 +753,13 @@ def test_take_detected_in_await_take_and_reset_between_trials(tmp_path):
         session, at = str(tmp_path / "s"), 0.2 + 0.1 * trial  # request ids derive from (method, now)
         assert request(c, "loop_trial", {"trial": trial, "session_dir": session}, now=at)["error"] is None
         rig.until("episode")
-        assert c.status(at)["take_detected"] is None
+        assert c.status(at)["take_detected"] is None and c.status(at)["take_hand_empty"] is None
         rig.rows = lambda epoch: None
         rig.until("await_take", limit=80)
         rig.rows = lambda epoch: chunk((epoch - 100) * 0.01)
-        rig.step(150)  # 3 s of the loaded hold: baseline over +1..+2 s, no take
+        rig.step(150)  # 3 s of the loaded hold (reference from the episode's end), no take
         assert rig.loop.take_detected is False and c.status(at)["take_detected"] is False
+        assert c.status(at)["take_hand_empty"] is rig.loop.take_hand_empty is True  # R32: this rig's wrist is 0
         rig.torque = arm_torque(-5.45, -3.4)  # taken: the arm unloads
         rig.step(49)
         assert not rig.loop.take_detected
@@ -766,6 +768,7 @@ def test_take_detected_in_await_take_and_reset_between_trials(tmp_path):
         assert (rig.loop.phase, rig.loop.stage) == ("LOOP_HOLD", "await_take")  # it only reports; the runner acts
         assert request(c, "loop_to_ready", now=at)["error"] is None
         assert rig.loop.take_detected is False and c.status(at)["take_detected"] is None
+        assert c.status(at)["take_hand_empty"] is None  # outside await_take
         rig.torque = arm_torque(-8.1, -5.2)  # the next bottle
         rig.step(50)
         assert rig.loop.stage == "ready"
@@ -788,7 +791,8 @@ def test_early_take_detected_from_the_episode_reference_and_logged(tmp_path, cap
     rig.torque = arm_torque(-8.1, -5.2)  # loaded through the episode's end
     ended_trial(tmp_path, rig)
     log = capsys.readouterr().out
-    assert "[loop] take reference sh/el = -8.10/-5.20 spread 0.00/0.00 n 2" in log and "(inert)" not in log
+    assert re.search(r"\[loop\] take reference sh/el = -8\.10/-5\.20 spread 0\.00/0\.00 n \d+ \| wrist yaw", log)
+    assert "(unsteady" not in log
     rig.step(25)  # still loaded for the hold's first 0.5 s (R28 also takes its first 0.3 s as the reference)
     rig.torque = arm_torque(-5.45, -3.4)  # taken early (r28: +0.6..1.6 s into the hold)
     rig.step(50)
@@ -832,3 +836,16 @@ def test_take_summary_logs_before_and_after_torque_per_hold(tmp_path, capsys):
     assert ("[loop] take summary: before sh/el = -6.30/-4.30 | hold end = -5.70/-4.00 | diff = +0.60/+0.30 | "
             "detected no |") in log and "ended by loop_to_ready | wrist yaw +0.00 -> +0.00 (+0.00)" in log
     assert "[loop] episode end torque sh/el/wrist yaw, 0.5 s medians from -3 s: " in log  # R31 diagnostics
+
+
+def test_a_freeze_during_the_move_to_ready_resumes_to_ready(tmp_path):  # review: the TRIAL_STAGES resume branch
+    rig = Rig().ready()
+    ended_trial(tmp_path, rig)
+    rig.loop.to_ready(rig.now)
+    rig.step(5)
+    assert rig.loop.stage == "to_ready"
+    rig.loop.freeze("operator stop", rig.now)
+    assert (rig.loop.phase, rig.loop.frozen_stage) == ("LOOP_FROZEN", "to_ready")
+    rig.loop.resume(rig.now)
+    rig.until("ready")
+    assert rig.loop.phase == "LOOP_HOLD" and not rig.loop.take_detected
