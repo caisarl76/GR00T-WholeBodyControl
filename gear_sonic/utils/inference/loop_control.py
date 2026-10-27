@@ -228,7 +228,10 @@ class LoopController:
                     self._hold_ring.popleft()
                 if now >= self._hold_trace_at:
                     t_hold = now - self._take.start
-                    print(f"[loop] hold +{t_hold:5.1f} s torque sh/el = {arm[0]:+.2f}/{arm[1]:+.2f}", flush=True)
+                    rest = np.asarray(feedback["motor_torque"], np.float64)[[23, 24, 26, 27, 28]]
+                    print(f"[loop] hold +{t_hold:5.1f} s torque sh/el = {arm[0]:+.2f}/{arm[1]:+.2f} | "
+                          f"sh roll/yaw = {rest[0]:+.2f}/{rest[1]:+.2f} | wrist r/p/y = "
+                          f"{rest[2]:+.2f}/{rest[3]:+.2f}/{rest[4]:+.2f}", flush=True)
                     self._hold_trace_at = now + 0.5
         if self.stage == "await_take" and not self._take.taken and self._take.update(feedback, now):
             sh, el = self._take.rise

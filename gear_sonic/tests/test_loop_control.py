@@ -827,6 +827,6 @@ def test_take_summary_logs_before_and_after_torque_per_hold(tmp_path, capsys):
     assert not rig.loop.take_detected
     rig.loop.to_ready(rig.now)  # the operator's Enter
     log = capsys.readouterr().out
-    assert "[loop] hold +  0.0 s torque sh/el =" in log
+    assert "[loop] hold +  0.0 s torque sh/el = -6.30/-4.30 | sh roll/yaw = +0.00/+0.00 | wrist r/p/y = " in log
     assert ("[loop] take summary: before sh/el = -6.30/-4.30 | hold end = -5.70/-4.00 | diff = +0.60/+0.30 | "
             "detected no |") in log and "ended by loop_to_ready" in log
