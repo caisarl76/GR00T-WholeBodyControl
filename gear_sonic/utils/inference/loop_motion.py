@@ -6,7 +6,9 @@ from pathlib import Path
 
 import numpy as np
 
-READY_POSE_PATH = Path(__file__).resolve().parents[2] / "data/handover/ready_pose_261020_ep76.npz"
+# Ready pose A (chosen on the robot 2026-10-26): lerobot's ep76 pose with the right shoulder yaw -0.40 rad, so the
+# right gripper stays out of the head camera's view for the re-arm check. ep76 is kept beside it.
+READY_POSE_PATH = Path(__file__).resolve().parents[2] / "data/handover/ready_pose_261026_candA.npz"
 TOKEN_ABS_MAX = 1.25
 _SHAPES = dict(
     token=(64,),

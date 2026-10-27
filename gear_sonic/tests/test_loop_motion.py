@@ -26,6 +26,16 @@ def test_load_ready_pose_shapes_and_sha():
     assert hashlib.sha256(READY_POSE_PATH.read_bytes()).hexdigest() == meta["sha256"]
 
 
+def test_ready_pose_a_is_ep76_with_the_right_shoulder_yawed_out():
+    a, ep76 = load_ready_pose(), load_ready_pose(READY_POSE_PATH.parent / "ready_pose_261020_ep76.npz")
+    assert READY_POSE_PATH.name == "ready_pose_261026_candA.npz"
+    diff = a.state - ep76.state
+    assert np.isclose(diff[9], -0.40) and np.allclose(np.delete(diff, 9), 0.0)  # state 9: right shoulder yaw
+    for name in ("hands", "raise_tokens", "raise_hands", "lower_tokens", "lower_hands"):
+        assert np.array_equal(getattr(a, name), getattr(ep76, name))
+    assert not np.array_equal(a.token, ep76.token)  # the SONIC encoding of the new static pose
+
+
 def test_load_ready_pose_rejects_bad_shapes(tmp_path):
     load_ready_pose(_save(tmp_path, _good()))
     bad = _good()

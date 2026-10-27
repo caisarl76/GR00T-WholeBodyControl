@@ -1,0 +1,25 @@
+{
+  "source": "VoLoAgent docs/artifacts/g1_ready_pose_candidates_20261026/build_candidates.py",
+  "voloagent_commit": "c28e81b",
+  "base": "ready_pose_261020_ep76.npz (lerobot a6e267c6)",
+  "sha256": "f5312f385ecbe4ec4679f40d08c9f6d631c691cba89fe398dece542b4ea640ee",
+  "right_arm_offsets_rad": {
+    "shoulder_yaw": -0.4
+  },
+  "why": "the right gripper out of the head-camera view, so the VLM re-arm check sees the bottle on the case (with ep76 the gripper read as a hand at the bottle)",
+  "validated_on_robot": "sessions ready-A to ready-A-r40, 2026-10-26/27",
+  "args": {
+    "meta": {
+      "dataset": "/mnt/data/jihun/datasets/G1_WBT_GR00T/handover_bottle_merged_sonic78_50hz_261020",
+      "episode": 76,
+      "frame": 11,
+      "arm_speed": 0.0,
+      "candidate": "A",
+      "right_arm_offsets_rad": {
+        "shoulder_yaw": -0.4
+      },
+      "token": "static SONIC encoding of the offset state (sonic_targets.joint_chunk_to_sonic, 60 x 50 Hz hold)",
+      "token_dist_from_ep76_static_encoding": 0.125
+    }
+  }
+}
