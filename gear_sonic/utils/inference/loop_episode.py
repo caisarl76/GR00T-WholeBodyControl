@@ -84,8 +84,10 @@ class HandoverDetector:
 # carries less), while the hold could sit +0.6 above the episode-end reference as the arm settled into it. So the
 # reference is the less-loaded of the episode end and the hold's first TAKE_HOLD0_S, and the rise threshold is
 # lower: worst loaded drift on that reference 0.44 / 0.25 (r27), weakest real take 1.00 / 0.81 (r30 trial 2).
-TAKE_MOTORS = (22, 25)  # right shoulder pitch, right elbow
-TAKE_RING_S = 1.0  # the episode's last torque samples kept for the reference
+TAKE_MOTORS = (22, 25, 28)  # right shoulder pitch, right elbow, right wrist yaw (R31)
+TAKE_UNLOAD_SIGN = np.array([1.0, 1.0, -1.0])  # the bottle loads shoulder/elbow negative, the wrist yaw positive
+TAKE_RING_S = 1.0  # the hold's last torque samples kept for the take summary
+TAKE_EPISODE_RING_S = 3.0  # the episode's last samples: the reference (last 0.5 s) and the episode-end log line
 TAKE_REFERENCE_S = 0.5  # reference = median over the last 0.5 s before the hold
 TAKE_REFERENCE_MIN_SAMPLES = 10
 TAKE_REFERENCE_SPREAD_NM = 1.0  # p90 - p10 per motor over the reference window; wider: inert (operator decides)
@@ -94,12 +96,19 @@ TAKE_HOLD0_S = 0.3  # the hold's first samples also form the reference (the less
 TAKE_HOLD_S = 1.0  # both rises held continuously this long
 # R30 (r33 trial 3): the arm still settling at the episode's end (spread 1.06) left the detector inert and a clean
 # +1.06 / +0.87 take at +5.1 s to the operator. Without an episode-end reference, the reference is the median of
-# the hold's first TAKE_REFERENCE_S window this steady (still holds: p90 - p10 ~0.06 N*m, r27 at 50 Hz).
+# the hold's first TAKE_STEADY_S window this steady (still holds: p90 - p10 ~0.06 N*m, r27 at 50 Hz). A full second,
+# not 0.5 s: r33 trial 3 still moved -8.56 -> -7.12 over the hold's first second.
 TAKE_STEADY_SPREAD_NM = 0.3
+TAKE_STEADY_S = 1.0
+# R31 (r34): two takes moved shoulder/elbow only +0.44/+0.31 and +0.25/+0.20, while the wrist yaw dropped 0.65 and
+# 0.46. Wrist yaw at real takes r27-r34: -0.42 to -1.04; with the bottle resting on the palm it holds +-0.05;
+# a person's hand on the bottle (r33 trial 7, bottle still on the palm) dropped it 0.31. Either rule counts.
+TAKE_WRIST_DROP_NM = 0.35
 
 
 def take_torque(msg):
-    """(shoulder pitch, elbow) tau_est from a g1_debug message, or None without a 29-value finite motor_torque."""
+    """(shoulder pitch, elbow, wrist yaw) tau_est from a g1_debug message, or None without a 29-value finite
+    motor_torque."""
     tau = np.asarray((msg or {}).get("motor_torque", []), np.float64).reshape(-1)
     if tau.shape != (29,) or not np.isfinite(tau[list(TAKE_MOTORS)]).all():
         return None
@@ -119,12 +128,13 @@ def take_reference(samples, start):
 
 
 class TakeDetector:
-    """True once the right arm unloads: shoulder pitch and elbow torque both rise TAKE_RISE_NM over the reference
-    for TAKE_HOLD_S. The reference is the less loaded (per motor) of ``reference`` (the episode's end,
-    take_reference) and the median of the hold's first TAKE_HOLD0_S, so detection starts after TAKE_HOLD0_S. The
-    grab spike loads the arm (more negative), so it cannot trigger. Messages without torque are ignored. With
-    ``reference`` None (R30), the reference is the median of the first TAKE_REFERENCE_S hold window whose p90 - p10
-    is within TAKE_STEADY_SPREAD_NM on both motors; until then it cannot trigger."""
+    """True once the right arm unloads for TAKE_HOLD_S: shoulder pitch and elbow torque both rise TAKE_RISE_NM over
+    the reference, or the wrist yaw drops TAKE_WRIST_DROP_NM below it (R31). ``rise`` is the unload per motor (the
+    wrist yaw drop as a positive number). The reference is the less loaded (per motor) of ``reference`` (the
+    episode's end, take_reference) and the median of the hold's first TAKE_HOLD0_S, so detection starts after
+    TAKE_HOLD0_S. The grab spike loads the arm (more negative), so it cannot trigger. Messages without torque are
+    ignored. With ``reference`` None (R30), the reference is the median of the first TAKE_STEADY_S hold window
+    whose p90 - p10 is within TAKE_STEADY_SPREAD_NM on every motor; until then it cannot trigger."""
 
     def __init__(self, start: float, reference):
         self.start, self.rising_since, self.taken, self.rise = start, None, False, None
@@ -139,10 +149,10 @@ class TakeDetector:
         if arm is None:
             return False
         if self.reference is None and self.episode_reference is None:  # R30
-            self.hold0 = [(t, a) for t, a in self.hold0 if t >= now - TAKE_REFERENCE_S] + [(now, arm)]
+            self.hold0 = [(t, a) for t, a in self.hold0 if t >= now - TAKE_STEADY_S] + [(now, arm)]
             arms = np.array([a for _, a in self.hold0])
             spread = np.percentile(arms, 90, axis=0) - np.percentile(arms, 10, axis=0)
-            if (now - self.start >= TAKE_REFERENCE_S and len(arms) >= TAKE_REFERENCE_MIN_SAMPLES
+            if (now - self.start >= TAKE_STEADY_S and len(arms) >= TAKE_REFERENCE_MIN_SAMPLES
                     and (spread <= TAKE_STEADY_SPREAD_NM).all()):
                 self.reference, self.steady_at = np.median(arms, axis=0), now
             return False
@@ -151,9 +161,10 @@ class TakeDetector:
                 self.hold0.append(arm)
                 return False
             hold0 = np.median(self.hold0, axis=0) if self.hold0 else self.episode_reference
-            self.reference = np.maximum(self.episode_reference, hold0)
-        self.rise = arm - self.reference
-        if (self.rise >= np.asarray(TAKE_RISE_NM)).all():
+            ref, hold0 = TAKE_UNLOAD_SIGN * self.episode_reference, TAKE_UNLOAD_SIGN * hold0
+            self.reference = TAKE_UNLOAD_SIGN * np.maximum(ref, hold0)
+        self.rise = TAKE_UNLOAD_SIGN * (arm - self.reference)
+        if (self.rise[:2] >= np.asarray(TAKE_RISE_NM)).all() or self.rise[2] >= TAKE_WRIST_DROP_NM:
             self.rising_since = now if self.rising_since is None else self.rising_since
             self.taken = now - self.rising_since >= TAKE_HOLD_S
         else:

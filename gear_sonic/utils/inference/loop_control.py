@@ -23,6 +23,7 @@ import numpy as np
 from gear_sonic.utils.inference.harness_control import ControlError
 from gear_sonic.utils.inference.lerobot_sonic_policy import lerobot_state
 from gear_sonic.utils.inference.loop_episode import (
+    TAKE_EPISODE_RING_S,
     TAKE_RING_S,
     EpisodeGuards,
     HandoverDetector,
@@ -60,7 +61,7 @@ class LoopController:
         self._outstanding = self._pending = None  # requested epoch; accepted (rows, t0) for the next tick
         self._requested_at = None  # now at the outstanding request: a replanned chunk's t0 (lerobot slot_t)
         self._take = None  # TakeDetector while in await_take (R26)
-        self._torque_ring = deque()  # (now, shoulder pitch, elbow torque) over the episode's last TAKE_RING_S
+        self._torque_ring = deque()  # (now, take_torque) over the episode's last TAKE_EPISODE_RING_S
         self._hold_ring = deque()  # the same over the hold's last TAKE_RING_S, for the take summary (diagnostics)
         self._take_before = self._take_at = None  # the reference median (also when inert); when it fired
         self._hold_trace_at = 0.0  # next hold-trace log line
@@ -234,15 +235,15 @@ class LoopController:
                           f"{rest[2]:+.2f}/{rest[3]:+.2f}/{rest[4]:+.2f}", flush=True)
                     self._hold_trace_at = now + 0.5
         if self.stage == "await_take" and not self._take.taken and self._take.update(feedback, now):
-            sh, el = self._take.rise
+            sh, el, wy = self._take.rise
             self._take_at = now
-            print(f"[loop] take detected: rise sh/el = {sh:+.2f}/{el:+.2f} after {now - self._take.start:.2f} s",
-                  flush=True)
+            print(f"[loop] take detected: rise sh/el = {sh:+.2f}/{el:+.2f} after {now - self._take.start:.2f} s"
+                  f" (wrist yaw drop {wy:+.2f})", flush=True)
         if self.stage == "episode":
             arm = take_torque(feedback)
             if arm is not None:
                 self._torque_ring.append((now, arm))
-            while self._torque_ring and self._torque_ring[0][0] < now - TAKE_RING_S:
+            while self._torque_ring and self._torque_ring[0][0] < now - TAKE_EPISODE_RING_S:
                 self._torque_ring.popleft()
             self._episode_step(now, feedback, state, feedback_age_s, camera_age_s)
         if self.stage == "first_chunk" and not self.commander.busy:  # lerobot wait_tick: the rest pose, slewed
@@ -307,8 +308,15 @@ class LoopController:
         self._hold_ring.clear()
         values = ("none" if median is None
                   else f"{median[0]:.2f}/{median[1]:.2f} spread {spread[0]:.2f}/{spread[1]:.2f}")
-        print(f"[loop] take reference sh/el = {values} n {n}"
+        wrist = "" if median is None else f" | wrist yaw {median[2]:+.2f} spread {spread[2]:.2f}"
+        print(f"[loop] take reference sh/el = {values} n {n}{wrist}"
               f"{' (unsteady: waiting for a steady hold)' if reference is None else ''}", flush=True)
+        # R31 diagnostics: was the bottle still loading the arm at the release (1 s before the episode's end)?
+        windows = [[a for t, a in self._torque_ring if now - k - 0.5 < t <= now - k]
+                   for k in (2.5, 2.0, 1.5, 1.0, 0.5, 0.0)]
+        medians = ["none" if not w else "{:+.2f}/{:+.2f}/{:+.2f}".format(*np.median(w, axis=0)) for w in windows]
+        print("[loop] episode end torque sh/el/wrist yaw, 0.5 s medians from -3 s: " + " | ".join(medians),
+              flush=True)
 
     def _take_summary(self, now, how):
         """One log line per hold: the loaded arm before (the reference median), the hold's last 0.5 s, and their
@@ -323,9 +331,10 @@ class LoopController:
         detected = "no" if taken_at is None else f"at +{taken_at:.2f} s"
         if self._take is not None and self._take.steady_at is not None:
             detected += f" (reference from the steady hold at +{self._take.steady_at - self._take.start:.1f} s)"
+        wrist = "" if diff is None else f" | wrist yaw {before[2]:+.2f} -> {after[2]:+.2f} ({diff[2]:+.2f})"
         print(f"[loop] take summary: before sh/el = {fmt(before)} | hold end = {fmt(after)} | "
-              f"diff = {fmt(diff)} | detected {detected} | hold {now - self._take.start:.1f} s, ended by {how}",
-              flush=True)
+              f"diff = {fmt(diff)} | detected {detected} | hold {now - self._take.start:.1f} s, ended by {how}"
+              f"{wrist}", flush=True)
 
     def _record(self, now, state, token, hands, label):
         t_ep, frame, chunk_t0 = -1.0, -1, math.nan

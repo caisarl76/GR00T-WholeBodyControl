@@ -830,4 +830,5 @@ def test_take_summary_logs_before_and_after_torque_per_hold(tmp_path, capsys):
     log = capsys.readouterr().out
     assert "[loop] hold +  0.0 s torque sh/el = -6.30/-4.30 | sh roll/yaw = +0.00/+0.00 | wrist r/p/y = " in log
     assert ("[loop] take summary: before sh/el = -6.30/-4.30 | hold end = -5.70/-4.00 | diff = +0.60/+0.30 | "
-            "detected no |") in log and "ended by loop_to_ready" in log
+            "detected no |") in log and "ended by loop_to_ready | wrist yaw +0.00 -> +0.00 (+0.00)" in log
+    assert "[loop] episode end torque sh/el/wrist yaw, 0.5 s medians from -3 s: " in log  # R31 diagnostics

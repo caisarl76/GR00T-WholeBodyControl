@@ -229,9 +229,9 @@ def test_blend_in_history_feeds_the_first_episode_check():
     assert _check(g, 130.9) is None and _check(g, 131.0) == ("end", "completed")  # the cap counts from start()
 
 
-def _torque(sh, el):
+def _torque(sh, el, wy=0.0):
     tau = np.zeros(29)
-    tau[22], tau[25] = sh, el  # right shoulder pitch, right elbow (hardware order)
+    tau[22], tau[25], tau[28] = sh, el, wy  # right shoulder pitch, elbow, wrist yaw (hardware order)
     return {"motor_torque": tau}
 
 
@@ -327,7 +327,7 @@ def test_r33_trial_3_settling_hold_then_take():  # R30, the harness trace of rea
     d = _detector(samples)
     assert d.episode_reference is None
     t = next((t for t, msg in samples if t > 0 and d.update(msg, t)), None)
-    assert d.steady_at is not None and 1.0 <= d.steady_at - d.start <= 1.6
+    assert d.steady_at is not None and 1.5 <= d.steady_at - d.start <= 2.6  # a steady second, mostly after settling
     assert t is not None and 5.1 + TAKE_HOLD_S <= t <= 5.6 + TAKE_HOLD_S
 
 
@@ -347,7 +347,7 @@ def test_take_reference_is_the_median_of_the_last_half_second():
 
 
 def test_take_detector_needs_a_continuous_second_and_skips_messages_without_torque():
-    d = TakeDetector(0.0, np.array([-8.0, -5.0]))
+    d = TakeDetector(0.0, np.array([-8.0, -5.0, 0.0]))
     assert not d.update(_torque(-6.0, -3.5), 3.0)
     assert not d.update({}, 3.5)  # no torque: ignored, the timer keeps running
     assert not d.update(_torque(-6.0, -3.5), 3.98)
@@ -355,13 +355,13 @@ def test_take_detector_needs_a_continuous_second_and_skips_messages_without_torq
     assert not d.update(_torque(-6.0, -3.5), 4.02)
     assert not d.update(_torque(-6.0, -3.5), 5.0)
     assert d.update(_torque(-6.0, -3.5), 5.02) and d.update({}, 5.04)  # stays taken
-    assert np.allclose(d.rise, [2.0, 1.5])
+    assert np.allclose(d.rise, [2.0, 1.5, 0.0])
 
 
 def test_take_detector_r28_reference_and_r30_trial2():
     # r30 trial 2: episode-end reference -7.62/-4.81, the hold settled at about -7.44/-4.69, after the take
     # -6.38/-3.81 (+1.24/+1.00 on the episode reference): fires under R28's 0.8/0.45 on the less-loaded reference
-    d = TakeDetector(0.0, np.array([-7.62, -4.81]))
+    d = TakeDetector(0.0, np.array([-7.62, -4.81, 0.0]))
     for k in range(15):  # the hold's first 0.3 s, loaded
         assert not d.update(_torque(-7.44, -4.69), k * 0.02)
     assert d.reference is None  # set on the first message after the hold's first 0.3 s
@@ -373,7 +373,51 @@ def test_take_detector_r28_reference_and_r30_trial2():
             fired = t
             break
     assert fired is not None and 2.5 <= fired <= 2.55
-    assert np.allclose(d.reference, [-7.44, -4.69])  # the less loaded of the episode end and the hold's start
+    assert np.allclose(d.reference, [-7.44, -4.69, 0.0])  # the less loaded of the episode end and the hold's start
     # the loaded drift seen on r27 (+0.44/+0.25 over the reference) never fires
-    s2 = TakeDetector(0.0, np.array([-8.19, -5.44]))
+    s2 = TakeDetector(0.0, np.array([-8.19, -5.44, 0.0]))
     assert not any(s2.update(_torque(-8.19 + 0.44, -5.44 + 0.25), k * 0.02) for k in range(500))
+
+
+def _hold(episode, phases, end=12.0):
+    """(t, message) at 50 Hz: the episode's last 1 s at ``episode`` (sh, el, wrist yaw), then the hold's
+    ``phases`` [(from t, (sh, el, wy)), ...] with +-0.03 N*m noise."""
+    out = []
+    for k in range(-50, int(end * 50)):
+        t = k * 0.02
+        load = episode if t <= 0 else [v for t0, v in phases if t >= t0][-1]
+        out.append((t, _torque(*(np.array(load) + 0.03 * np.sin(5.1 * k)))))
+    return out
+
+
+def test_r34_takes_seen_only_by_the_wrist_yaw():  # R31, harness traces of ready-A-r34 holds 3 and 4 (N*m)
+    # hold 4: shoulder/elbow -6.50/-4.06 -> -6.25/-3.85 (+0.25/+0.21), wrist yaw +1.35 -> +0.89 (-0.46) at +4.0 s
+    h4 = _hold((-6.44, -4.00, 1.28), [(0.0, (-6.50, -4.06, 1.35)), (4.0, (-6.25, -3.85, 0.89))])
+    t = _first_take(h4)
+    assert t is not None and 4.0 + TAKE_HOLD_S <= t <= 4.1 + TAKE_HOLD_S
+    # hold 3: the arm loaded further after the episode's end (-6.56/-4.19 -> -7.06/-4.62), so shoulder/elbow rose
+    # only +0.44/+0.31 over the less-loaded reference; wrist yaw +1.46 -> +0.81 at +5.1 s
+    h3 = _hold((-6.56, -4.19, 1.36), [(0.0, (-7.06, -4.62, 1.46)), (5.1, (-6.12, -3.88, 0.81))])
+    t = _first_take(h3)
+    assert t is not None and 5.1 + TAKE_HOLD_S <= t <= 5.2 + TAKE_HOLD_S
+
+
+def test_wrist_yaw_on_the_palm_does_not_fire():  # R31
+    # r33 trial 7: a person's hand on the bottle, still on the palm: wrist yaw -0.31, shoulder/elbow +0.38/+0.47
+    t7 = _hold((-7.44, -4.78, 1.19), [(0.0, (-7.44, -4.78, 1.19)), (0.5, (-7.06, -4.31, 0.88))], end=20.0)
+    assert _first_take(t7) is None
+    # a loaded hold whose wrist yaw rises (r33 trial 9: +1.22 -> +1.30) never fires
+    t9 = _hold((-7.44, -5.19, 1.22), [(0.0, (-7.88, -5.44, 1.22)), (1.0, (-8.12, -5.62, 1.30))], end=20.0)
+    assert _first_take(t9) is None
+
+
+def test_a_settling_step_in_the_first_half_second_is_not_a_reference():  # R30, TAKE_STEADY_S
+    # unsteady episode end, then 0.6 s flat at the settling value -8.56 and a step to the hold's level -7.12:
+    # a 0.5 s window would take -8.56 and fire on the settling (+1.44); the 1 s window waits for the real level
+    moving = lambda t: (-8.6 + (0.7 if int(t * 50) % 2 else -0.7), -5.8, 1.2)  # noqa: E731
+    h = _hold((0.0, 0.0, 0.0), [(0.0, (-8.56, -5.81, 1.20)), (0.6, (-7.12, -4.81, 1.20))], end=10.0)
+    h = [(t, _torque(*moving(t)) if t <= 0 else msg) for t, msg in h]
+    d = _detector(h)
+    assert d.episode_reference is None
+    assert next((t for t, msg in h if t > 0 and d.update(msg, t)), None) is None
+    assert d.reference is not None and abs(d.reference[0] + 7.12) < 0.1
