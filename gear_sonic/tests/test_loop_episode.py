@@ -319,8 +319,29 @@ def test_take_detector_needs_a_continuous_second_and_skips_messages_without_torq
     assert not d.update(_torque(-6.0, -3.5), 3.0)
     assert not d.update({}, 3.5)  # no torque: ignored, the timer keeps running
     assert not d.update(_torque(-6.0, -3.5), 3.98)
-    assert not d.update(_torque(-7.0, -3.5), 4.0)  # the shoulder falls back below +1.5: restart
+    assert not d.update(_torque(-7.4, -3.5), 4.0)  # the shoulder falls back below +0.8: restart
     assert not d.update(_torque(-6.0, -3.5), 4.02)
     assert not d.update(_torque(-6.0, -3.5), 5.0)
     assert d.update(_torque(-6.0, -3.5), 5.02) and d.update({}, 5.04)  # stays taken
     assert np.allclose(d.rise, [2.0, 1.5])
+
+
+def test_take_detector_r28_reference_and_r30_trial2():
+    # r30 trial 2: episode-end reference -7.62/-4.81, the hold settled at about -7.44/-4.69, after the take
+    # -6.38/-3.81 (+1.24/+1.00 on the episode reference): fires under R28's 0.8/0.45 on the less-loaded reference
+    d = TakeDetector(0.0, np.array([-7.62, -4.81]))
+    for k in range(15):  # the hold's first 0.3 s, loaded
+        assert not d.update(_torque(-7.44, -4.69), k * 0.02)
+    assert d.reference is None  # set on the first message after the hold's first 0.3 s
+    t, fired = 0.3, None
+    for k in range(150):
+        t = 0.3 + k * 0.02
+        load = (-7.40, -4.66) if t < 1.5 else (-6.38, -3.81)  # loaded drift +0.04, then the take at +1.5 s
+        if d.update(_torque(*load), t):
+            fired = t
+            break
+    assert fired is not None and 2.5 <= fired <= 2.55
+    assert np.allclose(d.reference, [-7.44, -4.69])  # the less loaded of the episode end and the hold's start
+    # the loaded drift seen on r27 (+0.44/+0.25 over the reference) never fires
+    s2 = TakeDetector(0.0, np.array([-8.19, -5.44]))
+    assert not any(s2.update(_torque(-8.19 + 0.44, -5.44 + 0.25), k * 0.02) for k in range(500))

@@ -789,12 +789,13 @@ def test_early_take_detected_from_the_episode_reference_and_logged(tmp_path, cap
     ended_trial(tmp_path, rig)
     log = capsys.readouterr().out
     assert "[loop] take reference sh/el = -8.10/-5.20 spread 0.00/0.00 n 2" in log and "(inert)" not in log
-    rig.torque = arm_torque(-5.45, -3.4)  # taken right away (r28: +0.6..1.6 s into the hold)
+    rig.step(25)  # still loaded for the hold's first 0.5 s (R28 also takes its first 0.3 s as the reference)
+    rig.torque = arm_torque(-5.45, -3.4)  # taken early (r28: +0.6..1.6 s into the hold)
     rig.step(50)
     assert not rig.loop.take_detected
     rig.step(2)
     assert rig.loop.take_detected
-    assert "[loop] take detected: rise sh/el = +2.65/+1.80 after 1.0" in capsys.readouterr().out
+    assert "[loop] take detected: rise sh/el = +2.65/+1.80 after 1.5" in capsys.readouterr().out
 
 
 def test_take_detector_inert_without_episode_torque_and_ring_cleared(tmp_path, capsys):
@@ -820,11 +821,12 @@ def test_take_summary_logs_before_and_after_torque_per_hold(tmp_path, capsys):
     rig = Rig().ready()
     rig.torque = arm_torque(-6.3, -4.3)  # loaded through the episode's end (r29 trial 0's reference)
     ended_trial(tmp_path, rig)
-    rig.torque = arm_torque(-5.4, -3.6)  # taken, but a smaller unload than the 1.5/1.0 thresholds: no detection
+    rig.step(25)  # loaded through the hold's first 0.5 s
+    rig.torque = arm_torque(-5.7, -4.0)  # taken, but a smaller unload than the 0.8/0.45 thresholds: no detection
     rig.step(120)
     assert not rig.loop.take_detected
     rig.loop.to_ready(rig.now)  # the operator's Enter
     log = capsys.readouterr().out
     assert "[loop] hold +  0.0 s torque sh/el =" in log
-    assert ("[loop] take summary: before sh/el = -6.30/-4.30 | hold end = -5.40/-3.60 | diff = +0.90/+0.70 | "
+    assert ("[loop] take summary: before sh/el = -6.30/-4.30 | hold end = -5.70/-4.00 | diff = +0.60/+0.30 | "
             "detected no |") in log and "ended by loop_to_ready" in log

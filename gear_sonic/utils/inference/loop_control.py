@@ -311,10 +311,12 @@ class LoopController:
         end = [arm for t, arm in self._hold_ring if t >= now - 0.5]
         after = np.median(end, axis=0) if end else None
         fmt = lambda v: "none" if v is None else f"{v[0]:+.2f}/{v[1]:+.2f}"  # noqa: E731
-        diff = None if after is None or self._take_before is None else after - self._take_before
+        effective = None if self._take is None else self._take.reference  # R28: set after the first 0.3 s
+        before = self._take_before if effective is None else effective
+        diff = None if after is None or before is None else after - before
         taken_at = None if self._take is None or self._take_at is None else self._take_at - self._take.start
         detected = "no" if taken_at is None else f"at +{taken_at:.2f} s"
-        print(f"[loop] take summary: before sh/el = {fmt(self._take_before)} | hold end = {fmt(after)} | "
+        print(f"[loop] take summary: before sh/el = {fmt(before)} | hold end = {fmt(after)} | "
               f"diff = {fmt(diff)} | detected {detected} | hold {now - self._take.start:.1f} s, ended by {how}",
               flush=True)
 

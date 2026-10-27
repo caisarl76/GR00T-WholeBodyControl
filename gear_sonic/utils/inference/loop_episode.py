@@ -80,12 +80,17 @@ class HandoverDetector:
 # spike the other way. r28: people take the bottle as early as +0.6 s into the hold, so the reference is the
 # loaded arm at the episode's end, not a window inside the hold (R27). r27: reference-window p90-p10 <= 0.62,
 # loaded rise in the first 4 s of the hold <= 0.44 / 0.25.
+# R28 (r30): the unload depends on the offer pose: +2.44 / +1.94 down to +1.00 / +0.81 (a pose where the arm
+# carries less), while the hold could sit +0.6 above the episode-end reference as the arm settled into it. So the
+# reference is the less-loaded of the episode end and the hold's first TAKE_HOLD0_S, and the rise threshold is
+# lower: worst loaded drift on that reference 0.44 / 0.25 (r27), weakest real take 1.00 / 0.81 (r30 trial 2).
 TAKE_MOTORS = (22, 25)  # right shoulder pitch, right elbow
 TAKE_RING_S = 1.0  # the episode's last torque samples kept for the reference
 TAKE_REFERENCE_S = 0.5  # reference = median over the last 0.5 s before the hold
 TAKE_REFERENCE_MIN_SAMPLES = 10
 TAKE_REFERENCE_SPREAD_NM = 1.0  # p90 - p10 per motor over the reference window; wider: inert (operator decides)
-TAKE_RISE_NM = (1.5, 1.0)  # rise toward zero (unload) over the reference, per motor
+TAKE_RISE_NM = (0.8, 0.45)  # rise toward zero (unload) over the reference, per motor
+TAKE_HOLD0_S = 0.3  # the hold's first samples also form the reference (the less loaded of the two, per motor)
 TAKE_HOLD_S = 1.0  # both rises held continuously this long
 
 
@@ -110,15 +115,17 @@ def take_reference(samples, start):
 
 
 class TakeDetector:
-    """True once the right arm unloads: shoulder pitch and elbow torque both rise TAKE_RISE_NM over ``reference``
-    (the loaded arm before the hold, take_reference) for TAKE_HOLD_S, from the hold's first tick. The grab spike
-    loads the arm (more negative), so it cannot trigger. Messages without torque are ignored; reference None makes
-    it inert (never triggers)."""
+    """True once the right arm unloads: shoulder pitch and elbow torque both rise TAKE_RISE_NM over the reference
+    for TAKE_HOLD_S. The reference is the less loaded (per motor) of ``reference`` (the episode's end,
+    take_reference) and the median of the hold's first TAKE_HOLD0_S, so detection starts after TAKE_HOLD0_S. The
+    grab spike loads the arm (more negative), so it cannot trigger. Messages without torque are ignored; reference
+    None makes it inert (never triggers)."""
 
     def __init__(self, start: float, reference):
         self.start, self.rising_since, self.taken, self.rise = start, None, False, None
-        self.reference = None if reference is None else np.asarray(reference, np.float64)
-        self.inert = self.reference is None
+        self.episode_reference = None if reference is None else np.asarray(reference, np.float64)
+        self.reference, self.hold0 = None, []  # the reference is set once the hold's first TAKE_HOLD0_S is in
+        self.inert = self.episode_reference is None
 
     def update(self, msg, now: float) -> bool:
         if self.taken or self.inert:
@@ -126,6 +133,12 @@ class TakeDetector:
         arm = take_torque(msg)
         if arm is None:
             return False
+        if self.reference is None:
+            if now - self.start < TAKE_HOLD0_S:
+                self.hold0.append(arm)
+                return False
+            hold0 = np.median(self.hold0, axis=0) if self.hold0 else self.episode_reference
+            self.reference = np.maximum(self.episode_reference, hold0)
         self.rise = arm - self.reference
         if (self.rise >= np.asarray(TAKE_RISE_NM)).all():
             self.rising_since = now if self.rising_since is None else self.rising_since
