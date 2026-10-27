@@ -287,3 +287,12 @@ def test_take_detector_needs_a_continuous_second_and_skips_messages_without_torq
     assert not d.update(_torque(-6.0, -3.5), 4.02)
     assert not d.update(_torque(-6.0, -3.5), 5.0)
     assert d.update(_torque(-6.0, -3.5), 5.02) and d.update({}, 5.04)  # stays taken
+
+
+def test_take_detector_stays_inert_when_the_baseline_window_is_not_steady():
+    # the arm still settling (or an early grab) inside +1.0..+2.0 s: no trusted baseline, the operator decides
+    settling = [(t, _torque(-9.0 + 1.2 * min(t, 2.0) / 2.0 if t <= 2.0 else -7.9, -5.0)) for t, _ in _r27_hold()]
+    det = TakeDetector(0.0)
+    assert not any(det.update(msg, t) for t, msg in settling) and det.inert
+    steady = TakeDetector(0.0)  # the r27 replay's window is steady and still fires
+    assert any(steady.update(msg, t) for t, msg in _r27_hold()) and not steady.inert

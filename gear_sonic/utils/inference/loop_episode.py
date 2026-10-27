@@ -82,20 +82,24 @@ TAKE_MOTORS = (22, 25)  # right shoulder pitch, right elbow
 TAKE_BASELINE_S = (1.0, 2.0)  # baseline window, seconds into the hold
 TAKE_RISE_NM = (1.5, 1.0)  # rise toward zero (unload) over the baseline, per motor
 TAKE_HOLD_S = 1.0  # both rises held continuously this long
+TAKE_BASELINE_SPREAD_NM = 0.5  # a baseline window spanning more than this (arm still settling, an early grab) is
+# not trusted: the detector stays inert for that hold and the operator's Enter decides. r27: settled within 0.2.
 
 
 class TakeDetector:
     """True once the right arm unloads: shoulder pitch and elbow torque both rise TAKE_RISE_NM over their
     baseline (the mean over TAKE_BASELINE_S of the hold that began at ``start``) for TAKE_HOLD_S. The grab spike
     loads the arm (more negative), so it cannot trigger. Messages without a 29-value finite motor_torque are
-    ignored; without baseline samples it never triggers."""
+    ignored; without baseline samples, or with a baseline window spread over TAKE_BASELINE_SPREAD_NM, it never
+    triggers."""
 
     def __init__(self, start: float):
         self.start, self.samples, self.baseline, self.rising_since, self.taken = start, [], None, None, False
+        self.inert = False  # the baseline window was not steady: never trigger in this hold
 
     def update(self, msg, now: float) -> bool:
-        if self.taken:
-            return True
+        if self.taken or self.inert:
+            return self.taken
         tau = np.asarray((msg or {}).get("motor_torque", []), np.float64).reshape(-1)
         if tau.shape != (29,) or not np.isfinite(tau[list(TAKE_MOTORS)]).all():
             return False
@@ -107,6 +111,9 @@ class TakeDetector:
                 self.samples.append(arm)
                 return False
             if not self.samples:
+                return False
+            if (np.ptp(self.samples, axis=0) > TAKE_BASELINE_SPREAD_NM).any():
+                self.inert = True
                 return False
             self.baseline = np.mean(self.samples, axis=0)
         if (arm - self.baseline >= np.asarray(TAKE_RISE_NM)).all():

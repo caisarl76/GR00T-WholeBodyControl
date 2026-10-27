@@ -52,13 +52,13 @@ class LoopController:
         self._outstanding = self._pending = None  # requested epoch; accepted (rows, t0) for the next tick
         self._requested_at = None  # now at the outstanding request: a replanned chunk's t0 (lerobot slot_t)
         self._take = None  # TakeDetector while in await_take (R26)
+        self._episode_t0 = self._last_chunk_at = self._next_replan = None
+        self._chunk_t0 = math.nan
 
     @property
     def take_detected(self) -> bool:
         """True once the bottle was taken in the current await_take (it only reports; the runner acts)."""
         return self._take is not None and self._take.taken
-        self._episode_t0 = self._last_chunk_at = self._next_replan = None
-        self._chunk_t0 = math.nan
 
     def _require(self, ok, method):
         if not ok:
