@@ -61,6 +61,9 @@ class LoopController:
         self._requested_at = None  # now at the outstanding request: a replanned chunk's t0 (lerobot slot_t)
         self._take = None  # TakeDetector while in await_take (R26)
         self._torque_ring = deque()  # (now, shoulder pitch, elbow torque) over the episode's last TAKE_RING_S
+        self._hold_ring = deque()  # the same over the hold's last TAKE_RING_S, for the take summary (diagnostics)
+        self._take_before = self._take_at = None  # the reference median (also when inert); when it fired
+        self._hold_trace_at = 0.0  # next hold-trace log line
         self._episode_t0 = self._last_chunk_at = self._next_replan = None
         self._chunk_t0 = math.nan
 
@@ -124,6 +127,8 @@ class LoopController:
             if self.trial_end_reason is None:
                 self.trial_end_reason = reason
             self._close_recorder()
+        if self.stage == "await_take":
+            self._take_summary(now, f"freeze: {reason}")
         self._outstanding = self._pending = self._take = None
         self._torque_ring.clear()
         self.commander.freeze()
@@ -148,6 +153,7 @@ class LoopController:
     def to_ready(self, now):
         """After a trial end: the bottle was taken (lerobot's operator Enter in finish(to_ready))."""
         self._require(self.phase == "LOOP_HOLD" and self.stage == "await_take", "loop_to_ready")
+        self._take_summary(now, "loop_to_ready")
         self._take = None
         self.commander.blend_to(self.ready.token, self.ready.hands, BLEND_TICKS, "to ready")
         self._motion("LOOP_MOTION", "to_ready", self._at_ready)
@@ -214,8 +220,19 @@ class LoopController:
             self._start_episode(now)
         if self.stage == "blend_in":
             self._guards.record(now, feedback)
+        if self.stage == "await_take":
+            arm = take_torque(feedback)
+            if arm is not None:  # diagnostics: the hold's torque, traced every 0.5 s and summarised at its end
+                self._hold_ring.append((now, arm))
+                while self._hold_ring[0][0] < now - TAKE_RING_S:
+                    self._hold_ring.popleft()
+                if now >= self._hold_trace_at:
+                    t_hold = now - self._take.start
+                    print(f"[loop] hold +{t_hold:5.1f} s torque sh/el = {arm[0]:+.2f}/{arm[1]:+.2f}", flush=True)
+                    self._hold_trace_at = now + 0.5
         if self.stage == "await_take" and not self._take.taken and self._take.update(feedback, now):
             sh, el = self._take.rise
+            self._take_at = now
             print(f"[loop] take detected: rise sh/el = {sh:+.2f}/{el:+.2f} after {now - self._take.start:.2f} s",
                   flush=True)
         if self.stage == "episode":
@@ -282,9 +299,24 @@ class LoopController:
         """R27: the reference is the loaded arm just before the hold (the episode's end); inert if unsteady."""
         reference, median, spread, n = take_reference(self._torque_ring, now)
         self._take = TakeDetector(now, reference)
+        self._take_before, self._take_at, self._hold_trace_at = median, None, now
+        self._hold_ring.clear()
         values = ("none" if median is None
                   else f"{median[0]:.2f}/{median[1]:.2f} spread {spread[0]:.2f}/{spread[1]:.2f}")
         print(f"[loop] take reference sh/el = {values} n {n}{' (inert)' if reference is None else ''}", flush=True)
+
+    def _take_summary(self, now, how):
+        """One log line per hold: the loaded arm before (the reference median), the hold's last 0.5 s, and their
+        difference (diagnostics only)."""
+        end = [arm for t, arm in self._hold_ring if t >= now - 0.5]
+        after = np.median(end, axis=0) if end else None
+        fmt = lambda v: "none" if v is None else f"{v[0]:+.2f}/{v[1]:+.2f}"  # noqa: E731
+        diff = None if after is None or self._take_before is None else after - self._take_before
+        taken_at = None if self._take is None or self._take_at is None else self._take_at - self._take.start
+        detected = "no" if taken_at is None else f"at +{taken_at:.2f} s"
+        print(f"[loop] take summary: before sh/el = {fmt(self._take_before)} | hold end = {fmt(after)} | "
+              f"diff = {fmt(diff)} | detected {detected} | hold {now - self._take.start:.1f} s, ended by {how}",
+              flush=True)
 
     def _record(self, now, state, token, hands, label):
         t_ep, frame, chunk_t0 = -1.0, -1, math.nan

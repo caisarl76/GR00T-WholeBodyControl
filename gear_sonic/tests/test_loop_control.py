@@ -814,3 +814,17 @@ def test_take_detector_inert_without_episode_torque_and_ring_cleared(tmp_path, c
     rig.rows = lambda epoch: chunk((epoch - 100) * 0.01)
     rig.until("episode").step(5)
     assert len(rig.loop._torque_ring) == 6
+
+
+def test_take_summary_logs_before_and_after_torque_per_hold(tmp_path, capsys):
+    rig = Rig().ready()
+    rig.torque = arm_torque(-6.3, -4.3)  # loaded through the episode's end (r29 trial 0's reference)
+    ended_trial(tmp_path, rig)
+    rig.torque = arm_torque(-5.4, -3.6)  # taken, but a smaller unload than the 1.5/1.0 thresholds: no detection
+    rig.step(120)
+    assert not rig.loop.take_detected
+    rig.loop.to_ready(rig.now)  # the operator's Enter
+    log = capsys.readouterr().out
+    assert "[loop] hold +  0.0 s torque sh/el =" in log
+    assert ("[loop] take summary: before sh/el = -6.30/-4.30 | hold end = -5.40/-3.60 | diff = +0.90/+0.70 | "
+            "detected no |") in log and "ended by loop_to_ready" in log
