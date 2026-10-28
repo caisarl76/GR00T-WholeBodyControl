@@ -21,7 +21,7 @@
  * ## `{user_topic}` (e.g. `g1_debug`) — published every tick
  * ---------------------------------------------------------------------------
  *
- * A single msgpack map with up to 37 keys (35 always-present + 2 conditional).
+ * A single msgpack map with up to 38 keys (36 always-present + 2 conditional).
  * All joints are in **MuJoCo order** (remapped from IsaacLab via
  * `isaaclab_to_mujoco`).
  *
@@ -57,6 +57,11 @@
  *      |                        |              |
  *      | **Encoder**            |              |
  *  17  | token_state            | double[N]    | Encoder token state (empty array if N/A).
+ *      |                        |              |
+ *      | **Motors** *(hardware order, not MuJoCo order)* |
+ *      | motor_temperature      | double[58]   | 2 per motor (winding, driver).
+ *      | motor_torque           | double[29]   | Estimated torque tau_est (N·m), the StateLogger record's
+ *      |                        |              | motor_torque; e.g. 22 = right shoulder pitch, 25 = right elbow.
  *      |                        |              |
  *      | **Heading** *(conditional — only when heading state is available)* |
  *  18  | init_base_quat         | double[4]    | Initial base quaternion at heading init.
@@ -299,9 +304,9 @@ public:
         buffer.clear();
         msgpack::packer<msgpack::sbuffer> pk(&buffer);
         const bool has_heading_state = heading != nullptr;
-        // State-logger fields: 22 base + 2 optional heading
+        // State-logger fields: 23 base + 2 optional heading
         // Visualisation fields: visualization.size() (typically 13)
-        int num_state_fields = has_heading_state ? 24 : 22;
+        int num_state_fields = has_heading_state ? 25 : 23;
         int num_viz_fields = static_cast<int>(visualization.size());
         pk.pack_map(num_state_fields + num_viz_fields);
 
@@ -424,6 +429,11 @@ public:
         pk.pack("motor_temperature");
         pk.pack_array(state.motor_temperature.size());
         for (const auto& val : state.motor_temperature) pk.pack(val);
+
+        // Motor torque: hardware order, tau_est per motor (as the StateLogger's motor_torque.csv)
+        pk.pack("motor_torque");
+        pk.pack_array(state.motor_torque.size());
+        for (const auto& val : state.motor_torque) pk.pack(val);
 
         if (has_heading_state) {
             pk.pack("init_base_quat");

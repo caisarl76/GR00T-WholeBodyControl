@@ -64,6 +64,16 @@ class HarnessLimits:
 
 
 @dataclass(frozen=True)
+class LeRobotPolicySettings:
+    """Serve the policy with lerobot's sonic_policy_server.py, played like its sonic_policy_streamer.py."""
+
+    chunk_blend_s: float = 0.0
+    max_token_step: float = 0.0
+    chunk_anchor_s: float = 0.0
+    dex3_right_order: str = "dataset"
+
+
+@dataclass(frozen=True)
 class SkillDefinition:
     skill_id: str
     prompt: str
@@ -141,6 +151,7 @@ class G1Profile:
     limits: HarnessLimits
     skills: dict[str, SkillDefinition]
     handover: HandoverSettings | None = None
+    lerobot_policy: LeRobotPolicySettings | None = None
 
     def require_skill(self, skill_id: str) -> SkillDefinition:
         if skill_id not in self.skills:
@@ -165,7 +176,7 @@ def load_profile(path: Path) -> G1Profile:
     }
     if (
         not isinstance(data, dict)
-        or data.keys() not in (expected, expected | {"handover"})
+        or not expected <= data.keys() <= expected | {"handover", "lerobot_policy"}
         or type(data["schema_version"]) is not int
         or data["schema_version"] != 1
     ):
@@ -251,6 +262,23 @@ def load_profile(path: Path) -> G1Profile:
         ):
             raise ValueError("Invalid handover desk pose")
         data["handover"] = HandoverSettings(**h)
+    if "lerobot_policy" in data:
+        lerobot = data["lerobot_policy"]
+        if (
+            not isinstance(lerobot, dict)
+            or lerobot.keys() - {"chunk_blend_s", "max_token_step", "chunk_anchor_s", "dex3_right_order"}
+            or not all(
+                finite_number(lerobot.get(key, 0.0))
+                for key in ("chunk_blend_s", "max_token_step", "chunk_anchor_s")
+            )
+            # The blend and the slew limit act within one 0.8 s chunk; tokens span [-1.25, 1.25].
+            or not 0 <= lerobot.get("chunk_blend_s", 0.0) <= 0.8
+            or not 0 <= lerobot.get("max_token_step", 0.0) <= 2.5
+            or not 0 <= lerobot.get("chunk_anchor_s", 0.0) <= 5.0
+            or lerobot.get("dex3_right_order", "dataset") not in ("dataset", "swap")
+        ):
+            raise ValueError("Invalid lerobot_policy settings")
+        data["lerobot_policy"] = LeRobotPolicySettings(**lerobot)
     del data["schema_version"]
     data.update(
         registry_sha256=hashlib.sha256(raw).hexdigest(),

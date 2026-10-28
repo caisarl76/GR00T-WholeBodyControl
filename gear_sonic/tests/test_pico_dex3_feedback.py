@@ -32,14 +32,21 @@ using Clock = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 using Fields = std::map<std::string, msgpack::object>;
 
+std::array<double, 29> torque() {  // tau_est in hardware order: motor i reads -0.5 * i N*m
+    std::array<double, 29> tau{};
+    for (int i = 0; i < 29; ++i) tau[i] = -0.5 * i;
+    return tau;
+}
+
 void log(StateLogger& logger, const std::array<Clock::time_point, 2>& stamps = {}) {
     std::array<double, 4> quat{1, 0, 0, 0};
     std::array<double, 3> vec{};
     std::array<double, 29> body{};
+    std::array<double, 29> tau = torque();
     std::array<double, 7> hand{};
     logger.LogFullState(quat, vec, vec, quat, vec, vec,
         std::span(body), std::span(body), std::span(body), std::span(body),
-        std::span(body), std::span(body), std::span(hand), std::span(hand),
+        std::span(body), std::span(tau), std::span(hand), std::span(hand),
         std::span(hand), std::span(hand), std::span(hand), std::span(hand), 0, stamps);
 }
 
@@ -52,7 +59,7 @@ msgpack::object_handle pack(const StateLogger::Entry& state, Clock::time_point n
     // An incorrect map field count either leaves trailing bytes or fails unpacking.
     assert(offset == buffer.size());
     assert(result.get().type == msgpack::type::MAP);
-    assert(result.get().via.map.size == (heading ? 25 : 23));
+    assert(result.get().via.map.size == (heading ? 26 : 24));  // 23 state (+2 heading) + 1 viz
     return result;
 }
 
@@ -60,6 +67,12 @@ int64_t check(const StateLogger::Entry& state, Clock::time_point now,
               bool left_valid, bool right_valid, int64_t left_age, int64_t right_age) {
     auto owner = pack(state, now);
     const auto fields = owner.get().as<Fields>();
+    const auto tau = fields.at("motor_torque").as<std::vector<double>>();  // hardware order, tau_est
+    if (state.motor_torque.size() == 29) {
+        assert(tau.size() == 29 && tau[22] == -11.0 && tau[25] == -12.5);
+    } else {
+        assert(tau.size() == state.motor_torque.size());
+    }
     assert(fields.at("left_hand_feedback_valid").as<bool>() == left_valid);
     assert(fields.at("right_hand_feedback_valid").as<bool>() == right_valid);
     const auto actual_left_age = fields.at("left_hand_feedback_age_ns").as<int64_t>();
@@ -202,6 +215,7 @@ int main(int argc, char** argv) {
                     assert fields["control_loop_type"] == "cpp"
                     assert fields["token_state"] == [0.25, 0.5]
                     assert len(fields["body_q_measured"]) == 29
+                    assert fields["motor_torque"] == [-0.5 * i for i in range(29)]  # tau_est, hardware order
                     for side in ("left", "right"):
                         assert fields[f"{side}_hand_q"] == [0.0] * 7
                         assert fields[f"{side}_hand_q_measured"] == [0.0] * 7

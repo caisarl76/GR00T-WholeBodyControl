@@ -2228,7 +2228,8 @@ class G1Deploy {
       bool harness_planner_hold = false,
       std::string planner_trace_path = "",
       MotorGainScaleConfig motor_gain_scales = {},
-      bool live_pose_playback = false)
+      bool live_pose_playback = false,
+      int dds_domain = 0)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2270,7 +2271,7 @@ class G1Deploy {
       }
       
       // Initialize ChannelFactory
-      ChannelFactory::Instance()->Init(0, networkInterface);
+      ChannelFactory::Instance()->Init(dds_domain, networkInterface);
 
       if (enable_dex3_hands_) {
         // Initialize Dex3 hands (ChannelFactory already initialized above)
@@ -4383,6 +4384,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
+    std::cout << "  --dds-domain <0-232>: DDS domain id (default: 0, the robot's; another id isolates a lo simulation)" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
@@ -4432,7 +4434,8 @@ int main(int argc, char const* argv[]) {
   std::string plannerFile = "";
 
   // Parse optional arguments
-  bool disableCrcCheck = false;\
+  bool disableCrcCheck = false;
+  int ddsDomain = 0;
   std::string obsConfigPath = "";
   std::string encoderFile = "";
   std::string targetMotionLogfile = "";
@@ -4466,6 +4469,13 @@ int main(int argc, char const* argv[]) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--dds-domain") {
+      if (i + 1 >= argc || std::string(argv[i + 1]).find_first_not_of("0123456789") != std::string::npos ||
+          std::string(argv[i + 1]).empty() || std::string(argv[i + 1]).size() > 3 || std::stoi(argv[i + 1]) > 232) {
+        std::cerr << "Error: --dds-domain requires an id from 0 to 232" << std::endl;
+        return 1;
+      }
+      ddsDomain = std::stoi(argv[++i]);
     } else if (std::string(argv[i]) == "--harness-planner-hold") {
       harness_planner_hold = true;
     } else if (std::string(argv[i]) == "--planner-trace-file") {
@@ -4797,7 +4807,8 @@ int main(int argc, char const* argv[]) {
     harness_planner_hold,
     planner_trace_path,
     motor_gain_scales,
-    live_pose_playback
+    live_pose_playback,
+    ddsDomain
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

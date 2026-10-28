@@ -17,6 +17,24 @@ PHASES = {
     "COMPLETED",
     "INTERRUPTED",
     "FAULT",
+    "LOOP_HOLD",
+    "LOOP_MOTION",
+    "LOOP_TRIAL",
+    "LOOP_FROZEN",
+}
+LOOP_STAGES = {
+    "stance",
+    "raise",
+    "ready",
+    "hold_rest",
+    "first_chunk",
+    "blend_in",
+    "episode",
+    "await_take",
+    "to_ready",
+    "frozen",
+    "lower",
+    "handback",
 }
 ERROR_CODES = {
     "INVALID_REQUEST",
@@ -44,6 +62,13 @@ PARAMS = {
     "reset_ready": {"execution_id": str},
     "walk_for": {"direction": str, "duration_s": float, "speed_mps": float},
     "turn_by": {"angle_rad": float, "rate_rps": float},
+    "loop_take_over": {},
+    "loop_raise": {},
+    "loop_trial": {"trial": int, "session_dir": str},
+    "loop_freeze": {},
+    "loop_resume": {},
+    "loop_to_ready": {},
+    "loop_end": {},
 }
 
 
@@ -96,6 +121,8 @@ def validate_params(method: str, params: dict) -> None:
             raise ValueError(f"Empty {key}")
     if method == "heartbeat" and params["sequence"] < 1:
         raise ValueError("Heartbeat sequence starts at 1")
+    if method == "loop_trial" and params["trial"] < 0:
+        raise ValueError("Trial numbers start at 0")
     if method == "walk_for":
         if (
             params["direction"] not in {"forward", "backward", "left", "right"}
@@ -152,6 +179,12 @@ class Status:
     locomotion_enabled: bool = False
     ready_return_enabled: bool = False
     right_hand_open: bool | None = None
+    loop_stage: str | None = None
+    loop_trial: int | None = None
+    trial_end_reason: str | None = None
+    frozen_stage: str | None = None
+    take_detected: bool | None = None
+    take_hand_empty: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -242,6 +275,8 @@ def _typed(cls, data):
             raise ValueError(f"Invalid {name} type")
     if "phase" in data and data["phase"] not in PHASES:
         raise ValueError("Invalid phase")
+    if any(data.get(key) not in LOOP_STAGES | {None} for key in ("loop_stage", "frozen_stage")):
+        raise ValueError("Invalid loop stage")
     if "right_hand_state" in data and data["right_hand_state"] not in {"open", "closed", "partial", "unknown"}:
         raise ValueError("Invalid measured hand state")
     if data.get("right_hand_sample_index") is not None and data["right_hand_sample_index"] < 0:
