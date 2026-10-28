@@ -77,6 +77,30 @@ def test_next_trial_is_one_past_the_highest_not_a_count(tmp_path, monkeypatch): 
     assert next_trial(tmp_path) == 8
 
 
+def test_a_log_only_trial_keeps_its_number_after_a_restart(tmp_path, monkeypatch):  # review of PR #20
+    # the log is written before the frames: a process stopped between the two leaves trial_002.npz alone, and
+    # after a restart the pending set is empty, so only the file can keep trial 2 from being handed out again
+    calls = []
+    real = loop_records._save_npz
+
+    def stop_after_the_log(path, **arrays):
+        calls.append(path.name)
+        if path.name.endswith("_frames.npz"):
+            raise OSError("process stopped")
+        real(path, **arrays)
+
+    monkeypatch.setattr(loop_records, "_save_npz", stop_after_the_log)
+    for i in (0, 1):
+        (tmp_path / f"trial_{i:03d}_frames.npz").write_bytes(b"")
+    _record(tmp_path, 2).close("handover")
+    assert TrialWriter.flush(10)
+    assert calls == ["trial_002.npz", "trial_002_frames.npz"]
+    assert (tmp_path / "trial_002.npz").exists() and not (tmp_path / "trial_002_frames.npz").exists()
+    monkeypatch.setattr(TrialWriter, "_pending", set())  # a restarted harness has no pending writes
+    assert next_trial(tmp_path) == 3
+    TrialWriter.errors.clear()  # the simulated stop was logged as a write error
+
+
 def test_close_returns_before_slow_write(tmp_path, monkeypatch):
     real = loop_records._save_npz
 
