@@ -64,6 +64,19 @@ def test_next_trial_counts_trial_files(tmp_path):
     assert next_trial(tmp_path) == 2
 
 
+def test_next_trial_is_one_past_the_highest_not_a_count(tmp_path, monkeypatch):  # review: sparse trial numbers
+    for i in (0, 2):
+        (tmp_path / f"trial_{i:03d}_frames.npz").write_bytes(b"")
+    (tmp_path / "trial_x_frames.npz").write_bytes(b"")  # not a trial number: ignored
+    assert next_trial(tmp_path) == 3  # a count (2) would hand out trial 2 again
+    real = loop_records._save_npz
+    monkeypatch.setattr(loop_records, "_save_npz", lambda *a, **k: (time.sleep(0.5), real(*a, **k)))
+    _record(tmp_path, 7).close("handover")  # queued above the highest file
+    assert next_trial(tmp_path) == 8
+    assert TrialWriter.flush(10)
+    assert next_trial(tmp_path) == 8
+
+
 def test_close_returns_before_slow_write(tmp_path, monkeypatch):
     real = loop_records._save_npz
 
