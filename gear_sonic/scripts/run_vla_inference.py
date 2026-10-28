@@ -1654,6 +1654,7 @@ def main(config: InferenceConfig):
         reset_state_subscriber.close()
         keyboard_listener.close()
         if harness_loop is not None:  # trial files are written on the TrialWriter thread
+            harness_loop.close_trial("harness shutdown")  # an active trial's samples are only in memory
             if not TrialWriter.flush(10):
                 print("[harness] trial files still being written after 10 s")
             for error in TrialWriter.errors:

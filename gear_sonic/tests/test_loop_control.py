@@ -15,7 +15,7 @@ from gear_sonic.utils.inference.harness_control import ControlError, HarnessCont
 from gear_sonic.utils.inference.lerobot_sonic_policy import TokenStream
 from gear_sonic.utils.inference.loop_control import LoopController
 from gear_sonic.utils.inference.loop_motion import PoseCommander, ReadyPose
-from gear_sonic.utils.inference.loop_records import TrialWriter
+from gear_sonic.utils.inference.loop_records import TrialWriter, next_trial
 
 TICK = 0.02
 PLANNER = np.full(64, -0.2, np.float32)
@@ -849,3 +849,17 @@ def test_a_freeze_during_the_move_to_ready_resumes_to_ready(tmp_path):  # review
     rig.loop.resume(rig.now)
     rig.until("ready")
     assert rig.loop.phase == "LOOP_HOLD" and not rig.loop.take_detected
+
+
+def test_harness_shutdown_saves_the_active_trial(tmp_path):  # review: Ctrl-C mid-episode lost the samples
+    rig = Rig().ready()
+    rig.loop.trial(next_trial(tmp_path), str(tmp_path), rig.now)
+    rig.rows = lambda epoch: chunk((epoch - 100) * 0.01)
+    rig.until("episode").step(20)
+    assert rig.loop._recorder is not None
+    rig.loop.close_trial("harness shutdown")  # run_vla_inference's finally, before TrialWriter.flush
+    assert TrialWriter.flush(10)
+    assert (tmp_path / "trial_000.npz").exists() and (tmp_path / "trial_000_frames.npz").exists()
+    assert str(np.load(tmp_path / "trial_000.npz")["episode_end"]) == "harness shutdown"
+    rig.loop.close_trial("harness shutdown")  # nothing active: a no-op
+    assert next_trial(tmp_path) == 1

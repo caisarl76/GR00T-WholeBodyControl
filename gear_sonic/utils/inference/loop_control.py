@@ -130,16 +130,21 @@ class LoopController:
         self._require(self.phase.startswith("LOOP_"), "loop_freeze")
         if self.phase == "LOOP_FROZEN":
             return
-        if self._recorder is not None:  # the trial ends here (a trial already ending keeps its reason)
-            if self.trial_end_reason is None:
-                self.trial_end_reason = reason
-            self._close_recorder()
+        self.close_trial(reason)
         if self.stage == "await_take":
             self._take_summary(now, f"freeze: {reason}")
         self._outstanding = self._pending = self._take = None
         self._torque_ring.clear()
         self.commander.freeze()
         self.frozen_stage, self.stage, self.phase, self.reason = self.stage, "frozen", "LOOP_FROZEN", reason
+
+    def close_trial(self, reason):
+        """Ends an active trial's recording here: its files go to the TrialWriter thread. A trial already ending
+        keeps its reason. Called by freeze and at harness shutdown, where the samples would otherwise be lost."""
+        if self._recorder is not None:
+            if self.trial_end_reason is None:
+                self.trial_end_reason = reason
+            self._close_recorder()
 
     def resume(self, now):
         self._require(self.phase == "LOOP_FROZEN", "loop_resume")

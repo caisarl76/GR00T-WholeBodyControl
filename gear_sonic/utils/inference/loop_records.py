@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
 import threading
 
 import numpy as np
@@ -109,13 +110,15 @@ class TrialWriter:
 
 
 def next_trial(session_dir: Path) -> int:
+    """One past the highest trial number in session_dir (either of its files) or still being written there.
+    The highest, not a count: with trials 0 and 2 on disk a count gives 2 and would let trial 2 be overwritten.
+    Either file: the log is written before the frames, so a write cut between them leaves the log alone."""
     session_dir = Path(session_dir).resolve()
-    with TrialWriter._cond:  # invariant: a trial is counted by its frames file or by pending, never by neither
-        done = {p.name for p in session_dir.glob("trial_*_frames.npz")}  # one snapshot, taken under the lock
-        queued = sum(
-            1 for d, t in TrialWriter._pending if d == session_dir and f"trial_{t:03d}_frames.npz" not in done
-        )
-        return len(done) + queued
+    with TrialWriter._cond:  # invariant: a trial is counted by one of its files or by pending, never by neither
+        done = {int(m[1]) for p in session_dir.glob("trial_*.npz")  # one snapshot, taken under the lock
+                if (m := re.fullmatch(r"trial_(\d+)(?:_frames)?\.npz", p.name))}
+        queued = {t for d, t in TrialWriter._pending if d == session_dir}
+        return max(done | queued, default=-1) + 1
 
 
 class TrialRecorder:
