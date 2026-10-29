@@ -8,7 +8,7 @@ from gear_sonic.utils.teleop.xr_upperbody_bridge import (
 )
 
 
-def feedback(value=0.8):
+def feedback(value=0.5):  # Inside the ±0.52 rad waist roll/pitch limits.
     return {
         "body_q_measured": np.full(29, value),
         "left_hand_q_measured": np.full(7, value),
@@ -31,7 +31,7 @@ def test_explicit_absolute_motor_measurement_wins_over_legacy_joint_fields():
 def test_standing_reset_starts_at_measured_pose_and_reaches_straight_preset():
     state = feedback()
     reset = StandingReset(state, np.zeros(7), np.zeros(7))
-    np.testing.assert_allclose(reset.command.upper_body_position, 0.8)
+    np.testing.assert_allclose(reset.command.upper_body_position, 0.5)
     np.testing.assert_allclose(reset.command.facing, [0, 1, 0], atol=1e-7)
     for _ in range(300):
         old = np.asarray(reset.command.upper_body_position)
@@ -52,7 +52,7 @@ def test_planner_initialization_delay_cannot_run_ramp_far_ahead_of_robot():
     reset = StandingReset(state, np.zeros(7), np.zeros(7))
     for _ in range(500):
         command = reset.advance(state, 0.02)
-    assert np.max(np.abs(np.asarray(command.upper_body_position) - 0.8)) <= 0.150001
+    assert np.max(np.abs(np.asarray(command.upper_body_position) - 0.5)) <= 0.150001
     before = command
     assert reset.advance(None, 10) == before
 
@@ -68,7 +68,7 @@ def test_reset_rejects_missing_or_invalid_feedback(field):
 def test_repeat_reset_captures_new_pose_and_preserves_closed_hand_target():
     first = StandingReset(feedback(), np.zeros(7), np.zeros(7))
     second = StandingReset(feedback(-0.5), np.full(7, 0.4), np.zeros(7))
-    np.testing.assert_allclose(first.command.upper_body_position, 0.8)
+    np.testing.assert_allclose(first.command.upper_body_position, 0.5)
     np.testing.assert_allclose(second.command.upper_body_position, -0.5)
     state = feedback(-0.5)
     for _ in range(300):
@@ -161,5 +161,5 @@ def test_reset_rejects_tracking_loss_that_cannot_meet_rate_and_lead_bounds():
 def test_measured_hold_rejects_out_of_bounds_right_arm(direction):
     state = feedback(0.)
     state["body_q_measured"][26] = direction * 2.12722
-    with pytest.raises(ValueError, match="Measured arm"):
+    with pytest.raises(ValueError, match="Measured waist or arm"):
         StandingReset(state, state["left_hand_q_measured"], state["right_hand_q_measured"])

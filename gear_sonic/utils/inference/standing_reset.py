@@ -21,8 +21,8 @@ _RIGHT_ARM_PLANNER_INDICES = [
 _LEFT_READY_PLANNER_INDICES = [
     G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(15, 19)
 ]
-# Both arms, motors 15-28 in motor order, matching LEFT_ARM_BOUNDS + RIGHT_ARM_BOUNDS.
-_ARM_PLANNER_INDICES = [G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(15, 29)]
+# Waist and both arms, motors 12-28 in motor order, matching WAIST_BOUNDS + LEFT_ARM_BOUNDS + RIGHT_ARM_BOUNDS.
+_BOUNDED_PLANNER_INDICES = [G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(12, 29)]
 _LEFT_WRIST_PLANNER_INDICES = [G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(19, 22)]
 _WRIST_PLANNER_INDICES = _LEFT_WRIST_PLANNER_INDICES + [
     G1_UPPER_BODY_JOINT_INDICES.index(motor_index) for motor_index in range(26, 29)
@@ -80,14 +80,15 @@ class StandingReset:
         yaw_tolerance_rad=np.pi / 36, settle_dwell_s=0.5,
     ):
         self._position = _measured_joints(state)
-        from .harness_profile import LEFT_ARM_BOUNDS, RIGHT_ARM_BOUNDS
+        from .harness_profile import LEFT_ARM_BOUNDS, RIGHT_ARM_BOUNDS, WAIST_BOUNDS
 
         self._right_arm_bounds = np.asarray(list(RIGHT_ARM_BOUNDS.values())).T
-        self._arm_bounds = np.asarray(list(LEFT_ARM_BOUNDS.values()) + list(RIGHT_ARM_BOUNDS.values())).T
+        self._joint_bounds = np.asarray(
+            list(WAIST_BOUNDS.values()) + list(LEFT_ARM_BOUNDS.values()) + list(RIGHT_ARM_BOUNDS.values())).T
         low, high = self._right_arm_bounds
-        measured_arm = self._position[_ARM_PLANNER_INDICES]
-        if np.any(measured_arm < self._arm_bounds[0]) or np.any(measured_arm > self._arm_bounds[1]):
-            raise ValueError("Measured arm exceeds G1 joint limits")
+        measured = self._position[_BOUNDED_PLANNER_INDICES]
+        if np.any(measured < self._joint_bounds[0]) or np.any(measured > self._joint_bounds[1]):
+            raise ValueError("Measured waist or arm exceeds G1 joint limits")
         self._compensate_tracking_bias = compensate_tracking_bias
         if not np.isfinite(joint_tolerance_rad) or joint_tolerance_rad <= 0:
             raise ValueError("Standing reset requires a positive finite joint tolerance")
@@ -208,20 +209,20 @@ class StandingReset:
                 error = np.where(np.abs(error) > self._tracking_deadband, error, 0.0)
                 self._tracking_trim = np.clip(self._tracking_trim + dt * error, -self._lead[:17], self._lead[:17])
                 reference[:17] += self._tracking_trim
-        reference[_ARM_PLANNER_INDICES] = np.clip(reference[_ARM_PLANNER_INDICES], *self._arm_bounds)
+        reference[_BOUNDED_PLANNER_INDICES] = np.clip(reference[_BOUNDED_PLANNER_INDICES], *self._joint_bounds)
         # A measured joint can fall back after reaching a reference. Retract
         # toward the feasible interval rather than freezing an excessive lead.
         lower, upper = measured - self._lead, measured + self._lead
-        lower[_ARM_PLANNER_INDICES] = np.maximum(lower[_ARM_PLANNER_INDICES], self._arm_bounds[0])
-        upper[_ARM_PLANNER_INDICES] = np.minimum(upper[_ARM_PLANNER_INDICES], self._arm_bounds[1])
+        lower[_BOUNDED_PLANNER_INDICES] = np.maximum(lower[_BOUNDED_PLANNER_INDICES], self._joint_bounds[0])
+        upper[_BOUNDED_PLANNER_INDICES] = np.minimum(upper[_BOUNDED_PLANNER_INDICES], self._joint_bounds[1])
         if np.any(lower > upper):
             raise ValueError("Joint feedback cannot satisfy G1 joint and lead bounds")
         bounded_reference = np.clip(reference, lower, upper)
         candidate = self._position + np.clip(bounded_reference - self._position, -step, step)
         if np.any(np.abs(candidate - measured) > self._lead + 1e-8):
             raise ValueError("Joint feedback moved beyond the rate-limited lead bound")
-        arm = candidate[_ARM_PLANNER_INDICES]
-        if np.any(arm < self._arm_bounds[0]) or np.any(arm > self._arm_bounds[1]):
+        bounded = candidate[_BOUNDED_PLANNER_INDICES]
+        if np.any(bounded < self._joint_bounds[0]) or np.any(bounded > self._joint_bounds[1]):
             raise ValueError("Joint feedback cannot satisfy G1 joint and lead bounds")
         self._position = candidate
         if self.stage == 0:
