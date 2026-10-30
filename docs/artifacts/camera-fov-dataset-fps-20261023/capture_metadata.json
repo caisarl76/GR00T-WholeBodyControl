@@ -1,0 +1,67 @@
+{
+  "capture_date": "2026-10-23",
+  "host": "unitree@192.168.0.223",
+  "name": "RealSense D435I",
+  "serial": "254322071593",
+  "firmware": "5.15.1.55",
+  "usb_type": "2.1",
+  "note": "Sequential captures from the same camera, not simultaneous; no option changes.",
+  "profiles": {
+    "1280x720": {
+      "width": 1280,
+      "height": 720,
+      "fps": 15,
+      "fx": 909.9323120117188,
+      "fy": 910.68701171875,
+      "ppx": 648.3077392578125,
+      "ppy": 368.02032470703125,
+      "distortion_model": "distortion.inverse_brown_conrady",
+      "distortion_coeffs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "fov_degrees": [
+        70.2378158569336,
+        43.135398864746094
+      ],
+      "frame_number": 40,
+      "sensor_timestamp_ms": 1792747289812.7444,
+      "timestamp_domain": "timestamp_domain.global_time",
+      "host_capture_time_unix": 1792747289.9980893
+    },
+    "640x480": {
+      "width": 640,
+      "height": 480,
+      "fps": 15,
+      "fx": 606.62158203125,
+      "fy": 607.1246948242188,
+      "ppx": 325.5384826660156,
+      "ppy": 245.3468780517578,
+      "distortion_model": "distortion.inverse_brown_conrady",
+      "distortion_coeffs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "fov_degrees": [
+        55.62067794799805,
+        43.13521957397461
+      ],
+      "frame_number": 40,
+      "sensor_timestamp_ms": 1792747293987.9753,
+      "timestamp_domain": "timestamp_domain.global_time",
+      "host_capture_time_unix": 1792747294.112075
+    }
+  },
+  "vga_bounds_in_hd_pixels": {
+    "left": 160.0000480128037,
+    "right": 1119.999983619282,
+    "top": 1.9961939358381642e-05,
+    "bottom": 719.9999958343794
+  }
+}
