@@ -1,0 +1,57 @@
+{
+  "serial": "349422070160",
+  "firmware": "5.15.1.55",
+  "usb_type": "2.1",
+  "depth_scale": 0.0010000000474974513,
+  "emitter_enabled": 1.0,
+  "profiles": {
+    "1280x720": {
+      "width": 1280,
+      "height": 720,
+      "fps": 6,
+      "fx": 654.01708984375,
+      "fy": 654.01708984375,
+      "ppx": 641.74169921875,
+      "ppy": 358.2585144042969,
+      "distortion_model": "distortion.brown_conrady",
+      "distortion_coeffs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "fov_degrees": [
+        88.75841522216797,
+        57.66053771972656
+      ],
+      "depth_to_color_rotation": null,
+      "depth_to_color_translation_m": null,
+      "frame_number": 31
+    },
+    "640x480": {
+      "width": 640,
+      "height": 480,
+      "fps": 6,
+      "fx": 392.4102478027344,
+      "fy": 392.4102478027344,
+      "ppx": 321.0450134277344,
+      "ppy": 238.95510864257812,
+      "distortion_model": "distortion.brown_conrady",
+      "distortion_coeffs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "fov_degrees": [
+        78.39212036132812,
+        62.90024948120117
+      ],
+      "depth_to_color_rotation": null,
+      "depth_to_color_translation_m": null,
+      "frame_number": 30
+    }
+  }
+}

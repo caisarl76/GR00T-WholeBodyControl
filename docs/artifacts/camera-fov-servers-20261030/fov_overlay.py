@@ -1,6 +1,9 @@
 """Overlay D435i stream-profile FOVs on the widest view, in tangent-plane coordinates.
 
 x = tan(horizontal angle), y = tan(vertical angle, +down): pinhole image rectangles map to rectangles.
+
+    python fov_overlay.py RGB_CAPTURE_DIR OUT.png [DEPTH_CAPTURE_DIR [ir|depth]]
+DEPTH_CAPTURE_DIR comes from capture_depth_ir.py; with it the depth/IR frames are drawn in their own bounds.
 """
 
 import json
@@ -13,11 +16,16 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
+import numpy as np
 from PIL import Image
 
 cap_dir = Path(sys.argv[1])
 out = Path(sys.argv[2])
-meta = json.loads((cap_dir / "capture_metadata.json").read_text())["profiles"]
+cap_meta = json.loads((cap_dir / "capture_metadata.json").read_text())
+meta = cap_meta["profiles"]
+depth_dir = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+depth_kind = sys.argv[4] if len(sys.argv) > 4 else "ir"
+dmeta = json.loads((depth_dir / "depth_profiles.json").read_text()) if depth_dir else None
 
 
 def from_intrinsics(p):
@@ -65,13 +73,17 @@ hd360 = {k: (v / 2 if k in ("fx", "fy", "ppx", "ppy", "width", "height") else v)
 vla_vga, vla_vga_in = vla_view(meta["640x480"])
 vla_169, vla_169_in = vla_view(hd360)
 
+# Depth/IR bounds: measured intrinsics when a depth capture is given, else the enumerated FOV.
+d_wide = from_intrinsics(dmeta["profiles"]["1280x720"]) if dmeta else from_fov(89.072, 57.923)
+d_vga = from_intrinsics(dmeta["profiles"]["640x480"]) if dmeta else from_fov(78.699, 63.177)
+
 # (bounds, label, color, linestyle, linewidth, label anchor)
 rects = [
-    (from_fov(89.072, 57.923), "Depth/IR 1280×720 · 848×480 · 640×360 · 480×270\n89.1° × 57.9°  (widest D435i view)", "#555555", "--", 2.0, "tl"),
-    (from_fov(78.699, 63.177), "Depth/IR 640×480\n78.7° × 63.2°", "#8a8a8a", ":", 2.0, "bl"),
-    (hd, "RGB 1280×720 (= 1920×1080) — widest RGB\n70.2° × 43.1°", "#1f9bd1", "-", 3.0, "above_r"),
+    (d_wide, "Depth/IR 1280×720 · 848×480 · 640×360 · 480×270\n{:.1f}° × {:.1f}°  (widest D435i view)".format(*fov_deg(d_wide)), "#555555", "--", 2.0, "tl"),
+    (d_vga, "Depth/IR 640×480\n{:.1f}° × {:.1f}°".format(*fov_deg(d_vga)), "#8a8a8a", ":", 2.0, "bl"),
+    (hd, "RGB 1280×720 (= 1920×1080) — widest RGB\n{:.1f}° × {:.1f}°".format(*fov_deg(hd)), "#1f9bd1", "-", 3.0, "above_r"),
     (from_fov(69.899, 43.135), "RGB 424×240  69.9° × 43.1°", "#2ca02c", "-.", 2.0, "below_r"),
-    (vga, "RGB 640×480 — GR00T-WBC server & LeRobot head-camera\nserver defaults   55.6° × 43.1°", "#e4572e", "-", 3.5, "in_b"),
+    (vga, "RGB 640×480 — GR00T-WBC server & LeRobot head-camera\nserver defaults   {:.1f}° × {:.1f}°".format(*fov_deg(vga)), "#e4572e", "-", 3.5, "in_b"),
     (vla_169, "VLA sees · 16:9 ≥256 rows (e.g. 640×360@60)\n"
      f"{vla_169_in[0]}×{vla_169_in[1]} · {(vla_169_in[0] // 32) * (vla_169_in[1] // 32)} tok · "
      "{:.1f}°×{:.1f}°".format(*fov_deg(vla_169)), "#7b2cbf", (0, (6, 3)), 2.5, "tl"),
@@ -82,6 +94,17 @@ rects = [
 
 fig, ax = plt.subplots(figsize=(16, 10.5))
 ax.set_facecolor("#ececec")
+
+if dmeta:
+    # Narrower-but-taller 640x480 first, so the 16:9 frame covers it and only its extra rows show.
+    for key, b in (("640x480", d_vga), ("1280x720", d_wide)):
+        if depth_kind == "depth":
+            z = np.asarray(Image.open(depth_dir / f"depth_{key}.png"), dtype=np.float32) * dmeta["depth_scale"]
+            frame = plt.get_cmap("turbo")(np.clip((z - 0.2) / (4.0 - 0.2), 0, 1))
+            frame[z == 0] = (0, 0, 0, 1)  # no depth
+        else:
+            frame = np.asarray(Image.open(depth_dir / f"ir_{key}.png").convert("L"))
+        ax.imshow(frame, cmap="gray", vmin=0, vmax=255, extent=(b[0], b[1], b[3], b[2]), zorder=0.5)
 
 # Real 1280x720 RGB capture, placed exactly in its own bounds.
 img = Image.open(cap_dir / "rgb_1280x720.png").convert("RGB")
@@ -94,7 +117,9 @@ for x0, x1 in ((hd[0], vga[0]), (vga[1], hd[1])):
             fontsize=12, fontweight="bold", zorder=6,
             bbox=dict(boxstyle="round,pad=0.3", fc="#b23a1d", ec="none", alpha=0.9))
 
-ax.text(0, -0.58, "depth / IR only — no RGB pixels here", ha="center", va="center", fontsize=11, color="#555555", zorder=6)
+ax.text(0, -0.58, "depth / IR only — no RGB pixels here" + (
+    f"  ({'depth 0.2–4 m, turbo; black = no depth' if depth_kind == 'depth' else 'left IR imager'})" if dmeta else ""), ha="center", va="center", fontsize=11, color="#555555", zorder=6,
+    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.85) if dmeta else None)
 
 for (l, r, t, b), label, color, ls, lw, anchor in rects:
     ax.add_patch(patches.Rectangle((l, t), r - l, b - t, fill=False, ec=color, ls=ls, lw=lw, zorder=5))
@@ -126,9 +151,10 @@ ax.set_yticks([math.tan(math.radians(d)) for d in deg_y], [f"{d}°" for d in deg
 ax.set_xlabel("horizontal angle from optical axis (tangent scale)")
 ax.set_ylabel("vertical angle (tangent scale)")
 ax.set_title(
-    "D435i (serial 254322071593) — field of view per stream profile vs. the widest view\n"
-    "Photo: real 1280×720 RGB capture (2026-10-23). RGB 1280×720 and 640×480 bounds from calibrated intrinsics; "
-    "other profiles centered from calibrated FOV.",
+    f"D435i (serial {cap_meta['serial']}) — field of view per stream profile vs. the widest view\n"
+    f"Photo: real 1280×720 RGB capture ({cap_meta['capture_date']}). RGB 1280×720 and 640×480 bounds from calibrated intrinsics; "
+    "other profiles centered from calibrated FOV."
+    + ("\nDepth/IR: real frames from the same camera, bounds from its depth intrinsics." if dmeta else ""),
     fontsize=12,
 )
 fig.text(
