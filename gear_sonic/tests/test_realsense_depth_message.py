@@ -37,3 +37,13 @@ def test_uint16_depth_is_lossless_over_msgpack():
     out = ImageMessageSchema.deserialize(msgpack.unpackb(wire, object_hook=m.decode))
     assert out.images["ego_view_depth"].dtype == np.uint16
     assert (out.images["ego_view_depth"] == 1500).all()
+
+
+def test_uint8_ir_round_trips_as_jpeg():
+    ir = np.tile(np.arange(0, 256, 16, dtype=np.uint8), (8, 1))
+    schema = ImageMessageSchema(timestamps={}, images={"ego_view_ir": ir})
+    wire = msgpack.packb(schema.serialize(), use_bin_type=True)
+    out = ImageMessageSchema.deserialize(msgpack.unpackb(wire, object_hook=m.decode))
+    # Decoded with IMREAD_COLOR: grayscale comes back replicated across 3 channels.
+    assert out.images["ego_view_ir"].shape == (8, 16, 3)
+    assert np.abs(out.images["ego_view_ir"][..., 0].astype(int) - ir).max() <= 8

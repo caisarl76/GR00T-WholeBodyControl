@@ -113,11 +113,15 @@ class ComposedCameraConfig:
     realsense_color_height: int = 480
     """RealSense RGB height."""
 
+    realsense_enable_ir: bool = False
+    """Publish the left IR image as ``<mount>_ir`` (grayscale, not aligned to color, so it keeps
+    the stereo module's full ~89 deg view at 16:9 depth/IR sizes)."""
+
     realsense_depth_width: int = 640
-    """RealSense depth width (depth is aligned to the color image when published)."""
+    """RealSense depth/IR width (depth is aligned to the color image when published; IR is not)."""
 
     realsense_depth_height: int = 480
-    """RealSense depth height."""
+    """RealSense depth/IR height."""
 
     def __post_init__(self):
         self.run_as_server = self.server
@@ -398,6 +402,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
             realsense_config = RealSenseConfig()
             realsense_config.fps = self.config.realsense_fps
             realsense_config.enable_depth = self.config.realsense_enable_depth
+            realsense_config.enable_ir = self.config.realsense_enable_ir
             realsense_config.color_image_dim = (
                 self.config.realsense_color_width,
                 self.config.realsense_color_height,

@@ -34,6 +34,8 @@ class RealSenseConfig:
     color_image_dim: tuple[int, int] = (640, 480)
     fps: int = 15
     enable_depth: bool = False
+    # Left IR imager at depth_image_dim, unaligned: keeps the stereo module's full ~89 deg 16:9 view.
+    enable_ir: bool = False
     mount_position: str = CameraMountPosition.EGO_VIEW.value
 
 
@@ -91,13 +93,35 @@ class RealSenseSensor(Sensor, SensorServer):
                     rs.format.z16,
                     config.fps,
                 )
+            if config.enable_ir:
+                self.config.enable_stream(
+                    rs.stream.infrared,
+                    1,
+                    config.depth_image_dim[0],
+                    config.depth_image_dim[1],
+                    rs.format.y8,
+                    config.fps,
+                )
             profile = self.pipeline.start(self.config)
+            self._intrinsics = {}
+            if config.enable_ir:
+                ir_intr = (
+                    profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile().get_intrinsics()
+                )
+                self._intrinsics[f"{mount_position}_ir"] = {
+                    "fx": float(ir_intr.fx),
+                    "fy": float(ir_intr.fy),
+                    "ppx": float(ir_intr.ppx),
+                    "ppy": float(ir_intr.ppy),
+                    "width": int(ir_intr.width),
+                    "height": int(ir_intr.height),
+                }
             if config.enable_depth:
                 self._align = rs.align(rs.stream.color)
                 color_intr = (
                     profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
                 )
-                self._intrinsics = {
+                self._intrinsics[mount_position] = {
                     "fx": float(color_intr.fx),
                     "fy": float(color_intr.fy),
                     "ppx": float(color_intr.ppx),
@@ -118,7 +142,7 @@ class RealSenseSensor(Sensor, SensorServer):
             self.start_server(port)
         print(
             f"Done initializing RealSense sensor: "
-            f"{selected_serial} (fps={config.fps}, depth={config.enable_depth})"
+            f"{selected_serial} (fps={config.fps}, depth={config.enable_depth}, ir={config.enable_ir})"
         )
 
     def read(self) -> dict[str, Any] | None:
@@ -128,6 +152,11 @@ class RealSenseSensor(Sensor, SensorServer):
             print(f"ERROR! Failed to wait for frames: {e}")
             return None
 
+        # Take IR before alignment: align reprojects onto the color view.
+        ir_frame = frames.get_infrared_frame(1) if self._realsense_config.enable_ir else None
+        if self._realsense_config.enable_ir and not ir_frame:
+            print("WARNING! No IR frame")
+            return None
         if self._realsense_config.enable_depth:
             frames = self._align.process(frames)
         color_frame = frames.get_color_frame()
@@ -168,12 +197,11 @@ class RealSenseSensor(Sensor, SensorServer):
         if self._realsense_config.enable_depth:
             timestamps[f"{self.mount_position}_depth"] = current_time
             images[f"{self.mount_position}_depth"] = depth_image
-        if self._realsense_config.enable_depth:
-            return {
-                "timestamps": timestamps,
-                "images": images,
-                "intrinsics": {self.mount_position: self._intrinsics},
-            }
+        if ir_frame:
+            timestamps[f"{self.mount_position}_ir"] = current_time
+            images[f"{self.mount_position}_ir"] = np.asanyarray(ir_frame.get_data()).copy()
+        if self._intrinsics:
+            return {"timestamps": timestamps, "images": images, "intrinsics": self._intrinsics}
         return {"timestamps": timestamps, "images": images}
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
