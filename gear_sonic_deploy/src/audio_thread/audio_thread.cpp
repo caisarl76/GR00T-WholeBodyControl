@@ -11,7 +11,7 @@ AudioThread::AudioThread():
   client_() {
   client_.Init();
   client_.SetTimeout(10.0f);
-  client_.SetVolume(100);
+  client_.SetVolume(50);  // half volume
   thread_ = std::jthread([this](std::stop_token st) { loop(st); });
 }
 

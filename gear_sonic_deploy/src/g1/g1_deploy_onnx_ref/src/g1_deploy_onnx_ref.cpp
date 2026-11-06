@@ -103,6 +103,7 @@
 
 // Utility classes
 #include "../include/utils.hpp"
+#include "../include/tts_queue.hpp"
 
 // Robot parameters
 #include "../include/robot_parameters.hpp"
@@ -267,8 +268,6 @@ class G1Deploy {
     std::array<bool, G1_NUM_MOTOR> motor_high_temp_ = {};
     static constexpr int16_t HIGH_TEMP_ENTER = 90;
     static constexpr int16_t HIGH_TEMP_EXIT = 85;
-    bool high_temp_warning_ = false;
-    std::string high_temp_message_;
 
     std::array<double, 4> init_ref_data_root_rot_array_;
 
@@ -2977,7 +2976,7 @@ class G1Deploy {
         }
       }
 
-      // Build high temperature warning message for audio
+      // Log high temperature warning to console; voice warning every 5th alert
       {
         static const char* joint_names_hw[] = {
           "Left Hip Pitch", "Left Hip Roll", "Left Hip Yaw", "Left Knee",
@@ -2990,7 +2989,6 @@ class G1Deploy {
           "Right Wrist Roll", "Right Wrist Pitch", "Right Wrist Yaw",
         };
         bool any_high = false;
-        std::string high_temp_msg = "Warning! High temperature at ";
         std::string high_temp_print_msg = "Warning! High temperature at ";
         bool first = true;
         for (int i = 0; i < G1_NUM_MOTOR; ++i) {
@@ -2998,20 +2996,20 @@ class G1Deploy {
             any_high = true;
             int16_t t = std::max(unitree_joint_state[i].temperature()[0],
                                  unitree_joint_state[i].temperature()[1]);
-            if (!first) { high_temp_msg += ", "; high_temp_print_msg += ", "; }
-            high_temp_msg += joint_names_hw[i];
+            if (!first) { high_temp_print_msg += ", "; }
             high_temp_print_msg += std::string(joint_names_hw[i]) + "(" + std::to_string(t) + ")";
             first = false;
           }
         }
-        high_temp_warning_ = any_high;
-        high_temp_message_ = any_high ? high_temp_msg : "";
-
-        // Print to console at ~1s intervals while overheating (50 Hz control loop)
+        // Print to console at ~1s intervals while overheating (50 Hz control loop);
+        // speak only once per 5 printed alerts (~5s) to limit speaker API calls.
         if (any_high) {
           static int high_temp_print_counter = 0;
           if (high_temp_print_counter % 50 == 0) {
             std::cout << "[HighTemp] " << high_temp_print_msg << std::endl;
+            if (high_temp_print_counter % (50 * 5) == 0) {
+              gear_sonic::deploy::AppendTts(pending_tts_, high_temp_print_msg);
+            }
           }
           high_temp_print_counter++;
         }
@@ -3123,8 +3121,6 @@ class G1Deploy {
           .motor_error = error_monitor_.hasErrors(),
           .low_state_late = low_state_late,
           .tts_message = std::move(pending_tts_),
-          .high_temperature = high_temp_warning_,
-          .high_temperature_message = high_temp_message_,
         });
       pending_tts_.clear();
 
@@ -4101,7 +4097,7 @@ class G1Deploy {
                 if (k > 0) tts += ", ";
                 tts += std::string(joint_names[idx]) + " " + std::to_string(temp_val);
               }
-              pending_tts_ = tts;
+              gear_sonic::deploy::AppendTts(pending_tts_, tts);
             }
           }
 
