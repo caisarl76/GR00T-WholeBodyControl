@@ -22,6 +22,11 @@ if(BUILD_DEPLOY_TESTS)
       -fsanitize=address,undefined)
   endif()
   add_test(NAME dex3_hand_field_decoder_test COMMAND dex3_hand_field_decoder_test)
+
+  add_executable(tts_queue_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/tts_queue_test.cpp)
+  target_include_directories(tts_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  set_target_properties(tts_queue_test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  add_test(NAME tts_queue_test COMMAND tts_queue_test)
 endif()
 
 if(BUILD_ROS2)
