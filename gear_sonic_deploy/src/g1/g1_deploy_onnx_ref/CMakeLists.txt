@@ -6,6 +6,13 @@ set(EXECUTABLE_NAME g1_deploy_onnx_ref)
 option(BUILD_ROS2 "Build optional ROS2 input/output support" OFF)
 option(BUILD_DEPLOY_TESTS "Build deploy-side test executables" OFF)
 
+if(BUILD_DEPLOY_TESTS)
+  add_executable(tts_queue_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/tts_queue_test.cpp)
+  target_include_directories(tts_queue_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  set_target_properties(tts_queue_test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+  add_test(NAME tts_queue_test COMMAND tts_queue_test)
+endif()
+
 if(BUILD_ROS2)
   find_package(rclcpp QUIET)
   find_package(std_msgs QUIET)

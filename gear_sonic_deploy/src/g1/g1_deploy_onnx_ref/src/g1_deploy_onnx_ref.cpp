@@ -97,6 +97,7 @@
 
 // Utility classes
 #include "../include/utils.hpp"
+#include "../include/tts_queue.hpp"
 
 // Robot parameters
 #include "../include/robot_parameters.hpp"
@@ -2902,8 +2903,7 @@ class G1Deploy {
           if (high_temp_print_counter % 50 == 0) {
             std::cout << "[HighTemp] " << high_temp_print_msg << std::endl;
             if (high_temp_print_counter % (50 * 5) == 0) {
-              if (!pending_tts_.empty()) { pending_tts_ += ". "; }
-              pending_tts_ += high_temp_print_msg;
+              gear_sonic::deploy::AppendTts(pending_tts_, high_temp_print_msg);
             }
           }
           high_temp_print_counter++;
@@ -3957,7 +3957,7 @@ class G1Deploy {
                 if (k > 0) tts += ", ";
                 tts += std::string(joint_names[idx]) + " " + std::to_string(temp_val);
               }
-              pending_tts_ = tts;
+              gear_sonic::deploy::AppendTts(pending_tts_, tts);
             }
           }
 
