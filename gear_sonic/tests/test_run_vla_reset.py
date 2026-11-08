@@ -343,7 +343,8 @@ def test_init_without_feedback_stays_paused_and_sends_no_pose(monkeypatch):
 
 def test_standing_reset_waits_for_measured_joints_before_advancing(monkeypatch):
     state = {
-        "body_q": np.ones(29),
+        # Waist roll/pitch (motors 13-14) stay inside their ±0.52 rad limits.
+        "body_q": np.r_[np.ones(13), .5, .5, np.ones(14)],
         "left_hand_q": np.zeros(7),
         "right_hand_q": np.zeros(7),
         "base_quat": [1, 0, 0, 0],
@@ -359,14 +360,14 @@ def test_standing_reset_waits_for_measured_joints_before_advancing(monkeypatch):
     def follow_target(index, worker_args):
         assert worker_args[0].empty(), "Standing reset must keep inference paused"
         if index == 14:
-            state["body_q"][:] = 0.8
+            state["body_q"] *= 0.8
 
     messages = run_keys(monkeypatch, ["k", "i"] + [None] * 20, state, follow_target)
     positions = np.array([
         unpack_bridge_message(raw, topic="planner")["upper_body_position"]
         for raw in messages if raw.startswith(b"planner")
     ])
-    np.testing.assert_allclose(positions[0], 1)
+    np.testing.assert_allclose(positions[0], np.r_[1, .5, .5, np.ones(14)])
     # The waist target stops 0.15 rad ahead of stalled feedback, then advances
     # again when the measured posture follows, at at most 0.5 rad/s.
     np.testing.assert_allclose(positions[10:13, 0], 0.85)

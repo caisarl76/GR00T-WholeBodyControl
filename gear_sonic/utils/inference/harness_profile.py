@@ -114,6 +114,12 @@ class HandoverSettings:
         return tuple(self.raised_right_arm_joints[name] for name in RIGHT_ARM_BOUNDS)
 
 
+# Motor order and limits from g1_29dof_with_hand.xml (waist motors 12–14); test_waist_bounds checks them.
+WAIST_BOUNDS = {
+    "waist_yaw_joint": (-2.618, 2.618),
+    "waist_roll_joint": (-0.52, 0.52),
+    "waist_pitch_joint": (-0.52, 0.52),
+}
 # Motor order and limits from g1_29dof_with_hand.xml (right arm motors 22–28).
 RIGHT_ARM_BOUNDS = {
     "right_shoulder_pitch_joint": (-3.0892, 2.6704),
