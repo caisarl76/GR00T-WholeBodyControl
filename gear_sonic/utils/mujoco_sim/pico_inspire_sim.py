@@ -90,7 +90,7 @@ class PicoInspireSim:
         elif (
             self.manager is not None
             and packet.provenance == self.manager
-            and self.manager.stream_mode in (1, 5)
+            and self.manager.stream_mode in (1, 2, 3, 5)
             and 0 <= now - self.manager_received < 0.25
             and packet.message_seq > self.last_sequence
         ):
@@ -114,7 +114,7 @@ class PicoInspireSim:
                 continue
         active = (
             self.target is not None
-            and self.manager.stream_mode in (1, 5)
+            and self.manager.stream_mode in (1, 2, 3, 5)
             and 0 <= now - self.manager_received < 0.25
             and 0 <= now - self.command_received < 0.25
         )
@@ -133,6 +133,8 @@ class PicoInspireSim:
         fields["last_applied_message_seq"][0] = self.last_applied_sequence
         if self.manager is not None:
             fields["accepted_pv"][:] = self.manager.to_array()
+        for side in ("left", "right"):
+            fields[f"{side}_feedback_age_ns"][0] = -1
         try:
             measured = self.plant.read_normalized_state()
             for side, q in zip(("left", "right"), measured, strict=True):
@@ -140,6 +142,7 @@ class PicoInspireSim:
                 if q.shape != (6,) or not np.isfinite(q).all() or np.any((q < 0) | (q > 1)):
                     raise ValueError("invalid measured Inspire state")
                 fields[f"{side}_angle_act"][:] = np.rint(q * 1000).astype(np.int32)
+                fields[f"{side}_feedback_age_ns"][0] = 0
             fields["feedback_healthy"][0] = True
         except (ValueError, TypeError):
             fields["fault_code"][0] = 1

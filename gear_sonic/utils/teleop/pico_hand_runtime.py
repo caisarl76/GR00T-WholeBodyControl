@@ -175,7 +175,12 @@ class PicoHandRuntime:
                 or self.feedback["bridge_state"][0] not in (1, 2)
             ):
                 return [None, None]
-            return [self.feedback[f"{side}_angle_act"].astype(np.float64) / 1000 for side in ("left", "right")]
+            measured = []
+            for side in ("left", "right"):
+                age = self.feedback.get(f"{side}_feedback_age_ns", np.array([-1], np.int64))[0]
+                fresh = 0 <= age and age + now_ns - self.received_ns < limit
+                measured.append(self.feedback[f"{side}_angle_act"].astype(np.float64) / 1000 if fresh else None)
+            return measured
         measured = []
         for side in ("left", "right"):
             valid = self.feedback.get(f"{side}_hand_feedback_valid")

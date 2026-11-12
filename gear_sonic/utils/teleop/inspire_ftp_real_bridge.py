@@ -20,7 +20,7 @@ VALID_STREAM_MODES = frozenset(range(6))
 _PROVENANCE_STRUCT = struct.Struct("<16sqi")
 
 CONTROL_PERIOD_NS = 100_000_000
-MAX_TICK_INTERVAL_NS = 110_000_000
+MAX_TICK_INTERVAL_NS = 200_000_000
 SOURCE_STALE_NS = 250_000_000
 STATE_STALE_NS = 500_000_000
 MIN_COMMAND = 800
@@ -28,6 +28,10 @@ MAX_COMMAND = 1000
 MAX_STEP = 5
 OPEN_FEEDBACK_MIN = 950
 OPEN_CONFIRM_TICKS = 10
+OPEN_ONLY_TIMEOUT_NS = 25_000_000_000
+OPEN_ONLY_HOLD_TICKS = 20
+# Tolerate measured lag independently of the five-count command step.
+OPEN_ONLY_MAX_FEEDBACK_LAG = MAX_COMMAND - OPEN_FEEDBACK_MIN
 # More than sixteen distinct mode/session changes inside one 10 Hz control period
 # indicates a control-plane flood, while this cap still tolerates a large burst.
 MAX_PENDING_MANAGER_TRANSITIONS = 16
@@ -38,7 +42,7 @@ MAX_REJECTED_PAIRS = 2**31 - 1
 
 _SIDES = frozenset(("left", "right"))
 _OPEN_COUNTS = (MAX_COMMAND,) * 6
-_AUTHORIZED_TOPICS = {1: "inspire_hand", 5: "inspire_hand"}
+_AUTHORIZED_TOPICS = {mode: "inspire_hand" for mode in (1, 2, 3, 5)}
 
 SixInts = tuple[int, int, int, int, int, int]
 SixFloats = tuple[float, float, float, float, float, float]
@@ -53,6 +57,7 @@ class BridgeState(enum.Enum):
     OPENING = enum.auto()
     FAULT_LATCHED = enum.auto()
     SHUTDOWN_OPENING = enum.auto()
+    COMMISSIONING_OPENING = enum.auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,15 +276,15 @@ def _validate_pair_side(values: object, label: str) -> SixFloats:
     raise ValueError(f"{label} must be a tuple of six built-in floats")
 
 
-def _to_enveloped_counts(values: SixFloats) -> tuple[SixInts, int]:
-    limited = sum(value < 0.8 for value in values)
-    counts = tuple(max(MIN_COMMAND, min(MAX_COMMAND, round(value * 1000))) for value in values)
+def _to_enveloped_counts(values: SixFloats, minimum: int = MIN_COMMAND) -> tuple[SixInts, int]:
+    limited = sum(value < minimum / 1000 for value in values)
+    counts = tuple(max(minimum, min(MAX_COMMAND, round(value * 1000))) for value in values)
     return counts, limited  # type: ignore[return-value]
 
 
-def _bounded_counts(target: SixInts, baseline: SixInts) -> SixInts:
+def _bounded_counts(target: SixInts, baseline: SixInts, minimum: int = MIN_COMMAND) -> SixInts:
     return tuple(
-        max(MIN_COMMAND, min(MAX_COMMAND, current + max(-MAX_STEP, min(MAX_STEP, goal - current))))
+        max(minimum, min(MAX_COMMAND, current + max(-MAX_STEP, min(MAX_STEP, goal - current))))
         for goal, current in zip(target, baseline, strict=True)
     )  # type: ignore[return-value]
 
@@ -287,8 +292,25 @@ def _bounded_counts(target: SixInts, baseline: SixInts) -> SixInts:
 class InspireFtpSafetyController:
     """Pure fail-open state machine for two real Inspire FTP hands."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        initialize_hands: bool = False,
+        no_active_slew_limit: bool = False,
+        full_position_range: bool = False,
+    ) -> None:
         self._state = BridgeState.MONITORING
+        self._initialize_hands = initialize_hands
+        self._open_only = initialize_hands
+        self._no_active_slew_limit = no_active_slew_limit
+        self._minimum_command = 0 if full_position_range else MIN_COMMAND
+        self._open_only_started_ns = None
+        self._open_only_hold_ticks = 0
+        self.open_only_completed = False
+        self._opening_resumed = False
+        self._fault_feedback = None
+        self._ready_error_feedback = None
+        self._ever_active = False
         self._armed = False
         self._manager_provenance: StreamProvenance | None = None
         self._manager_received_ns: int | None = None
@@ -298,6 +320,7 @@ class InspireFtpSafetyController:
         self._provenance_generation = 0
         self._manager_changed = False
         self._latest_pair: HandPair | None = None
+        self._handoff_source_received_ns: int | None = None
         self._latest_left_target: SixInts = _OPEN_COUNTS
         self._latest_right_target: SixInts = _OPEN_COUNTS
         self._latest_left_limited = False
@@ -321,6 +344,7 @@ class InspireFtpSafetyController:
         self._envelope_limited_values = 0
         self._shutdown_open_attempts = 0
         self._shutdown_hold_ticks = 0
+        self._shutdown_hold_attempts = 0
         self._sequence_pv = None
         self._last_seen_sequence = -1
         self._last_seen_fingerprint = None
@@ -446,6 +470,8 @@ class InspireFtpSafetyController:
     def accept_manager(self, provenance: StreamProvenance, received_ns: int) -> bool:
         """Validate and stage a manager tuple for the next eligible control tick."""
 
+        if self.open_only:
+            return False
         if not isinstance(provenance, StreamProvenance):
             self._set_pending_fault("malformed manager provenance")
             return False
@@ -507,6 +533,8 @@ class InspireFtpSafetyController:
     ) -> bool:
         """Atomically accept one exact, authorized, normalized hand pair."""
 
+        if self.open_only:
+            return False
         try:
             left_values = _validate_pair_side(left, "left hand pair")
             right_values = _validate_pair_side(right, "right hand pair")
@@ -548,7 +576,7 @@ class InspireFtpSafetyController:
             and self._pending_fault is None
             and self._signal_count == 0
             and not self._manager_changed
-            and not manager_change_pending
+            and (not manager_change_pending or self._pending_changes_preserve_hand_pose())
             and manager is not None
             and provenance == manager
             and type(received_ns) is int
@@ -570,9 +598,10 @@ class InspireFtpSafetyController:
             return False
         # Everything above is side-effect-free.  Convert and stage both hands before
         # publishing any accepted-pair state so malformed pairs cannot refresh freshness.
-        left_counts, left_limited = _to_enveloped_counts(left_values)
-        right_counts, right_limited = _to_enveloped_counts(right_values)
+        left_counts, left_limited = _to_enveloped_counts(left_values, self._minimum_command)
+        right_counts, right_limited = _to_enveloped_counts(right_values, self._minimum_command)
         self._latest_pair = HandPair(left_values, right_values, provenance, topic, received_ns, message_seq)
+        self._handoff_source_received_ns = None
         self._latest_left_target = left_counts
         self._latest_right_target = right_counts
         self._latest_left_limited = left_limited > 0
@@ -598,7 +627,15 @@ class InspireFtpSafetyController:
             return False
         unhealthy = any(canonical.err)
         if unhealthy:
-            self._set_pending_fault(f"{canonical.side} hand reported nonzero error")
+            if self._ready_error_is_recoverable():
+                self._ready_error_feedback = canonical
+                # A recovered sample must not authorize a pair queued before
+                # the error, even when both samples arrive between ticks.
+                self._invalidate_authorization(increment_generation=False)
+            else:
+                if self._fault_feedback is None and self.fault_reason is None:
+                    self._fault_feedback = canonical
+                self._set_pending_fault(f"{canonical.side} hand reported nonzero error")
         current = self._left_state if canonical.side == "left" else self._right_state
         if current is not None and canonical.received_ns < current.received_ns:
             return False
@@ -630,14 +667,14 @@ class InspireFtpSafetyController:
                 raise ValueError(f"{snapshot.side} hand feedback is stale")
             if any(snapshot.err):
                 raise ValueError(f"{snapshot.side} hand feedback is unhealthy")
-            if any(value < OPEN_FEEDBACK_MIN for value in snapshot.angle_act):
+            if not self.open_only and any(value < OPEN_FEEDBACK_MIN for value in snapshot.angle_act):
                 raise ValueError(f"{snapshot.side} hand is not open")
         self._left_state = canonical_left
         self._right_state = canonical_right
         self._last_successful_left = canonical_left.angle_act
         self._last_successful_right = canonical_right.angle_act
         self._armed = True
-        self._state = BridgeState.READY
+        self._state = BridgeState.COMMISSIONING_OPENING if self.open_only else BridgeState.READY
         self._open_confirm_ticks = 0
         self._ready_after_ns = None
         self._last_control_cycle_ns = None
@@ -655,8 +692,14 @@ class InspireFtpSafetyController:
                 raise ValueError(f"{side} hand feedback is stale")
             if any(snapshot.err):
                 raise ValueError(f"{side} hand feedback is unhealthy")
-            if any(value < OPEN_FEEDBACK_MIN for value in snapshot.angle_act):
+            if not self.open_only and any(value < OPEN_FEEDBACK_MIN for value in snapshot.angle_act):
                 raise ValueError(f"{side} hand is not open")
+
+        if self.open_only and self._open_only_started_ns is None and not self._opening_resumed:
+            # Registration may take seconds. Seed the first write from the latest
+            # measured values after ownership is proved, not preflight positions.
+            self._last_successful_left = self._left_state.angle_act
+            self._last_successful_right = self._right_state.angle_act
 
     def latch_fault(self, reason: str) -> None:
         """Queue an irreversible safety fault for the next control tick."""
@@ -681,6 +724,8 @@ class InspireFtpSafetyController:
         if type(now_ns) is not int or now_ns < 0:
             raise ValueError("now_ns must be a nonnegative built-in int")
         timing_fault, cycle_eligible = self._observe_cycle_timing(now_ns)
+        if self.open_only and self._armed:
+            return self._open_only_tick(now_ns, timing_fault, cycle_eligible)
         if self._signal_count >= 2:
             self._discard_manager_events()
             return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=False, exit_now=True)
@@ -718,6 +763,12 @@ class InspireFtpSafetyController:
 
         if self._state is BridgeState.MONITORING:
             return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=False)
+        if self._state is BridgeState.READY and any(
+            snapshot is not None and any(snapshot.err) for snapshot in self.hand_states
+        ):
+            # Waiting for first optical admission: preserve truthful unhealthy
+            # status, and do not keep driving an errored hand toward open.
+            return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=False)
         if self._state is BridgeState.FAULT_LATCHED and not self._armed:
             return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=False, exit_now=True)
         if self._state is BridgeState.ACTIVE:
@@ -733,15 +784,19 @@ class InspireFtpSafetyController:
         if side not in _SIDES:
             raise ValueError(f"invalid hand side: {side!r}")
         values = _strict_six_ints(attempted, "attempted command", MAX_COMMAND)
-        if any(value < MIN_COMMAND for value in values):
+        if not self.open_only and any(value < self._minimum_command for value in values):
             raise ValueError("attempted command lies below the safety envelope")
         if type(succeeded) is not bool:
             raise ValueError("succeeded must be bool")
         baseline = self._last_successful_left if side == "left" else self._last_successful_right
         if baseline is None:
             raise RuntimeError("controller has not been armed")
-        if any(abs(value - previous) > MAX_STEP for value, previous in zip(values, baseline, strict=True)):
+        if not (self._no_active_slew_limit and self._state is BridgeState.ACTIVE) and any(
+            abs(value - previous) > MAX_STEP for value, previous in zip(values, baseline, strict=True)
+        ):
             raise ValueError("attempted command exceeds maximum per-tick step")
+        if self.open_only and any(value < previous for value, previous in zip(values, baseline, strict=True)):
+            raise ValueError("open-only command must never close")
         if succeeded:
             if side == "left":
                 self._last_successful_left = values
@@ -752,7 +807,82 @@ class InspireFtpSafetyController:
                 self._left_write_failures += 1
             else:
                 self._right_write_failures += 1
+            if self._state is BridgeState.SHUTDOWN_OPENING:
+                self._shutdown_hold_ticks = 0
             self._set_pending_fault(f"{side} hand command write failed")
+
+    def _open_only_tick(self, now_ns: int, timing_fault: str | None, cycle_eligible: bool) -> ControlDecision:
+        """Bound commissioning to measured, monotonic opening; faults never move."""
+
+        if self._open_only_started_ns is None:
+            self._open_only_started_ns = now_ns
+        fault = self._fault_reason or self._new_fault(now_ns, timing_fault)
+        if self._signal_count:
+            fault = fault or "open-only interrupted"
+        if now_ns - self._open_only_started_ns >= OPEN_ONLY_TIMEOUT_NS:
+            fault = fault or "open-only timed out"
+        for baseline, snapshot in zip(
+            (self._last_successful_left, self._last_successful_right), self.hand_states, strict=True
+        ):
+            if (
+                baseline is not None
+                and snapshot is not None
+                and any(
+                    previous - measured > OPEN_ONLY_MAX_FEEDBACK_LAG or measured - previous > MAX_STEP
+                    for previous, measured in zip(baseline, snapshot.angle_act, strict=True)
+                )
+            ):
+                fault = fault or f"{snapshot.side} open-only feedback diverged"
+        if fault:
+            self._fault_reason = fault
+            self._state = BridgeState.FAULT_LATCHED
+            return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=False, exit_now=True)
+        if not cycle_eligible:
+            return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=False)
+        self._last_control_cycle_ns = now_ns
+        self._update_open_confirmation(now_ns)
+        if self._last_successful_left == _OPEN_COUNTS and self._last_successful_right == _OPEN_COUNTS:
+            if self._open_confirm_ticks >= OPEN_CONFIRM_TICKS:
+                if self._open_only_hold_ticks >= OPEN_ONLY_HOLD_TICKS:
+                    self.open_only_completed = True
+                    if self._initialize_hands:
+                        self._open_only = False
+                        self._state = BridgeState.READY
+                        self._discard_manager_events()
+                        self._manager_provenance = None
+                        self._manager_received_ns = None
+                        self._invalidate_authorization(increment_generation=True)
+                        return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=False)
+                    return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=False, exit_now=True)
+                self._open_only_hold_ticks += 1
+            else:
+                self._open_only_hold_ticks = 0
+        return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=True)
+
+    @property
+    def shutdown_open_attempt_limit(self) -> int:
+        """Allow bounded opening across the selected command range."""
+
+        return (MAX_COMMAND - self._minimum_command + MAX_STEP - 1) // MAX_STEP
+
+    @property
+    def fault_feedback(self) -> ValidatedHandState | None:
+        """Preserve the first nonzero-error sample that triggered a fault."""
+
+        return self._fault_feedback
+
+    @property
+    def ready_error_feedback(self) -> ValidatedHandState | None:
+        """Latest pre-ACTIVE READY warning, retained after feedback recovers."""
+
+        return self._ready_error_feedback
+
+    def _ready_error_is_recoverable(self) -> bool:
+        return self._state is BridgeState.READY and not self._ever_active and self.fault_reason is None
+
+    @property
+    def open_only(self) -> bool:
+        return self._open_only
 
     def _set_pending_fault(self, reason: str) -> None:
         if self._fault_reason is None and self._pending_fault is None:
@@ -774,8 +904,29 @@ class InspireFtpSafetyController:
             received_ns = event.received_ns
         return current, received_ns, retired_sessions, provenance_change_pending
 
+    def _pending_changes_preserve_hand_pose(self) -> bool:
+        """Only an entirely authorized same-session mode chain may retain a pose."""
+
+        current = self._manager_provenance
+        if self._state is not BridgeState.ACTIVE or self._manager_changed or current is None:
+            return False
+        for event in self._pending_manager_events:
+            if (
+                event.provenance.session_id != current.session_id
+                or current.stream_mode not in _AUTHORIZED_TOPICS
+                or event.provenance.stream_mode not in _AUTHORIZED_TOPICS
+            ):
+                return False
+            current = event.provenance
+        return True
+
     def _apply_manager_events(self) -> None:
+        preserve_pose = self._pending_changes_preserve_hand_pose()
+        last_source_received_ns = (
+            self._latest_pair.received_ns if self._latest_pair is not None else self._handoff_source_received_ns
+        )
         manager_changed = False
+        any_changed = False
         for event in self._pending_manager_events:
             current = self._manager_provenance
             changed = event.provenance != current
@@ -784,9 +935,25 @@ class InspireFtpSafetyController:
             self._manager_provenance = event.provenance
             self._manager_received_ns = event.received_ns
             if changed:
+                any_changed = True
                 self.last_applied_message_seq = -1
-                self._invalidate_authorization(increment_generation=True)
-                manager_changed = manager_changed or current is not None
+                if preserve_pose:
+                    self._provenance_generation += 1
+                else:
+                    self._invalidate_authorization(increment_generation=True)
+                    manager_changed = manager_changed or current is not None
+        if (
+            any_changed
+            and preserve_pose
+            and (self._latest_pair is None or self._latest_pair.provenance != self._manager_provenance)
+        ):
+            # Hold actual completed writes, never continue an old closing target.
+            # The old source clock bounds this wait; manager heartbeats or further
+            # mode changes cannot extend it without a fresh matching q6 command.
+            self._clear_pair_targets()
+            self._handoff_source_received_ns = last_source_received_ns
+            self._latest_left_target = self._last_successful_left or _OPEN_COUNTS
+            self._latest_right_target = self._last_successful_right or _OPEN_COUNTS
         self._manager_changed = self._manager_changed or manager_changed
         self._pending_manager_events.clear()
         self._pending_manager_transition_count = 0
@@ -811,6 +978,11 @@ class InspireFtpSafetyController:
         self._maximum_tick_interval_ns = max(self._maximum_tick_interval_ns, interval_ns)
         if interval_ns > MAX_TICK_INTERVAL_NS:
             self._loop_overrun_count += 1
+            if self._state is BridgeState.READY:
+                # Waiting with open targets is not active motion. Keep the gap
+                # observable, but require a new pair before admitting movement.
+                self._clear_pair_targets()
+                return None, True
             return "control tick interval overrun", True
         return None, interval_ns >= CONTROL_PERIOD_NS
 
@@ -823,13 +995,18 @@ class InspireFtpSafetyController:
             return "manager timestamp is in the future"
         if self._latest_pair is not None and self._latest_pair.received_ns > now_ns:
             return "source timestamp is in the future"
-        if self._state in (BridgeState.READY, BridgeState.ACTIVE, BridgeState.OPENING):
+        if self._state in (
+            BridgeState.READY,
+            BridgeState.ACTIVE,
+            BridgeState.OPENING,
+            BridgeState.COMMISSIONING_OPENING,
+        ):
             for side, snapshot in (("left", self._left_state), ("right", self._right_state)):
                 if snapshot is not None and now_ns < snapshot.received_ns:
                     return f"{side} hand state timestamp is in the future"
                 if snapshot is None or now_ns - snapshot.received_ns >= STATE_STALE_NS:
                     return f"{side} hand state timeout"
-                if any(snapshot.err):
+                if any(snapshot.err) and not self._ready_error_is_recoverable():
                     return f"{side} hand reported nonzero error"
         return None
 
@@ -879,6 +1056,7 @@ class InspireFtpSafetyController:
                 return
             if self._latest_pair is not None and self._pair_is_fresh(now_ns):
                 self._state = BridgeState.ACTIVE
+                self._ever_active = True
         elif self._state is BridgeState.ACTIVE:
             if self._manager_changed:
                 self._manager_changed = False
@@ -887,7 +1065,13 @@ class InspireFtpSafetyController:
             elif (
                 not self._manager_is_fresh(now_ns)
                 or not self._manager_is_authorized()
-                or not self._pair_is_fresh(now_ns)
+                or not (
+                    self._pair_is_fresh(now_ns)
+                    or (
+                        self._handoff_source_received_ns is not None
+                        and 0 <= now_ns - self._handoff_source_received_ns < SOURCE_STALE_NS
+                    )
+                )
             ):
                 self._invalidate_authorization(increment_generation=True)
                 self._state = BridgeState.OPENING
@@ -907,6 +1091,7 @@ class InspireFtpSafetyController:
 
     def _clear_pair_targets(self) -> None:
         self._latest_pair = None
+        self._handoff_source_received_ns = None
         self._latest_left_target = _OPEN_COUNTS
         self._latest_right_target = _OPEN_COUNTS
         self._latest_left_limited = False
@@ -922,10 +1107,27 @@ class InspireFtpSafetyController:
     ) -> ControlDecision:
         left = self._last_successful_left or _OPEN_COUNTS
         right = self._last_successful_right or _OPEN_COUNTS
+        if self.open_only:
+            counts = tuple(
+                tuple(
+                    max(previous, min(MAX_COMMAND, previous + MAX_STEP, measured + OPEN_ONLY_MAX_FEEDBACK_LAG))
+                    for previous, measured in zip(baseline, snapshot.angle_act, strict=True)
+                )
+                if snapshot is not None
+                else baseline
+                for baseline, snapshot in zip((left, right), self.hand_states, strict=True)
+            )
+        elif self._no_active_slew_limit and self._state is BridgeState.ACTIVE:
+            counts = (left_target, right_target)
+        else:
+            counts = (
+                _bounded_counts(left_target, left, self._minimum_command),
+                _bounded_counts(right_target, right, self._minimum_command),
+            )
         return ControlDecision(
             state=self._state,
-            left_counts=_bounded_counts(left_target, left),
-            right_counts=_bounded_counts(right_target, right),
+            left_counts=counts[0],
+            right_counts=counts[1],
             publish=publish and self._armed,
             fault_reason=self._fault_reason or self._pending_fault,
             exit_now=exit_now,
@@ -938,11 +1140,12 @@ class InspireFtpSafetyController:
         right = self._last_successful_right or _OPEN_COUNTS
         both_open = left == _OPEN_COUNTS and right == _OPEN_COUNTS
         if both_open:
-            if self._shutdown_hold_ticks >= 20:
+            if self._shutdown_hold_ticks >= 20 or self._shutdown_hold_attempts >= 40:
                 return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=False, exit_now=True)
             self._shutdown_hold_ticks += 1
+            self._shutdown_hold_attempts += 1
             return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=True)
-        if self._shutdown_open_attempts >= 40:
+        if self._shutdown_open_attempts >= self.shutdown_open_attempt_limit:
             return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=False, exit_now=True)
         self._shutdown_open_attempts += 1
         return self._decision(_OPEN_COUNTS, _OPEN_COUNTS, publish=True)

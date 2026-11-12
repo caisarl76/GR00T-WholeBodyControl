@@ -106,11 +106,13 @@ class ControllerChords:
             if now_ns - self.changed_at[key] >= 40_000_000:
                 self.stable[key] = value
         down = {key for key, value in self.stable.items() if value}
-        if self.deadline is None and down:
-            self.deadline = now_ns + 200_000_000
-        if self.deadline is None:
-            return None
         candidate = next((action for chord, action in self.CHORDS if chord <= down), None)
+        # A modifier held before its partner must not consume the chord window.
+        if candidate is None:
+            self.deadline = None
+            return None
+        if self.deadline is None:
+            self.deadline = now_ns + 200_000_000
         if candidate == "sonic" or now_ns >= self.deadline:
             self.wait_release = True
             self.neutral_since = self.deadline = None

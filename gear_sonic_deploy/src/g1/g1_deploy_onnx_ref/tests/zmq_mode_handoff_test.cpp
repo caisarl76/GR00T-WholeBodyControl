@@ -288,6 +288,7 @@ int main() {
                              std::array<double, 3>{3.1, -3.1, 2.9}}) {
       auto initial_reference = euler_z_to_quat_d(yaws[0]);
       HeadingState heading(euler_z_to_quat_d(0.6), 0.25);
+      const auto captured_base_quat = heading.init_base_quat;
       const double old_world_yaw = 0.6 + 0.25 + yaws[1] - yaws[0];
       PlannerState state;
       state.QueueHeadingHandoff(euler_z_to_quat_d(yaws[1]), euler_z_to_quat_d(1.2));
@@ -299,7 +300,7 @@ int main() {
               "heading handoff must preserve world yaw, including wraparound and chained commits");
       require(initial_reference == euler_z_to_quat_d(yaws[2]),
               "heading handoff must use the latest destination origin");
-      require(heading.init_base_quat == euler_z_to_quat_d(0.6),
+      require(heading.init_base_quat == captured_base_quat,
               "heading handoff must preserve the captured robot base quaternion");
     }
     {

@@ -22,12 +22,17 @@ AUTHORIZED_MODES = {1, 5}
 def recording_mode_allowed(mode, profile, hand_input=None):
     """Native-fist Dex3 planner packets lack the optical episode hand fields.
 
+    Controller frozen-upper-body packets retain both held hand commands.
     Absent hand_input preserves compatibility with older controller publishers.
     """
     return (
-        mode in AUTHORIZED_MODES
+        (
+            mode in AUTHORIZED_MODES
+            or (profile == PROFILES["inspire_ftp"] and mode in (2, 3))
+            or (profile == PROFILES["dex3"] and mode == 3)
+        )
         and hand_input != 2
-        and not (profile == PROFILES["dex3"] and hand_input == 0 and mode == 5)
+        and not (profile == PROFILES["dex3"] and hand_input == 0 and mode in (3, 5))
     )
 
 

@@ -73,6 +73,22 @@ def test_bad_retarget_candidates_are_counted_without_unsafe_emissions():
     assert report["replay_safety_checks_pass"]
 
 
+@pytest.mark.parametrize("profile,size", [("dex3", 7), ("inspire_ftp", 6)])
+def test_zero_rate_replay_reports_disabled_cap_and_keeps_loss_checks(profile, size):
+    arrays = synthetic_capture(size=size)
+    arrays["source_timestamp_ns"][10:22, 0] = 10
+    output, report = replay(
+        arrays, profile, retargeters=[FakeRetargeter(0.8, size), FakeRetargeter(0.8, size)], max_rate=0.0
+    )
+    assert not report["rate_limit_enabled"]
+    assert report["max_observed_rate"] > 2.0
+    assert report["counts"]["rate_violations"] == 0
+    assert report["counts"]["held_command_changes"] == 0
+    assert output["state"][14, 0] == TrackingState.HOLDING
+    assert any("disabled" in item for item in report["missing_qualification_evidence"])
+    assert not report["d0_qualified"]
+
+
 def test_replay_preserves_right_side_for_measured_feedback_admission():
     arrays = synthetic_capture(1)
     arrays["measured"][0, 1, 5] = -0.0007

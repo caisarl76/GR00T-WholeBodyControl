@@ -245,7 +245,8 @@ def test_feedback_timeout_write_failure_and_overrun_are_latched():
     c.tick(BASE + 11 * PERIOD)
     assert c.state is BridgeState.FAULT_LATCHED and "write failed" in c.fault_reason
     c = ready()
-    c.tick(BASE + 11 * PERIOD)
+    command(c, 10, 0)
+    c.tick(BASE + 12 * PERIOD + 1)
     assert c.state is BridgeState.FAULT_LATCHED and "overrun" in c.fault_reason
     c = ready()
     for tick in range(10, 15):

@@ -272,6 +272,45 @@ def test_real_dex3_frame_drops_absent_hands_and_orders_state(collector):
     assert c._add_data_frame()
 
 
+def test_controller_episode_keeps_frames_across_freeze_and_unfreeze(collector):
+    c = collector
+    m = start(c)
+    c.latest_image_msg = {"images": {}}
+    c.latest_proprio_msg = {"body_q": np.zeros(29), "last_action": np.zeros(29)}
+    for side in ("left", "right"):
+        c.latest_proprio_msg.update(
+            {
+                f"{side}_hand_q": np.zeros(7),
+                f"last_{side}_hand_action": np.zeros(7),
+                f"{side}_hand_feedback_valid": True,
+                f"{side}_hand_feedback_age_ns": 0,
+            }
+        )
+    for epoch, mode in enumerate((1, 3, 3, 1)):
+        fields = m.fields(epoch, mode)
+        fields["hand_input"] = np.array([1], np.int32)
+        c._handle_manager_state(pack_pose_message(fields, "manager_state", 4))
+        assert c.recorder.capture_active
+        body, hand = packets(generation=epoch + 1)
+        body["pv"] = hand["pv"] = fields["pv"]
+        hand["hand_input"] = np.array([1], np.int32)
+        topic = "pose" if mode == 1 else "planner"
+        c._body_packets[topic], c._hand_diagnostics = body, hand
+        assert c._add_data_frame(), f"dropped recording frame in mode {mode}"
+        assert not c._add_data_frame()  # Keep generation deduplication during holds.
+    assert len(c.data_exporter.frames) == 4
+    assert [frame["teleop.stream_mode"].item() for frame in c.data_exporter.frames] == [1, 3, 3, 1]
+    assert c.data_exporter.frames[1]["teleop.left_hand_held"].item()
+    assert c.data_exporter.saved == []
+
+
+def test_frozen_dex3_join_rejects_optical_input():
+    body, hand = packets()
+    body["pv"] = hand["pv"] = make_pv(b"m" * 16, 1, 3)
+    with pytest.raises(ValueError):
+        join_hand_frame(body, hand, "dex3", 1_000_000_000, b"m" * 16, 3)
+
+
 def test_managed_recording_requires_v4_wire_message(collector):
     c = collector
     m = ManagerRecording(b"m" * 16, c.hand_profile)
@@ -602,3 +641,33 @@ def test_legacy_interrupt_during_save_does_not_attempt_discard_or_retry(collecto
     assert attempts == [True]
     assert c.data_exporter.saved == []
     assert c.data_exporter.episode_buffer["size"] == 2
+
+
+@pytest.mark.parametrize("reported_age", [500_000_000, 700_000_000])
+def test_fresh_status_packets_do_not_rearm_cached_physical_feedback(collector, reported_age):
+    c = collector
+    c._inspire_status_socket = Socket()
+    for sequence in range(10):
+        fields = unpack_pose_message(status_packet(sequence), topic="inspire_hand_status")
+        fields = {key: value for key, value in fields.items() if isinstance(value, np.ndarray)}
+        fields["left_feedback_age_ns"] = np.array([reported_age], np.int64)
+        fields["right_feedback_age_ns"] = np.array([0], np.int64)
+        c._inspire_status_socket.messages.append(pack_pose_message(fields, topic="inspire_hand_status", version=1))
+    c._poll_inspire_status()
+    assert c._inspire_status is not None
+    assert not c._inspire_status["ready"]
+    assert c._pc2_healthy_streak == 0
+
+
+def test_legacy_status_without_physical_age_does_not_rearm(collector):
+    c = collector
+    c._inspire_status_socket = Socket()
+    for sequence in range(10):
+        fields = unpack_pose_message(status_packet(sequence), topic="inspire_hand_status")
+        fields = {key: value for key, value in fields.items() if isinstance(value, np.ndarray)}
+        fields.pop("left_feedback_age_ns")
+        fields.pop("right_feedback_age_ns")
+        c._inspire_status_socket.messages.append(pack_pose_message(fields, topic="inspire_hand_status", version=1))
+    c._poll_inspire_status()
+    assert c._inspire_status is not None
+    assert not c._inspire_status["ready"]
