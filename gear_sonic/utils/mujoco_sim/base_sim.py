@@ -17,7 +17,9 @@ import xml.etree.ElementTree as ET
 
 import mujoco
 import mujoco.viewer
+import msgpack
 import numpy as np
+import zmq
 from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
@@ -182,6 +184,7 @@ class DefaultEnv:
                 )
 
         # Enable the elastic band
+        self.elastic_band = None
         if self.config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
             self.elastic_band = ElasticBand()
             if "g1" in self.config["ROBOT_TYPE"]:
@@ -527,6 +530,16 @@ class DefaultEnv:
         mujoco.mj_resetData(self.mj_model, self.mj_data)
 
 
+def drain_wrench(sock, last):
+    """Newest wrench ``[fx, fy, fz, tx, ty, tz]`` pending on a PULL socket (non-blocking), else ``last``."""
+    while True:
+        try:
+            m = msgpack.unpackb(sock.recv(zmq.NOBLOCK), raw=False)
+        except zmq.Again:
+            return last
+        last = np.concatenate([np.asarray(m["force"], float), np.asarray(m["torque"], float)])
+
+
 class BaseSimulator:
     """Base simulator class that handles initialization and running of simulations"""
 
@@ -586,7 +599,57 @@ class BaseSimulator:
         pass
 
     def init_publisher(self):
-        pass
+        self._dist_sock = None
+        port = self.config.get("disturbance_port")
+        if port is not None:
+            if self.config.get("ENABLE_ELASTIC_BAND"):
+                raise ValueError("disturbance_port needs the elastic band disabled (both write xfrc_applied)")
+            self._dist_sock = zmq.Context.instance().socket(zmq.PULL)
+            self._dist_sock.setsockopt(zmq.LINGER, 0)
+            self._dist_sock.bind(f"tcp://*:{port}")
+            self._dist_body = mujoco.mj_name2id(
+                self.sim_env.mj_model, mujoco.mjtObj.mjOBJ_BODY, "pelvis"
+            )
+            if self._dist_body < 0:
+                raise ValueError("disturbance_port: no MuJoCo body named 'pelvis'")
+            self._wrench = np.zeros(6)
+        self._gt_sock = None
+        if self.config.get("publish_ground_truth", False):
+            self._gt_sock = zmq.Context.instance().socket(zmq.PUB)
+            self._gt_sock.setsockopt(zmq.LINGER, 0)
+            self._gt_sock.bind(f"tcp://*:{self.config.get('ground_truth_port', 5560)}")
+            env = self.sim_env
+            self._gt_bodies = [
+                (n, mujoco.mj_name2id(env.mj_model, mujoco.mjtObj.mjOBJ_BODY, n))
+                for n in self.config.get("gt_bodies", [])
+            ]
+            for n, i in self._gt_bodies:
+                if i < 0:
+                    raise ValueError(f"gt_bodies: unknown MuJoCo body '{n}'")
+
+    def apply_disturbance(self):
+        """Hold the newest pending world-frame wrench (N, N*m) on the pelvis."""
+        self._wrench = drain_wrench(self._dist_sock, self._wrench)
+        self.sim_env.mj_data.xfrc_applied[self._dist_body] = self._wrench
+
+    def publish_ground_truth(self):
+        d = self.sim_env.mj_data
+        msg = {
+            "t_mono_ns": time.monotonic_ns(),
+            "t_sim": float(d.time),
+            "pelvis_pos": d.qpos[0:3].tolist(),
+            "pelvis_quat_wxyz": d.qpos[3:7].tolist(),
+            "bodies": {
+                n: {"pos": d.xpos[i].tolist(), "quat_wxyz": d.xquat[i].tolist()}
+                for n, i in self._gt_bodies
+            },
+        }
+        if self._dist_sock is not None:
+            msg["pelvis_wrench"] = self._wrench.tolist()
+        try:
+            self._gt_sock.send(b"sim_gt" + msgpack.packb(msg), zmq.NOBLOCK)
+        except zmq.Again:
+            pass
 
     def init_unitree_bridge(self):
         self.unitree_bridge = UnitreeSdk2Bridge(self.config)
@@ -607,7 +670,11 @@ class BaseSimulator:
             ):
                 step_start = time.monotonic()
 
+                if self._dist_sock is not None:
+                    self.apply_disturbance()
                 self.sim_env.sim_step()
+                if self._gt_sock is not None:
+                    self.publish_ground_truth()
                 now = time.time()
                 if now - ts > 1 / 10.0 and self.redis_client is not None:
                     head_pose = self.sim_env.get_head_pose()

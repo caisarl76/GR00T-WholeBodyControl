@@ -279,9 +279,9 @@ private:
             has_heading_state = true;
         }
 
-        // State-logger fields: 18 base + 2 optional heading
+        // State-logger fields: 18 base + 2 optional heading + t_mono_ns
         // Visualisation fields: output_data_map_.size() (typically 11)
-        int num_state_fields = has_heading_state ? 20 : 18;
+        int num_state_fields = (has_heading_state ? 20 : 18) + 1;
         int num_viz_fields = static_cast<int>(output_data_map_.size());
         pk.pack_map(num_state_fields + num_viz_fields);
 
@@ -289,6 +289,12 @@ private:
 
         pk.pack("control_loop_type");
         pk.pack("cpp");
+
+        // Source time on the same CLOCK_MONOTONIC as Python time.monotonic_ns()
+        pk.pack("t_mono_ns");
+        pk.pack(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()));
 
         pk.pack("index");
         pk.pack(state.index);

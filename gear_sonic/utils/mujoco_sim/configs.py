@@ -5,7 +5,7 @@ and can load/override values from a WBC YAML file. SimLoopConfig extends it
 with multiprocessing and image-publish settings for the sim loop entry point.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import os
 from pathlib import Path
 import subprocess
@@ -341,6 +341,20 @@ class SimLoopConfig(BaseConfig):
 
     camera_port: int = 5555
     """Camera port for image publishing"""
+
+    elastic_band: bool = True
+    """Virtual spring band holding the pelvis (lifts the robot). Disable for free-standing gates."""
+    publish_ground_truth: bool = False
+    """Publish sim ground truth (topic sim_gt) once per sim step"""
+
+    ground_truth_port: int = 5560
+    """ZMQ PUB port for sim ground truth"""
+
+    disturbance_port: Optional[int] = None
+    """ZMQ PULL port for a world-frame pelvis wrench {"force": [3], "torque": [3]} (needs --no-elastic-band)"""
+
+    gt_bodies: list[str] = field(default_factory=list)
+    """MuJoCo body names whose world pose is added to the sim_gt payload"""
 
     verbose: bool = False
     """Verbose output, override the base config verbose"""

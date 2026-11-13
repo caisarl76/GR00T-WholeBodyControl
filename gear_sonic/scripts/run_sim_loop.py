@@ -37,6 +37,11 @@ def main(config: ArgsConfig):
     wbc_config = config.load_wbc_yaml()
     # NOTE: we will override the interface to local if it is not specified
     wbc_config["ENV_NAME"] = config.env_name
+    wbc_config["ENABLE_ELASTIC_BAND"] = config.elastic_band
+    wbc_config["publish_ground_truth"] = config.publish_ground_truth
+    wbc_config["ground_truth_port"] = config.ground_truth_port
+    wbc_config["disturbance_port"] = config.disturbance_port
+    wbc_config["gt_bodies"] = list(config.gt_bodies)
 
     if config.enable_image_publish:
         assert (
